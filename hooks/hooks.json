@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test -f \"${CLAUDE_PLUGIN_ROOT}/jdwp-mcp-server/target/mcp-jdwp-java.jar\" || mvn -f \"${CLAUDE_PLUGIN_ROOT}/pom.xml\" -pl jdwp-mcp-server -am package -DskipTests -q"
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT}\"; JAR=\"$PLUGIN/jdwp-mcp-server/target/mcp-jdwp-java.jar\"; MARKER=\"$PLUGIN/jdwp-mcp-server/target/.build-sha\"; EXPECTED=$(git -C \"$PLUGIN\" rev-parse HEAD 2>/dev/null || echo no-git); ACTUAL=$(cat \"$MARKER\" 2>/dev/null || echo); if [ ! -f \"$JAR\" ] || [ \"$EXPECTED\" != \"$ACTUAL\" ]; then mvn -f \"$PLUGIN/pom.xml\" -pl jdwp-mcp-server -am package -DskipTests -q && printf '%s' \"$EXPECTED\" > \"$MARKER\"; fi"
           }
         ]
       }
