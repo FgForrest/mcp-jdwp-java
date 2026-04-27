@@ -279,12 +279,20 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Extracts locals and the `this` reference from a stack frame. Uses declared type rather than
-     * runtime type for `this` to handle proxy classes (Guice, CGLIB, etc.). Throws
-     * `AbsentInformationException` if the frame's method was compiled without `-g` (no local
-     * variable debug info).
+     * Extracts locals and the `this` reference from a stack frame, then appends any caller-supplied
+     * synthetic bindings. Uses declared type rather than runtime type for `this` to handle proxy
+     * classes (Guice, CGLIB, etc.). Throws `AbsentInformationException` if the frame's method was
+     * compiled without `-g` (no local variable debug info).
+     *
+     * @param frame          stack frame providing locals and `this`
+     * @param extraBindings  additional name → value pairs to expose as synthetic locals (used for
+     *                       `$exception` when evaluating at an exception breakpoint). Iteration
+     *                       order is preserved as wrapper-method parameter order — pass a
+     *                       {@link java.util.LinkedHashMap} or {@code Map.of(...)} to keep the
+     *                       order deterministic.
      */
-    private static EvaluationContext buildContext(StackFrame frame) throws AbsentInformationException {
+    private static EvaluationContext buildContext(StackFrame frame, Map<String, Value> extraBindings)
+        throws AbsentInformationException {
         final List<ContextVariable> variables = new ArrayList<>();
         final List<Value> values = new ArrayList<>();
 
@@ -307,7 +315,32 @@ public class JdiExpressionEvaluator {
                 values.add(frame.getValue(var));
             }
         }
+
+        // Synthetic bindings are appended last so they appear after the real locals in the wrapper
+        // signature. Cache key (signature + expression) naturally varies on the bound type, so two
+        // different exception subclasses thrown at the same site get distinct cached compilations.
+        for (Map.Entry<String, Value> entry : extraBindings.entrySet()) {
+            variables.add(new ContextVariable(entry.getKey(), inferDeclaredType(entry.getValue())));
+            values.add(entry.getValue());
+        }
+
         return new EvaluationContext(variables, values);
+    }
+
+    /**
+     * Resolves a wrapper-visible declared type for a JDI {@link Value}. Mirrors the public-supertype
+     * walk performed by {@link #getDeclaredType(ReferenceType)} so a non-public exception subclass
+     * still binds as a public ancestor (worst case {@code java.lang.Object}). Falls back to
+     * {@code java.lang.Object} for {@code null} and unrecognised value kinds.
+     */
+    private static String inferDeclaredType(@Nullable Value value) {
+        if (value instanceof ObjectReference objRef) {
+            return getDeclaredType(objRef.referenceType());
+        }
+        if (value instanceof PrimitiveValue primValue) {
+            return primValue.type().name();
+        }
+        return "java.lang.Object";
     }
 
     /**
@@ -456,17 +489,34 @@ public class JdiExpressionEvaluator {
 
     /**
      * Evaluates `expression` in the context of `frame` and returns the result as a JDI {@link Value}.
-     * Side effect: populates {@link #compilationCache}. The auto-rewrite of bare `this.field`
-     * references only runs when `this`'s declared type is public — for non-public types the wrapper
-     * class can't reference the type at all, so the rewrite would just produce a misleading
-     * "type not visible" error.
+     * Convenience overload — equivalent to {@link #evaluate(StackFrame, String, Map)} with no extra
+     * bindings.
+     */
+    public @Nullable Value evaluate(StackFrame frame, String expression) throws JdiEvaluationException {
+        return evaluate(frame, expression, Map.of());
+    }
+
+    /**
+     * Evaluates `expression` in the context of `frame` plus any caller-supplied synthetic bindings,
+     * and returns the result as a JDI {@link Value}. Side effect: populates {@link #compilationCache}.
+     * The auto-rewrite of bare `this.field` references only runs when `this`'s declared type is
+     * public — for non-public types the wrapper class can't reference the type at all, so the
+     * rewrite would just produce a misleading "type not visible" error.
      *
-     * @param frame      stack frame providing the context (local variables and `this`)
-     * @param expression Java expression to evaluate
+     * <p>Synthetic bindings (e.g. {@code "$exception" -> ObjectReference}) appear in the wrapper's
+     * parameter list after the real locals and can be referenced by name in the expression. This is
+     * how {@link one.edee.mcp.jdwp.JdiEventListener} exposes the thrown object on the log path of
+     * an exception breakpoint.
+     *
+     * @param frame         stack frame providing the context (local variables and `this`)
+     * @param expression    Java expression to evaluate
+     * @param extraBindings additional name → value pairs to expose as synthetic locals; pass
+     *                      {@code Map.of()} for none
      * @return the JDI value produced by the user expression (autoboxed to `Object`)
      * @throws JdiEvaluationException wrapping any underlying compilation, classloader, or invocation failure
      */
-    public @Nullable Value evaluate(StackFrame frame, String expression) throws JdiEvaluationException {
+    public @Nullable Value evaluate(StackFrame frame, String expression, Map<String, Value> extraBindings)
+        throws JdiEvaluationException {
         // Reentrancy guard: mark the firing thread as mid-evaluation BEFORE touching JDI so the
         // event listener suppresses any recursive breakpoint / exception event that fires while
         // we are inside the invokeMethod chain (defineClass / forName / user wrapper method /
@@ -484,7 +534,7 @@ public class JdiExpressionEvaluator {
             // The caller (e.g., jdwp_evaluate_watchers) is responsible for calling configureCompilerClasspath()
 
             // 1. Analyze the frame to build the evaluation context
-            final EvaluationContext context = buildContext(frame);
+            final EvaluationContext context = buildContext(frame, extraBindings);
 
             // Auto-rewrite bare references to fields of `this` so users can write
             // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.

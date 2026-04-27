@@ -8,6 +8,7 @@ import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.ExceptionRequest;
 import one.edee.mcp.jdwp.BreakpointTracker.ExceptionBreakpointInfo;
+import one.edee.mcp.jdwp.BreakpointTracker.ExceptionBreakpointSpec;
 import one.edee.mcp.jdwp.BreakpointTracker.PendingExceptionBreakpoint;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -46,7 +47,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		void shouldRegisterExceptionBreakpointAndAssignId() {
 			ExceptionRequest req = mock(ExceptionRequest.class);
 
-			int id = tracker.registerExceptionBreakpoint(req, "java.lang.NullPointerException", true, true);
+			int id = tracker.registerExceptionBreakpoint(req, ExceptionBreakpointSpec.suspending("java.lang.NullPointerException", true, true));
 
 			assertThat(id).isEqualTo(1);
 			assertThat(tracker.getAllExceptionBreakpoints()).containsKey(id);
@@ -56,8 +57,8 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		void shouldReturnAllExceptionBreakpointsAsUnmodifiableMap() {
 			ExceptionRequest reqA = mock(ExceptionRequest.class);
 			ExceptionRequest reqB = mock(ExceptionRequest.class);
-			tracker.registerExceptionBreakpoint(reqA, "java.lang.NullPointerException", true, false);
-			tracker.registerExceptionBreakpoint(reqB, "java.lang.IllegalStateException", false, true);
+			tracker.registerExceptionBreakpoint(reqA, ExceptionBreakpointSpec.suspending("java.lang.NullPointerException", true, false));
+			tracker.registerExceptionBreakpoint(reqB, ExceptionBreakpointSpec.suspending("java.lang.IllegalStateException", false, true));
 
 			Map<Integer, ExceptionBreakpointInfo> all = tracker.getAllExceptionBreakpoints();
 
@@ -69,7 +70,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		@Test
 		void shouldStoreExceptionClassCaughtAndUncaughtFlags() {
 			ExceptionRequest req = mock(ExceptionRequest.class);
-			int id = tracker.registerExceptionBreakpoint(req, "com.example.MyException", true, false);
+			int id = tracker.registerExceptionBreakpoint(req, ExceptionBreakpointSpec.suspending("com.example.MyException", true, false));
 
 			ExceptionBreakpointInfo info = tracker.getAllExceptionBreakpoints().get(id);
 
@@ -87,7 +88,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			when(req.virtualMachine()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
 
-			int id = tracker.registerExceptionBreakpoint(req, "java.lang.NullPointerException", true, true);
+			int id = tracker.registerExceptionBreakpoint(req, ExceptionBreakpointSpec.suspending("java.lang.NullPointerException", true, true));
 
 			boolean removed = tracker.removeExceptionBreakpoint(id);
 
@@ -103,7 +104,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldFallThroughToPendingWhenActiveExceptionNotFound() {
-			int id = tracker.registerPendingExceptionBreakpoint("com.example.MyException", true, true);
+			int id = tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
 			boolean removed = tracker.removeExceptionBreakpoint(id);
 
@@ -112,10 +113,49 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		}
 
 		@Test
+		void shouldStoreLogOnlyAndExpressionFlags() {
+			ExceptionRequest req = mock(ExceptionRequest.class);
+			int id = tracker.registerExceptionBreakpoint(
+				req, ExceptionBreakpointSpec.logOnly("java.lang.IllegalStateException", true, true, "$exception.getMessage()"));
+
+			ExceptionBreakpointInfo info = tracker.getAllExceptionBreakpoints().get(id);
+
+			assertThat(info.isLogOnly()).isTrue();
+			assertThat(info.getExpression()).isEqualTo("$exception.getMessage()");
+		}
+
+		@Test
+		void shouldDefaultLogOnlyAndExpressionToFalseAndNull() {
+			ExceptionRequest req = mock(ExceptionRequest.class);
+			int id = tracker.registerExceptionBreakpoint(
+				req, ExceptionBreakpointSpec.suspending("java.lang.NullPointerException", true, true));
+
+			ExceptionBreakpointInfo info = tracker.getAllExceptionBreakpoints().get(id);
+
+			assertThat(info.isLogOnly()).isFalse();
+			assertThat(info.getExpression()).isNull();
+		}
+
+		@Test
+		void shouldFindExceptionInfoByRequest() {
+			ExceptionRequest req = mock(ExceptionRequest.class);
+			ExceptionRequest other = mock(ExceptionRequest.class);
+			tracker.registerExceptionBreakpoint(
+				req, ExceptionBreakpointSpec.logOnly("java.lang.IllegalStateException", true, true, "$exception.getMessage()"));
+
+			ExceptionBreakpointInfo info = tracker.findExceptionInfoByRequest(req);
+
+			assertThat(info).isNotNull();
+			assertThat(info.getExceptionClass()).isEqualTo("java.lang.IllegalStateException");
+			assertThat(info.isLogOnly()).isTrue();
+			assertThat(tracker.findExceptionInfoByRequest(other)).isNull();
+		}
+
+		@Test
 		void shouldTolerateDeadVmOnRemove() {
 			ExceptionRequest req = mock(ExceptionRequest.class);
 			when(req.virtualMachine()).thenThrow(new RuntimeException("VM dead"));
-			int id = tracker.registerExceptionBreakpoint(req, "com.example.MyException", true, true);
+			int id = tracker.registerExceptionBreakpoint(req, ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
 			boolean removed = tracker.removeExceptionBreakpoint(id);
 
@@ -130,7 +170,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldRegisterPendingExceptionBreakpointAndAssignId() {
-			int id = tracker.registerPendingExceptionBreakpoint("com.example.MyException", true, true);
+			int id = tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
 			assertThat(id).isEqualTo(1);
 			assertThat(tracker.getAllPendingExceptionBreakpoints()).containsKey(id);
@@ -138,9 +178,9 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldGetPendingExceptionBreakpointsForClass() {
-			tracker.registerPendingExceptionBreakpoint("com.example.A", true, true);
-			tracker.registerPendingExceptionBreakpoint("com.example.A", false, true);
-			tracker.registerPendingExceptionBreakpoint("com.example.B", true, false);
+			tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.A", true, true));
+			tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.A", false, true));
+			tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.B", true, false));
 
 			var matches = tracker.getPendingExceptionBreakpointsForClass("com.example.A");
 
@@ -151,7 +191,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldPromotePendingExceptionToActive() {
-			int id = tracker.registerPendingExceptionBreakpoint("com.example.MyException", true, true);
+			int id = tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 			ExceptionRequest req = mock(ExceptionRequest.class);
 
 			tracker.promotePendingExceptionToActive(id, req);
@@ -166,8 +206,21 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		}
 
 		@Test
+		void shouldCarryLogOnlyAndExpressionAcrossPromotion() {
+			int id = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.logOnly("com.example.MyException", true, true, "$exception.getMessage()"));
+			ExceptionRequest req = mock(ExceptionRequest.class);
+
+			tracker.promotePendingExceptionToActive(id, req);
+
+			ExceptionBreakpointInfo info = tracker.getAllExceptionBreakpoints().get(id);
+			assertThat(info.isLogOnly()).isTrue();
+			assertThat(info.getExpression()).isEqualTo("$exception.getMessage()");
+		}
+
+		@Test
 		void shouldMarkPendingExceptionFailed() {
-			int id = tracker.registerPendingExceptionBreakpoint("com.example.MyException", true, true);
+			int id = tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
 			tracker.markPendingExceptionFailed(id, "class not found");
 
@@ -183,7 +236,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldReturnAllPendingExceptionBreakpointsAsUnmodifiableMap() {
-			tracker.registerPendingExceptionBreakpoint("com.example.A", true, true);
+			tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.A", true, true));
 
 			Map<Integer, PendingExceptionBreakpoint> all = tracker.getAllPendingExceptionBreakpoints();
 
@@ -343,8 +396,8 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int activeId = tracker.registerBreakpoint(activeBp);
 			tracker.setCondition(activeId, "x > 0");
 			tracker.registerPendingBreakpoint("com.Foo", 10, 2, "ALL");
-			tracker.registerExceptionBreakpoint(excReq, "com.example.MyException", true, true);
-			tracker.registerPendingExceptionBreakpoint("com.example.OtherException", true, false);
+			tracker.registerExceptionBreakpoint(excReq, ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+			tracker.registerPendingExceptionBreakpoint(ExceptionBreakpointSpec.suspending("com.example.OtherException", true, false));
 			tracker.registerClassPrepareRequest("com.Foo", cpr);
 
 			EventRequestManager erm = mock(EventRequestManager.class);

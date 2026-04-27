@@ -156,7 +156,7 @@ class BreakpointTrackerMetadataCleanupTest {
 			ClassPrepareRequest cpr = mockCpr();
 			tracker.registerClassPrepareRequest("com.Foo", cpr);
 			int lineId = tracker.registerPendingBreakpoint("com.Foo", 10, 2, "ALL");
-			tracker.registerPendingExceptionBreakpoint("com.Foo", true, true);
+			tracker.registerPendingExceptionBreakpoint(BreakpointTracker.ExceptionBreakpointSpec.suspending("com.Foo", true, true));
 
 			tracker.removePendingBreakpoint(lineId);
 

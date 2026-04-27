@@ -329,22 +329,24 @@ public class JdiEventListener {
     }
 
     /**
-     * Handles a JDI exception event by recording an `EXCEPTION` entry with throw/catch location
-     * metadata and routing the firing thread through {@link BreakpointTracker#setLastBreakpointThread}
-     * with the sentinel BP id `-1`. The sentinel lets `jdwp_get_current_thread` and the
-     * `findSuspendedThread` fallback locate the thread without needing a real breakpoint id.
-     *
-     * <p>Returns {@code true} when the firing thread should stay suspended, {@code false} when the
-     * exception was suppressed by the reentrancy guard — an expression evaluation that throws
-     * must not cause the outer {@code invokeMethod} to hang on a re-suspended thread. The
-     * exception still surfaces to the caller via the usual JDI {@link InvocationException}
-     * channel, so the user sees their expression error.
+     * Handles a JDI exception event. Three paths:
+     * <ul>
+     *   <li><b>Reentrancy-suppressed</b> — the firing thread is already inside an MCP-driven
+     *       {@code invokeMethod} chain. Records {@code EXCEPTION_SUPPRESSED} and returns
+     *       {@code false} so the listener auto-resumes; otherwise the outer invocation would hang
+     *       on a re-suspended thread. The exception still propagates back to the original caller
+     *       via the usual JDI {@link InvocationException} channel, so no information is lost.</li>
+     *   <li><b>Log-only</b> — the firing {@link BreakpointTracker.ExceptionBreakpointInfo} has
+     *       {@code logOnly=true}. Records {@code EXCEPTION_LOG} (with the optional expression's
+     *       result, or {@code EXCEPTION_LOG_ERROR} on evaluation failure) and returns
+     *       {@code false} so the throwing thread auto-resumes — non-intrusive exception tracing.</li>
+     *   <li><b>Suspending (default)</b> — records {@code EXCEPTION}, parks the firing thread under
+     *       the sentinel BP id {@code -1} so {@code jdwp_get_current_thread} can locate it, fires
+     *       the resume-until-event latch, and returns {@code true}.</li>
+     * </ul>
      */
     private boolean handleExceptionEvent(ExceptionEvent event) {
-        // Reentrancy guard — an exception breakpoint that fires while the firing thread is
-        // already inside an MCP-driven invokeMethod chain must NOT re-suspend the thread, or
-        // the outer invocation deadlocks. The exception still propagates back to the caller
-        // through JDI's normal InvocationException channel, so no information is lost.
+        // Reentrancy guard — see contract above.
         if (evaluationGuard.isEvaluating(event.thread())) {
             try {
                 final String exceptionType = event.exception().referenceType().name();
@@ -373,6 +375,18 @@ public class JdiEventListener {
                 ? catchLocation.declaringType().name() + ':' + catchLocation.lineNumber() : "uncaught";
             final String threadName = event.thread().name();
 
+            // Look up the firing BP record so we can decide between log-only and suspending mode.
+            // event.request() may be null on synthesised events (defensive — JDI normally fills it).
+            final BreakpointTracker.ExceptionBreakpointInfo info =
+                event.request() instanceof ExceptionRequest exReq
+                    ? breakpointTracker.findExceptionInfoByRequest(exReq) : null;
+
+            if (info != null && info.isLogOnly()) {
+                evaluateExceptionLogpoint(event, info, exception, exceptionType,
+                    throwInfo, catchInfo, threadName);
+                return false;
+            }
+
             breakpointTracker.setLastBreakpointThread(event.thread(), -1);
             breakpointTracker.fireNextEvent();
 
@@ -391,6 +405,60 @@ public class JdiEventListener {
     }
 
     /**
+     * Records an {@code EXCEPTION_LOG} entry for a log-only exception breakpoint and, if the BP
+     * carries an expression, evaluates it against the throwing frame with {@code $exception} bound
+     * to the thrown object. Evaluation failures (compilation error, target-VM exception during
+     * {@code invokeMethod}, etc.) are captured as a separate {@code EXCEPTION_LOG_ERROR} entry —
+     * the listener never throws so a single bad expression cannot break the event loop.
+     *
+     * <p>Runs on the JDI listener thread, mirroring {@link #evaluateLogpoint}: this is safe
+     * because we are inside a synchronously-dispatched event handler, not inside a JDI callback,
+     * so {@code invokeMethod} is permitted on the suspended firing thread.
+     */
+    private void evaluateExceptionLogpoint(ExceptionEvent event,
+                                           BreakpointTracker.ExceptionBreakpointInfo info,
+                                           ObjectReference exception, String exceptionType,
+                                           String throwInfo, String catchInfo, String threadName) {
+        final String expression = info.getExpression();
+
+        if (expression == null) {
+            // Log-only with no expression — same metadata as EXCEPTION, distinct type so callers
+            // can grep `EXCEPTION_LOG` for non-suspending traces.
+            eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_LOG",
+                String.format("%s thrown at %s, caught at %s on thread %s [log-only]",
+                    exceptionType, throwInfo, catchInfo, threadName),
+                Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
+                    "catchLocation", catchInfo, "thread", threadName)));
+            log.info("[JDI] Exception {} logged at {} (log-only) on thread {}",
+                exceptionType, throwInfo, threadName);
+            return;
+        }
+
+        try {
+            final String resultStr = evaluateAndFormat(event.thread(), expression,
+                Map.of("$exception", exception));
+
+            eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_LOG",
+                String.format("%s thrown at %s on thread %s [%s = %s]",
+                    exceptionType, throwInfo, threadName, expression, resultStr),
+                Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
+                    "catchLocation", catchInfo, "thread", threadName,
+                    "expression", expression, "result", resultStr)));
+            log.info("[JDI] Exception {} logged at {} with {} = {} on thread {}",
+                exceptionType, throwInfo, expression, resultStr, threadName);
+        } catch (Exception e) {
+            eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_LOG_ERROR",
+                String.format("%s thrown at %s on thread %s — error evaluating '%s': %s",
+                    exceptionType, throwInfo, threadName, expression, e.getMessage()),
+                Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
+                    "thread", threadName, "expression", expression,
+                    "error", String.valueOf(e.getMessage()))));
+            log.warn("[JDI] Exception logpoint evaluation failed for '{}': {}",
+                expression, e.getMessage());
+        }
+    }
+
+    /**
      * Evaluates the logpoint expression and records a `LOGPOINT` (or `LOGPOINT_ERROR`) entry. Runs
      * on the JDI listener thread; this is safe because we're inside a synchronously-dispatched
      * event handler — JDI's prohibition on `invokeMethod` applies to event-dispatch callbacks, not
@@ -402,12 +470,7 @@ public class JdiEventListener {
     private void evaluateLogpoint(BreakpointEvent event, int bpId, String expression,
                                   String className, int lineNumber, String threadName) {
         try {
-            final ThreadReference thread = event.thread();
-            expressionEvaluator.configureCompilerClasspath(thread);
-            final StackFrame frame = thread.frame(0);
-            final Value result = expressionEvaluator.evaluate(frame, expression);
-
-            final String resultStr = formatLogpointResult(result);
+            final String resultStr = evaluateAndFormat(event.thread(), expression, Map.of());
 
             eventHistory.record(new EventHistory.DebugEvent("LOGPOINT",
                 String.format("[Logpoint %d] %s = %s at %s:%d", bpId, expression, resultStr, className, lineNumber),
@@ -421,6 +484,21 @@ public class JdiEventListener {
                 String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, e.getMessage())));
             log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, e.getMessage());
         }
+    }
+
+    /**
+     * Configures the compiler classpath, takes the top frame of {@code thread}, evaluates
+     * {@code expression} with the supplied synthetic bindings, and returns the formatted result.
+     * Shared between {@link #evaluateLogpoint} and {@link #evaluateExceptionLogpoint} — both want
+     * the same evaluate-and-format pipeline; only the recorded event types and metadata differ.
+     * Throws on any failure so the caller can produce a {@code *_ERROR} event entry.
+     */
+    private String evaluateAndFormat(ThreadReference thread, String expression,
+                                     Map<String, Value> extraBindings) throws Exception {
+        expressionEvaluator.configureCompilerClasspath(thread);
+        final StackFrame frame = thread.frame(0);
+        final Value result = expressionEvaluator.evaluate(frame, expression, extraBindings);
+        return formatLogpointResult(result);
     }
 
     /**
@@ -524,6 +602,9 @@ public class JdiEventListener {
                 final BreakpointTracker.PendingExceptionBreakpoint pending = entry.getValue();
                 try {
                     final ExceptionRequest exReq = erm.createExceptionRequest(refType, pending.isCaught(), pending.isUncaught());
+                    // Always SUSPEND_EVENT_THREAD: logOnly BPs are auto-resumed by handleExceptionEvent
+                    // after recording / optional expression evaluation. SUSPEND_NONE would prevent
+                    // invokeMethod for the expression eval.
                     exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
                     exReq.enable();
                     breakpointTracker.promotePendingExceptionToActive(id, exReq);

@@ -19,8 +19,9 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * (MCP tool calls on worker threads) never block each other.
  * - Cleared on `jdwp_reset`, `jdwp_clear_events`, and {@link JDIConnectionService#cleanupSessionState}.
  * <p>
- * Documented event type strings: `BREAKPOINT`, `STEP`, `EXCEPTION`, `LOGPOINT`, `LOGPOINT_ERROR`,
- * `VM_START`, `VM_DEATH`. These are the keys clients can grep on or filter by.
+ * Documented event type strings: `BREAKPOINT`, `STEP`, `EXCEPTION`, `EXCEPTION_LOG`,
+ * `EXCEPTION_LOG_ERROR`, `LOGPOINT`, `LOGPOINT_ERROR`, `BREAKPOINT_SUPPRESSED`,
+ * `EXCEPTION_SUPPRESSED`, `VM_START`, `VM_DEATH`. These are the keys clients can grep on or filter by.
  */
 @Service
 public class EventHistory {

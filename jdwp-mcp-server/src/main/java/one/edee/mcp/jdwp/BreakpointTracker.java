@@ -45,6 +45,15 @@ public class BreakpointTracker {
      */
     private final ConcurrentHashMap<Integer, BreakpointRequest> breakpointsById = new ConcurrentHashMap<>();
     /**
+     * Reverse index for {@link #breakpointsById} keyed by JDI request identity (not equals — the JDI
+     * implementation does not promise structural equality across requests). Populated and torn down
+     * in lockstep with {@link #breakpointsById} so {@link #findIdByRequest} and
+     * {@link #unregisterByRequest} are O(1) instead of scanning the values map. The JDI listener
+     * thread calls {@code findIdByRequest} on every BP hit, so a linear scan here would be a hot
+     * spot under high BP volume.
+     */
+    private final ConcurrentHashMap<BreakpointRequest, Integer> breakpointIdsByRequest = new ConcurrentHashMap<>();
+    /**
      * Line breakpoints awaiting class load; populated by {@link #registerPendingBreakpoint} via `jdwp_set_breakpoint`.
      */
     private final ConcurrentHashMap<Integer, PendingBreakpoint> pendingBreakpointsById = new ConcurrentHashMap<>();
@@ -60,6 +69,14 @@ public class BreakpointTracker {
      * Active exception breakpoints keyed by synthetic ID; populated by {@link #registerExceptionBreakpoint}.
      */
     private final ConcurrentHashMap<Integer, ExceptionBreakpointInfo> exceptionBreakpointsById = new ConcurrentHashMap<>();
+    /**
+     * Reverse index for {@link #exceptionBreakpointsById} keyed by the JDI {@link ExceptionRequest}
+     * identity. Hot path: {@link JdiEventListener#handleExceptionEvent} calls
+     * {@link #findExceptionInfoByRequest} on every exception event, and log-only BPs matching broad
+     * supertypes (e.g. {@code Throwable}) can fire frequently. Maintained in lockstep with the
+     * primary map.
+     */
+    private final ConcurrentHashMap<ExceptionRequest, ExceptionBreakpointInfo> exceptionInfoByRequest = new ConcurrentHashMap<>();
     /**
      * Exception breakpoints awaiting class load; promoted via {@link #promotePendingExceptionToActive}.
      */
@@ -107,6 +124,7 @@ public class BreakpointTracker {
     public int registerBreakpoint(BreakpointRequest bp) {
         final int id = idCounter.getAndIncrement();
         breakpointsById.put(id, bp);
+        breakpointIdsByRequest.put(bp, id);
         return id;
     }
 
@@ -129,6 +147,7 @@ public class BreakpointTracker {
         // Try active breakpoints first
         final BreakpointRequest bp = breakpointsById.remove(id);
         if (bp != null) {
+            breakpointIdsByRequest.remove(bp);
             try {
                 bp.virtualMachine().eventRequestManager().deleteEventRequest(bp);
             } catch (Exception e) {
@@ -158,26 +177,21 @@ public class BreakpointTracker {
      * before invoking this method, otherwise the request stays alive in the target VM.
      */
     public void unregisterByRequest(BreakpointRequest bp) {
-        final Integer id = findIdByRequest(bp);
-        breakpointsById.entrySet().removeIf(e -> e.getValue() == bp);
+        final Integer id = breakpointIdsByRequest.remove(bp);
         if (id != null) {
+            breakpointsById.remove(id);
             breakpointMetadata.remove(id);
         }
     }
 
     /**
-     * Find the synthetic ID for a given JDI BreakpointRequest.
+     * Find the synthetic ID for a given JDI BreakpointRequest. O(1) via the reverse index.
      *
      * @return the ID, or null if not tracked
      */
     @Nullable
     public Integer findIdByRequest(BreakpointRequest bp) {
-        for (Map.Entry<Integer, BreakpointRequest> entry : breakpointsById.entrySet()) {
-            if (entry.getValue() == bp) {
-                return entry.getKey();
-            }
-        }
-        return null;
+        return breakpointIdsByRequest.get(bp);
     }
 
     /**
@@ -216,6 +230,7 @@ public class BreakpointTracker {
             deleteQuietly(erm, bp);
         }
         breakpointsById.clear();
+        breakpointIdsByRequest.clear();
 
         pendingBreakpointsById.clear();
         breakpointMetadata.clear();
@@ -229,6 +244,7 @@ public class BreakpointTracker {
             deleteQuietly(erm, info.request);
         }
         exceptionBreakpointsById.clear();
+        exceptionInfoByRequest.clear();
         pendingExceptionBreakpointsById.clear();
 
         lastBreakpoint = null;
@@ -296,6 +312,7 @@ public class BreakpointTracker {
     public void promotePendingToActive(int id, BreakpointRequest bp) {
         pendingBreakpointsById.remove(id);
         breakpointsById.put(id, bp);
+        breakpointIdsByRequest.put(bp, id);
     }
 
     /**
@@ -414,15 +431,26 @@ public class BreakpointTracker {
      * Registers an active exception breakpoint and returns its synthetic ID. Twin of
      * {@link #registerBreakpoint} for the exception side of the state machine.
      *
-     * @param req            the JDI exception request already created and enabled
-     * @param exceptionClass fully qualified name of the exception class being intercepted
-     * @param caught         whether caught exceptions should trigger a break
-     * @param uncaught       whether uncaught exceptions should trigger a break
+     * @param req  the JDI exception request already created and enabled
+     * @param spec the user-facing options bundle (class, caught/uncaught flags, logOnly, expression)
      */
-    public int registerExceptionBreakpoint(ExceptionRequest req, String exceptionClass, boolean caught, boolean uncaught) {
+    public int registerExceptionBreakpoint(ExceptionRequest req, ExceptionBreakpointSpec spec) {
         final int id = idCounter.getAndIncrement();
-        exceptionBreakpointsById.put(id, new ExceptionBreakpointInfo(exceptionClass, caught, uncaught, req));
+        final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(spec, req);
+        exceptionBreakpointsById.put(id, info);
+        exceptionInfoByRequest.put(req, info);
         return id;
+    }
+
+    /**
+     * Looks up the {@link ExceptionBreakpointInfo} for a given JDI {@link ExceptionRequest}, or
+     * {@code null} if the request is not tracked. O(1) via the reverse index. Used by
+     * {@link JdiEventListener#handleExceptionEvent} to read the {@code logOnly} flag and the
+     * optional log expression from the firing request on every exception event.
+     */
+    @Nullable
+    public ExceptionBreakpointInfo findExceptionInfoByRequest(ExceptionRequest req) {
+        return exceptionInfoByRequest.get(req);
     }
 
     /**
@@ -435,6 +463,7 @@ public class BreakpointTracker {
     public synchronized boolean removeExceptionBreakpoint(int id) {
         final ExceptionBreakpointInfo info = exceptionBreakpointsById.remove(id);
         if (info != null) {
+            exceptionInfoByRequest.remove(info.request);
             try {
                 info.request.virtualMachine().eventRequestManager().deleteEventRequest(info.request);
             } catch (Exception e) {
@@ -462,14 +491,10 @@ public class BreakpointTracker {
      * {@link #registerPendingBreakpoint} for the exception side of the state machine. The caller
      * is expected to also register a `ClassPrepareRequest` so {@link JdiEventListener#handleClassPrepareEvent}
      * can promote it via {@link #promotePendingExceptionToActive}.
-     *
-     * @param exceptionClass fully qualified name of the exception class to intercept
-     * @param caught         whether caught exceptions should trigger a break
-     * @param uncaught       whether uncaught exceptions should trigger a break
      */
-    public synchronized int registerPendingExceptionBreakpoint(String exceptionClass, boolean caught, boolean uncaught) {
+    public synchronized int registerPendingExceptionBreakpoint(ExceptionBreakpointSpec spec) {
         final int id = idCounter.getAndIncrement();
-        pendingExceptionBreakpointsById.put(id, new PendingExceptionBreakpoint(exceptionClass, caught, uncaught));
+        pendingExceptionBreakpointsById.put(id, new PendingExceptionBreakpoint(spec));
         return id;
     }
 
@@ -498,8 +523,9 @@ public class BreakpointTracker {
     public void promotePendingExceptionToActive(int id, ExceptionRequest req) {
         final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.remove(id);
         if (pending != null) {
-            exceptionBreakpointsById.put(id, new ExceptionBreakpointInfo(
-                pending.getExceptionClass(), pending.isCaught(), pending.isUncaught(), req));
+            final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(pending.getSpec(), req);
+            exceptionBreakpointsById.put(id, info);
+            exceptionInfoByRequest.put(req, info);
         }
     }
 
@@ -603,6 +629,9 @@ public class BreakpointTracker {
 
                 final ExceptionRequest exReq = erm.createExceptionRequest(
                     refType, pending.isCaught(), pending.isUncaught());
+                // Always SUSPEND_EVENT_THREAD: even logOnly BPs need a brief suspend so the
+                // listener can read the exception object / evaluate the optional expression.
+                // Auto-resume happens in JdiEventListener.handleExceptionEvent.
                 exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
                 exReq.enable();
                 promotePendingExceptionToActive(id, exReq);
@@ -706,10 +735,12 @@ public class BreakpointTracker {
         // Release any awaiter BEFORE we touch state — see fireNextEvent() for why this matters.
         fireNextEvent();
         breakpointsById.clear();
+        breakpointIdsByRequest.clear();
         pendingBreakpointsById.clear();
         breakpointMetadata.clear();
         classPrepareRequests.clear();
         exceptionBreakpointsById.clear();
+        exceptionInfoByRequest.clear();
         pendingExceptionBreakpointsById.clear();
         lastBreakpoint = null;
         idCounter.set(1);
@@ -790,31 +821,45 @@ public class BreakpointTracker {
     }
 
     /**
-     * Tracks an exception breakpoint created via JDI ExceptionRequest.
+     * Tracks an exception breakpoint created via JDI ExceptionRequest. When {@code spec.logOnly()}
+     * is true, {@link JdiEventListener#handleExceptionEvent} records an {@code EXCEPTION_LOG} entry
+     * and auto-resumes the firing thread instead of leaving it suspended; the optional
+     * {@code spec.expression()} is evaluated against the throwing frame with {@code $exception}
+     * bound to the thrown object and the result is attached to the log entry (or recorded as
+     * {@code EXCEPTION_LOG_ERROR} on evaluation failure).
      */
     public static class ExceptionBreakpointInfo {
         final ExceptionRequest request;
-        private final String exceptionClass;
-        private final boolean caught;
-        private final boolean uncaught;
+        private final ExceptionBreakpointSpec spec;
 
-        public ExceptionBreakpointInfo(String exceptionClass, boolean caught, boolean uncaught, ExceptionRequest request) {
-            this.exceptionClass = exceptionClass;
-            this.caught = caught;
-            this.uncaught = uncaught;
+        public ExceptionBreakpointInfo(ExceptionBreakpointSpec spec, ExceptionRequest request) {
+            this.spec = spec;
             this.request = request;
         }
 
+        public ExceptionBreakpointSpec getSpec() {
+            return spec;
+        }
+
         public String getExceptionClass() {
-            return exceptionClass;
+            return spec.exceptionClass();
         }
 
         public boolean isCaught() {
-            return caught;
+            return spec.caught();
         }
 
         public boolean isUncaught() {
-            return uncaught;
+            return spec.uncaught();
+        }
+
+        public boolean isLogOnly() {
+            return spec.logOnly();
+        }
+
+        @Nullable
+        public String getExpression() {
+            return spec.expression();
         }
 
         public ExceptionRequest getRequest() {
@@ -827,28 +872,37 @@ public class BreakpointTracker {
      * Will be promoted to an active exception breakpoint when the class loads.
      */
     public static class PendingExceptionBreakpoint {
-        private final String exceptionClass;
-        private final boolean caught;
-        private final boolean uncaught;
+        private final ExceptionBreakpointSpec spec;
         @Nullable
         private volatile String failureReason;
 
-        public PendingExceptionBreakpoint(String exceptionClass, boolean caught, boolean uncaught) {
-            this.exceptionClass = exceptionClass;
-            this.caught = caught;
-            this.uncaught = uncaught;
+        public PendingExceptionBreakpoint(ExceptionBreakpointSpec spec) {
+            this.spec = spec;
+        }
+
+        public ExceptionBreakpointSpec getSpec() {
+            return spec;
         }
 
         public String getExceptionClass() {
-            return exceptionClass;
+            return spec.exceptionClass();
         }
 
         public boolean isCaught() {
-            return caught;
+            return spec.caught();
         }
 
         public boolean isUncaught() {
-            return uncaught;
+            return spec.uncaught();
+        }
+
+        public boolean isLogOnly() {
+            return spec.logOnly();
+        }
+
+        @Nullable
+        public String getExpression() {
+            return spec.expression();
         }
 
         @Nullable
@@ -861,6 +915,41 @@ public class BreakpointTracker {
          */
         public void setFailureReason(@Nullable String failureReason) {
             this.failureReason = failureReason;
+        }
+    }
+
+    /**
+     * User-facing options bundle for an exception breakpoint. Captures the same flags accepted by
+     * {@code jdwp_set_exception_breakpoint}, in a shape that travels through the active and pending
+     * tracker records and across pending → active promotion without callers having to repeat
+     * positional arguments. Construct via {@link #suspending} or {@link #logOnly} for the common
+     * cases.
+     */
+    public record ExceptionBreakpointSpec(
+        String exceptionClass,
+        boolean caught,
+        boolean uncaught,
+        boolean logOnly,
+        @Nullable String expression
+    ) {
+        /**
+         * Default suspending behaviour: the throwing thread is parked at the throw site for
+         * inspection and no expression is evaluated.
+         */
+        public static ExceptionBreakpointSpec suspending(String exceptionClass, boolean caught, boolean uncaught) {
+            return new ExceptionBreakpointSpec(exceptionClass, caught, uncaught, false, null);
+        }
+
+        /**
+         * Log-only behaviour: the listener records an {@code EXCEPTION_LOG} event and auto-resumes
+         * the throwing thread. {@code expression} (optional, may be {@code null}) is evaluated
+         * against the throwing frame with {@code $exception} bound to the thrown object — pass
+         * {@code null} for pure log-only, or e.g. {@code "$exception.getMessage()"} for an enriched
+         * trace.
+         */
+        public static ExceptionBreakpointSpec logOnly(String exceptionClass, boolean caught, boolean uncaught,
+                                                      @Nullable String expression) {
+            return new ExceptionBreakpointSpec(exceptionClass, caught, uncaught, true, expression);
         }
     }
 }

@@ -85,7 +85,7 @@ class JDWPToolsNullParamDefaultsTest {
 			// are applied before the VM access, so we simply verify no NPE on the Boolean unboxing.
 			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
 
-			String result = tools.jdwp_set_exception_breakpoint("java.lang.NullPointerException", null, null);
+			String result = tools.jdwp_set_exception_breakpoint("java.lang.NullPointerException", null, null, null, null);
 			// Should get an error about connection, not a NullPointerException on auto-unboxing.
 			assertThat(result).contains("Error");
 			assertThat(result).doesNotContain("NullPointerException");

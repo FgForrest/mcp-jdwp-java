@@ -1261,11 +1261,19 @@ public class JDWPTools {
         return "Event history cleared";
     }
 
-    @McpTool(description = "Set a breakpoint that triggers when a specific exception is thrown. If the exception class is not yet loaded, the breakpoint is deferred and will activate automatically when the JVM loads it.")
+    @McpTool(description = "Set a breakpoint that triggers when a specific exception is thrown. " +
+        "By default suspends the throwing thread for inspection. Pass logOnly=true (or supply an " +
+        "expression) to instead record an EXCEPTION_LOG event and auto-resume — useful for tracing " +
+        "exception flows without halting execution. The optional expression is evaluated against the " +
+        "throwing frame with the special variable $exception bound to the thrown object (e.g., " +
+        "\"$exception.getMessage()\"). If the exception class is not yet loaded, the breakpoint is " +
+        "deferred and will activate automatically when the JVM loads it.")
     public String jdwp_set_exception_breakpoint(
         @McpToolParam(description = "Exception class name (e.g., 'java.lang.NullPointerException', 'java.lang.Exception' for all)") String exceptionClass,
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
-        @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught) {
+        @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
+        @McpToolParam(required = false, description = "If true, record an EXCEPTION_LOG event and auto-resume instead of suspending. Implied true when expression is supplied. Default: false.") @Nullable Boolean logOnly,
+        @McpToolParam(required = false, description = "Optional expression evaluated on each hit; the result is attached to the EXCEPTION_LOG event. Use $exception to refer to the thrown object. Implies logOnly=true.") @Nullable String expression) {
         try {
             if (caught == null) {
                 caught = true;
@@ -1273,6 +1281,13 @@ public class JDWPTools {
             if (uncaught == null) {
                 uncaught = true;
             }
+            final String normalisedExpression = (expression == null || expression.isBlank()) ? null : expression;
+            // An expression always implies logOnly — without auto-resume, evaluating it would be
+            // redundant (the user could just set a normal BP and inspect manually).
+            final boolean effectiveLogOnly = (logOnly != null && logOnly) || normalisedExpression != null;
+            final BreakpointTracker.ExceptionBreakpointSpec spec = effectiveLogOnly
+                ? BreakpointTracker.ExceptionBreakpointSpec.logOnly(exceptionClass, caught, uncaught, normalisedExpression)
+                : BreakpointTracker.ExceptionBreakpointSpec.suspending(exceptionClass, caught, uncaught);
 
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
@@ -1282,7 +1297,7 @@ public class JDWPTools {
 
             if (eagerType == null) {
                 // Class not loadable yet — defer
-                final int pendingId = breakpointTracker.registerPendingExceptionBreakpoint(exceptionClass, caught, uncaught);
+                final int pendingId = breakpointTracker.registerPendingExceptionBreakpoint(spec);
 
                 if (!breakpointTracker.hasClassPrepareRequest(exceptionClass)) {
                     final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
@@ -1297,18 +1312,25 @@ public class JDWPTools {
                           Exception: %s
                           Caught: %s
                           Uncaught: %s
+                          Mode: %s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
-                    pendingId, exceptionClass, caught, uncaught);
+                    pendingId, exceptionClass, caught, uncaught,
+                    effectiveLogOnly ? "log-only" : "suspend",
+                    normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "");
             }
 
             final ExceptionRequest exReq = erm.createExceptionRequest(eagerType, caught, uncaught);
+            // Always SUSPEND_EVENT_THREAD; logOnly BPs are auto-resumed by JdiEventListener after
+            // recording / expression evaluation (invokeMethod requires the firing thread suspended).
             exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
             exReq.enable();
 
-            final int id = breakpointTracker.registerExceptionBreakpoint(exReq, exceptionClass, caught, uncaught);
+            final int id = breakpointTracker.registerExceptionBreakpoint(exReq, spec);
 
-            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s",
-                id, exceptionClass, caught, uncaught);
+            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s",
+                id, exceptionClass, caught, uncaught,
+                effectiveLogOnly ? "log-only" : "suspend",
+                normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1344,8 +1366,10 @@ public class JDWPTools {
                 result.append(String.format("Active exception breakpoints: %d\n\n", active.size()));
                 for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> entry : active.entrySet()) {
                     final BreakpointTracker.ExceptionBreakpointInfo info = entry.getValue();
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s\n",
-                        i++, entry.getKey(), info.getExceptionClass(), info.isCaught(), info.isUncaught()));
+                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s\n",
+                        i++, entry.getKey(), info.getExceptionClass(), info.isCaught(), info.isUncaught(),
+                        info.isLogOnly() ? "log-only" : "suspend",
+                        info.getExpression() != null ? ", expression: " + info.getExpression() : ""));
                 }
             }
 
@@ -1358,8 +1382,11 @@ public class JDWPTools {
                     final BreakpointTracker.PendingExceptionBreakpoint pb = entry.getValue();
                     final String status = pb.getFailureReason() != null
                         ? " [FAILED: " + pb.getFailureReason() + ']' : " [PENDING]";
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s%s\n",
-                        i++, entry.getKey(), pb.getExceptionClass(), pb.isCaught(), pb.isUncaught(), status));
+                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s\n",
+                        i++, entry.getKey(), pb.getExceptionClass(), pb.isCaught(), pb.isUncaught(),
+                        pb.isLogOnly() ? "log-only" : "suspend",
+                        pb.getExpression() != null ? ", expression: " + pb.getExpression() : "",
+                        status));
                 }
             }
 

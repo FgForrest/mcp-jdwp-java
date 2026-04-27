@@ -4,11 +4,7 @@ import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
-import com.sun.jdi.VMDisconnectedException;
-import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.event.BreakpointEvent;
-import com.sun.jdi.event.Event;
-import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.ExceptionEvent;
 import com.sun.jdi.request.BreakpointRequest;
@@ -17,13 +13,13 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.Iterator;
-import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.assertLatestEventType;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -76,7 +72,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		EventSet eventSet = mockEventSet(event);
 
 		evaluationGuard.enter(evalThread.uniqueID());
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		// Suppressed: listener must call eventSet.resume() and NOT touch tracker state.
 		// (Note on the latch: we deliberately don't assert on the next-event latch here because
@@ -87,7 +83,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		// entry in EventHistory.)
 		verify(eventSet).resume();
 		assertThat(tracker.getLastBreakpointThread()).isNull();
-		assertLatestEventType("BREAKPOINT_SUPPRESSED");
+		assertLatestEventType(eventHistory, "BREAKPOINT_SUPPRESSED");
 
 		// Guard state unaffected by the suppression — cleanup is the caller's responsibility.
 		assertThat(evaluationGuard.isEvaluating(evalThread)).isTrue();
@@ -108,13 +104,13 @@ class JdiEventListenerEvaluationSuppressionTest {
 		EventSet eventSet = mockEventSet(event);
 		CountDownLatch latch = tracker.armNextEventLatch();
 
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		verify(eventSet, never()).resume();
 		assertThat(tracker.getLastBreakpointThread()).isSameAs(normalThread);
 		assertThat(tracker.getLastBreakpointId()).isEqualTo(bpId);
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
-		assertLatestEventType("BREAKPOINT");
+		assertLatestEventType(eventHistory, "BREAKPOINT");
 	}
 
 	@Test
@@ -124,7 +120,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		EventSet eventSet = mockEventSet(event);
 
 		evaluationGuard.enter(evalThread.uniqueID());
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		// Suppressed: resume() called, tracker untouched, EXCEPTION_SUPPRESSED recorded.
 		// See the note in shouldSuppressBreakpointEventWhenThreadIsInsideEvaluation for why the
@@ -132,7 +128,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		verify(eventSet).resume();
 		assertThat(tracker.getLastBreakpointThread()).isNull();
 		assertThat(tracker.getLastBreakpointId()).isNull();
-		assertLatestEventType("EXCEPTION_SUPPRESSED");
+		assertLatestEventType(eventHistory, "EXCEPTION_SUPPRESSED");
 	}
 
 	@Test
@@ -149,67 +145,15 @@ class JdiEventListenerEvaluationSuppressionTest {
 		CountDownLatch latch = tracker.armNextEventLatch();
 
 		evaluationGuard.enter(evalThread.uniqueID()); // guard is for evalThread, NOT otherThread
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		verify(eventSet, never()).resume();
 		assertThat(tracker.getLastBreakpointThread()).isSameAs(otherThread);
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
-		assertLatestEventType("BREAKPOINT");
+		assertLatestEventType(eventHistory, "BREAKPOINT");
 	}
 
-	// ── Helpers ─────────────────────────────────────────────────────────────
-
-	/**
-	 * Drives the listener with exactly one caller-supplied {@link EventSet} followed by a
-	 * {@link VMDisconnectedException} sentinel so the listener's main loop exits cleanly. A
-	 * {@link CountDownLatch} fires once the second {@code queue.remove()} call has returned,
-	 * meaning the event set has been fully processed (including the trailing
-	 * {@code eventSet.resume()} call on the auto-resume path). A short post-await sleep lets
-	 * the disconnect catch block settle before assertions.
-	 */
-	private void runListenerWith(EventSet eventSet) throws InterruptedException {
-		VirtualMachine vm = mock(VirtualMachine.class);
-		EventQueue queue = mock(EventQueue.class);
-		when(vm.eventQueue()).thenReturn(queue);
-
-		BlockingQueue<Object> pending = new ArrayBlockingQueue<>(4);
-		pending.put(eventSet);
-		pending.put(new VMDisconnectedException());
-
-		CountDownLatch drained = new CountDownLatch(2);
-		when(queue.remove()).thenAnswer(invocation -> {
-			Object next = pending.take();
-			drained.countDown();
-			if (next instanceof EventSet es) {
-				return es;
-			}
-			throw (VMDisconnectedException) next;
-		});
-
-		listener.start(vm);
-
-		// Both queue.remove() calls have been issued — the event set has been fully handled
-		// by the time the second call returns (the listener calls eventSet.resume() BEFORE
-		// looping back to queue.remove()).
-		assertThat(drained.await(2, TimeUnit.SECONDS)).isTrue();
-		// Give the listener's catch block a moment to run after the disconnect throw so the
-		// loop exits cleanly before the test asserts mock-interaction state.
-		Thread.sleep(30);
-	}
-
-	/**
-	 * Creates an {@link EventSet} mock that iterates the given events exactly once and
-	 * records calls to {@link EventSet#resume()} so the test can verify auto-resume.
-	 */
-	private static EventSet mockEventSet(Event... events) {
-		EventSet set = mock(EventSet.class);
-		when(set.iterator()).thenAnswer(inv -> iteratorOver(events));
-		return set;
-	}
-
-	private static Iterator<Event> iteratorOver(Event[] events) {
-		return List.of(events).iterator();
-	}
+	// ── Test-specific event factories ───────────────────────────────────────
 
 	/** Builds a {@link BreakpointEvent} mock wired to the given request, thread, and location. */
 	private static BreakpointEvent mockBreakpointEvent(BreakpointRequest request,
@@ -237,19 +181,5 @@ class JdiEventListenerEvaluationSuppressionTest {
 		when(event.exception()).thenReturn(exception);
 		// throwLocation/catchLocation are only touched on the non-suppressed path, so leave null.
 		return event;
-	}
-
-	private static ThreadReference mockThread(String name, long uniqueId) {
-		ThreadReference thread = mock(ThreadReference.class);
-		when(thread.name()).thenReturn(name);
-		when(thread.uniqueID()).thenReturn(uniqueId);
-		return thread;
-	}
-
-	/** Asserts that the most recent {@link EventHistory} entry has the expected type string. */
-	private void assertLatestEventType(String expectedType) {
-		List<EventHistory.DebugEvent> recent = eventHistory.getRecent(5);
-		assertThat(recent).isNotEmpty();
-		assertThat(recent.get(recent.size() - 1).type()).isEqualTo(expectedType);
 	}
 }
