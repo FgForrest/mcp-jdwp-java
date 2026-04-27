@@ -1,6 +1,6 @@
 ---
 name: java-debug
-description: Debug live Java applications via the jdwp-inspector MCP server — set breakpoints, inspect runtime state, evaluate expressions, mutate variables at runtime, catch exceptions at their throw site, and trace execution non-intrusively with logpoints. Use when investigating Java bugs, test failures, runtime exceptions, race conditions, or any JVM behavior that is hard to understand from reading code alone.
+description: Debug live Java applications via the jdwp-inspector MCP server — set breakpoints, inspect runtime state, evaluate expressions, mutate variables at runtime, catch exceptions at their throw site, and trace execution non-intrusively with line logpoints or log-only exception breakpoints (with $exception-bound expressions). Use when investigating Java bugs, test failures, runtime exceptions, race conditions, or any JVM behavior that is hard to understand from reading code alone.
 ---
 
 # Java Debug
@@ -83,6 +83,15 @@ Test shows `CompletionException("Async task failed")`, but the real cause is 3 f
 4. The line BP hits -> call any inspection tool (e.g. `jdwp_get_locals`) -> this triggers class loading -> exception BP self-promotes from `[PENDING]` to active.
 5. `jdwp_resume_until_event` past the line BP.
 6. The exception BP catches the throw -> `jdwp_get_stack` shows the **real** root frame, not the wrapper.
+
+### "Trace exceptions without stopping the app"
+
+A long-running service throws something occasionally and you want to see when/where without halting traffic.
+
+1. `jdwp_set_exception_breakpoint("java.sql.SQLException", logOnly=true, expression="$exception.getSQLState() + \\\": \\\" + $exception.getMessage()")` — `$exception` is bound to the thrown object; the listener auto-resumes after recording.
+2. Let the service run. Each throw produces an `EXCEPTION_LOG` entry (or `EXCEPTION_LOG_ERROR` if the expression fails).
+3. `jdwp_get_events(50)` to inspect throw locations + evaluated expression results in chronological order.
+4. Pass `logOnly=true` with no `expression` for a pure non-intrusive trace (just type, throw location, catch location, thread).
 
 ### "Object inside a HashMap is no longer findable"
 

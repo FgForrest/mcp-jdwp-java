@@ -288,6 +288,18 @@ jdwp_set_exception_breakpoint(
 
 Catch exceptions at the throw site — before the stack unwinds. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_list_exception_breakpoints()` to see active and pending exception breakpoints.
 
+**Log-only mode** — record the throw without suspending the thread, optionally evaluating an expression with `$exception` bound to the thrown object:
+
+```
+jdwp_set_exception_breakpoint(
+  exceptionClass="java.sql.SQLException",
+  logOnly=true,
+  expression="$exception.getSQLState() + \": \" + $exception.getMessage()"
+)
+```
+
+Each hit records an `EXCEPTION_LOG` entry to `jdwp_get_events`; failures during evaluation surface as `EXCEPTION_LOG_ERROR` so the listener never throws. A non-null `expression` implies `logOnly=true`. Use this to trace exception flows in long-running services without stopping them.
+
 ### Expression evaluation
 
 ```
@@ -417,7 +429,7 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 | `jdwp_clear_breakpoint_by_id`     | `breakpointId`                                            | Remove breakpoint by ID                             |
 | `jdwp_list_breakpoints`           | —                                                         | List all breakpoints (active, pending, failed)      |
 | `jdwp_clear_all_breakpoints`      | —                                                         | Remove all breakpoints                              |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`                  | Break on exception throw (supports deferred)        |
+| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `logOnly?`, `expression?` | Break on exception throw (supports deferred and log-only with `$exception` binding) |
 | `jdwp_clear_exception_breakpoint` | `breakpointId`                                            | Remove exception breakpoint                         |
 | `jdwp_list_exception_breakpoints` | —                                                         | List exception breakpoints (active and pending)     |
 
@@ -434,7 +446,7 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 | Tool                | Parameters | Description                                               |
 |---------------------|------------|-----------------------------------------------------------|
-| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints) |
+| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs) |
 | `jdwp_clear_events` | —          | Clear event history                                       |
 
 ### Watchers (6)
