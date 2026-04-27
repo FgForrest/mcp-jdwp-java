@@ -21,27 +21,32 @@ Live debugging of a running JVM via JDWP. Replaces "add a println, re-run, repea
 
 ## Prerequisites
 
-The target JVM must be running with the JDWP agent on port 5005:
+The target JVM must be running with the JDWP agent. **The port is whatever the developer (or their deployment) chose** — port 5005 is only the convention for build-system test shortcuts. Long-running services very often expose JDWP on a different port (8003, 8000, 9009, …).
 
 ```
--agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:5005
+-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:<port>
 ```
 
 `suspend=y` blocks the JVM at startup until you attach — use for tests and early-startup bugs. `suspend=n` lets the JVM run freely — use for long-running services where you attach on demand.
 
-**Quick launch shortcuts:**
+**Two attach scenarios:**
+
+1. **Launch-and-debug (tests, reproducers):** start a fresh JVM yourself, usually on port 5005 via the shortcuts below.
+2. **Attach-to-running (services already up):** the developer tells you the port — "JDWP is ready on 8003". Skip the launch step entirely and pass that port to `jdwp_wait_for_attach(port=8003)`. **If the port isn't 5005, do not guess — ask.**
+
+**Quick launch shortcuts (these all default to port 5005):**
 - Maven Surefire: `mvn test -Dtest=<TestClass> -Dmaven.surefire.debug`
 - Gradle: `./gradlew test --tests "com.example.MyTest" --debug-jvm`
 - Standalone: `java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar app.jar`
 
-For build-system-specific gotchas (Surefire `<argLine>` overrides, Gradle `maxParallelForks`, `bootRun`): see [references/prerequisites.md](references/prerequisites.md).
+For build-system-specific gotchas (Surefire `<argLine>` overrides, Gradle `maxParallelForks`, `bootRun`) and the already-running-service workflow: see [references/prerequisites.md](references/prerequisites.md).
 
 ## Core Workflow
 
 Every debug session follows this sequence:
 
-1. **Launch the target** in a separate shell with `suspend=y`. The JVM blocks until step 2.
-2. **Attach:** `jdwp_wait_for_attach()` — polls until the JVM is listening, then attaches. No manual port-checking needed.
+1. **Launch the target** in a separate shell with `suspend=y` — *or skip this step if the JVM is already running with JDWP open*. The JVM blocks until step 2.
+2. **Attach:** `jdwp_wait_for_attach()` defaults to `localhost:5005`. For any other port — and crucially for already-running services — pass it explicitly: `jdwp_wait_for_attach(port=8003)`. Polls until the JVM is listening, then attaches.
 3. **Set breakpoints** at suspected bug locations: `jdwp_set_breakpoint(className, lineNumber)`. Add exception breakpoints or logpoints as needed.
 4. **Resume and wait:** `jdwp_resume_until_event()` — releases the JVM and BLOCKS until the next BP/step/exception fires. Returns the suspended thread info.
 5. **Inspect in one call:** `jdwp_get_breakpoint_context()` — returns thread, top frames, locals (incl. `this`), and `this` field dump.

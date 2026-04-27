@@ -1,6 +1,35 @@
 # JDWP Launch Prerequisites
 
-Build-system-specific details for launching JVMs with the JDWP debug agent.
+Build-system-specific details for launching JVMs with the JDWP debug agent — **and** how to attach to a JVM that's already running.
+
+## Already-running services (most common in practice)
+
+If the target JVM is already up with JDWP open, **don't launch anything** — go straight to attach. The port is set by whoever started the JVM and is rarely 5005 outside of test shortcuts. Typical situations:
+
+- A long-running container or staged environment exposing JDWP on a non-default port (e.g. 8003, 8000, 9009).
+- A `bootRun`/Tomcat instance the developer left running locally.
+- A deployment with `JAVA_TOOL_OPTIONS` baked in.
+
+**Workflow:**
+
+1. Ask the developer for the port if you weren't told (e.g. "JDWP is ready on 8003"). **Do not assume 5005.**
+2. Attach: `jdwp_wait_for_attach(port=<port>)` — host defaults to `localhost`; pass `host=...` for a remote/container target.
+3. Continue with the normal Core Workflow from step 3 onwards (set breakpoints, resume, inspect).
+
+**Verify a port is actually listening:**
+
+```bash
+ss -tnlp | grep <port>      # Linux
+lsof -i :<port>              # macOS / BSD
+```
+
+**Inspect the agent string of a local running JVM (to discover the port yourself):**
+
+```bash
+ps -ef | grep "agentlib:jdwp"
+```
+
+The `address=*:<port>` (or `address=<port>`) field tells you what to pass to `jdwp_wait_for_attach`.
 
 ## Maven Surefire Tests
 
