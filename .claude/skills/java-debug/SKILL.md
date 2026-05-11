@@ -1,1 +1,0 @@
-../../skills/java-debug/SKILL.md
