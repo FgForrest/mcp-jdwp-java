@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
  * by {@code jdwp_get_stack} and {@code jdwp_get_breakpoint_context}. The 5-arg overload
  * controls noise collapsing and indentation; the 4-arg convenience overload always collapses.
  */
+@DisplayName("JDWPTools appendUserFrames helper")
 class JDWPToolsAppendUserFramesTest {
 
 	@Nested

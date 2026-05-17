@@ -7,7 +7,6 @@ import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.Value;
-import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -36,11 +35,7 @@ class JDIConnectionServiceCollectionViewLiveTest {
 
 	@BeforeEach
 	void setUp() {
-		JdiEventListener listener = mock(JdiEventListener.class);
-		BreakpointTracker tracker = new BreakpointTracker();
-		EventHistory eventHistory = new EventHistory();
-		WatcherManager watcherManager = new WatcherManager();
-		service = new JDIConnectionService(listener, tracker, eventHistory, watcherManager, new EvaluationGuard());
+		service = JDIConnectionServiceTestSupport.newServiceWithMocks();
 	}
 
 	/**

@@ -44,7 +44,7 @@ class JDIConnectionServiceUnboxTest {
 	@Test
 	@DisplayName("does NOT recognise application classes")
 	void shouldNotRecogniseUserClasses() {
-		assertThat(JDIConnectionService.isBoxedPrimitiveType("io.mcp.jdwp.sandbox.order.Order")).isFalse();
+		assertThat(JDIConnectionService.isBoxedPrimitiveType("one.edee.mcp.jdwp.sandbox.order.Order")).isFalse();
 		assertThat(JDIConnectionService.isBoxedPrimitiveType("com.example.MyEntity")).isFalse();
 	}
 

@@ -258,6 +258,52 @@ class JdiEventListenerClassPrepareTest {
 		assertThat(tracker.hasClassPrepareRequest("com.example.Foo")).isFalse();
 	}
 
+	@Test
+	@DisplayName("Generic exception from createBreakpointRequest marks the pending line BP as FAILED")
+	void shouldRecordFailureWhenCreateBreakpointRequestThrowsGenericException() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location loc = mock(Location.class);
+		when(refType.name()).thenReturn("com.example.Foo");
+		when(refType.locationsOfLine(42)).thenReturn(List.of(loc));
+
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(loc))
+			.thenThrow(new RuntimeException("ERM rejected the request"));
+
+		int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		// The generic catch (Exception e) branch must record the failure on the pending entry so
+		// the user can see why activation failed — and the listener thread must NOT die.
+		BreakpointTracker.PendingBreakpoint pending = tracker.getPendingBreakpoint(pendingId);
+		assertThat(pending).isNotNull();
+		assertThat(pending.getFailureReason()).contains("ERM rejected the request");
+	}
+
+	@Test
+	@DisplayName("Generic exception from createExceptionRequest marks the pending exception BP as FAILED")
+	void shouldRecordFailureWhenCreateExceptionRequestThrowsGenericException() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		when(refType.name()).thenReturn("com.example.MyException");
+
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createExceptionRequest(refType, true, true))
+			.thenThrow(new RuntimeException("ERM rejected the exception request"));
+
+		int pendingId = tracker.registerPendingExceptionBreakpoint(
+			ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		BreakpointTracker.PendingExceptionBreakpoint pending =
+			tracker.getAllPendingExceptionBreakpoints().get(pendingId);
+		assertThat(pending).isNotNull();
+		assertThat(pending.getFailureReason()).contains("ERM rejected the exception request");
+	}
+
 	// ── Test-specific event factory ──────────────────────────────────────────
 
 	private static ClassPrepareEvent mockClassPrepareEvent(ReferenceType refType, EventRequestManager erm) {

@@ -25,8 +25,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Captures bugs found by the bug-hunter pass that involve {@link JDWPTools} entry points.
- * Each test asserts the CURRENT broken behaviour so the eventual fix can flip the assertion.
+ * Pins observable bugs in {@link JDWPTools} entry points. Each test asserts the CURRENT broken
+ * behaviour so the eventual fix can flip the assertion to the corrected expectation.
  */
 @DisplayName("JDWPTools known limitations")
 class JDWPToolsBugCaptureTest {
@@ -45,7 +45,10 @@ class JDWPToolsBugCaptureTest {
 		watcherManager = mock(WatcherManager.class);
 		evaluator = mock(JdiExpressionEvaluator.class);
 		eventHistory = mock(EventHistory.class);
-		tools = new JDWPTools(jdiService, breakpointTracker, watcherManager, evaluator, eventHistory, new EvaluationGuard());
+		tools = JDWPToolsTestSupport.newTools(
+			jdiService, breakpointTracker, watcherManager, evaluator,
+			eventHistory, new EvaluationGuard(),
+			new one.edee.mcp.jdwp.discovery.JvmDiscoveryService());
 	}
 
 	/**
@@ -99,7 +102,7 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * Tier 1B: in {@code jdwp_set_breakpoint}, the recheck-after-CPR-registration path can throw
+	 * In {@code jdwp_set_breakpoint}, the recheck-after-CPR-registration path can throw
 	 * {@link AbsentInformationException} from {@code locationsOfLine}. The pending breakpoint
 	 * registered earlier in the method must be removed in the catch block — otherwise it leaks
 	 * into {@code BreakpointTracker} along with its ClassPrepareRequest.
@@ -133,9 +136,9 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * Tier 1B: same orphan-leak in {@code jdwp_set_logpoint}. The recheck path can throw
-	 * {@link AbsentInformationException}, leaking the pending entry, its logpoint expression
-	 * metadata, and the ClassPrepareRequest.
+	 * Same orphan-leak surface in {@code jdwp_set_logpoint}. The recheck path can throw
+	 * {@link AbsentInformationException}; the pending entry, its logpoint expression metadata,
+	 * and the ClassPrepareRequest must all be cleaned up.
 	 */
 	@Test
 	void shouldRemoveOrphanPendingLogpointWhenLocationsOfLineThrows() throws Exception {
@@ -160,8 +163,8 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * Tier 3-E: when the user calls {@code jdwp_clear_breakpoint} with an exception class name,
-	 * the "no breakpoint found" message should hint at {@code jdwp_clear_exception_breakpoint}
+	 * When the user calls {@code jdwp_clear_breakpoint} with an exception class name, the
+	 * "no breakpoint found" message should hint at {@code jdwp_clear_exception_breakpoint}
 	 * instead of leaving the user wondering why the clear was a no-op. The hint MUST only fire
 	 * when the class name actually matches a tracked exception BP — otherwise it's noise on
 	 * every typo.
@@ -188,8 +191,8 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * Tier 3-E: the hint must NOT appear for a regular class name with no matching exception BP.
-	 * The original "no breakpoint found" message should be preserved verbatim so this isn't
+	 * Counterpart: the hint must NOT appear for a regular class name with no matching exception
+	 * BP. The original "no breakpoint found" message should be preserved verbatim so this isn't
 	 * noise on every typo or normal miss.
 	 */
 	@Test
@@ -206,5 +209,61 @@ class JDWPToolsBugCaptureTest {
 		String result = tools.jdwp_clear_breakpoint("com.example.Unknown", 42);
 
 		assertThat(result).doesNotContain("jdwp_clear_exception_breakpoint");
+	}
+
+	/**
+	 * {@code jdwp_get_breakpoint_context} renders the {@code this} field dump by calling
+	 * {@code thisObj.getValue(field)} for each instance field. If a single field's read throws
+	 * (e.g. {@link com.sun.jdi.ObjectCollectedException} on a field whose value has been GC'd),
+	 * the tool must catch per-field, emit {@code "<unavailable>"} for the offending field, and
+	 * keep rendering the rest. Aborting the whole dump on a single dead reference would erase the
+	 * other fields the user wants to inspect.
+	 */
+	@Test
+	void shouldAbortBreakpointContextOnPerFieldException() throws Exception {
+		// Wire a current breakpoint with a live `this` and a single field whose getValue throws.
+		final com.sun.jdi.ThreadReference thread = mock(com.sun.jdi.ThreadReference.class);
+		when(thread.name()).thenReturn("main");
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+
+		final com.sun.jdi.StackFrame frame = mock(com.sun.jdi.StackFrame.class);
+		when(thread.frames()).thenReturn(List.of(frame));
+		final com.sun.jdi.Location loc = mock(com.sun.jdi.Location.class);
+		final com.sun.jdi.ReferenceType decl = mock(com.sun.jdi.ReferenceType.class);
+		when(frame.location()).thenReturn(loc);
+		when(loc.declaringType()).thenReturn(decl);
+		when(decl.name()).thenReturn("com.example.User");
+		final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+		when(loc.method()).thenReturn(method);
+		when(method.name()).thenReturn("m");
+		when(loc.sourceName()).thenReturn("User.java");
+		when(loc.lineNumber()).thenReturn(10);
+
+		final com.sun.jdi.ObjectReference thisObj = mock(com.sun.jdi.ObjectReference.class);
+		when(frame.thisObject()).thenReturn(thisObj);
+		final com.sun.jdi.ReferenceType thisType = mock(com.sun.jdi.ReferenceType.class);
+		when(thisObj.referenceType()).thenReturn(thisType);
+		when(thisType.name()).thenReturn("com.example.User");
+		when(thisObj.uniqueID()).thenReturn(42L);
+		when(frame.visibleVariables()).thenReturn(List.of());
+		when(frame.getValues(List.of())).thenReturn(java.util.Map.of());
+
+		final com.sun.jdi.Field field = mock(com.sun.jdi.Field.class);
+		when(field.isStatic()).thenReturn(false);
+		when(field.typeName()).thenReturn("java.lang.String");
+		when(field.name()).thenReturn("name");
+		when(thisType.allFields()).thenReturn(List.of(field));
+		when(thisObj.getValue(field)).thenThrow(new com.sun.jdi.ObjectCollectedException("gone"));
+
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(thread, 1));
+
+		final String result = tools.jdwp_get_breakpoint_context(5, true);
+
+		assertThat(result).doesNotStartWith("Error:");
+		assertThat(result).contains("=== Breakpoint Context ===");
+		assertThat(result).contains("name = <unavailable");
+		assertThat(result).contains("ObjectCollectedException");
 	}
 }

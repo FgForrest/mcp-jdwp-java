@@ -10,6 +10,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code jdwp_get_stack} and {@code jdwp_get_breakpoint_context} to collapse JUnit/maven/reflection
  * machinery out of stack traces. Pure string-prefix matching, no JDI involvement.
  */
+@DisplayName("JDWPTools isNoiseFrame predicate")
 class JDWPToolsNoiseFrameTest {
 
 	@Test

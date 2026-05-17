@@ -40,6 +40,7 @@ import static org.mockito.Mockito.when;
  * underlying JDI request objects. This keeps the tests focused on the contract observable through
  * the {@code @McpTool} return values and the event stream.
  */
+@DisplayName("JDWPTools chain-aware tool surface")
 class JDWPToolsChainToolsTest {
 
 	private JDIConnectionService jdiService;
@@ -59,7 +60,10 @@ class JDWPToolsChainToolsTest {
 		watcherManager = new WatcherManager();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		eventHistory = new EventHistory();
-		tools = new JDWPTools(jdiService, tracker, watcherManager, evaluator, eventHistory, new EvaluationGuard());
+		tools = JDWPToolsTestSupport.newTools(
+			jdiService, tracker, watcherManager, evaluator,
+			eventHistory, new EvaluationGuard(),
+			new one.edee.mcp.jdwp.discovery.JvmDiscoveryService());
 		vm = mock(VirtualMachine.class);
 		erm = mock(EventRequestManager.class);
 		when(jdiService.getVM()).thenReturn(vm);
@@ -350,7 +354,7 @@ class JDWPToolsChainToolsTest {
 		}
 
 		@Test
-		@DisplayName("registers chain and leaves the active BP disabled when trigger provided (F6)")
+		@DisplayName("registers chain and leaves the active BP disabled when trigger provided")
 		void shouldRegisterChainAndDisableActiveBpWhenTriggerProvided() throws Exception {
 			BreakpointRequest createdBp = mock(BreakpointRequest.class);
 			ReferenceType refType = mock(ReferenceType.class);
@@ -698,7 +702,7 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_diagnose();
+			String result = tools.jdwp_diagnose(null);
 
 			assertThat(result).contains("[chain: trigger=#" + triggerId)
 				.contains("ARMED");
@@ -717,7 +721,7 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, pendingTriggerId, false);
 
-			String result = tools.jdwp_diagnose();
+			String result = tools.jdwp_diagnose(null);
 
 			assertThat(result).contains("Every active BP is WAITING on a trigger");
 		}
@@ -739,7 +743,7 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, pendingTriggerId, false);
 
-			String result = tools.jdwp_diagnose();
+			String result = tools.jdwp_diagnose(null);
 
 			assertThat(result).doesNotContain("Every active BP is WAITING on a trigger");
 		}
@@ -764,7 +768,7 @@ class JDWPToolsChainToolsTest {
 
 			tracker.registerPendingBreakpoint("com.example.Pending", 42, 2, "ALL");
 
-			String result = tools.jdwp_diagnose();
+			String result = tools.jdwp_diagnose(null);
 
 			final int interpStart = result.indexOf("INTERPRETATION:");
 			assertThat(interpStart).isGreaterThanOrEqualTo(0);

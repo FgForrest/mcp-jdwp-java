@@ -12,6 +12,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * optional single-quote delimiters from user-supplied char literals and validates that the
  * remaining payload is exactly one character.
  */
+@DisplayName("JDWPTools parseCharInput utility")
 class JDWPToolsParseCharInputTest {
 
 	@Nested

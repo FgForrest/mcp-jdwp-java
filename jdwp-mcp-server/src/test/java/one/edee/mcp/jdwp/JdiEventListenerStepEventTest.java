@@ -1,12 +1,7 @@
 package one.edee.mcp.jdwp;
 
-import com.sun.jdi.Location;
-import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
-import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
-import com.sun.jdi.event.Event;
-import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.StepEvent;
 import com.sun.jdi.request.EventRequestManager;
@@ -17,13 +12,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.Iterator;
-import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.assertLatestEventType;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockStepEvent;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -69,12 +65,12 @@ class JdiEventListenerStepEventTest {
 		EventSet eventSet = mockEventSet(event);
 
 		CountDownLatch latch = tracker.armNextEventLatch();
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		// StepRequest should be deleted (JDI convention for one-shot steps)
 		verify(erm).deleteEventRequest(stepRequest);
 		// STEP event recorded
-		assertLatestEventType("STEP");
+		assertLatestEventType(eventHistory, "STEP");
 		// Latch should be fired
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
 		// EventSet should NOT be resumed (step stays suspended)
@@ -95,81 +91,13 @@ class JdiEventListenerStepEventTest {
 		EventSet eventSet = mockEventSet(event);
 
 		evaluationGuard.enter(evalThread.uniqueID());
-		runListenerWith(eventSet);
+		runListenerWith(listener, eventSet);
 
 		// StepRequest is always deleted, even when suppressed
 		verify(erm).deleteEventRequest(stepRequest);
 		// STEP_SUPPRESSED recorded
-		assertLatestEventType("STEP_SUPPRESSED");
+		assertLatestEventType(eventHistory, "STEP_SUPPRESSED");
 		// EventSet should be auto-resumed since no event demanded suspension
 		verify(eventSet).resume();
-	}
-
-	// ── Helpers ──
-
-	private void runListenerWith(EventSet eventSet) throws InterruptedException {
-		VirtualMachine vm = mock(VirtualMachine.class);
-		EventQueue queue = mock(EventQueue.class);
-		when(vm.eventQueue()).thenReturn(queue);
-
-		BlockingQueue<Object> pending = new ArrayBlockingQueue<>(4);
-		try {
-			pending.put(eventSet);
-			pending.put(new VMDisconnectedException());
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			return;
-		}
-
-		CountDownLatch drained = new CountDownLatch(2);
-		when(queue.remove()).thenAnswer(invocation -> {
-			Object next = pending.take();
-			drained.countDown();
-			if (next instanceof EventSet es) {
-				return es;
-			}
-			throw (VMDisconnectedException) next;
-		});
-
-		listener.start(vm);
-		assertThat(drained.await(2, TimeUnit.SECONDS)).isTrue();
-		Thread.sleep(30);
-	}
-
-	private static EventSet mockEventSet(Event... events) {
-		EventSet set = mock(EventSet.class);
-		when(set.iterator()).thenAnswer(inv -> iteratorOver(events));
-		return set;
-	}
-
-	private static Iterator<Event> iteratorOver(Event[] events) {
-		return List.of(events).iterator();
-	}
-
-	private static StepEvent mockStepEvent(ThreadReference thread, StepRequest request,
-			String className, int line) {
-		StepEvent event = mock(StepEvent.class);
-		when(event.request()).thenReturn(request);
-		when(event.thread()).thenReturn(thread);
-		Location location = mock(Location.class);
-		ReferenceType declaringType = mock(ReferenceType.class);
-		when(declaringType.name()).thenReturn(className);
-		when(location.declaringType()).thenReturn(declaringType);
-		when(location.lineNumber()).thenReturn(line);
-		when(event.location()).thenReturn(location);
-		return event;
-	}
-
-	private static ThreadReference mockThread(String name, long uniqueId) {
-		ThreadReference thread = mock(ThreadReference.class);
-		when(thread.name()).thenReturn(name);
-		when(thread.uniqueID()).thenReturn(uniqueId);
-		return thread;
-	}
-
-	private void assertLatestEventType(String expectedType) {
-		List<EventHistory.DebugEvent> recent = eventHistory.getRecent(5);
-		assertThat(recent).isNotEmpty();
-		assertThat(recent.get(recent.size() - 1).type()).isEqualTo(expectedType);
 	}
 }

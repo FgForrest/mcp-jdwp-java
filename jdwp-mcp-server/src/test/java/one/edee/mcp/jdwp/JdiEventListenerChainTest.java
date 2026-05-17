@@ -1,8 +1,6 @@
 package one.edee.mcp.jdwp;
 
-import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
-import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
@@ -17,7 +15,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockBreakpointEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockException;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockExceptionEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -427,44 +428,5 @@ class JdiEventListenerChainTest {
 
 	private boolean hasEventOfType(String type) {
 		return eventHistory.getRecent(20).stream().anyMatch(e -> type.equals(e.type()));
-	}
-
-	private static BreakpointEvent mockBreakpointEvent(ThreadReference thread, BreakpointRequest request,
-			String className, int line) {
-		BreakpointEvent event = mock(BreakpointEvent.class);
-		when(event.request()).thenReturn(request);
-		when(event.thread()).thenReturn(thread);
-		Location location = mock(Location.class);
-		ReferenceType declaringType = mock(ReferenceType.class);
-		when(declaringType.name()).thenReturn(className);
-		when(location.declaringType()).thenReturn(declaringType);
-		when(location.lineNumber()).thenReturn(line);
-		when(event.location()).thenReturn(location);
-		return event;
-	}
-
-	private static ExceptionEvent mockExceptionEvent(ExceptionRequest request, ThreadReference thread,
-			ObjectReference exception, String declaringClassName, int throwLine) {
-		ExceptionEvent event = mock(ExceptionEvent.class);
-		when(event.request()).thenReturn(request);
-		when(event.thread()).thenReturn(thread);
-		when(event.exception()).thenReturn(exception);
-
-		Location throwLocation = mock(Location.class);
-		ReferenceType declaringType = mock(ReferenceType.class);
-		when(declaringType.name()).thenReturn(declaringClassName);
-		when(throwLocation.declaringType()).thenReturn(declaringType);
-		when(throwLocation.lineNumber()).thenReturn(throwLine);
-		when(event.location()).thenReturn(throwLocation);
-		when(event.catchLocation()).thenReturn(null);
-		return event;
-	}
-
-	private static ObjectReference mockException(String exceptionType) {
-		ObjectReference exception = mock(ObjectReference.class);
-		ReferenceType refType = mock(ReferenceType.class);
-		when(refType.name()).thenReturn(exceptionType);
-		when(exception.referenceType()).thenReturn(refType);
-		return exception;
 	}
 }

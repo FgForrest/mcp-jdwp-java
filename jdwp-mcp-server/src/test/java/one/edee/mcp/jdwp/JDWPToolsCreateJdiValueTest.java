@@ -30,6 +30,7 @@ import static org.mockito.Mockito.when;
  * via reflection. Each test mocks the {@link VirtualMachine}'s {@code mirrorOf*} return value
  * for the corresponding primitive kind, and asserts that the parser routed the input correctly.
  */
+@org.junit.jupiter.api.DisplayName("JDWPTools createJdiValue parser")
 class JDWPToolsCreateJdiValueTest {
 
 	private JDWPTools tools;
@@ -42,7 +43,10 @@ class JDWPToolsCreateJdiValueTest {
 		WatcherManager watcherManager = mock(WatcherManager.class);
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		EventHistory eventHistory = mock(EventHistory.class);
-		tools = new JDWPTools(jdiService, tracker, watcherManager, evaluator, eventHistory, new EvaluationGuard());
+		tools = JDWPToolsTestSupport.newTools(
+			jdiService, tracker, watcherManager, evaluator,
+			eventHistory, new EvaluationGuard(),
+			new one.edee.mcp.jdwp.discovery.JvmDiscoveryService());
 		vm = mock(VirtualMachine.class);
 	}
 

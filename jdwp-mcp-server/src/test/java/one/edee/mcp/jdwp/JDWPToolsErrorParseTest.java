@@ -10,6 +10,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * that drives error enrichment in {@code jdwp_evaluate_expression}. Covers the three JDT compiler
  * error patterns we want to enrich, plus negative cases.
  */
+@DisplayName("JDWPTools parseUnresolvedFieldName")
 class JDWPToolsErrorParseTest {
 
 	// ── pattern 1: "X cannot be resolved" ───────────────────────────────────────────────

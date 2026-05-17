@@ -4,14 +4,12 @@ import com.sun.jdi.Field;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
-import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -26,44 +24,40 @@ class JDIConnectionServiceTreeMapDepthLimitTest {
 
 	@BeforeEach
 	void setUp() {
-		JdiEventListener listener = mock(JdiEventListener.class);
-		BreakpointTracker tracker = new BreakpointTracker();
-		EventHistory eventHistory = new EventHistory();
-		WatcherManager watcherManager = new WatcherManager();
-		service = new JDIConnectionService(listener, tracker, eventHistory, watcherManager, new EvaluationGuard());
+		service = JDIConnectionServiceTestSupport.newServiceWithMocks();
 	}
 
 	@Nested
-	@DisplayName("Depth limit enforcement")
+	@DisplayName("MAX_TREE_DEPTH guard prevents unbounded recursion on corrupted trees")
 	class DepthLimit {
 
+		/**
+		 * A left-spine chain 100 levels deep exceeds both {@code MAX_TREE_DEPTH} (64) and the
+		 * {@code COLLECTION_VIEW_LIMIT} (50). The walker must stop early — either when the depth
+		 * guard kicks in or when the view limit is reached — and must NOT recurse all the way down
+		 * (which would risk a {@code StackOverflowError} on a truly corrupted tree).
+		 */
 		@Test
-		@DisplayName("Deep left-spine tree (100 levels) stops without stack overflow")
+		@DisplayName("Deep left-spine tree (100 levels) stops at the view limit and does not stack-overflow")
 		void shouldStopWithoutStackOverflowOnDeeplyNestedTree() throws Exception {
-			// Build a left-spine chain 100 levels deep (exceeds MAX_TREE_DEPTH = 64).
-			// Each node has key/value, a "left" child pointing deeper, and no "right" child.
-			ObjectReference deepest = buildLeftSpineTree(100);
+			final ObjectReference deepest = buildLeftSpineTree(100);
 
-			int[] counter = {0};
-			StringBuilder out = new StringBuilder();
+			final int[] counter = {0};
+			final StringBuilder out = new StringBuilder(512);
 
-			// Should not throw StackOverflowError; just stops at MAX_TREE_DEPTH.
-			assertThatCode(() -> {
-				try {
-					TestReflectionUtils.invokePrivate(
-						service, "walkTreeMapInOrder",
-						new Class[]{ObjectReference.class, int[].class, StringBuilder.class},
-						deepest, counter, out);
-				} catch (Exception e) {
-					if (e.getCause() instanceof StackOverflowError soe) {
-						throw soe;
-					}
-					// Other exceptions (e.g., mock-related) are acceptable in this safety test
-				}
-			}).doesNotThrowAnyException();
+			// Drive the walker directly. Any thrown StackOverflowError would propagate as the
+			// cause of InvocationTargetException; an assertion failure here proves we did not
+			// recurse 100 deep.
+			TestReflectionUtils.invokePrivate(
+				service, "walkTreeMapInOrder",
+				new Class[]{ObjectReference.class, int[].class, StringBuilder.class},
+				deepest, counter, out);
 
-			// Counter should be < 100 because the depth limit kicks in before traversal completes
-			assertThat(counter[0]).isLessThan(100);
+			// The walker stops at COLLECTION_VIEW_LIMIT (50) on a left-spine because in-order
+			// traversal visits every left descendant before rendering the current node — so all
+			// 50 rendered entries come from the deepest end of the spine. The strict <=50 bound
+			// catches a regression that loosens the view limit or removes the depth guard.
+			assertThat(counter[0]).isLessThanOrEqualTo(50);
 		}
 	}
 
@@ -97,6 +91,24 @@ class JDIConnectionServiceTreeMapDepthLimitTest {
 			assertThat(result).contains("\"a\"");
 			assertThat(result).contains("\"b\"");
 			assertThat(result).contains("\"c\"");
+		}
+
+		@Test
+		@DisplayName("Empty TreeMap (null root) renders zero entries without throwing")
+		void shouldRenderEmptyTreeWithoutNpe() throws Exception {
+			// An empty TreeMap has root == null. The walker must short-circuit on null instead
+			// of dereferencing it — otherwise getMapEntries() catches the NPE and renders an
+			// "Error: ..." line to the user where "Entries: (empty)" is expected.
+			int[] counter = {0};
+			StringBuilder out = new StringBuilder();
+
+			TestReflectionUtils.invokePrivate(
+				service, "walkTreeMapInOrder",
+				new Class[]{ObjectReference.class, int[].class, StringBuilder.class},
+				null, counter, out);
+
+			assertThat(counter[0]).isZero();
+			assertThat(out.toString()).isEmpty();
 		}
 
 		@Test

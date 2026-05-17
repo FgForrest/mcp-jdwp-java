@@ -1,8 +1,6 @@
 package one.edee.mcp.jdwp;
 
-import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
-import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.EventSet;
@@ -13,15 +11,18 @@ import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.assertLatestEventType;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.latestMeaningfulEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockException;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockExceptionEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,6 +68,7 @@ class JdiEventListenerExceptionLogTest {
 	}
 
 	@Test
+	@DisplayName("logOnly without expression: auto-resume + EXCEPTION_LOG, evaluator untouched")
 	void shouldAutoResumeAndRecordExceptionLogWhenLogOnlyWithoutExpression() throws Exception {
 		ThreadReference thread = mockThread("worker-1", 100L);
 		ExceptionRequest request = mock(ExceptionRequest.class);
@@ -90,6 +92,7 @@ class JdiEventListenerExceptionLogTest {
 	}
 
 	@Test
+	@DisplayName("logOnly with expression: evaluator invoked with $exception binding, result recorded")
 	void shouldEvaluateExpressionAndBindExceptionWhenLogOnlyWithExpression() throws Exception {
 		ThreadReference thread = mockThread("worker-2", 200L);
 		ExceptionRequest request = mock(ExceptionRequest.class);
@@ -117,8 +120,7 @@ class JdiEventListenerExceptionLogTest {
 		verify(evaluator).evaluate(eq(frame), eq("$exception.getMessage()"),
 			eq(Map.of("$exception", exception)));
 
-		List<EventHistory.DebugEvent> recent = eventHistory.getRecent(5);
-		EventHistory.DebugEvent last = recent.get(recent.size() - 1);
+		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
 		assertThat(last.type()).isEqualTo("EXCEPTION_LOG");
 		assertThat(last.summary()).contains("$exception.getMessage()", "boom");
 		assertThat(last.details()).containsEntry("expression", "$exception.getMessage()");
@@ -126,6 +128,7 @@ class JdiEventListenerExceptionLogTest {
 	}
 
 	@Test
+	@DisplayName("Evaluation failure: EXCEPTION_LOG_ERROR recorded and thread still auto-resumes")
 	void shouldRecordExceptionLogErrorAndStillAutoResumeOnEvaluationFailure() throws Exception {
 		ThreadReference thread = mockThread("worker-3", 300L);
 		ExceptionRequest request = mock(ExceptionRequest.class);
@@ -148,12 +151,12 @@ class JdiEventListenerExceptionLogTest {
 		// Auto-resume must still happen — a bad expression cannot leave the thread parked.
 		verify(eventSet).resume();
 		assertLatestEventType(eventHistory, "EXCEPTION_LOG_ERROR");
-		List<EventHistory.DebugEvent> recent = eventHistory.getRecent(5);
-		EventHistory.DebugEvent last = recent.get(recent.size() - 1);
+		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
 		assertThat(last.summary()).contains("compile failed");
 	}
 
 	@Test
+	@DisplayName("logOnly=false (default): suspends, populates tracker, records EXCEPTION")
 	void shouldSuspendAndRecordExceptionWhenLogOnlyFalse() throws Exception {
 		// Regression guard: default behaviour (logOnly=false) must keep the thread suspended and
 		// record EXCEPTION — same as before this feature was introduced.
@@ -177,31 +180,53 @@ class JdiEventListenerExceptionLogTest {
 		assertLatestEventType(eventHistory, "EXCEPTION");
 	}
 
-	// ── Test-specific event factories ───────────────────────────────────────
+	@Test
+	@DisplayName("Suspending path with non-null catch location formats catchLocation as ClassName:lineNumber")
+	void shouldFormatCatchLocationWhenSuspendingExceptionHasCatchSite() throws Exception {
+		// Pins the formatting branch in handleExceptionEvent: when catchLocation is non-null, the
+		// recorded EXCEPTION details map must contain "ClassName:lineNumber", not the "uncaught"
+		// sentinel used for null catch sites.
+		ThreadReference thread = mockThread("worker-catch", 500L);
+		ExceptionRequest request = mock(ExceptionRequest.class);
+		ObjectReference exception = mockException("java.lang.IllegalStateException");
 
-	private static ExceptionEvent mockExceptionEvent(ExceptionRequest request, ThreadReference thread,
-			ObjectReference exception, String declaringClassName, int throwLine) {
-		ExceptionEvent event = mock(ExceptionEvent.class);
-		when(event.request()).thenReturn(request);
-		when(event.thread()).thenReturn(thread);
-		when(event.exception()).thenReturn(exception);
+		tracker.registerExceptionBreakpoint(
+			request, ExceptionBreakpointSpec.suspending("java.lang.IllegalStateException", true, true));
 
-		Location throwLocation = mock(Location.class);
-		ReferenceType declaringType = mock(ReferenceType.class);
-		when(declaringType.name()).thenReturn(declaringClassName);
-		when(throwLocation.declaringType()).thenReturn(declaringType);
-		when(throwLocation.lineNumber()).thenReturn(throwLine);
-		when(event.location()).thenReturn(throwLocation);
-		when(event.catchLocation()).thenReturn(null);
+		ExceptionEvent event = mockExceptionEvent(request, thread, exception,
+			"com.example.Throwing", 11, "com.example.Catching", 27);
+		EventSet eventSet = mockEventSet(event);
 
-		return event;
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet, never()).resume();
+		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
+		assertThat(last.type()).isEqualTo("EXCEPTION");
+		assertThat(last.details()).containsEntry("catchLocation", "com.example.Catching:27");
+		assertThat(last.summary()).contains("caught at com.example.Catching:27");
 	}
 
-	private static ObjectReference mockException(String exceptionType) {
-		ObjectReference exception = mock(ObjectReference.class);
-		ReferenceType refType = mock(ReferenceType.class);
-		when(refType.name()).thenReturn(exceptionType);
-		when(exception.referenceType()).thenReturn(refType);
-		return exception;
+	@Test
+	@DisplayName("Log-only path with non-null catch location records catchLocation in details")
+	void shouldFormatCatchLocationWhenLogOnlyExceptionHasCatchSite() throws Exception {
+		// Same branch as above but exercised via the log-only auto-resume path — both paths
+		// share the same catch-location formatter and must produce the same string shape.
+		ThreadReference thread = mockThread("worker-log-catch", 600L);
+		ExceptionRequest request = mock(ExceptionRequest.class);
+		ObjectReference exception = mockException("java.lang.IllegalArgumentException");
+
+		tracker.registerExceptionBreakpoint(
+			request, ExceptionBreakpointSpec.logOnly("java.lang.IllegalArgumentException", true, true, null));
+
+		ExceptionEvent event = mockExceptionEvent(request, thread, exception,
+			"com.example.Throwing", 18, "com.example.Handler", 73);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
+		assertThat(last.type()).isEqualTo("EXCEPTION_LOG");
+		assertThat(last.details()).containsEntry("catchLocation", "com.example.Handler:73");
 	}
 }

@@ -20,7 +20,7 @@ import static org.mockito.Mockito.when;
  * <p>{@code enter} and {@code exit} take a {@code long} captured by the caller, so most tests
  * here don't need any JDI mocks at all. The two {@link #isEvaluating(ThreadReference)} tests
  * mock a {@link ThreadReference} because that signature exists for the listener's hot path and
- * we still want coverage for it — the same precedent used by {@code JdiEventListenerDisconnectBugTest}
+ * we still want coverage for it — the same precedent used by {@code JdiEventListenerDisconnectTest}
  * for mocking JDI interfaces that have no real-VM-free fake.
  */
 class EvaluationGuardTest {

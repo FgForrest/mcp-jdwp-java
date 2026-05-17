@@ -1,11 +1,17 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.BreakpointRequest;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -19,6 +25,7 @@ import static org.mockito.Mockito.when;
  * defaulting logic produces observable output (event counts, error messages revealing the
  * default, etc.) without needing a full VM mock.
  */
+@DisplayName("MCP tool null-parameter defaults")
 class JDWPToolsNullParamDefaultsTest {
 
 	private JDWPTools tools;
@@ -33,7 +40,9 @@ class JDWPToolsNullParamDefaultsTest {
 		WatcherManager watcherManager = new WatcherManager();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		eventHistory = new EventHistory();
-		tools = new JDWPTools(jdiService, tracker, watcherManager, evaluator, eventHistory, new EvaluationGuard());
+		tools = JDWPToolsTestSupport.newTools(
+			jdiService, tracker, watcherManager, evaluator,
+			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
 	}
 
 	@Nested
@@ -135,6 +144,108 @@ class JDWPToolsNullParamDefaultsTest {
 
 			String result = tools.jdwp_evaluate_watchers(1L, "current_frame", 42);
 			assertThat(result).contains("Error");
+		}
+	}
+
+	@Nested
+	@DisplayName("jdwp_get_stack defaults")
+	class GetStackDefaults {
+
+		@Test
+		@DisplayName("null maxFrames and null includeNoise default without NPE")
+		void shouldDefaultMaxFramesAndIncludeNoiseWhenNull() throws Exception {
+			final VirtualMachine vm = mock(VirtualMachine.class);
+			final ThreadReference thread = mock(ThreadReference.class);
+			when(jdiService.getVM()).thenReturn(vm);
+			when(vm.allThreads()).thenReturn(List.of(thread));
+			when(thread.uniqueID()).thenReturn(1L);
+			when(thread.isSuspended()).thenReturn(true);
+			when(thread.name()).thenReturn("main");
+			when(thread.frames()).thenReturn(List.of());
+
+			final String result = tools.jdwp_get_stack(1L, null, null);
+
+			// No frames produced — but the header is still rendered, proving the defaults wired
+			// through without an NPE on the Integer / Boolean unboxing.
+			assertThat(result).contains("Stack trace for thread 1");
+			assertThat(result).contains("0 frame(s) total");
+		}
+	}
+
+	@Nested
+	@DisplayName("jdwp_get_threads defaults")
+	class GetThreadsDefaults {
+
+		@Test
+		@DisplayName("null includeSystemThreads defaults to false (system threads hidden)")
+		void shouldDefaultIncludeSystemThreadsToFalse() throws Exception {
+			final VirtualMachine vm = mock(VirtualMachine.class);
+			final ThreadReference user = mock(ThreadReference.class);
+			final ThreadReference system = mock(ThreadReference.class);
+			when(jdiService.getVM()).thenReturn(vm);
+			when(vm.allThreads()).thenReturn(List.of(user, system));
+			when(user.name()).thenReturn("main");
+			when(user.uniqueID()).thenReturn(1L);
+			when(user.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING);
+			when(user.isSuspended()).thenReturn(false);
+			// "Reference Handler" is a known JVM-internal thread name in ThreadFormatting's
+			// hide list, so this thread should be filtered out when includeSystemThreads is null.
+			when(system.name()).thenReturn("Reference Handler");
+			when(system.uniqueID()).thenReturn(2L);
+			when(system.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING);
+			when(system.isSuspended()).thenReturn(false);
+
+			final String result = tools.jdwp_get_threads(null);
+
+			assertThat(result).contains("main");
+			assertThat(result).contains("system thread(s) hidden");
+			assertThat(result).doesNotContain("Reference Handler");
+		}
+	}
+
+	@Nested
+	@DisplayName("jdwp_resume_until_event defaults")
+	class ResumeUntilEventDefaults {
+
+		@Test
+		@DisplayName("null timeoutMs falls through without NPE on auto-unbox")
+		void shouldHandleNullTimeoutMs() throws Exception {
+			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
+
+			assertThatCode(() -> tools.jdwp_resume_until_event(null))
+				.doesNotThrowAnyException();
+		}
+	}
+
+	@Nested
+	@DisplayName("jdwp_set_breakpoint_dependency defaults")
+	class SetBreakpointDependencyDefaults {
+
+		@Test
+		@DisplayName("null oneShot defaults to false (sticky)")
+		void shouldDefaultOneShotToFalseWhenNull() {
+			final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
+			final int depId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
+
+			final String result = tools.jdwp_set_breakpoint_dependency(depId, triggerId, null);
+
+			assertThat(result).contains("sticky");
+			assertThat(tracker.getDependencyOfDependent(depId).oneShot()).isFalse();
+		}
+	}
+
+	@Nested
+	@DisplayName("jdwp_get_breakpoint_context more defaults")
+	class BreakpointContextMoreDefaults {
+
+		@Test
+		@DisplayName("null maxFrames and null includeThisFields both default without NPE")
+		void shouldDefaultMaxFramesAndIncludeThisFieldsWhenNull() {
+			// No current breakpoint — the method bails early with the documented message but
+			// still proves both Integer/Boolean unboxes are guarded against null.
+			final String result = tools.jdwp_get_breakpoint_context(null, null);
+
+			assertThat(result).contains("No current breakpoint");
 		}
 	}
 }

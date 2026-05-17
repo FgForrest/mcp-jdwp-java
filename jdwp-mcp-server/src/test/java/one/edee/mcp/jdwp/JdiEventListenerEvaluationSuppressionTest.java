@@ -1,8 +1,6 @@
 package one.edee.mcp.jdwp;
 
-import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
-import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.EventSet;
@@ -11,30 +9,30 @@ import com.sun.jdi.request.BreakpointRequest;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.assertLatestEventType;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockBreakpointEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockException;
+import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockExceptionEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /**
- * Layer B of the recursive-breakpoint suppression test plan: verify that the real
- * {@link JdiEventListener} loop honours {@link EvaluationGuard} for every suspending event
- * type, without regressing the normal suspend path.
- *
- * <p>Setup mirrors {@code JdiEventListenerDisconnectBugTest}: we mock {@link VirtualMachine}
- * and feed synthetic {@link EventSet}s through a real {@link EventQueue} implementation, then
- * let the listener consume them on its daemon thread. Each test pushes one event set followed
- * by a disconnect sentinel so the listener exits cleanly at the end.
+ * Verifies that {@link JdiEventListener} honours the {@link EvaluationGuard} for every
+ * suspending event type: when the firing thread is already inside an MCP-driven {@code invokeMethod}
+ * chain, the listener must suppress the recursive event (auto-resume, do not mutate tracker state,
+ * record a {@code *_SUPPRESSED} entry), so the outer evaluation does not deadlock on a re-suspended
+ * thread. Companion tests pin the regression: a normal (non-evaluating) thread must still suspend.
  *
  * <p>Each scenario asserts the observable side effects: whether {@link EventSet#resume()} was
  * called (auto-resume path), whether the tracker's {@code lastBreakpointThread} was set,
@@ -62,12 +60,13 @@ class JdiEventListenerEvaluationSuppressionTest {
 	}
 
 	@Test
+	@DisplayName("Suppressed BP: guard armed, auto-resume, no tracker mutation, BREAKPOINT_SUPPRESSED recorded")
 	void shouldSuppressBreakpointEventWhenThreadIsInsideEvaluation() throws Exception {
 		ThreadReference evalThread = mockThread("eval-thread", 111L);
 		BreakpointRequest request = mock(BreakpointRequest.class);
 		int bpId = tracker.registerBreakpoint(request);
 
-		BreakpointEvent event = mockBreakpointEvent(request, evalThread,
+		BreakpointEvent event = mockBreakpointEvent(evalThread, request,
 			"io.mcp.jdwp.sandbox.recursion.RecursiveCalculator", 42);
 		EventSet eventSet = mockEventSet(event);
 
@@ -92,6 +91,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 	}
 
 	@Test
+	@DisplayName("Normal BP on non-evaluating thread suspends and populates tracker state")
 	void shouldSuspendBreakpointEventOnANormalThread() throws Exception {
 		// Regression guard: without the guard armed, the happy path must suspend normally,
 		// populate lastBreakpointThread, and release the next-event latch.
@@ -99,7 +99,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		BreakpointRequest request = mock(BreakpointRequest.class);
 		int bpId = tracker.registerBreakpoint(request);
 
-		BreakpointEvent event = mockBreakpointEvent(request, normalThread,
+		BreakpointEvent event = mockBreakpointEvent(normalThread, request,
 			"io.mcp.jdwp.sandbox.order.OrderProcessor", 30);
 		EventSet eventSet = mockEventSet(event);
 		CountDownLatch latch = tracker.armNextEventLatch();
@@ -114,9 +114,12 @@ class JdiEventListenerEvaluationSuppressionTest {
 	}
 
 	@Test
+	@DisplayName("Suppressed exception: guard armed, auto-resume, EXCEPTION_SUPPRESSED recorded")
 	void shouldSuppressExceptionEventWhenThreadIsInsideEvaluation() throws Exception {
 		ThreadReference evalThread = mockThread("eval-thread", 333L);
-		ExceptionEvent event = mockExceptionEvent(evalThread, "java.lang.IllegalStateException");
+		ObjectReference exception = mockException("java.lang.IllegalStateException");
+		ExceptionEvent event = mockExceptionEvent(null, evalThread, exception,
+			"com.example.Service", 99);
 		EventSet eventSet = mockEventSet(event);
 
 		evaluationGuard.enter(evalThread.uniqueID());
@@ -132,6 +135,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 	}
 
 	@Test
+	@DisplayName("BP on a different thread is not suppressed by another thread's guard")
 	void shouldNotSuppressBreakpointOnDifferentThread() throws Exception {
 		// Suppression is per-thread. An evaluation on thread A must not hide a BP on thread B.
 		ThreadReference evalThread = mockThread("eval-thread", 444L);
@@ -139,7 +143,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		BreakpointRequest request = mock(BreakpointRequest.class);
 		tracker.registerBreakpoint(request);
 
-		BreakpointEvent event = mockBreakpointEvent(request, otherThread,
+		BreakpointEvent event = mockBreakpointEvent(otherThread, request,
 			"io.mcp.jdwp.sandbox.session.SessionStore", 24);
 		EventSet eventSet = mockEventSet(event);
 		CountDownLatch latch = tracker.armNextEventLatch();
@@ -151,35 +155,5 @@ class JdiEventListenerEvaluationSuppressionTest {
 		assertThat(tracker.getLastBreakpointThread()).isSameAs(otherThread);
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
 		assertLatestEventType(eventHistory, "BREAKPOINT");
-	}
-
-	// ── Test-specific event factories ───────────────────────────────────────
-
-	/** Builds a {@link BreakpointEvent} mock wired to the given request, thread, and location. */
-	private static BreakpointEvent mockBreakpointEvent(BreakpointRequest request,
-			ThreadReference thread, String className, int line) {
-		BreakpointEvent event = mock(BreakpointEvent.class);
-		when(event.request()).thenReturn(request);
-		when(event.thread()).thenReturn(thread);
-		Location location = mock(Location.class);
-		ReferenceType declaringType = mock(ReferenceType.class);
-		when(declaringType.name()).thenReturn(className);
-		when(location.declaringType()).thenReturn(declaringType);
-		when(location.lineNumber()).thenReturn(line);
-		when(event.location()).thenReturn(location);
-		return event;
-	}
-
-	/** Builds an {@link ExceptionEvent} mock whose exception reports the given fully-qualified type. */
-	private static ExceptionEvent mockExceptionEvent(ThreadReference thread, String exceptionType) {
-		ExceptionEvent event = mock(ExceptionEvent.class);
-		when(event.thread()).thenReturn(thread);
-		ObjectReference exception = mock(ObjectReference.class);
-		ReferenceType refType = mock(ReferenceType.class);
-		when(refType.name()).thenReturn(exceptionType);
-		when(exception.referenceType()).thenReturn(refType);
-		when(event.exception()).thenReturn(exception);
-		// throwLocation/catchLocation are only touched on the non-suppressed path, so leave null.
-		return event;
 	}
 }
