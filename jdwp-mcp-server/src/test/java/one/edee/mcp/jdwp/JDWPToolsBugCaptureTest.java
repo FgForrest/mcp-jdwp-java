@@ -163,55 +163,6 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * When the user calls {@code jdwp_clear_breakpoint} with an exception class name, the
-	 * "no breakpoint found" message should hint at {@code jdwp_clear_exception_breakpoint}
-	 * instead of leaving the user wondering why the clear was a no-op. The hint MUST only fire
-	 * when the class name actually matches a tracked exception BP — otherwise it's noise on
-	 * every typo.
-	 */
-	@Test
-	void shouldHintAtExceptionClearToolWhenClassNameMatchesPendingExceptionBp() throws Exception {
-		VirtualMachine vm = mock(VirtualMachine.class);
-		EventRequestManager erm = mock(EventRequestManager.class);
-		when(jdiService.getVM()).thenReturn(vm);
-		when(vm.eventRequestManager()).thenReturn(erm);
-		// No regular line BP class is loaded — go down the "class not loaded" branch
-		when(vm.classesByName("java.lang.NullPointerException")).thenReturn(List.of());
-		// No pending line BPs for that class either
-		when(breakpointTracker.getAllPendingBreakpoints()).thenReturn(java.util.Map.of());
-		// But there IS a pending exception BP
-		BreakpointTracker.PendingExceptionBreakpoint pending = mock(BreakpointTracker.PendingExceptionBreakpoint.class);
-		when(pending.getExceptionClass()).thenReturn("java.lang.NullPointerException");
-		when(breakpointTracker.getAllPendingExceptionBreakpoints()).thenReturn(java.util.Map.of(5, pending));
-		when(breakpointTracker.getAllExceptionBreakpoints()).thenReturn(java.util.Map.of());
-
-		String result = tools.jdwp_clear_breakpoint("java.lang.NullPointerException", 0);
-
-		assertThat(result).contains("jdwp_clear_exception_breakpoint");
-	}
-
-	/**
-	 * Counterpart: the hint must NOT appear for a regular class name with no matching exception
-	 * BP. The original "no breakpoint found" message should be preserved verbatim so this isn't
-	 * noise on every typo or normal miss.
-	 */
-	@Test
-	void shouldNotHintAtExceptionClearToolForUnknownClassName() throws Exception {
-		VirtualMachine vm = mock(VirtualMachine.class);
-		EventRequestManager erm = mock(EventRequestManager.class);
-		when(jdiService.getVM()).thenReturn(vm);
-		when(vm.eventRequestManager()).thenReturn(erm);
-		when(vm.classesByName("com.example.Unknown")).thenReturn(List.of());
-		when(breakpointTracker.getAllPendingBreakpoints()).thenReturn(java.util.Map.of());
-		when(breakpointTracker.getAllPendingExceptionBreakpoints()).thenReturn(java.util.Map.of());
-		when(breakpointTracker.getAllExceptionBreakpoints()).thenReturn(java.util.Map.of());
-
-		String result = tools.jdwp_clear_breakpoint("com.example.Unknown", 42);
-
-		assertThat(result).doesNotContain("jdwp_clear_exception_breakpoint");
-	}
-
-	/**
 	 * {@code jdwp_get_breakpoint_context} renders the {@code this} field dump by calling
 	 * {@code thisObj.getValue(field)} for each instance field. If a single field's read throws
 	 * (e.g. {@link com.sun.jdi.ObjectCollectedException} on a field whose value has been GC'd),

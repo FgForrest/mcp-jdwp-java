@@ -31,7 +31,7 @@ import static org.mockito.Mockito.when;
  * ({@code jdwp_set_breakpoint_dependency}, {@code jdwp_clear_breakpoint_dependency},
  * {@code jdwp_disarm_until_trigger}), the optional {@code triggerBreakpointId} argument on
  * {@code jdwp_set_breakpoint} and {@code jdwp_set_exception_breakpoint}, the cascade-on-clear path
- * in {@code jdwp_clear_breakpoint_by_id} / {@code jdwp_clear_exception_breakpoint}, the
+ * in {@code jdwp_clear_breakpoint(id)} (kind-agnostic), the
  * {@code [chain: ...]} suffix in {@code jdwp_list_breakpoints} / {@code jdwp_list_exception_breakpoints}
  * / {@code jdwp_diagnose}, and the chain-stuck interpretation hint emitted by the diagnostic.
  *
@@ -470,9 +470,9 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_clear_breakpoint_by_id(triggerId);
+			String result = tools.jdwp_clear_breakpoint(triggerId);
 
-			assertThat(result).contains("cleared successfully");
+			assertThat(result).contains("Breakpoint " + triggerId + " cleared");
 			assertThat(result).contains("chain broken");
 			verify(depBp).setEnabled(true);
 			assertThat(hasEventOfType("CHAIN_BROKEN")).isTrue();
@@ -486,63 +486,46 @@ class JDWPToolsChainToolsTest {
 			when(triggerBp.virtualMachine()).thenReturn(vm);
 			int triggerId = tracker.registerBreakpoint(triggerBp);
 
-			String result = tools.jdwp_clear_breakpoint_by_id(triggerId);
+			String result = tools.jdwp_clear_breakpoint(triggerId);
 
-			assertThat(result).contains("cleared successfully");
+			assertThat(result).contains("Breakpoint " + triggerId + " cleared");
 			assertThat(result).doesNotContain("chain broken");
 			assertThat(hasEventOfType("CHAIN_BROKEN")).isFalse();
 		}
 
+		/**
+		 * {@link JDWPTools#jdwp_clear_breakpoint(int)} is kind-agnostic: an exception-BP ID is
+		 * accepted, removed, and cascades the chain — every dependent that was waiting on it is
+		 * armed unconditionally and gets a {@code CHAIN_BROKEN} event. Verifies the unified-tool
+		 * contract: callers do not have to think about whether their ID is a line BP or an
+		 * exception BP.
+		 */
 		@Test
-		@DisplayName("exception BP clear also cascades chain break")
-		void shouldEmitChainBrokenEventsWhenClearingExceptionTriggerWithDependents() {
+		@DisplayName("clear-by-id cascades chain when removing an exception-BP trigger")
+		void shouldCascadeChainBreakWhenRemovingExceptionBpTrigger() {
 			ExceptionRequest exTrigger = mock(ExceptionRequest.class);
 			BreakpointRequest depBp = mock(BreakpointRequest.class);
-			when(exTrigger.virtualMachine()).thenReturn(vm);
 			int triggerId = tracker.registerExceptionBreakpoint(exTrigger,
 				ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_clear_exception_breakpoint(triggerId);
+			String result = tools.jdwp_clear_breakpoint(triggerId);
 
-			assertThat(result).contains("chain broken");
+			assertThat(result).contains("Exception breakpoint " + triggerId + " cleared");
+			assertThat(result).contains("dependent BP(s) armed (chain broken)");
 			verify(depBp).setEnabled(true);
 			assertThat(hasEventOfType("CHAIN_BROKEN")).isTrue();
 			assertThat(tracker.getDependentsOfTrigger(triggerId)).isEmpty();
+			assertThat(tracker.getDependencyOfDependent(depId)).isNull();
 		}
 
 		/**
-		 * {@link JDWPTools#jdwp_clear_breakpoint_by_id} validates the ID kind BEFORE running
-		 * {@code cascadeChainBreak}. An exception-BP ID is rejected with a pointer to
-		 * {@code jdwp_clear_exception_breakpoint}, and the chain that was pointing at the exception
-		 * BP as a trigger stays intact — no spurious {@code CHAIN_BROKEN} event, no surprise
-		 * re-arming of dependents.
-		 */
-		@Test
-		@DisplayName("clear-by-id does not cascade chain when ID is an exception BP")
-		void shouldNotCascadeChainBreakWhenIdIsExceptionBp() {
-			ExceptionRequest exTrigger = mock(ExceptionRequest.class);
-			BreakpointRequest depBp = mock(BreakpointRequest.class);
-			int triggerId = tracker.registerExceptionBreakpoint(exTrigger,
-				ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
-			int depId = tracker.registerBreakpoint(depBp);
-			tracker.registerDependency(depId, triggerId, false);
-
-			String result = tools.jdwp_clear_breakpoint_by_id(triggerId);
-
-			// New: helpful message that points the user at the correct tool.
-			assertThat(result).contains("exception breakpoint")
-				.contains("jdwp_clear_exception_breakpoint");
-			// Chain is intact — no CHAIN_BROKEN event, dependent still wired.
-			assertThat(hasEventOfType("CHAIN_BROKEN")).isFalse();
-			assertThat(tracker.getDependentsOfTrigger(triggerId)).containsExactly(depId);
-			assertThat(tracker.getDependencyOfDependent(depId)).isNotNull();
-		}
-
-		/**
-		 * Companion to {@link #shouldNotCascadeChainBreakWhenIdIsExceptionBp}: passing a wholly
-		 * unknown ID returns the historic "not found" message without any chain side effects.
+		 * Negative counterpart to {@link #shouldCascadeChainBreakWhenRemovingExceptionBpTrigger}:
+		 * whereas that sibling asserts the cascade fires for a real exception-BP trigger, this one
+		 * proves a wholly unknown ID returns the historic "not found" message and leaves any
+		 * existing chain bookkeeping untouched (no {@code CHAIN_BROKEN} event, dependents
+		 * preserved).
 		 */
 		@Test
 		@DisplayName("clear-by-id with unknown ID returns 'not found' and does not cascade")
@@ -554,7 +537,7 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_clear_breakpoint_by_id(987_654);
+			String result = tools.jdwp_clear_breakpoint(987_654);
 
 			assertThat(result).startsWith("Breakpoint 987654 not found");
 			assertThat(hasEventOfType("CHAIN_BROKEN")).isFalse();
@@ -605,7 +588,7 @@ class JDWPToolsChainToolsTest {
 			int pendingDepId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 			tracker.registerDependency(pendingDepId, triggerId, false);
 
-			tools.jdwp_clear_breakpoint_by_id(triggerId);
+			tools.jdwp_clear_breakpoint(triggerId);
 
 			EventHistory.DebugEvent ev = findEventOfType("CHAIN_BROKEN");
 			assertThat(ev).isNotNull();
@@ -628,12 +611,34 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			tools.jdwp_clear_breakpoint_by_id(triggerId);
+			tools.jdwp_clear_breakpoint(triggerId);
 
 			EventHistory.DebugEvent ev = findEventOfType("CHAIN_BROKEN");
 			assertThat(ev).isNotNull();
 			assertThat(ev.summary()).contains("armed unconditionally");
 			assertThat(ev.summary()).doesNotContain("still pending");
+		}
+
+		/**
+		 * Clearing a line breakpoint via the unified {@code jdwp_clear_breakpoint(int)} also
+		 * deletes every watcher registered against that breakpoint and surfaces the count in the
+		 * tool's response. The cleanup branch is gated on the BP being a line BP, so the assertion
+		 * also doubles as documentation of that contract.
+		 */
+		@Test
+		@DisplayName("clearing a line breakpoint removes its associated watchers")
+		void shouldRemoveAssociatedWatchersWhenClearingLineBreakpoint() {
+			BreakpointRequest bp = mock(BreakpointRequest.class);
+			when(bp.virtualMachine()).thenReturn(vm);
+			int bpId = tracker.registerBreakpoint(bp);
+			watcherManager.createWatcher("label1", bpId, "expr1");
+			watcherManager.createWatcher("label2", bpId, "expr2");
+
+			String result = tools.jdwp_clear_breakpoint(bpId);
+
+			assertThat(result).contains("Breakpoint " + bpId + " cleared");
+			assertThat(result).contains("(2 associated watcher(s) also removed)");
+			assertThat(watcherManager.getWatchersForBreakpoint(bpId)).isEmpty();
 		}
 	}
 

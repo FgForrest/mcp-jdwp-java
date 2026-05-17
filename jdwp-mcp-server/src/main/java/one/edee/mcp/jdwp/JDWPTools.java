@@ -1612,94 +1612,6 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Remove a breakpoint at a specific line in a class")
-    public String jdwp_clear_breakpoint(
-        @McpToolParam(description = "Fully qualified class name") String className,
-        @McpToolParam(description = "Line number") int lineNumber) {
-        try {
-            final VirtualMachine vm = jdiService.getVM();
-            final EventRequestManager erm = vm.eventRequestManager();
-
-            final List<ReferenceType> classes = vm.classesByName(className);
-
-            if (classes.isEmpty()) {
-                // Class not loaded yet — the BP can only exist as a pending entry.
-                int removedPending = 0;
-                for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> entry :
-                    breakpointTracker.getAllPendingBreakpoints().entrySet()) {
-                    final BreakpointTracker.PendingBreakpoint pb = entry.getValue();
-                    if (pb.getClassName().equals(className) && pb.getLineNumber() == lineNumber) {
-                        breakpointTracker.removePendingBreakpoint(entry.getKey());
-                        removedPending++;
-                    }
-                }
-                if (removedPending > 0) {
-                    return String.format("Removed %d pending breakpoint(s) at %s:%d", removedPending, className, lineNumber);
-                }
-                return String.format("No breakpoint found at %s:%d (class not loaded)%s",
-                    className, lineNumber, exceptionBreakpointHint(className));
-            }
-
-            final ReferenceType refType = classes.get(0);
-
-            final List<Location> locations = refType.locationsOfLine(lineNumber);
-            if (locations.isEmpty()) {
-                return String.format("Error: No code at line %d in class %s%s",
-                    lineNumber, className, exceptionBreakpointHint(className));
-            }
-
-            final Location location = locations.get(0);
-
-            // Copy the live list — deleteEventRequest mutates it and would otherwise CME the loop.
-            final List<BreakpointRequest> breakpoints = new ArrayList<>(erm.breakpointRequests());
-            int removed = 0;
-            int chainBreaks = 0;
-            for (BreakpointRequest bp : breakpoints) {
-                if (bp.location().equals(location)) {
-                    final Integer bpId = breakpointTracker.findIdByRequest(bp);
-                    if (bpId != null) {
-                        chainBreaks += cascadeChainBreak(bpId);
-                        watcherManager.deleteWatchersForBreakpoint(bpId);
-                    }
-                    breakpointTracker.unregisterByRequest(bp);
-                    erm.deleteEventRequest(bp);
-                    removed++;
-                }
-            }
-
-            if (removed == 0) {
-                return String.format("No breakpoint found at %s:%d%s",
-                    className, lineNumber, exceptionBreakpointHint(className));
-            }
-
-            return String.format("Removed %d breakpoint(s) at %s:%d%s",
-                removed, className, lineNumber,
-                chainBreaks > 0 ? String.format(" — %d dependent BP(s) armed (chain broken)", chainBreaks) : "");
-        } catch (AbsentInformationException e) {
-            return "Error: No line number information available for this class";
-        } catch (Exception e) {
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    /**
-     * Returns a UX hint pointing the user at {@link #jdwp_clear_exception_breakpoint} when the
-     * given class name matches an active or pending exception breakpoint, otherwise an empty
-     * string. Used by {@link #jdwp_clear_breakpoint} to disambiguate the "no breakpoint found"
-     * message when the user has confused the two clear tools.
-     */
-    private String exceptionBreakpointHint(String className) {
-        final boolean matchesActive = breakpointTracker.getAllExceptionBreakpoints().values().stream()
-            .anyMatch(info -> className.equals(info.getExceptionClass()));
-        final boolean matchesPending = breakpointTracker.getAllPendingExceptionBreakpoints().values().stream()
-            .anyMatch(p -> className.equals(p.getExceptionClass()));
-        if (matchesActive || matchesPending) {
-            return " — for exception breakpoints, use jdwp_clear_exception_breakpoint(id) "
-                + "(see jdwp_list_exception_breakpoints)";
-        }
-        return "";
-    }
-
     @McpTool(description = "List all breakpoints (active, pending, and failed) set by this MCP server")
     public String jdwp_list_breakpoints() {
         try {
@@ -1782,35 +1694,34 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Clear a specific breakpoint by its ID (from jdwp_list_breakpoints)")
-    public String jdwp_clear_breakpoint_by_id(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_list_breakpoints or jdwp_list_exception_breakpoints). Routes by kind: line breakpoints and exception breakpoints are both addressed by the same ID space.")
+    public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
-            // Validate the ID kind BEFORE running cascadeChainBreak. The cascade detaches every
-            // dependent that was waiting on `breakpointId` and arms them unconditionally — running
-            // it for an exception-BP ID or a wholly unknown ID would silently demolish a chain the
-            // user did not intend to touch.
+            // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
+            // CHAIN_BROKEN events land in front of the removal confirmation.
             final boolean isLineBp = breakpointTracker.getBreakpoint(breakpointId) != null
                 || breakpointTracker.getPendingBreakpoint(breakpointId) != null;
-            if (!isLineBp) {
-                // Distinguish "wrong kind" from "unknown" so the user gets actionable guidance.
-                if (breakpointTracker.isKnownBreakpointId(breakpointId)) {
-                    return String.format("Breakpoint %d is an exception breakpoint — use "
-                        + "jdwp_clear_exception_breakpoint to remove it", breakpointId);
-                }
+            final boolean isExceptionBp = !isLineBp && breakpointTracker.isKnownBreakpointId(breakpointId);
+
+            if (!isLineBp && !isExceptionBp) {
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
-            // Cascade BEFORE removal so CHAIN_BROKEN events land in front of the removal confirmation.
             final int detached = cascadeChainBreak(breakpointId);
-            final boolean removed = breakpointTracker.removeBreakpoint(breakpointId);
+            final boolean removed = isLineBp
+                ? breakpointTracker.removeBreakpoint(breakpointId)
+                : breakpointTracker.removeExceptionBreakpoint(breakpointId);
             if (!removed) {
-                // Defensive: should not happen given the pre-check, but handle the race where
-                // another thread removed the BP between the check and the removal.
+                // Defensive: handle the race where another thread removed the BP between the
+                // kind probe above and this call.
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
-            final int watchersRemoved = watcherManager.deleteWatchersForBreakpoint(breakpointId);
-            String msg = String.format("Breakpoint %d cleared successfully", breakpointId);
+            final int watchersRemoved = isLineBp
+                ? watcherManager.deleteWatchersForBreakpoint(breakpointId) : 0;
+
+            final String kindLabel = isLineBp ? "Breakpoint" : "Exception breakpoint";
+            String msg = String.format("%s %d cleared", kindLabel, breakpointId);
             if (watchersRemoved > 0) {
                 msg += String.format(" (%d associated watcher(s) also removed)", watchersRemoved);
             }
@@ -2135,21 +2046,6 @@ public class JDWPTools {
                 expressionLine,
                 conditionLine,
                 chainInfo);
-        } catch (Exception e) {
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    @McpTool(description = "Remove an exception breakpoint by its ID")
-    public String jdwp_clear_exception_breakpoint(@McpToolParam(description = "Exception breakpoint ID") int breakpointId) {
-        try {
-            final int chainBreaks = cascadeChainBreak(breakpointId);
-            final boolean removed = breakpointTracker.removeExceptionBreakpoint(breakpointId);
-            if (!removed) {
-                return String.format("Exception breakpoint %d not found", breakpointId);
-            }
-            return String.format("Exception breakpoint %d cleared%s", breakpointId,
-                chainBreaks > 0 ? String.format(" — %d dependent BP(s) armed (chain broken)", chainBreaks) : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }

@@ -20,8 +20,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * removed, so {@link #getStats()}'s `breakpointsWithWatchers` count never drifts.
  * <p>
  * Lifecycle: cleared by `jdwp_reset`, `jdwp_disconnect`, and `jdwp_clear_all_watchers`. Entries are
- * also auto-removed when their parent breakpoint is cleared (`JDWPTools.jdwp_clear_breakpoint` /
- * `jdwp_clear_breakpoint_by_id` call {@link #deleteWatchersForBreakpoint}).
+ * also auto-removed when their parent breakpoint is cleared (`JDWPTools.jdwp_clear_breakpoint`
+ * calls {@link #deleteWatchersForBreakpoint}).
  * <p>
  * Thread-safety: maps are {@link ConcurrentHashMap}; the public mutators are `synchronized` so
  * the dual-index updates remain atomic against concurrent reads.
