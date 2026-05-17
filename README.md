@@ -27,7 +27,7 @@ Raw JDWP/JDI gives you threads, stack frames, and variables. That's enough for a
 - **Smart filtering** — JVM internal threads and framework noise frames are hidden by default
 - **Blocking resume** — `resume_until_event` eliminates the "resume → poll → poll" dance
 
-44 MCP tools, exposed over STDIO. Your agent gets the same power as IntelliJ's debugger.
+46 MCP tools, exposed over STDIO. Your agent gets the same power as IntelliJ's debugger.
 
 ## Quick start
 
@@ -290,17 +290,53 @@ jdwp_set_exception_breakpoint(
 
 Catch exceptions at the throw site — before the stack unwinds. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_list_exception_breakpoints()` to see active and pending exception breakpoints.
 
-**Log-only mode** — record the throw without suspending the thread, optionally evaluating an expression with `$exception` bound to the thrown object:
+**Log-only mode** — record the throw without suspending the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
 
 ```
-jdwp_set_exception_breakpoint(
+jdwp_set_exception_logpoint(
   exceptionClass="java.sql.SQLException",
-  logOnly=true,
   expression="$exception.getSQLState() + \": \" + $exception.getMessage()"
 )
 ```
 
-Each hit records an `EXCEPTION_LOG` entry to `jdwp_get_events`; failures during evaluation surface as `EXCEPTION_LOG_ERROR` so the listener never throws. A non-null `expression` implies `logOnly=true`. Use this to trace exception flows in long-running services without stopping them.
+Each hit records an `EXCEPTION_LOG` entry to `jdwp_get_events`; failures during evaluation surface as `EXCEPTION_LOG_ERROR` so the listener never throws. Use this to trace exception flows in long-running services without stopping them.
+
+### Field breakpoints (watchpoints)
+
+```
+jdwp_set_field_breakpoint(
+  className="com.example.OrderState",
+  fieldName="status",
+  mode="modification"
+)
+```
+
+Suspend whenever a field is read (`access`), written (`modification`), or both (`both` — IntelliJ-style, binds both directions to one synthetic ID). Conditions are evaluated against the firing frame with five synthetic bindings:
+
+- `$oldValue` — value before the event (the value being read, or the value about to be overwritten)
+- `$newValue` — value about to be written (modification events only)
+- `$object` — the instance the field belongs to, or `null` for static fields
+- `$fieldName` — the field name as a string
+- `$mode` — `"access"` or `"modification"`, identifying which direction fired
+
+**Log-only mode** — record reads/writes without suspending, evaluating an expression with the same bindings:
+
+```
+jdwp_set_field_logpoint(
+  className="com.example.OrderState",
+  fieldName="status",
+  mode="modification",
+  expression="$oldValue + \" -> \" + $newValue"
+)
+```
+
+Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR`. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
+
+Hard errors (no silent fallback): invalid `mode`, ambiguous or missing field, `objectFilterId` on a static field. The deferred path can't validate static-ness until class load, so it surfaces a warning Note in the response.
+
+**Performance:** field watchpoints fire on **every** read/write of the watched field. For hot fields they can dominate target-VM CPU — prefer narrow filters or short-lived sessions. `jdwp_diagnose` surfaces `canWatchFieldAccess` / `canWatchFieldModification` plus a perf warning when connected.
+
+Use `jdwp_list_field_breakpoints()` to see active and pending field breakpoints with chain status, mode, filters, and any pending failure reason.
 
 ### Chained breakpoints
 
@@ -416,7 +452,7 @@ jdwp_get_breakpoint_context(maxFrames=5, includeThisFields=true)
 
 Returns thread info, top stack frames, locals at frame 0, and `this` fields in a single call — replaces the four-call sequence `get_current_thread → get_stack → get_locals → get_fields(this)` that an agent would otherwise need at every breakpoint hit.
 
-## Tool reference (44 tools)
+## Tool reference (46 tools)
 
 ### Connection (3)
 
@@ -451,19 +487,21 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 | `jdwp_step_into`          | `threadId`   | Step into (F7)                                        |
 | `jdwp_step_out`           | `threadId`   | Step out (Shift+F8)                                   |
 
-### Breakpoints (9)
+### Breakpoints (11)
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
-| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?` | Set breakpoint (supports conditions, deferred, and trigger chaining) |
-| `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`     | Non-stopping breakpoint that logs expression result |
-| `jdwp_clear_breakpoint`           | `className`, `lineNumber`                                 | Remove breakpoint by location                       |
-| `jdwp_clear_breakpoint_by_id`     | `breakpointId`                                            | Remove breakpoint by ID                             |
-| `jdwp_list_breakpoints`           | —                                                         | List all breakpoints (active, pending, failed; chain status rendered inline) |
-| `jdwp_clear_all_breakpoints`      | —                                                         | Remove all breakpoints                              |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `logOnly?`, `expression?`, `triggerBreakpointId?`, `oneShot?` | Break on exception throw (supports deferred, log-only with `$exception` binding, and trigger chaining) |
-| `jdwp_clear_exception_breakpoint` | `breakpointId`                                            | Remove exception breakpoint                         |
+| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?` | Set line breakpoint (supports conditions, deferred, and trigger chaining) |
+| `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`     | Non-stopping line breakpoint that logs expression result |
+| `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, and field BPs |
+| `jdwp_list_breakpoints`           | —                                                         | List all line breakpoints (active, pending, failed; chain status rendered inline) |
+| `jdwp_clear_all_breakpoints`      | —                                                         | Remove all breakpoints (line, exception, and field — active and pending) |
+| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred and trigger chaining) |
+| `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
 | `jdwp_list_exception_breakpoints` | —                                                         | List exception breakpoints (active and pending; chain status rendered inline) |
+| `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
+| `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
+| `jdwp_list_field_breakpoints`     | —                                                         | List field breakpoints (active and pending; chain status, mode, filters rendered inline) |
 
 ### Breakpoint chains (3)
 
