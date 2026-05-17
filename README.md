@@ -233,18 +233,18 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #6 The Field That Lies
 
-**Difficulty:** Moderate | **Test:** `UserProfileTest` | **Package:** `userprofile`
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile`
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
 
-**Hint:** The "read-only" formatter you handed the profile to is not as read-only as its name suggests. Don't try to find the write by reading the call chain — let the JVM tell you when the field changes.
+**Hint:** You will not find the write by ripgrep'ing for `setDisplayName` — the public setter is never called. A line BP on the setter never fires. Whatever path the write travels, the field's value still flips. Let the JVM tell you exactly when it changes, regardless of how the write reaches the field.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`LoginNormalizer.welcomeMessage` calls a private `normalizeForDisplay` helper that writes the lower-cased form back to `UserProfile.displayName` "to keep a canonical version on the profile". From the test's perspective the formatter is read-only — but the side effect mutates the caller's data.
+`LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName` — bypassing the public setter entirely. From the test's perspective the formatter is read-only; from JDI's perspective every reflective write is still a real field modification.
 
-**Debug path:** `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")` — the next write to the field suspends the thread at the actual mutation line. `jdwp_get_stack` shows `LoginNormalizer.normalizeForDisplay` is the culprit. No line-BP-spelunking required.
+**Debug path:** `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")` — JDI watchpoints fire on every JVM-level field store, including stores issued through `Field.set` and `Unsafe`. The next write suspends the thread inside `DisplayNameMirror.mirror`; `jdwp_get_stack` walks back through `canonicalForm` to `LoginNormalizer.welcomeMessage` and names the culprit. A line BP on `UserProfile.setDisplayName` would never fire — the setter is genuinely unused.
 
 </details>
 

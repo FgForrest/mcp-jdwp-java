@@ -2268,11 +2268,14 @@ public class JDWPTools {
             }
             final boolean effectiveOneShot = oneShot != null && oneShot;
             final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
-            final boolean isLogpoint = expression != null;
+            // Capture the non-null expression in a local so NullAway can track the narrowing
+            // across the ternary that picks suspending vs log-only.
+            final String logpointExpression = expression;
+            final boolean isLogpoint = logpointExpression != null;
 
-            final BreakpointTracker.FieldBreakpointSpec spec = isLogpoint
+            final BreakpointTracker.FieldBreakpointSpec spec = logpointExpression != null
                 ? BreakpointTracker.FieldBreakpointSpec.logOnly(className, fieldName, watchMode,
-                    expression, threadFilterId, objectFilterId, normalisedCondition)
+                    logpointExpression, threadFilterId, objectFilterId, normalisedCondition)
                 : BreakpointTracker.FieldBreakpointSpec.suspending(className, fieldName, watchMode,
                     threadFilterId, objectFilterId, normalisedCondition);
 
