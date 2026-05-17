@@ -5,6 +5,7 @@ import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.ExceptionEvent;
+import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ExceptionRequest;
 import one.edee.mcp.jdwp.BreakpointTracker.ExceptionBreakpointSpec;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
@@ -228,5 +229,126 @@ class JdiEventListenerExceptionLogTest {
 		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
 		assertThat(last.type()).isEqualTo("EXCEPTION_LOG");
 		assertThat(last.details()).containsEntry("catchLocation", "com.example.Handler:73");
+	}
+
+	/**
+	 * Pins the condition gate on log-only exception BPs: when a condition is attached to the
+	 * exception logpoint and evaluates to {@code false}, the listener must auto-resume the event
+	 * set WITHOUT recording an {@code EXCEPTION_LOG} entry, WITHOUT evaluating the log expression,
+	 * and WITHOUT propagating chain effects to dependents. Mirrors the line-BP condition-false
+	 * carve-out: a skipped condition is not a meaningful trigger, so dependents must remain
+	 * disabled.
+	 */
+	@Test
+	@DisplayName("Log-only exception BP with condition false: auto-resume, no log, no chain effects")
+	void shouldSkipExceptionLogAndChainWhenConditionFalse() throws Exception {
+		ThreadReference thread = mockThread("worker-cond-false", 700L);
+		ExceptionRequest request = mock(ExceptionRequest.class);
+		ObjectReference exception = mockException("java.lang.RuntimeException");
+		StackFrame frame = mock(StackFrame.class);
+		when(thread.frame(0)).thenReturn(frame);
+
+		// Register the log-only exception BP WITH an expression — so we can also assert the
+		// expression is NOT evaluated when the condition is false (only the condition itself runs).
+		int exId = tracker.registerExceptionBreakpoint(
+			request, ExceptionBreakpointSpec.logOnly("java.lang.RuntimeException", true, true,
+				"$exception.getMessage()"));
+
+		// Wire a disabled line-BP dependent on the exception BP so we can assert no chain arming.
+		BreakpointRequest dependentBp = mock(BreakpointRequest.class);
+		int depId = tracker.registerBreakpoint(dependentBp);
+		tracker.registerDependency(depId, exId, false);
+		when(dependentBp.isEnabled()).thenReturn(false);
+
+		// Condition evaluator stub — returns primitive boolean false.
+		tracker.setCondition(exId, "$exception.getMessage() != null");
+		com.sun.jdi.BooleanValue falseVal = mock(com.sun.jdi.BooleanValue.class);
+		when(falseVal.value()).thenReturn(false);
+		when(evaluator.evaluate(eq(frame), eq("$exception.getMessage() != null"),
+			eq(Map.of("$exception", exception)))).thenReturn(falseVal);
+
+		ExceptionEvent event = mockExceptionEvent(request, thread, exception,
+			"com.example.Worker", 42);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		// Thread auto-resumes — a condition-false exception logpoint must not park the thread.
+		verify(eventSet).resume();
+		// No EXCEPTION_LOG (or EXCEPTION_LOG_ERROR) entry was recorded.
+		assertThat(eventHistory.getRecent(20))
+			.extracting(EventHistory.DebugEvent::type)
+			.doesNotContain("EXCEPTION_LOG", "EXCEPTION_LOG_ERROR");
+		// Chain effects must be skipped — dependent stays disabled, no CHAIN_ARMED entry.
+		verify(dependentBp, never()).setEnabled(true);
+		assertThat(eventHistory.getRecent(20))
+			.extracting(EventHistory.DebugEvent::type)
+			.doesNotContain("CHAIN_ARMED");
+		// Exactly one evaluator invocation — the condition. The log expression must NOT run.
+		verify(evaluator).evaluate(eq(frame), eq("$exception.getMessage() != null"),
+			eq(Map.of("$exception", exception)));
+		verify(evaluator, org.mockito.Mockito.times(1))
+			.evaluate(any(), anyString(), any());
+	}
+
+	/**
+	 * Counterpart to {@code shouldSkipExceptionLogAndChainWhenConditionFalse}: when the condition
+	 * evaluates to {@code true} the listener proceeds with the normal log-only flow — it runs the
+	 * log expression, records an {@code EXCEPTION_LOG} entry with the formatted result, and arms
+	 * any dependents. Verifies that the evaluator is consulted exactly twice (condition, then
+	 * expression) so the condition gate does not accidentally short-circuit the happy path.
+	 */
+	@Test
+	@DisplayName("Log-only exception BP with condition true: expression runs, EXCEPTION_LOG recorded, chain armed")
+	void shouldEvaluateExpressionAndRecordExceptionLogWhenConditionTrue() throws Exception {
+		ThreadReference thread = mockThread("worker-cond-true", 701L);
+		ExceptionRequest request = mock(ExceptionRequest.class);
+		ObjectReference exception = mockException("java.lang.RuntimeException");
+		StackFrame frame = mock(StackFrame.class);
+		when(thread.frame(0)).thenReturn(frame);
+
+		int exId = tracker.registerExceptionBreakpoint(
+			request, ExceptionBreakpointSpec.logOnly("java.lang.RuntimeException", true, true,
+				"$exception.getMessage()"));
+
+		BreakpointRequest dependentBp = mock(BreakpointRequest.class);
+		int depId = tracker.registerBreakpoint(dependentBp);
+		tracker.registerDependency(depId, exId, false);
+		when(dependentBp.isEnabled()).thenReturn(false);
+
+		tracker.setCondition(exId, "$exception.getMessage() != null");
+		// Distinct stubs for condition vs. expression so we can assert both ran in the correct order.
+		com.sun.jdi.BooleanValue trueVal = mock(com.sun.jdi.BooleanValue.class);
+		when(trueVal.value()).thenReturn(true);
+		when(evaluator.evaluate(eq(frame), eq("$exception.getMessage() != null"),
+			eq(Map.of("$exception", exception)))).thenReturn(trueVal);
+		com.sun.jdi.StringReference msgRef = mock(com.sun.jdi.StringReference.class);
+		when(msgRef.value()).thenReturn("boom");
+		when(evaluator.evaluate(eq(frame), eq("$exception.getMessage()"),
+			eq(Map.of("$exception", exception)))).thenReturn(msgRef);
+
+		ExceptionEvent event = mockExceptionEvent(request, thread, exception,
+			"com.example.Worker", 43);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		// EXCEPTION_LOG must be recorded — find it amongst recent entries (CHAIN_ARMED follows it
+		// because chain effects are applied AFTER the log entry is written).
+		EventHistory.DebugEvent logEntry = eventHistory.getRecent(20).stream()
+			.filter(e -> "EXCEPTION_LOG".equals(e.type()))
+			.findFirst()
+			.orElseThrow(() -> new AssertionError("expected an EXCEPTION_LOG entry in history"));
+		assertThat(logEntry.details()).containsEntry("expression", "$exception.getMessage()");
+		assertThat(logEntry.details()).containsEntry("result", "boom");
+		// Chain effects must fire — dependent gets armed.
+		verify(dependentBp).setEnabled(true);
+		assertThat(eventHistory.getRecent(20))
+			.extracting(EventHistory.DebugEvent::type)
+			.contains("CHAIN_ARMED");
+		// Exactly two evaluator invocations: the condition, then the log expression.
+		verify(evaluator, org.mockito.Mockito.times(2))
+			.evaluate(any(), anyString(), any());
 	}
 }

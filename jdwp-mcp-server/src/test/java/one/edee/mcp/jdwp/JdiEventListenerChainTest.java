@@ -228,7 +228,7 @@ class JdiEventListenerChainTest {
 		// Condition evaluator returns boolean primitive false.
 		com.sun.jdi.BooleanValue falseVal = mock(com.sun.jdi.BooleanValue.class);
 		when(falseVal.value()).thenReturn(false);
-		when(evaluator.evaluate(any(), anyString())).thenReturn(falseVal);
+		when(evaluator.evaluate(any(), anyString(), any())).thenReturn(falseVal);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, triggerBp, "com.Foo", 22);
 		EventSet eventSet = mockEventSet(event);
@@ -262,7 +262,7 @@ class JdiEventListenerChainTest {
 		when(thread.frame(0)).thenReturn(frame);
 		com.sun.jdi.BooleanValue trueVal = mock(com.sun.jdi.BooleanValue.class);
 		when(trueVal.value()).thenReturn(true);
-		when(evaluator.evaluate(any(), anyString())).thenReturn(trueVal);
+		when(evaluator.evaluate(any(), anyString(), any())).thenReturn(trueVal);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, triggerBp, "com.Foo", 33);
 		EventSet eventSet = mockEventSet(event);
@@ -297,7 +297,7 @@ class JdiEventListenerChainTest {
 		when(thread.frame(0)).thenReturn(frame);
 		com.sun.jdi.BooleanValue falseVal = mock(com.sun.jdi.BooleanValue.class);
 		when(falseVal.value()).thenReturn(false);
-		when(evaluator.evaluate(any(), anyString())).thenReturn(falseVal);
+		when(evaluator.evaluate(any(), anyString(), any())).thenReturn(falseVal);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, triggerBp, "com.Foo", 44);
 		EventSet eventSet = mockEventSet(event);
@@ -305,8 +305,10 @@ class JdiEventListenerChainTest {
 
 		verify(eventSet).resume();
 		verify(dependentBp, never()).setEnabled(anyBoolean());
-		// Logpoint expression must NOT have been evaluated — only the 2-arg condition variant.
-		verify(evaluator, never()).evaluate(any(), anyString(), any());
+		// Exactly one evaluator call — the condition. The logpoint expression must NOT have been
+		// evaluated because the condition gated it out. Both paths share the 3-arg overload, so
+		// the assertion is "the evaluator was called once, not twice".
+		verify(evaluator, org.mockito.Mockito.times(1)).evaluate(any(), anyString(), any());
 		assertThat(hasEventOfType("LOGPOINT")).isFalse();
 		assertThat(hasEventOfType("CHAIN_ARMED")).isFalse();
 	}

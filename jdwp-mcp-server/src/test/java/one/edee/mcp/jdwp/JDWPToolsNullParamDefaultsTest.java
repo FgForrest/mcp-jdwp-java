@@ -96,7 +96,7 @@ class JDWPToolsNullParamDefaultsTest {
 			// path and trivially match).
 			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
 
-			String result = tools.jdwp_set_exception_breakpoint("com.example.MyException", null, null, null, null, null, null);
+			String result = tools.jdwp_set_exception_breakpoint("com.example.MyException", null, null, null, null);
 			// Should get an error about connection, not a NullPointerException on auto-unboxing.
 			assertThat(result).contains("Error");
 			assertThat(result).doesNotContain("NullPointerException");

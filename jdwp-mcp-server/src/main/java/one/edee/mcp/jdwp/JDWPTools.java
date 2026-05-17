@@ -1997,28 +1997,65 @@ public class JDWPTools {
         return "Event history cleared";
     }
 
-    @McpTool(description = "Set a breakpoint that triggers when a specific exception is thrown. " +
-        "By default suspends the throwing thread for inspection. Pass logOnly=true (or supply an " +
-        "expression) to instead record an EXCEPTION_LOG event and auto-resume — useful for tracing " +
-        "exception flows without halting execution. The optional expression is evaluated against the " +
-        "throwing frame with the special variable $exception bound to the thrown object (e.g., " +
-        "\"$exception.getMessage()\"). If the exception class is not yet loaded, the breakpoint is " +
+    @McpTool(description = "Set a breakpoint that suspends the throwing thread when a specific exception " +
+        "is thrown — caught at the throw site, before the stack unwinds. For non-stopping tracing, use " +
+        "jdwp_set_exception_logpoint instead. If the exception class is not yet loaded, the breakpoint is " +
         "deferred and will activate automatically when the JVM loads it.")
     public String jdwp_set_exception_breakpoint(
         @McpToolParam(description = "Exception class name (e.g., 'java.lang.NullPointerException', 'java.lang.Exception' for all)") String exceptionClass,
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
-        @McpToolParam(required = false, description = "If true, record an EXCEPTION_LOG event and auto-resume instead of suspending. Implied true when expression is supplied. Default: false.") @Nullable Boolean logOnly,
-        @McpToolParam(required = false, description = "Optional expression evaluated on each hit; the result is attached to the EXCEPTION_LOG event. Use $exception to refer to the thrown object. Implies logOnly=true.") @Nullable String expression,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        return registerExceptionBreakpointInternal(
+            exceptionClass, caught, uncaught,
+            /* expression */ null, /* condition */ null,
+            triggerBreakpointId, oneShot);
+    }
+
+    @McpTool(description = "Set a non-stopping breakpoint that records an EXCEPTION_LOG event for each " +
+        "throw of the given exception type. The expression is evaluated against the throwing frame with " +
+        "$exception bound to the thrown object (e.g., \"$exception.getMessage()\"); its result is attached " +
+        "to the event. The optional condition is evaluated with the same $exception binding — the log is " +
+        "recorded only when the condition is true. Use this for tracing exception flows in long-running " +
+        "services without halting traffic. If the exception class is not yet loaded, the logpoint is " +
+        "deferred and will activate automatically when the JVM loads it.")
+    public String jdwp_set_exception_logpoint(
+        @McpToolParam(description = "Exception class name (e.g., 'java.sql.SQLException')") String exceptionClass,
+        @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object") String expression,
+        @McpToolParam(required = false, description = "Optional condition with $exception bound — only log when this evaluates to true") @Nullable String condition,
+        @McpToolParam(required = false, description = "Log caught exceptions (default: true)") @Nullable Boolean caught,
+        @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
+        @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
+        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        if (expression == null || expression.isBlank()) {
+            return "Error: expression is required for jdwp_set_exception_logpoint. "
+                + "Use jdwp_set_exception_breakpoint for a suspending exception BP without expression evaluation.";
+        }
+        return registerExceptionBreakpointInternal(
+            exceptionClass, caught, uncaught,
+            expression, condition,
+            triggerBreakpointId, oneShot);
+    }
+
+    /**
+     * Shared registration path for suspending exception breakpoints and exception logpoints. The two
+     * public tools differ only in their parameter validation and the rendered summary; everything
+     * inside (trigger validation, eager class load, deferred path with {@code ClassPrepareRequest},
+     * active path with the chain-disable-then-enable ordering) is identical and lives here.
+     *
+     * @param expression when non-null, switches the helper into log-only mode and is rendered on a dedicated line
+     * @param condition  non-null persists a metadata condition under the synthetic ID; evaluated by
+     *                   {@link JdiEventListener} on each hit with {@code $exception} bound
+     */
+    private String registerExceptionBreakpointInternal(
+        String exceptionClass,
+        @Nullable Boolean caught, @Nullable Boolean uncaught,
+        @Nullable String expression, @Nullable String condition,
+        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot) {
         try {
-            if (caught == null) {
-                caught = true;
-            }
-            if (uncaught == null) {
-                uncaught = true;
-            }
+            final boolean effectiveCaught = caught == null || caught;
+            final boolean effectiveUncaught = uncaught == null || uncaught;
             if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
             }
@@ -2026,13 +2063,13 @@ public class JDWPTools {
             final String chainInfo = triggerBreakpointId != null
                 ? String.format("\n  Chain: trigger=#%d%s",
                     triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
-            final String normalisedExpression = (expression == null || expression.isBlank()) ? null : expression;
-            // An expression always implies logOnly — without auto-resume, evaluating it would be
-            // redundant (the user could just set a normal BP and inspect manually).
-            final boolean effectiveLogOnly = (logOnly != null && logOnly) || normalisedExpression != null;
-            final BreakpointTracker.ExceptionBreakpointSpec spec = effectiveLogOnly
-                ? BreakpointTracker.ExceptionBreakpointSpec.logOnly(exceptionClass, caught, uncaught, normalisedExpression)
-                : BreakpointTracker.ExceptionBreakpointSpec.suspending(exceptionClass, caught, uncaught);
+            final boolean isLogpoint = expression != null;
+            final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
+            final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
+            final String conditionLine = normalisedCondition != null ? "\n  Condition: " + normalisedCondition : "";
+            final BreakpointTracker.ExceptionBreakpointSpec spec = isLogpoint
+                ? BreakpointTracker.ExceptionBreakpointSpec.logOnly(exceptionClass, effectiveCaught, effectiveUncaught, expression)
+                : BreakpointTracker.ExceptionBreakpointSpec.suspending(exceptionClass, effectiveCaught, effectiveUncaught);
 
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
@@ -2043,6 +2080,9 @@ public class JDWPTools {
             if (eagerType == null) {
                 // Class not loadable yet — defer
                 final int pendingId = breakpointTracker.registerPendingExceptionBreakpoint(spec);
+                if (normalisedCondition != null) {
+                    breakpointTracker.setCondition(pendingId, normalisedCondition);
+                }
                 if (triggerBreakpointId != null) {
                     breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
                 }
@@ -2060,11 +2100,12 @@ public class JDWPTools {
                           Exception: %s
                           Caught: %s
                           Uncaught: %s
-                          Mode: %s%s%s
+                          Mode: %s%s%s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
-                    pendingId, exceptionClass, caught, uncaught,
-                    effectiveLogOnly ? "log-only" : "suspend",
-                    normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "",
+                    pendingId, exceptionClass, effectiveCaught, effectiveUncaught,
+                    isLogpoint ? "log-only" : "suspend",
+                    expressionLine,
+                    conditionLine,
                     chainInfo);
             }
 
@@ -2072,12 +2113,15 @@ public class JDWPTools {
             // edge), and only enable as the very last step. JDI delivers events the instant a
             // request is enabled; enabling-then-disabling a chained BP opens a window where an
             // exception could fire and bypass the chain.
-            final ExceptionRequest exReq = erm.createExceptionRequest(eagerType, caught, uncaught);
+            final ExceptionRequest exReq = erm.createExceptionRequest(eagerType, effectiveCaught, effectiveUncaught);
             // Always SUSPEND_EVENT_THREAD; logOnly BPs are auto-resumed by JdiEventListener after
             // recording / expression evaluation (invokeMethod requires the firing thread suspended).
             exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
 
             final int id = breakpointTracker.registerExceptionBreakpoint(exReq, spec);
+            if (normalisedCondition != null) {
+                breakpointTracker.setCondition(id, normalisedCondition);
+            }
             if (triggerBreakpointId != null) {
                 breakpointTracker.registerDependency(id, triggerBreakpointId, effectiveOneShot);
                 // Stays disabled — the chain will arm it when the trigger fires.
@@ -2085,10 +2129,11 @@ public class JDWPTools {
                 exReq.setEnabled(true);
             }
 
-            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s",
-                id, exceptionClass, caught, uncaught,
-                effectiveLogOnly ? "log-only" : "suspend",
-                normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "",
+            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s%s",
+                id, exceptionClass, effectiveCaught, effectiveUncaught,
+                isLogpoint ? "log-only" : "suspend",
+                expressionLine,
+                conditionLine,
                 chainInfo);
         } catch (Exception e) {
             return "Error: " + e.getMessage();

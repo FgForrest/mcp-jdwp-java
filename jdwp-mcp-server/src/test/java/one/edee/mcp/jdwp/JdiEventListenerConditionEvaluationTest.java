@@ -80,7 +80,7 @@ class JdiEventListenerConditionEvaluationTest {
 		// Build the boxed-Boolean mock chain BEFORE the evaluator stubbing — Mockito does not
 		// allow nesting mock creation inside another .thenReturn(...) argument.
 		ObjectReference boxedTrue = boxedBoolean(true);
-		when(evaluator.evaluate(any(StackFrame.class), anyString())).thenReturn(boxedTrue);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenReturn(boxedTrue);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 10);
 		EventSet eventSet = mockEventSet(event);
@@ -102,7 +102,7 @@ class JdiEventListenerConditionEvaluationTest {
 		StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
 		ObjectReference boxedFalse = boxedBoolean(false);
-		when(evaluator.evaluate(any(StackFrame.class), anyString())).thenReturn(boxedFalse);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenReturn(boxedFalse);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 11);
 		EventSet eventSet = mockEventSet(event);
@@ -125,7 +125,7 @@ class JdiEventListenerConditionEvaluationTest {
 		when(thread.frame(0)).thenReturn(frame);
 		IntegerValue intResult = mock(IntegerValue.class);
 		when(intResult.value()).thenReturn(42);
-		when(evaluator.evaluate(any(StackFrame.class), anyString())).thenReturn(intResult);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenReturn(intResult);
 
 		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 12);
 		EventSet eventSet = mockEventSet(event);
@@ -147,7 +147,7 @@ class JdiEventListenerConditionEvaluationTest {
 		ThreadReference thread = mockThread("worker-cond-fail", 1103L);
 		StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(any(StackFrame.class), anyString()))
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any()))
 			.thenThrow(new JdiEvaluationException("compile failed"));
 
 		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 13);
@@ -187,7 +187,7 @@ class JdiEventListenerConditionEvaluationTest {
 		java.util.concurrent.CountDownLatch evaluatorEntered = new java.util.concurrent.CountDownLatch(1);
 		// Mockito rejects checked-throws for methods that don't declare them, so we throw the
 		// InterruptedException through thenAnswer which has no signature validation.
-		when(evaluator.evaluate(any(StackFrame.class), anyString()))
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any()))
 			.thenAnswer(invocation -> {
 				listenerThreadRef.set(Thread.currentThread());
 				evaluatorEntered.countDown();

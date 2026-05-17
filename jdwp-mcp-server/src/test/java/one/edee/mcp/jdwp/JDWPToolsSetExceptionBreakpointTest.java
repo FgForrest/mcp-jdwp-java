@@ -20,9 +20,10 @@ import static org.mockito.Mockito.when;
 
 /**
  * Behavioural tests for {@link JDWPTools#jdwp_set_exception_breakpoint}: the null-default
- * behaviour for caught / uncaught (both default to true), the {@code expression → logOnly=true}
- * promotion, the blank-expression-is-no-expression normalisation, the deferred path when the
- * exception class is not yet loaded, and the unknown-trigger rejection.
+ * behaviour for caught / uncaught (both default to true), the deferred path when the exception
+ * class is not yet loaded, and the unknown-trigger rejection. The log-only / expression-bearing
+ * variants live in {@link JDWPToolsSetExceptionLogpointTest} since they target the separate
+ * {@code jdwp_set_exception_logpoint} tool.
  */
 @DisplayName("jdwp_set_exception_breakpoint")
 class JDWPToolsSetExceptionBreakpointTest {
@@ -63,44 +64,10 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null);
 
-		assertThat(result).contains("Caught: true").contains("Uncaught: true");
+		assertThat(result).contains("Caught: true").contains("Uncaught: true").contains("Mode: suspend");
 		verify(erm).createExceptionRequest(refType, true, true);
-	}
-
-	/**
-	 * Supplying an expression promotes the BP to log-only mode even when the {@code logOnly}
-	 * flag is null. Verified by the rendered "Mode: log-only" label and the expression line.
-	 */
-	@Test
-	@DisplayName("expression implies logOnly=true even when logOnly is null")
-	void shouldImplyLogOnlyWhenExpressionProvided() throws Exception {
-		final ReferenceType refType = mock(ReferenceType.class);
-		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
-		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
-
-		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, "$exception.getMessage()", null, null);
-
-		assertThat(result).contains("Mode: log-only");
-		assertThat(result).contains("Expression: $exception.getMessage()");
-	}
-
-	@Test
-	@DisplayName("blank expression is treated as no expression and falls back to suspend mode")
-	void shouldTreatBlankExpressionAsNoExpression() throws Exception {
-		final ReferenceType refType = mock(ReferenceType.class);
-		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
-		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
-
-		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, "   ", null, null);
-
-		assertThat(result).contains("Mode: suspend");
-		assertThat(result).doesNotContain("Expression:");
 	}
 
 	@Test
@@ -111,7 +78,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"com.example.MyException", null, null, null, null, null, null);
+			"com.example.MyException", null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("com.example.MyException");
@@ -123,7 +90,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null, 999, null);
+			"java.lang.RuntimeException", null, null, 999, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 	}
@@ -139,7 +106,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null, triggerId, true);
+			"java.lang.RuntimeException", null, null, triggerId, true);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}

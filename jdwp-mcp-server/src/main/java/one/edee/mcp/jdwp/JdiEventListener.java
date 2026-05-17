@@ -540,6 +540,15 @@ public class JdiEventListener {
                 ? breakpointTracker.findExceptionIdByRequest(firingRequest) : null;
 
             if (info != null && info.isLogOnly()) {
+                final String condition = firingId != null
+                    ? breakpointTracker.getCondition(firingId) : null;
+                if (condition != null && !evaluateConditionWithBindings(
+                        event.thread(), condition, Map.of("$exception", exception))) {
+                    // Condition false — skip the log AND chain effects. Same rationale as the
+                    // line-BP path: a skipped condition is not a meaningful trigger.
+                    log.debug("[JDI] Exception logpoint {} condition false, skipping", firingId);
+                    return false;
+                }
                 evaluateExceptionLogpoint(event, info, exception, exceptionType,
                     throwInfo, catchInfo, threadName);
                 if (firingId != null) {
@@ -667,18 +676,29 @@ public class JdiEventListener {
     }
 
     /**
-     * Evaluates a conditional breakpoint expression at frame 0. Fail-safe policy: any error
-     * (compilation failure, non-boolean result, exception during execution) returns `true` so the
-     * user sees the breakpoint hit and can investigate the problem rather than silently skipping
-     * the BP. Recognises both primitive `BooleanValue` and the boxed `java.lang.Boolean` returned
-     * via the wrapper class's `(Object)(...)` autoboxing cast.
+     * Evaluates a conditional breakpoint expression at frame 0 with no extra synthetic bindings.
+     * Delegates to {@link #evaluateConditionWithBindings} — kept as a narrow entry point for the
+     * line-BP path where {@code $exception} / field-event bindings are not in scope.
      */
     private boolean evaluateCondition(BreakpointEvent event, String condition) {
+        return evaluateConditionWithBindings(event.thread(), condition, Map.of());
+    }
+
+    /**
+     * Evaluates a condition expression at frame 0 of {@code thread} with additional synthetic
+     * bindings (e.g. {@code $exception} for exception logpoints, {@code $oldValue}/{@code $newValue}
+     * for field watchpoints). Fail-safe policy: any error (compilation failure, non-boolean result,
+     * exception during execution) returns {@code true} so the user sees the breakpoint fire and can
+     * investigate the problem rather than silently skipping it. Recognises both primitive
+     * {@link BooleanValue} and the boxed {@code java.lang.Boolean} returned via the wrapper class's
+     * {@code (Object)(...)} autoboxing cast.
+     */
+    private boolean evaluateConditionWithBindings(ThreadReference thread, String condition,
+                                                  Map<String, Value> extraBindings) {
         try {
-            final ThreadReference thread = event.thread();
             expressionEvaluator.configureCompilerClasspath(thread);
             final StackFrame frame = thread.frame(0);
-            final Value result = expressionEvaluator.evaluate(frame, condition);
+            final Value result = expressionEvaluator.evaluate(frame, condition, extraBindings);
 
             if (result instanceof BooleanValue boolVal) {
                 return boolVal.value();
