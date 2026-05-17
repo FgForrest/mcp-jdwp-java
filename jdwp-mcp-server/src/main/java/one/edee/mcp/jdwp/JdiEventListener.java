@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -55,6 +56,15 @@ public class JdiEventListener {
     private final EventHistory eventHistory;
     private final JdiExpressionEvaluator expressionEvaluator;
     private final EvaluationGuard evaluationGuard;
+    /**
+     * Late-bound handle to the connection service so {@link #handleClassPrepareEvent} can promote
+     * pending field watchpoints synchronously on class load. {@code @Lazy} because
+     * {@code JDIConnectionService} itself depends on this listener (it wires the VM-death hook)
+     * and Spring would otherwise reject the circular constructor injection. {@code null} in tests
+     * that build the listener directly — the field-promotion loop short-circuits when it's missing.
+     */
+    @Nullable
+    private final JDIConnectionService jdiConnectionService;
     @Nullable
     private volatile Thread listenerThread;
     private volatile boolean running;
@@ -72,11 +82,13 @@ public class JdiEventListener {
 
     public JdiEventListener(BreakpointTracker breakpointTracker, EventHistory eventHistory,
                             @Lazy JdiExpressionEvaluator expressionEvaluator,
-                            EvaluationGuard evaluationGuard) {
+                            EvaluationGuard evaluationGuard,
+                            @Lazy @Nullable JDIConnectionService jdiConnectionService) {
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.expressionEvaluator = expressionEvaluator;
         this.evaluationGuard = evaluationGuard;
+        this.jdiConnectionService = jdiConnectionService;
     }
 
     /**
@@ -274,6 +286,10 @@ public class JdiEventListener {
                         }
                     } else if (event instanceof ExceptionEvent exEvent) {
                         if (handleExceptionEvent(exEvent)) {
+                            shouldSuspend = true;
+                        }
+                    } else if (event instanceof WatchpointEvent wpEvent) {
+                        if (handleWatchpointEvent(wpEvent)) {
                             shouldSuspend = true;
                         }
                     } else if (event instanceof ClassPrepareEvent cpEvent) {
@@ -627,6 +643,185 @@ public class JdiEventListener {
     }
 
     /**
+     * Dispatches a field watchpoint hit and returns whether the firing thread should stay
+     * suspended. Mirrors {@link #handleBreakpointEvent} for the field-access / field-modification
+     * paths, with five synthetic bindings exposed to conditions and logpoint expressions:
+     * <ul>
+     *   <li>{@code $oldValue} — value before the event. For a modification event this is the value
+     *       about to be overwritten; for an access event it is the value being read.</li>
+     *   <li>{@code $newValue} — value about to be written. ModificationWatchpointEvent only;
+     *       referencing it in an access-only expression yields a compile error from the evaluator.</li>
+     *   <li>{@code $object} — the instance the field belongs to; {@code null} for static fields.</li>
+     *   <li>{@code $fieldName} — String mirror of the field name.</li>
+     *   <li>{@code $mode} — String mirror "access" or "modification" indicating which kind of event
+     *       fired (distinct from the BP's configured mode in {@code BOTH}).</li>
+     * </ul>
+     * Auto-resume cases (returns {@code false}): reentrancy guard active, condition evaluates to
+     * false, or the BP is configured as a logpoint. Suspending cases (returns {@code true}):
+     * untracked watchpoints (defensive — should not happen), plain field BPs, BPs whose condition
+     * is true (or whose evaluator throws — fail-safe), or any internal error during binding setup.
+     * <p>
+     * Chain effects propagate on every real hit and on logpoint hits, but are suppressed when the
+     * condition evaluates to false — the symmetry mirrors {@link #handleBreakpointEvent}.
+     */
+    private boolean handleWatchpointEvent(WatchpointEvent event) {
+        // Reentrancy guard — see handleBreakpointEvent for the rationale.
+        if (evaluationGuard.isEvaluating(event.thread())) {
+            try {
+                final String className = event.field().declaringType().name();
+                final String fieldName = event.field().name();
+                final String threadName = event.thread().name();
+                eventHistory.record(new EventHistory.DebugEvent("FIELD_BREAKPOINT_SUPPRESSED",
+                    String.format("Recursive field event on %s.%s suppressed (thread '%s' inside MCP evaluation)",
+                        className, fieldName, threadName),
+                    Map.of("class", className, "field", fieldName, "thread", threadName)));
+                log.info("[JDI] Suppressing recursive field watchpoint on {}.{} (thread {})",
+                    className, fieldName, threadName);
+            } catch (Exception e) {
+                log.debug("[JDI] Error recording suppressed field event: {}", e.getMessage());
+            }
+            return false;
+        }
+
+        try {
+            final WatchpointRequest request = event.request() instanceof WatchpointRequest wr ? wr : null;
+            final Integer bpId = request != null ? breakpointTracker.findFieldIdByRequest(request) : null;
+            final BreakpointTracker.FieldBreakpointInfo info = request != null
+                ? breakpointTracker.findFieldInfoByRequest(request) : null;
+
+            if (bpId == null || info == null) {
+                log.warn("[JDI] Untracked field watchpoint hit on {}.{}",
+                    event.field().declaringType().name(), event.field().name());
+                return true;
+            }
+
+            final boolean isModification = event instanceof ModificationWatchpointEvent;
+            final String modeStr = isModification ? "modification" : "access";
+            final String className = event.field().declaringType().name();
+            final String fieldName = event.field().name();
+            final String threadName = event.thread().name();
+
+            breakpointTracker.setLastBreakpointThread(event.thread(), bpId);
+
+            final Map<String, Value> bindings;
+            try {
+                bindings = buildFieldEventBindings(event, isModification, fieldName, modeStr);
+            } catch (Exception bindEx) {
+                log.warn("[JDI] Could not build bindings for field event on {}.{}: {}",
+                    className, fieldName, bindEx.getMessage());
+                return true;
+            }
+
+            final String condition = breakpointTracker.getCondition(bpId);
+            if (condition != null && !evaluateConditionWithBindings(event.thread(), condition, bindings)) {
+                log.debug("[JDI] Field BP {} condition false, skipping", bpId);
+                // Condition-false is not a meaningful hit — chain trigger does not propagate.
+                return false;
+            }
+
+            final BreakpointTracker.FieldBreakpointSpec spec = info.getSpec();
+            if (spec.logOnly()) {
+                evaluateFieldLogpoint(event, bpId, spec, modeStr, className, fieldName, threadName, bindings);
+                applyChainEffectsAfterHit(bpId, request);
+                return false;
+            }
+
+            eventHistory.record(new EventHistory.DebugEvent(
+                isModification ? "FIELD_MODIFICATION" : "FIELD_ACCESS",
+                String.format("Field %s.%s %s on thread %s", className, fieldName, modeStr, threadName),
+                Map.of("breakpointId", String.valueOf(bpId),
+                    "class", className, "field", fieldName,
+                    "mode", modeStr, "thread", threadName,
+                    "oldValue", String.valueOf(event.valueCurrent()))));
+
+            log.info("[JDI] Field {} {} on {} (BP #{})", fieldName, modeStr, threadName, bpId);
+            breakpointTracker.fireNextEvent();
+            applyChainEffectsAfterHit(bpId, request);
+            return true;
+        } catch (Exception e) {
+            log.warn("[JDI] Error handling watchpoint event: {}", e.getMessage());
+            return true;
+        }
+    }
+
+    /**
+     * Builds the synthetic-binding map exposed to conditions and logpoint expressions on a field
+     * watchpoint hit. {@code $oldValue} / {@code $object} are conditionally present (the JDI value
+     * may itself be a primitive null sentinel, in which case the binding is omitted so the user
+     * gets a compile error rather than a misleading NullPointerException at evaluation time).
+     * {@code $newValue} appears only for {@link ModificationWatchpointEvent}.
+     */
+    private static Map<String, Value> buildFieldEventBindings(WatchpointEvent event,
+                                                              boolean isModification,
+                                                              String fieldName, String modeStr) {
+        final VirtualMachine vm = event.virtualMachine();
+        final Map<String, Value> bindings = new HashMap<>();
+        if (event.valueCurrent() != null) {
+            bindings.put("$oldValue", event.valueCurrent());
+        }
+        if (isModification) {
+            final Value newValue = ((ModificationWatchpointEvent) event).valueToBe();
+            if (newValue != null) {
+                bindings.put("$newValue", newValue);
+            }
+        }
+        if (event.object() != null) {
+            bindings.put("$object", event.object());
+        }
+        bindings.put("$fieldName", vm.mirrorOf(fieldName));
+        bindings.put("$mode", vm.mirrorOf(modeStr));
+        // Map is method-scoped and the downstream consumers (condition + logpoint evaluators) read
+        // it without mutation — skipping Map.copyOf saves an allocation per field hit on a hot path.
+        return bindings;
+    }
+
+    /**
+     * Records a {@code FIELD_LOGPOINT} entry for a log-only field watchpoint and, if the spec
+     * carries an expression, evaluates it against the firing frame with the field-event synthetic
+     * bindings injected. Evaluation failures are captured as a separate {@code FIELD_LOGPOINT_ERROR}
+     * entry so the listener never throws.
+     */
+    private void evaluateFieldLogpoint(WatchpointEvent event, int bpId,
+                                       BreakpointTracker.FieldBreakpointSpec spec,
+                                       String modeStr, String className, String fieldName,
+                                       String threadName, Map<String, Value> bindings) {
+        final String expression = spec.expression();
+        if (expression == null) {
+            eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT",
+                String.format("Field %s.%s %s on thread %s [log-only]",
+                    className, fieldName, modeStr, threadName),
+                Map.of("breakpointId", String.valueOf(bpId),
+                    "class", className, "field", fieldName,
+                    "mode", modeStr, "thread", threadName)));
+            log.info("[JDI] Field {} {} logged on {} (BP #{}, log-only)",
+                fieldName, modeStr, threadName, bpId);
+            return;
+        }
+        try {
+            final String resultStr = evaluateAndFormat(event.thread(), expression, bindings);
+            eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT",
+                String.format("Field %s.%s %s on thread %s [%s = %s]",
+                    className, fieldName, modeStr, threadName, expression, resultStr),
+                Map.of("breakpointId", String.valueOf(bpId),
+                    "class", className, "field", fieldName,
+                    "mode", modeStr, "thread", threadName,
+                    "expression", expression, "result", resultStr)));
+            log.info("[JDI] Field {} {} logged on {} with {} = {} (BP #{})",
+                fieldName, modeStr, threadName, expression, resultStr, bpId);
+        } catch (Exception e) {
+            eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
+                String.format("Field %s.%s %s on thread %s — error evaluating '%s': %s",
+                    className, fieldName, modeStr, threadName, expression, e.getMessage()),
+                Map.of("breakpointId", String.valueOf(bpId),
+                    "class", className, "field", fieldName,
+                    "expression", expression,
+                    "error", String.valueOf(e.getMessage()))));
+            log.warn("[JDI] Field logpoint evaluation failed for {}.{}: {}",
+                className, fieldName, e.getMessage());
+        }
+    }
+
+    /**
      * Evaluates the logpoint expression and records a `LOGPOINT` (or `LOGPOINT_ERROR`) entry. Runs
      * on the JDI listener thread; this is safe because we're inside a synchronously-dispatched
      * event handler — JDI's prohibition on `invokeMethod` applies to event-dispatch callbacks, not
@@ -736,13 +931,15 @@ public class JdiEventListener {
                 breakpointTracker.getPendingBreakpointsForClass(className);
             final List<Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint>> pendingExList =
                 breakpointTracker.getPendingExceptionBreakpointsForClass(className);
+            final List<Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint>> pendingFieldList =
+                breakpointTracker.getPendingFieldBreakpointsForClass(className);
 
-            if (pendingList.isEmpty() && pendingExList.isEmpty()) {
+            if (pendingList.isEmpty() && pendingExList.isEmpty() && pendingFieldList.isEmpty()) {
                 return;
             }
 
-            log.info("[JDI] ClassPrepareEvent for '{}', activating {} deferred breakpoint(s) and {} deferred exception breakpoint(s)",
-                className, pendingList.size(), pendingExList.size());
+            log.info("[JDI] ClassPrepareEvent for '{}', activating {} deferred breakpoint(s), {} deferred exception breakpoint(s), {} deferred field BP(s)",
+                className, pendingList.size(), pendingExList.size(), pendingFieldList.size());
 
             final VirtualMachine vm = event.virtualMachine();
             final EventRequestManager erm = vm.eventRequestManager();
@@ -799,8 +996,18 @@ public class JdiEventListener {
                 }
             }
 
+            // Promote pending FIELD watchpoints synchronously here — the loading thread auto-resumes
+            // right after this handler returns, runs <clinit>, and any static-field writes inside
+            // <clinit> would be lost if the field BP weren't already armed. jdiConnectionService is
+            // null in unit tests that build the listener directly without the Spring context — those
+            // tests don't exercise field-BP promotion, so the short-circuit is harmless.
+            if (jdiConnectionService != null) {
+                breakpointTracker.promotePendingFieldsForClass(refType, vm, erm, jdiConnectionService);
+            }
+
             if (breakpointTracker.getPendingBreakpointsForClass(className).isEmpty()
-                && breakpointTracker.getPendingExceptionBreakpointsForClass(className).isEmpty()) {
+                && breakpointTracker.getPendingExceptionBreakpointsForClass(className).isEmpty()
+                && breakpointTracker.getPendingFieldBreakpointsForClass(className).isEmpty()) {
                 final ClassPrepareRequest cpr = breakpointTracker.removeClassPrepareRequest(className);
                 if (cpr != null) {
                     erm.deleteEventRequest(cpr);

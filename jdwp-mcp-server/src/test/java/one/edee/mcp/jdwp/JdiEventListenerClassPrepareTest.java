@@ -55,7 +55,7 @@ class JdiEventListenerClassPrepareTest {
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard);
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null);
 	}
 
 	@AfterEach

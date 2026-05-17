@@ -922,84 +922,14 @@ public class BreakpointTracker {
             if (pending.getFailureReason() != null) {
                 continue;
             }
-
-            final FieldBreakpointSpec spec = pending.getSpec();
             try {
-                final ReferenceType refType = jdiService.findOrForceLoadClass(spec.className(), preferredThread);
+                final ReferenceType refType = jdiService.findOrForceLoadClass(
+                    pending.getSpec().className(), preferredThread);
                 if (refType == null) {
                     continue;
                 }
-
-                final List<Field> candidates = refType.allFields().stream()
-                    .filter(f -> f.name().equals(spec.fieldName()))
-                    .toList();
-                if (candidates.isEmpty()) {
-                    markPendingFieldFailed(id, String.format(
-                        "Field '%s' not found on %s or its supertypes", spec.fieldName(), spec.className()));
-                    continue;
-                }
-                if (candidates.size() > 1) {
-                    markPendingFieldFailed(id, String.format(
-                        "Field '%s' is ambiguous on %s (declared on %d types) — use a more specific className",
-                        spec.fieldName(), spec.className(), candidates.size()));
-                    continue;
-                }
-                final Field field = candidates.get(0);
-                if (spec.objectFilterId() != null && field.isStatic()) {
-                    markPendingFieldFailed(id, String.format(
-                        "Field '%s' on %s is static; objectId filter does not apply",
-                        spec.fieldName(), spec.className()));
-                    continue;
-                }
-
-                // Two-step creation for BOTH-mode is split across two erm calls plus two
-                // configureFieldRequest calls — any of them can throw on a VM in mid-transition. The
-                // inner try/catch tracks every JDI request handed out so a half-creation can roll
-                // back via erm.deleteEventRequest before re-throwing into the outer catch. Without
-                // the rollback the access request would stay armed on the target VM with no tracker
-                // entry pointing at it, and events on it would be delivered but immediately
-                // discarded (findFieldInfoByRequest returns null).
-                final List<EventRequest> createdRequests = new ArrayList<>(2);
-                try {
-                    AccessWatchpointRequest accessReq = null;
-                    ModificationWatchpointRequest modReq = null;
-                    if (spec.mode() == FieldWatchMode.ACCESS || spec.mode() == FieldWatchMode.BOTH) {
-                        accessReq = erm.createAccessWatchpointRequest(field);
-                        createdRequests.add(accessReq);
-                        configureFieldRequest(accessReq, spec, vm, jdiService);
-                    }
-                    if (spec.mode() == FieldWatchMode.MODIFICATION || spec.mode() == FieldWatchMode.BOTH) {
-                        modReq = erm.createModificationWatchpointRequest(field);
-                        createdRequests.add(modReq);
-                        configureFieldRequest(modReq, spec, vm, jdiService);
-                    }
-
-                    if (accessReq != null) {
-                        disarmIfChained(id, accessReq);
-                    }
-                    if (modReq != null) {
-                        disarmIfChained(id, modReq);
-                    }
-                    promotePendingFieldToActive(id, accessReq, modReq);
+                if (promoteSinglePendingField(id, pending, refType, vm, erm, jdiService)) {
                     promoted++;
-                    log.info("[Tracker] Opportunistically promoted pending field BP {} for {}.{}",
-                        id, spec.className(), spec.fieldName());
-                } catch (Exception inner) {
-                    // Delete every half-created request so a retry cycle does not see orphan JDI
-                    // requests on the target VM. Per-request delete failures are swallowed — the
-                    // outer log entry below is enough diagnostic noise for what is already a
-                    // best-effort rollback path.
-                    for (EventRequest leaked : createdRequests) {
-                        try {
-                            erm.deleteEventRequest(leaked);
-                        } catch (Exception ignore) {
-                            // No-op: best-effort cleanup, do not mask the original failure.
-                        }
-                    }
-                    // Mark the pending entry failed so future tryPromotePending cycles skip it
-                    // instead of retrying the same orphan-prone path on every tool call.
-                    markPendingFieldFailed(id, "Failed during promotion: " + inner.getMessage());
-                    log.debug("[Tracker] Field BP {} promotion rolled back: {}", id, inner.getMessage());
                 }
             } catch (Exception e) {
                 log.debug("[Tracker] Failed to promote pending field BP {}: {}", id, e.getMessage());
@@ -1007,6 +937,130 @@ public class BreakpointTracker {
         }
 
         return promoted;
+    }
+
+    /**
+     * Synchronously promotes every pending field watchpoint that targets {@code refType.name()}.
+     * Called from {@link JdiEventListener#handleClassPrepareEvent} so a field BP registered before
+     * its class loaded catches static-initializer reads/writes too — the loading thread auto-resumes
+     * immediately after this returns and runs {@code <clinit>}, so the promotion must be in place
+     * before that point or the first events on the field are lost.
+     *
+     * @return number of pending field BPs successfully promoted
+     */
+    public synchronized int promotePendingFieldsForClass(ReferenceType refType, VirtualMachine vm,
+                                                         EventRequestManager erm,
+                                                         JDIConnectionService jdiService) {
+        final String className = refType.name();
+        int promoted = 0;
+        // Snapshot the matching pending entries before iterating — promoteSinglePendingField mutates
+        // pendingFieldBreakpointsById on success and on terminal failure.
+        for (Map.Entry<Integer, PendingFieldBreakpoint> entry :
+            new ArrayList<>(getPendingFieldBreakpointsForClass(className))) {
+            final int id = entry.getKey();
+            final PendingFieldBreakpoint pending = entry.getValue();
+            if (pending.getFailureReason() != null) {
+                continue;
+            }
+            try {
+                if (promoteSinglePendingField(id, pending, refType, vm, erm, jdiService)) {
+                    promoted++;
+                }
+            } catch (Exception e) {
+                log.debug("[Tracker] Failed to promote pending field BP {} on class-load: {}", id, e.getMessage());
+            }
+        }
+        return promoted;
+    }
+
+    /**
+     * Resolves the field declared on {@code refType}, creates the appropriate watchpoint request(s)
+     * per the spec mode, applies suspend policy / thread / instance filters, registers them with the
+     * reverse indexes, and flips the pending entry to active. Returns {@code true} on success,
+     * {@code false} when the field cannot be resolved (e.g. ambiguous / missing — pending is marked
+     * failed with an explanatory reason). The {@code BOTH}-mode partial-creation rollback is
+     * preserved so a half-armed pair never leaks onto the target VM.
+     *
+     * <p>Shared by {@link #tryPromotePending} (safety-net path) and
+     * {@link #promotePendingFieldsForClass} (class-prepare path).
+     */
+    private boolean promoteSinglePendingField(int id, PendingFieldBreakpoint pending,
+                                              ReferenceType refType, VirtualMachine vm,
+                                              EventRequestManager erm, JDIConnectionService jdiService) {
+        final FieldBreakpointSpec spec = pending.getSpec();
+
+        final List<Field> candidates = refType.allFields().stream()
+            .filter(f -> f.name().equals(spec.fieldName()))
+            .toList();
+        if (candidates.isEmpty()) {
+            markPendingFieldFailed(id, String.format(
+                "Field '%s' not found on %s or its supertypes", spec.fieldName(), spec.className()));
+            return false;
+        }
+        if (candidates.size() > 1) {
+            markPendingFieldFailed(id, String.format(
+                "Field '%s' is ambiguous on %s (declared on %d types) — use a more specific className",
+                spec.fieldName(), spec.className(), candidates.size()));
+            return false;
+        }
+        final Field field = candidates.get(0);
+        if (spec.objectFilterId() != null && field.isStatic()) {
+            markPendingFieldFailed(id, String.format(
+                "Field '%s' on %s is static; objectId filter does not apply",
+                spec.fieldName(), spec.className()));
+            return false;
+        }
+
+        // Two-step creation for BOTH-mode is split across two erm calls plus two
+        // configureFieldRequest calls — any of them can throw on a VM in mid-transition. The
+        // inner try/catch tracks every JDI request handed out so a half-creation can roll
+        // back via erm.deleteEventRequest before re-throwing into the outer catch. Without
+        // the rollback the access request would stay armed on the target VM with no tracker
+        // entry pointing at it, and events on it would be delivered but immediately
+        // discarded (findFieldInfoByRequest returns null).
+        final List<EventRequest> createdRequests = new ArrayList<>(2);
+        try {
+            AccessWatchpointRequest accessReq = null;
+            ModificationWatchpointRequest modReq = null;
+            if (spec.mode() == FieldWatchMode.ACCESS || spec.mode() == FieldWatchMode.BOTH) {
+                accessReq = erm.createAccessWatchpointRequest(field);
+                createdRequests.add(accessReq);
+                configureFieldRequest(accessReq, spec, vm, jdiService);
+            }
+            if (spec.mode() == FieldWatchMode.MODIFICATION || spec.mode() == FieldWatchMode.BOTH) {
+                modReq = erm.createModificationWatchpointRequest(field);
+                createdRequests.add(modReq);
+                configureFieldRequest(modReq, spec, vm, jdiService);
+            }
+
+            if (accessReq != null) {
+                disarmIfChained(id, accessReq);
+            }
+            if (modReq != null) {
+                disarmIfChained(id, modReq);
+            }
+            promotePendingFieldToActive(id, accessReq, modReq);
+            log.info("[Tracker] Promoted pending field BP {} for {}.{}",
+                id, spec.className(), spec.fieldName());
+            return true;
+        } catch (Exception inner) {
+            // Delete every half-created request so a retry cycle does not see orphan JDI
+            // requests on the target VM. Per-request delete failures are swallowed — the
+            // outer log entry below is enough diagnostic noise for what is already a
+            // best-effort rollback path.
+            for (EventRequest leaked : createdRequests) {
+                try {
+                    erm.deleteEventRequest(leaked);
+                } catch (Exception ignore) {
+                    // No-op: best-effort cleanup, do not mask the original failure.
+                }
+            }
+            // Mark the pending entry failed so future promotion attempts skip it instead of
+            // retrying the same orphan-prone path on every tool call.
+            markPendingFieldFailed(id, "Failed during promotion: " + inner.getMessage());
+            log.debug("[Tracker] Field BP {} promotion rolled back: {}", id, inner.getMessage());
+            return false;
+        }
     }
 
     /**

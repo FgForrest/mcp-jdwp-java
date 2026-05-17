@@ -49,7 +49,7 @@ class JdiEventListenerUntrackedBreakpointTest {
 		tracker = new BreakpointTracker();
 		eventHistory = new EventHistory();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard());
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null);
 	}
 
 	@AfterEach

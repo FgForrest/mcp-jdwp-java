@@ -77,7 +77,7 @@ final class JDIConnectionServiceTestSupport {
 		final WatcherManager watchers = new WatcherManager();
 		final EvaluationGuard guard = new EvaluationGuard();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard);
+		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null);
 		return new JDIConnectionService(listener, tracker, history, watchers, guard);
 	}
 
