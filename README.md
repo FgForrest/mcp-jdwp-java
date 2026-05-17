@@ -309,7 +309,7 @@ jdwp_set_breakpoint(className="com.example.LazyService", lineNumber=15)
 → "Breakpoint deferred — class com.example.LazyService not yet loaded. Will activate on class load."
 ```
 
-If the target class isn't loaded when the breakpoint is set, the server registers a `ClassPrepareRequest` and automatically promotes the breakpoint to active when the JVM loads the class. Works for line breakpoints, logpoints, and exception breakpoints. `jdwp_list_breakpoints()` shows pending breakpoints with their status.
+If the target class isn't loaded when the breakpoint is set, the server registers a `ClassPrepareRequest` and automatically promotes the breakpoint to active when the JVM loads the class. Works for line breakpoints, logpoints, and exception breakpoints. `jdwp_overview()` shows pending breakpoints with their status.
 
 ### Exception breakpoints
 
@@ -321,7 +321,7 @@ jdwp_set_exception_breakpoint(
 )
 ```
 
-Catch exceptions at the throw site — before the stack unwinds. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_list_exception_breakpoints()` to see active and pending exception breakpoints.
+Catch exceptions at the throw site — before the stack unwinds. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_overview(types="exception_breakpoint")` to see active and pending exception breakpoints.
 
 **Log-only mode** — record the throw without suspending the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
 
@@ -369,7 +369,7 @@ Hard errors (no silent fallback): invalid `mode`, ambiguous or missing field, `o
 
 **Performance:** field watchpoints fire on **every** read/write of the watched field. For hot fields they can dominate target-VM CPU — prefer narrow filters or short-lived sessions. `jdwp_diagnose` surfaces `canWatchFieldAccess` / `canWatchFieldModification` plus a perf warning when connected.
 
-Use `jdwp_list_field_breakpoints()` to see active and pending field breakpoints with chain status, mode, filters, and any pending failure reason.
+Use `jdwp_overview(types="field_breakpoint")` to see active and pending field breakpoints with chain status, mode, and any pending failure reason.
 
 ### Chained breakpoints
 
@@ -530,21 +530,19 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`  |
 | `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event` |
 
-### Breakpoints (11)
+### Breakpoints (7)
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
 | `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?` | Set line breakpoint (supports conditions, deferred, and trigger chaining) |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`     | Non-stopping line breakpoint that logs expression result |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, and field BPs |
-| `jdwp_list_breakpoints`           | —                                                         | List all line breakpoints (active, pending, failed; chain status rendered inline) |
-| `jdwp_clear_all_breakpoints`      | —                                                         | Remove all breakpoints (line, exception, and field — active and pending) |
 | `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred and trigger chaining) |
 | `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
-| `jdwp_list_exception_breakpoints` | —                                                         | List exception breakpoints (active and pending; chain status rendered inline) |
 | `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
 | `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
-| `jdwp_list_field_breakpoints`     | —                                                         | List field breakpoints (active and pending; chain status, mode, filters rendered inline) |
+
+(For listing or bulk-clearing breakpoints across any combination of kinds, see `jdwp_overview` and `jdwp_clear` in the Debug state section below.)
 
 ### Breakpoint chains (3)
 
@@ -576,22 +574,35 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 |-----------------|---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `jdwp_diagnose` | `inspectAll?` | Three-block "state of the world" snapshot: (1) MCP server (PID/uptime/configured target), (2) JDWP connection — last-attempt error when disconnected, breakpoints+events report when connected, (3) Local JVMs visible to the user with their JDWP ports (confirmed via handshake). Pass `inspectAll=true` to attach briefly to every same-user JVM whose port could not be read from `/proc`, to discover the port via `sun.jdwp.listenerAddress` (default false — attaches are visible to targets). Recognises the chain-stuck state where every armed BP is WAITING on a non-fired trigger. Run this first when nothing seems to work. |
 
-### Watchers (6)
+### Watchers (4)
 
 | Tool                                | Parameters                            | Description                                         |
 |-------------------------------------|---------------------------------------|-----------------------------------------------------|
 | `jdwp_attach_watcher`               | `breakpointId`, `label`, `expression` | Attach expression watcher to a breakpoint           |
 | `jdwp_detach_watcher`               | `watcherId`                           | Remove a watcher                                    |
-| `jdwp_list_watchers_for_breakpoint` | `breakpointId`                        | List watchers on a breakpoint                       |
-| `jdwp_list_all_watchers`            | —                                     | List all watchers across all breakpoints            |
+| `jdwp_list_watchers_for_breakpoint` | `breakpointId`                        | List watchers on a specific breakpoint              |
 | `jdwp_evaluate_watchers`            | `threadId`, `scope`, `breakpointId?`  | Evaluate watchers (`current_frame` or `full_stack`) |
-| `jdwp_clear_all_watchers`           | —                                     | Remove all watchers                                 |
+
+### Marked instances (3)
+
+| Tool                     | Parameters                       | Description                                                                              |
+|--------------------------|----------------------------------|------------------------------------------------------------------------------------------|
+| `jdwp_mark_instance`     | `label`, `objectId`, `pin?`      | Label a cached object as `$label` so expressions (conditions, logpoints, watchers) can reference it; pinned by default (`disableCollection`) |
+| `jdwp_unmark_instance`   | `label`                          | Remove a mark and release its pin                                                        |
+| `jdwp_rename_mark`       | `oldLabel`, `newLabel`           | Rename a mark, preserving its pin and underlying object                                  |
+
+### Debug state (2)
+
+| Tool            | Parameters         | Description                                                                                                          |
+|-----------------|--------------------|----------------------------------------------------------------------------------------------------------------------|
+| `jdwp_overview` | `types?`, `filter?` | Unified read-only listing of breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marks. Filter by type subset and/or case-insensitive substring (class/label/expression/type). |
+| `jdwp_clear`    | `types`, `filter?`  | Bulk-delete by type and/or substring filter. `types` is REQUIRED (use `'all'` to clear every supported kind). To preview, call `jdwp_overview` with the same args first. |
 
 ### Session (1)
 
-| Tool         | Parameters | Description                                                                  |
-|--------------|------------|------------------------------------------------------------------------------|
-| `jdwp_reset` | —          | Clear all state (breakpoints, watchers, cache, events) without disconnecting |
+| Tool         | Parameters | Description                                                                          |
+|--------------|------------|--------------------------------------------------------------------------------------|
+| `jdwp_reset` | —          | Clear all state (breakpoints, watchers, marks, cache, events) without disconnecting |
 
 ## Resources (2)
 

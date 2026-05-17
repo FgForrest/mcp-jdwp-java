@@ -54,7 +54,7 @@ class JDWPToolsAttachWatcherTest {
 	/**
 	 * A blank ({@code ""} or whitespace-only) label is rejected with the same kind of error used
 	 * for empty expressions. Without this guard, the watcher would be created with an empty label
-	 * and become unidentifiable in {@code jdwp_list_all_watchers}.
+	 * and become unidentifiable in {@code jdwp_overview(types="watcher")}.
 	 */
 	@Test
 	@DisplayName("rejects a blank label")

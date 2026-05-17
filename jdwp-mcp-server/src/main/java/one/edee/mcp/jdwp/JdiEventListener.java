@@ -4,6 +4,7 @@ import com.sun.jdi.*;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.*;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +57,7 @@ public class JdiEventListener {
     private final EventHistory eventHistory;
     private final JdiExpressionEvaluator expressionEvaluator;
     private final EvaluationGuard evaluationGuard;
+    private final MarkedInstanceRegistry markedInstances;
     /**
      * Late-bound handle to the connection service so {@link #handleClassPrepareEvent} can promote
      * pending field watchpoints synchronously on class load. {@code @Lazy} because
@@ -83,12 +85,14 @@ public class JdiEventListener {
     public JdiEventListener(BreakpointTracker breakpointTracker, EventHistory eventHistory,
                             @Lazy JdiExpressionEvaluator expressionEvaluator,
                             EvaluationGuard evaluationGuard,
-                            @Lazy @Nullable JDIConnectionService jdiConnectionService) {
+                            @Lazy @Nullable JDIConnectionService jdiConnectionService,
+                            MarkedInstanceRegistry markedInstances) {
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.expressionEvaluator = expressionEvaluator;
         this.evaluationGuard = evaluationGuard;
         this.jdiConnectionService = jdiConnectionService;
+        this.markedInstances = markedInstances;
     }
 
     /**
@@ -860,8 +864,27 @@ public class JdiEventListener {
                                      Map<String, Value> extraBindings) throws Exception {
         expressionEvaluator.configureCompilerClasspath(thread);
         final StackFrame frame = thread.frame(0);
-        final Value result = expressionEvaluator.evaluate(frame, expression, extraBindings);
+        final Value result = expressionEvaluator.evaluate(frame, expression,
+            mergeMarkedBindings(extraBindings));
         return formatLogpointResult(result);
+    }
+
+    /**
+     * Combines the per-event {@code extraBindings} (e.g. {@code $exception}, {@code $oldValue})
+     * with the agent-curated marked-instance bindings supplied by {@link MarkedInstanceRegistry}.
+     * Marks are added first so per-event names — which are reserved at mark creation time and
+     * therefore cannot legally collide — would still win on a {@code putAll}-style overwrite,
+     * preserving the documented precedence even if a future code path were to bypass the
+     * validator. Used by every MCP evaluation call site (conditions AND logpoint expressions).
+     */
+    private Map<String, Value> mergeMarkedBindings(Map<String, Value> extraBindings) {
+        final Map<String, Value> marked = markedInstances.buildBindings();
+        if (marked.isEmpty()) {
+            return extraBindings;
+        }
+        final Map<String, Value> merged = new HashMap<>(marked);
+        merged.putAll(extraBindings);
+        return merged;
     }
 
     /**
@@ -887,7 +910,8 @@ public class JdiEventListener {
         try {
             expressionEvaluator.configureCompilerClasspath(thread);
             final StackFrame frame = thread.frame(0);
-            final Value result = expressionEvaluator.evaluate(frame, condition, extraBindings);
+            final Value result = expressionEvaluator.evaluate(frame, condition,
+                mergeMarkedBindings(extraBindings));
 
             if (result instanceof BooleanValue boolVal) {
                 return boolVal.value();

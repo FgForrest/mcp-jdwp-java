@@ -8,6 +8,7 @@ import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService.JdkNotFoundException;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -65,6 +66,13 @@ public class JDIConnectionService {
     private final EventHistory eventHistory;
     private final WatcherManager watcherManager;
     private final EvaluationGuard evaluationGuard;
+    /**
+     * Server-wide registry of agent-labelled JDI object references. Held here so its lifecycle is
+     * gated by the connection: pinned object references must be released both on VM death (see
+     * {@link #notifyVmDied()}) and on explicit session teardown (see {@link #cleanupSessionState()})
+     * — otherwise stale pins would survive a reconnect and leak across sessions.
+     */
+    private final MarkedInstanceRegistry markedInstances;
     /**
      * Maps {@link ObjectReference#uniqueID()} to the live JDI mirror so MCP tools can reference
      * objects by ID across multiple calls. Populated as a side effect of {@link #formatFieldValue}
@@ -124,12 +132,13 @@ public class JDIConnectionService {
 
     public JDIConnectionService(JdiEventListener eventListener, BreakpointTracker breakpointTracker,
                                 EventHistory eventHistory, WatcherManager watcherManager,
-                                EvaluationGuard evaluationGuard) {
+                                EvaluationGuard evaluationGuard, MarkedInstanceRegistry markedInstances) {
         this.eventListener = eventListener;
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.watcherManager = watcherManager;
         this.evaluationGuard = evaluationGuard;
+        this.markedInstances = markedInstances;
         // Wire post-mortem cleanup so the listener can null the VM the moment the target dies.
         eventListener.setVmDeathHook(this::notifyVmDied);
     }
@@ -383,7 +392,9 @@ public class JDIConnectionService {
      * Post-mortem cleanup invoked by {@link JdiEventListener} on VMDeath / VMDisconnect.
      * Idempotent and best-effort: preserves {@link #eventHistory} (the listener's VM_DEATH entry
      * stays queryable) and {@link #lastHost} / {@link #lastPort} (so {@link #ensureConnected()}
-     * can auto-reconnect on the next restart cycle).
+     * can auto-reconnect on the next restart cycle). Marked-instance pins are released as a side
+     * effect — the underlying JDI references are gone with the VM, so keeping them would only
+     * leak dangling entries into the next session.
      */
     public synchronized void notifyVmDied() {
         if (vm == null) {
@@ -397,6 +408,7 @@ public class JDIConnectionService {
         vm = null;
         breakpointTracker.reset();
         watcherManager.clearAll();
+        markedInstances.clearAll();
         objectCache.clear();
         cachedClasspath = null;
         discoveredJdkPath = null;
@@ -405,7 +417,7 @@ public class JDIConnectionService {
 
     /**
      * Releases all session-bound state held by the MCP server: JDI event requests, object cache,
-     * watchers, classpath cache, event history, and the VM reference itself. Best-effort —
+     * watchers, marked instances, classpath cache, event history, and the VM reference itself. Best-effort —
      * tolerates a dead VM (falls back to in-memory {@code reset()} when JDI calls would fail).
      * Also clears the auto-reconnect seed ({@link #lastHost}/{@link #lastPort}) so a subsequent
      * tool call cannot silently re-attach to the just-released target — this is the
@@ -428,6 +440,7 @@ public class JDIConnectionService {
         }
 
         watcherManager.clearAll();
+        markedInstances.clearAll();
         objectCache.clear();
         cachedClasspath = null;
         discoveredJdkPath = null;

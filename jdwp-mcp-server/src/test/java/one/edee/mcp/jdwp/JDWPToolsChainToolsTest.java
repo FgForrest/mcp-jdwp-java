@@ -32,8 +32,8 @@ import static org.mockito.Mockito.when;
  * {@code jdwp_disarm_until_trigger}), the optional {@code triggerBreakpointId} argument on
  * {@code jdwp_set_breakpoint} and {@code jdwp_set_exception_breakpoint}, the cascade-on-clear path
  * in {@code jdwp_clear_breakpoint(id)} (kind-agnostic), the
- * {@code [chain: ...]} suffix in {@code jdwp_list_breakpoints} / {@code jdwp_list_exception_breakpoints}
- * / {@code jdwp_diagnose}, and the chain-stuck interpretation hint emitted by the diagnostic.
+ * {@code chain=trigger=#N} suffix in {@code jdwp_overview} / {@code jdwp_diagnose}, and the
+ * chain-stuck interpretation hint emitted by the diagnostic.
  *
  * <p>Tests use a REAL {@link BreakpointTracker} and {@link EventHistory} so they exercise the
  * real chain bookkeeping and event recording, while mocking {@link JDIConnectionService} and the
@@ -74,7 +74,7 @@ class JDWPToolsChainToolsTest {
 
 	/**
 	 * Wires a {@link BreakpointRequest} mock with a location report of
-	 * {@code className}/{@code lineNumber} so {@link JDWPTools#jdwp_list_breakpoints} can render
+	 * {@code className}/{@code lineNumber} so {@link JDWPTools#jdwp_overview(String, String)} can render
 	 * it without throwing. {@code suspendPolicy} mirrors the JDI {@link EventRequest} constants
 	 * (2 = SUSPEND_ALL on the JDI ABI).
 	 */
@@ -643,21 +643,21 @@ class JDWPToolsChainToolsTest {
 	}
 
 	@Nested
-	@DisplayName("jdwp_list_breakpoints chain rendering")
-	class ListBreakpointsChainRendering {
+	@DisplayName("jdwp_overview chain rendering")
+	class OverviewChainRendering {
 
 		@Test
 		@DisplayName("renders chain suffix for an ARMED active dependent")
-		void shouldRenderChainSuffixInListBreakpointsForActiveDependent() {
+		void shouldRenderChainSuffixInOverviewForActiveDependent() {
 			BreakpointRequest depBp = mockBreakpointAt("com.example.Foo", 10, EventRequest.SUSPEND_ALL);
 			when(depBp.isEnabled()).thenReturn(true);
 			int triggerId = tracker.registerBreakpoint(mockBreakpointAt("com.example.Trigger", 1, EventRequest.SUSPEND_ALL));
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_list_breakpoints();
+			String result = tools.jdwp_overview("breakpoint", null);
 
-			assertThat(result).contains("Chain: trigger=#" + triggerId)
+			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("sticky")
 				.contains("ARMED");
 		}
@@ -669,15 +669,15 @@ class JDWPToolsChainToolsTest {
 			int pendingDepId = tracker.registerPendingBreakpoint("com.example.Foo", 99, 2, "all");
 			tracker.registerDependency(pendingDepId, triggerId, true);
 
-			String result = tools.jdwp_list_breakpoints();
+			String result = tools.jdwp_overview("breakpoint", null);
 
-			assertThat(result).contains("Chain: trigger=#" + triggerId)
+			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("one-shot");
 		}
 
 		@Test
-		@DisplayName("renders chain suffix in jdwp_list_exception_breakpoints")
-		void shouldRenderChainOnExceptionListing() {
+		@DisplayName("renders chain suffix in exception_breakpoint section")
+		void shouldRenderChainOnExceptionOverview() {
 			BreakpointRequest triggerBp = mock(BreakpointRequest.class);
 			ExceptionRequest exReq = mock(ExceptionRequest.class);
 			when(exReq.isEnabled()).thenReturn(false);
@@ -686,9 +686,9 @@ class JDWPToolsChainToolsTest {
 				ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
 			tracker.registerDependency(exId, triggerId, false);
 
-			String result = tools.jdwp_list_exception_breakpoints();
+			String result = tools.jdwp_overview("exception_breakpoint", null);
 
-			assertThat(result).contains("chain=#" + triggerId)
+			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("sticky")
 				.contains("WAITING");
 		}

@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp;
 
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 
 import static org.mockito.Mockito.mock;
@@ -42,7 +43,8 @@ final class JDWPToolsTestSupport {
 			mock(JdiExpressionEvaluator.class),
 			mock(EventHistory.class),
 			new EvaluationGuard(),
-			mock(JvmDiscoveryService.class)
+			mock(JvmDiscoveryService.class),
+			new MarkedInstanceRegistry()
 		);
 	}
 
@@ -67,7 +69,34 @@ final class JDWPToolsTestSupport {
 			expressionEvaluator,
 			eventHistory,
 			evaluationGuard,
-			jvmDiscoveryService
+			jvmDiscoveryService,
+			new MarkedInstanceRegistry()
+		);
+	}
+
+	/**
+	 * Overload that accepts a caller-supplied {@link MarkedInstanceRegistry} — needed by tests that
+	 * verify mark-related behaviour through the tool surface (overview, clear, locals footer).
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		EventHistory eventHistory,
+		EvaluationGuard evaluationGuard,
+		JvmDiscoveryService jvmDiscoveryService,
+		MarkedInstanceRegistry markedInstances
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			eventHistory,
+			evaluationGuard,
+			jvmDiscoveryService,
+			markedInstances
 		);
 	}
 }

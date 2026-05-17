@@ -19,7 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * The secondary index is auto-cleaned: when a breakpoint's watcher list becomes empty its entry is
  * removed, so {@link #getStats()}'s `breakpointsWithWatchers` count never drifts.
  * <p>
- * Lifecycle: cleared by `jdwp_reset`, `jdwp_disconnect`, and `jdwp_clear_all_watchers`. Entries are
+ * Lifecycle: cleared by `jdwp_reset`, `jdwp_disconnect`, and `jdwp_clear(types="watcher")`. Entries are
  * also auto-removed when their parent breakpoint is cleared (`JDWPTools.jdwp_clear_breakpoint`
  * calls {@link #deleteWatchersForBreakpoint}).
  * <p>

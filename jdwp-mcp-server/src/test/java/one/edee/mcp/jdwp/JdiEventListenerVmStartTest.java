@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.VMStartEvent;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -32,7 +33,7 @@ class JdiEventListenerVmStartTest {
 		tracker = new BreakpointTracker();
 		eventHistory = new EventHistory();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null);
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null, new MarkedInstanceRegistry());
 	}
 
 	@AfterEach

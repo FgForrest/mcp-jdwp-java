@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp;
 
 import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
 
@@ -49,7 +50,8 @@ final class JDIConnectionServiceTestSupport {
 			new BreakpointTracker(),
 			new EventHistory(),
 			new WatcherManager(),
-			new EvaluationGuard()
+			new EvaluationGuard(),
+			new MarkedInstanceRegistry()
 		);
 	}
 
@@ -61,7 +63,18 @@ final class JDIConnectionServiceTestSupport {
 	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
 			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
 			EvaluationGuard guard) {
-		return new JDIConnectionService(listener, tracker, history, watchers, guard);
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry());
+	}
+
+	/**
+	 * Same as {@link #newServiceWithCollaborators(JdiEventListener, BreakpointTracker, EventHistory,
+	 * WatcherManager, EvaluationGuard)} but lets the caller hand in a {@link MarkedInstanceRegistry}
+	 * — needed by tests that verify {@code clearAll()} is invoked on lifecycle events.
+	 */
+	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
+			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
+			EvaluationGuard guard, MarkedInstanceRegistry marks) {
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, marks);
 	}
 
 	/**
@@ -77,8 +90,8 @@ final class JDIConnectionServiceTestSupport {
 		final WatcherManager watchers = new WatcherManager();
 		final EvaluationGuard guard = new EvaluationGuard();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null);
-		return new JDIConnectionService(listener, tracker, history, watchers, guard);
+		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry());
 	}
 
 	/**

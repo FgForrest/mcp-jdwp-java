@@ -651,7 +651,7 @@ public class BreakpointTracker {
     /**
      * Records why a pending exception breakpoint could not be activated (e.g., the exception class
      * exists but cannot be force-loaded). The pending entry stays in the map so the failure reason
-     * is visible to `jdwp_list_exception_breakpoints`.
+     * is visible to `jdwp_overview(types="exception_breakpoint")`.
      */
     public void markPendingExceptionFailed(int id, @Nullable String reason) {
         final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.get(id);
@@ -766,7 +766,7 @@ public class BreakpointTracker {
 
     /**
      * Records why a pending field watchpoint could not be activated. The pending entry stays in the
-     * map so the failure reason is visible to {@code jdwp_list_field_breakpoints}.
+     * map so the failure reason is visible to {@code jdwp_overview(types="field_breakpoint")}.
      */
     public void markPendingFieldFailed(int id, @Nullable String reason) {
         final PendingFieldBreakpoint pending = pendingFieldBreakpointsById.get(id);

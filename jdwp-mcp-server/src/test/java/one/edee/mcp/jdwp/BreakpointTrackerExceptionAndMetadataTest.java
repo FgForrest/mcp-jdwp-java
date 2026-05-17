@@ -435,7 +435,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		/**
 		 * Verifies {@link BreakpointTracker#clearAll(EventRequestManager)} also wipes chain
 		 * state — without this, a fresh session could observe stale dependency edges across a
-		 * {@code jdwp_reset} / {@code jdwp_clear_all_breakpoints} call.
+		 * {@code jdwp_reset} / {@code jdwp_clear(types="all")} call.
 		 */
 		@Test
 		void shouldClearChainStateOnClearAll() {

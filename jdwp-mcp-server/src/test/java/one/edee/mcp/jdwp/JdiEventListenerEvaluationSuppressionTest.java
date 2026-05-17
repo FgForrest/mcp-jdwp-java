@@ -7,6 +7,7 @@ import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.ExceptionEvent;
 import com.sun.jdi.request.BreakpointRequest;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -51,7 +52,7 @@ class JdiEventListenerEvaluationSuppressionTest {
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null);
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
 	}
 
 	@AfterEach

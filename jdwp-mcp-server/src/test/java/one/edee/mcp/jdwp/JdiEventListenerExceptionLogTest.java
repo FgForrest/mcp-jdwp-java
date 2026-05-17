@@ -9,6 +9,7 @@ import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ExceptionRequest;
 import one.edee.mcp.jdwp.BreakpointTracker.ExceptionBreakpointSpec;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,7 +61,7 @@ class JdiEventListenerExceptionLogTest {
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null);
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
 	}
 
 	@AfterEach

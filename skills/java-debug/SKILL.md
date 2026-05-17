@@ -172,6 +172,31 @@ A value gets set in many places and you want to know which write produced the ba
 3. `jdwp_get_events(50)` -> all logpoint hits in chronological order.
 4. The last entry before the test fails is the culprit.
 
+### "Track a specific instance across many breakpoints"
+
+You found the interesting object at one breakpoint (a particular `Cart`, `Session`, `User`, etc.) and want to reference it by name later — in conditions, in logpoint expressions, in watchers — even from frames where the variable name is different or absent.
+
+1. At the BP where you spotted it, label it: `jdwp_mark_instance(label="cart_42", objectId=<id from jdwp_get_locals>)`. By default the object is **pinned** in the target heap (`disableCollection`) so the label remains valid across the rest of the session even if the application drops every other reference.
+2. Now reference it in any later expression as `$cart_42`. Works in conditional breakpoints, logpoint expressions, watchers, and exception logpoint expressions.
+3. List active marks: `jdwp_overview(types="mark")`. They also appear in the "Marked instances visible to expressions" footer of `jdwp_get_locals` and `jdwp_get_breakpoint_context`, so you see them at every stop without an extra call.
+4. Done with it: `jdwp_unmark_instance("cart_42")` (releases the pin).
+
+**Per-instance condition** — break only when *this specific* user is being processed:
+
+```
+jdwp_set_breakpoint("CartService", 99, condition="user == $watched_user")
+```
+
+**Cross-frame logpoint** — log a property of a tracked object from a deep frame where the variable doesn't exist by that name:
+
+```
+jdwp_set_logpoint("PaymentService", 42, "\"cart total: \" + $cart_42.getTotal()")
+```
+
+**Reserved labels** (will be rejected): `exception`, `oldValue`, `newValue`, `object`, `fieldName`, `mode`, `_this`. Plus any Java keyword. Plus the label of an already-marked object — `jdwp_unmark_instance` or `jdwp_rename_mark` first.
+
+**Pinning caveat:** if you want to observe natural GC of the marked object, pass `pin=false`. The mark then survives in the registry but `buildBindings` will skip it once `isCollected()` returns true; the overview shows it with `[collected — binding will be skipped]`.
+
 ### "Same method runs 1000× but I only care about the call after login"
 
 A noisy method fires repeatedly throughout the run; you only want to stop on it within a specific context (after a particular trigger).
@@ -214,6 +239,12 @@ After any step, `jdwp_resume_until_event` blocks until the `STEP` event lands. T
 - **Don't step over more than ~3 lines in a row.** If you already know which line you want to inspect, put a breakpoint there and `jdwp_resume_until_event`. One round-trip beats N. The same goes for stepping through loop iterations — use a conditional breakpoint or logpoint.
 - **Don't catch `Throwable` or `Exception` "to be safe".** Target the specific exception type. Broad exception breakpoints fire on every JDK internal exception — extremely noisy and slow.
 - **Don't stop at the first wrapped exception.** The original throw site is almost always more informative. Set an exception BP on the inner type and re-run.
+
+## Inspecting and clearing debug state
+
+Use `jdwp_overview()` for a unified read of every kind of debug state (breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, marked instances) in one call. Filter by type (`types="breakpoint,watcher"`) or by substring (`filter="Cart"`).
+
+To bulk-clear: `jdwp_clear(types="...", filter="...")`. The `types` parameter is required so an empty call cannot wipe everything. To preview a clear safely, call `jdwp_overview` with the same `types`/`filter` first — the matching rows are exactly what `jdwp_clear` would remove. Per-id clears still go through `jdwp_clear_breakpoint(id)` / `jdwp_detach_watcher(id)`.
 
 ## First Questions At a New Breakpoint
 

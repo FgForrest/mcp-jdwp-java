@@ -341,7 +341,7 @@ class BreakpointTrackerFieldBreakpointTest {
 		int promoted = tracker.tryPromotePending(service, null);
 
 		assertThat(promoted).isZero();
-		// Pending entry stays in the map so it surfaces in jdwp_list_field_breakpoints, but its
+		// Pending entry stays in the map so it surfaces in jdwp_overview(types="field_breakpoint"), but its
 		// failure reason is set so subsequent tryPromotePending cycles skip it instead of retrying
 		// the same orphan-prone code path on every tool call.
 		assertThat(tracker.getAllPendingFieldBreakpoints()).containsKey(id);

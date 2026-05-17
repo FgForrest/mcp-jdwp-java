@@ -24,7 +24,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * Behavioural tests for the field-breakpoint MCP tool surface: {@link JDWPTools#jdwp_set_field_breakpoint},
- * {@link JDWPTools#jdwp_set_field_logpoint}, {@link JDWPTools#jdwp_list_field_breakpoints}, and the
+ * {@link JDWPTools#jdwp_set_field_logpoint}, the {@code jdwp_overview} field-breakpoint section, and the
  * field-routing branch of {@link JDWPTools#jdwp_clear_breakpoint}.
  *
  *
@@ -211,14 +211,14 @@ class JDWPToolsFieldBreakpointTest {
 	}
 
 	@Test
-	@DisplayName("jdwp_list_field_breakpoints returns the empty-state hint when nothing is set")
-	void shouldReturnEmptyStateMessageWhenNoFieldBps() {
-		final String result = tools.jdwp_list_field_breakpoints();
-		assertThat(result).startsWith("No field breakpoints set");
+	@DisplayName("jdwp_overview(types=\"field_breakpoint\") emits an empty section when nothing is set")
+	void shouldEmitEmptyFieldBreakpointSection() {
+		final String result = tools.jdwp_overview("field_breakpoint", null);
+		assertThat(result).contains("Field breakpoints (0):");
 	}
 
 	@Test
-	@DisplayName("jdwp_list_field_breakpoints lists active + pending entries")
+	@DisplayName("jdwp_overview(types=\"field_breakpoint\") lists active + pending entries")
 	void shouldListActiveAndPendingFieldBreakpoints() {
 		// Active BP via registerFieldBreakpoint
 		final AccessWatchpointRequest activeReq = mock(AccessWatchpointRequest.class);
@@ -234,15 +234,14 @@ class JDWPToolsFieldBreakpointTest {
 				"com.Bar", "session", BreakpointTracker.FieldWatchMode.MODIFICATION,
 				"$newValue", null, null, null));
 
-		final String result = tools.jdwp_list_field_breakpoints();
+		final String result = tools.jdwp_overview("field_breakpoint", null);
 
 		assertThat(result)
-			.contains("Active field breakpoints: 1")
-			.contains("Pending field breakpoints: 1")
+			.contains("Field breakpoints (2):")
 			.contains("com.Foo.counter")
 			.contains("com.Bar.session")
-			.contains("ID: " + activeId)
-			.contains("ID: " + pendingId)
+			.contains("#" + activeId)
+			.contains("#" + pendingId)
 			.contains("[PENDING]");
 	}
 
@@ -421,8 +420,8 @@ class JDWPToolsFieldBreakpointTest {
 	}
 
 	@Test
-	@DisplayName("jdwp_clear_all_breakpoints with only field BPs reads cleanly without leading \"Cleared 0\"")
-	void shouldRenderCleanlyWhenOnlyFieldBpsCleared() {
+	@DisplayName("jdwp_clear(types=\"field_breakpoint\") clears all field BPs and reports the total")
+	void shouldClearAllFieldBreakpoints() {
 		final AccessWatchpointRequest req = mock(AccessWatchpointRequest.class);
 		when(req.virtualMachine()).thenReturn(vm);
 		tracker.registerFieldBreakpoint(
@@ -431,18 +430,18 @@ class JDWPToolsFieldBreakpointTest {
 				null, null, null),
 			req, null);
 
-		final String result = tools.jdwp_clear_all_breakpoints();
+		final String result = tools.jdwp_clear("field_breakpoint", null);
 
-		assertThat(result).doesNotContain("Cleared 0 breakpoint")
-			.contains("All associated watchers cleared")
-			.contains("Also cleared 1 field breakpoint(s)");
+		assertThat(result).contains("Field breakpoints: 1 match")
+			.contains("Total cleared: 1");
+		assertThat(tracker.getAllFieldBreakpoints()).isEmpty();
 	}
 
 	@Test
-	@DisplayName("jdwp_clear_all_breakpoints returns the no-op message when nothing is set")
-	void shouldReturnNoOpWhenNoBreakpointsAtAll() {
-		final String result = tools.jdwp_clear_all_breakpoints();
-		assertThat(result).isEqualTo("No breakpoints to clear");
+	@DisplayName("jdwp_clear(types=\"field_breakpoint\") reports nothing matched when no field BPs exist")
+	void shouldReportNothingMatchedWhenNoFieldBreakpoints() {
+		final String result = tools.jdwp_clear("field_breakpoint", null);
+		assertThat(result).contains("(nothing matched)");
 	}
 
 	@Test
@@ -457,7 +456,7 @@ class JDWPToolsFieldBreakpointTest {
 
 		assertThat(result).startsWith("Field breakpoint deferred")
 			.contains("Note: objectFilterId is set")
-			.contains("jdwp_list_field_breakpoints");
+			.contains("jdwp_overview(types=\"field_breakpoint\")");
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────

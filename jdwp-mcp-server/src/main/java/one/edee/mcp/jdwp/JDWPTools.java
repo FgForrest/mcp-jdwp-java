@@ -7,6 +7,8 @@ import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.marks.MarkInfo;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.Watcher;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
@@ -26,7 +28,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * Single MCP-facing surface for the JDWP debugger. Each {@code @McpTool} method is auto-discovered
@@ -87,11 +88,13 @@ public class JDWPTools {
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
     private final JvmDiscoveryService jvmDiscoveryService;
+    private final MarkedInstanceRegistry markedInstances;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
-                     JvmDiscoveryService jvmDiscoveryService) {
+                     JvmDiscoveryService jvmDiscoveryService,
+                     MarkedInstanceRegistry markedInstances) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -99,6 +102,7 @@ public class JDWPTools {
         this.eventHistory = eventHistory;
         this.evaluationGuard = evaluationGuard;
         this.jvmDiscoveryService = jvmDiscoveryService;
+        this.markedInstances = markedInstances;
     }
 
     /**
@@ -471,9 +475,43 @@ public class JDWPTools {
                     formatValue(value)));
             }
 
+            appendMarkedInstancesFooter(result);
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Appends a "marked instances visible to expressions" footer to {@code out} listing every live
+     * mark so the agent can see, at every locals/context call, which {@code $label} names are
+     * resolvable from the current frame. Skipped entirely when no marks are registered to keep
+     * the existing locals output unchanged for the common case.
+     *
+     * <p>The footer is purely advisory — the locals/fields payload above it is the primary value.
+     * If the registry throws while we are enumerating it (a partially-disconnected VM, a corrupted
+     * mark entry, etc.) we swallow the exception, log it, and append a one-line warning so the
+     * agent still receives every variable in the frame plus a hint that the marks list was
+     * unavailable. Letting the exception propagate would force the outer catch to replace the
+     * whole response with {@code "Error: ..."}, destroying the locals.
+     */
+    private void appendMarkedInstancesFooter(StringBuilder out) {
+        if (markedInstances.isEmpty()) {
+            return;
+        }
+        try {
+            final List<MarkInfo> marks = markedInstances.list().stream()
+                .sorted(Comparator.comparing(MarkInfo::label))
+                .toList();
+            out.append("\n--- Marked instances visible to expressions ---\n");
+            for (MarkInfo m : marks) {
+                out.append(String.format("  $%s : %s (Object#%d)%s\n",
+                    m.label(), m.typeName(), m.objectId(),
+                    m.collected() ? " [collected — binding will be skipped]" : ""));
+            }
+        } catch (Exception e) {
+            log.warn("[JDWP] Marked-instances footer rendering failed: {}", e.getMessage());
+            out.append(String.format("(marked-instances footer unavailable: %s)%n", e.getMessage()));
         }
     }
 
@@ -1671,89 +1709,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "List all breakpoints (active, pending, and failed) set by this MCP server")
-    public String jdwp_list_breakpoints() {
-        try {
-            final Map<Integer, BreakpointRequest> active = breakpointTracker.getAllBreakpoints();
-            final Map<Integer, BreakpointTracker.PendingBreakpoint> pending = breakpointTracker.getAllPendingBreakpoints();
-
-            if (active.isEmpty() && pending.isEmpty()) {
-                return "No breakpoints set";
-            }
-
-            final StringBuilder result = new StringBuilder();
-            int i = 1;
-
-            if (!active.isEmpty()) {
-                result.append(String.format("Active breakpoints: %d\n\n", active.size()));
-
-                for (Map.Entry<Integer, BreakpointRequest> entry : active.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointRequest bp = entry.getValue();
-                    final Location loc = bp.location();
-
-                    final String policyStr = switch (bp.suspendPolicy()) {
-                        case EventRequest.SUSPEND_ALL -> "all";
-                        case EventRequest.SUSPEND_EVENT_THREAD -> "thread";
-                        case EventRequest.SUSPEND_NONE -> "none";
-                        default -> "unknown";
-                    };
-                    result.append(String.format("Breakpoint %d (ID: %d):\n", i++, id));
-                    result.append(String.format("  Class: %s\n", loc.declaringType().name()));
-                    result.append(String.format("  Method: %s\n", loc.method().name()));
-                    result.append(String.format("  Line: %d\n", loc.lineNumber()));
-                    result.append(String.format("  Enabled: %s\n", bp.isEnabled()));
-                    result.append(String.format("  Suspend: %s\n", policyStr));
-                    final String cond = breakpointTracker.getCondition(id);
-                    if (cond != null) {
-                        result.append(String.format("  Condition: %s\n", cond));
-                    }
-                    final String logExpr = breakpointTracker.getLogpointExpression(id);
-                    if (logExpr != null) {
-                        result.append(String.format("  Type: LOGPOINT\n  Expression: %s\n", logExpr));
-                    }
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    if (chain != null) {
-                        result.append(String.format("  Chain: trigger=#%d (%s, %s)\n",
-                            chain.triggerId(),
-                            chain.oneShot() ? "one-shot" : "sticky",
-                            bp.isEnabled() ? "ARMED" : "WAITING"));
-                    }
-                    result.append('\n');
-                }
-            }
-
-            if (!pending.isEmpty()) {
-                result.append(String.format("Pending breakpoints: %d\n\n", pending.size()));
-
-                for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> entry : pending.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointTracker.PendingBreakpoint pb = entry.getValue();
-                    result.append(String.format("Breakpoint %d (ID: %d):\n", i++, id));
-                    result.append(String.format("  Class: %s\n", pb.getClassName()));
-                    result.append(String.format("  Line: %d\n", pb.getLineNumber()));
-                    result.append(String.format("  Suspend: %s\n", pb.getSuspendPolicyLabel()));
-                    if (pb.getFailureReason() != null) {
-                        result.append(String.format("  Status: FAILED (%s)\n", pb.getFailureReason()));
-                    } else {
-                        result.append("  Status: PENDING (class not yet loaded)\n");
-                    }
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    if (chain != null) {
-                        result.append(String.format("  Chain: trigger=#%d (%s)\n",
-                            chain.triggerId(), chain.oneShot() ? "one-shot" : "sticky"));
-                    }
-                    result.append('\n');
-                }
-            }
-
-            return result.toString();
-        } catch (Exception e) {
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_list_breakpoints, jdwp_list_exception_breakpoints, or jdwp_list_field_breakpoints). Routes by kind: line, exception, and field breakpoints share one ID space.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
@@ -2136,66 +2092,6 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "List all exception breakpoints (active and pending)")
-    public String jdwp_list_exception_breakpoints() {
-        try {
-            final Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> active = breakpointTracker.getAllExceptionBreakpoints();
-            final Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pending = breakpointTracker.getAllPendingExceptionBreakpoints();
-
-            if (active.isEmpty() && pending.isEmpty()) {
-                return "No exception breakpoints set.\n\nUse jdwp_set_exception_breakpoint() to catch exceptions.";
-            }
-
-            final StringBuilder result = new StringBuilder();
-            int i = 1;
-
-            if (!active.isEmpty()) {
-                result.append(String.format("Active exception breakpoints: %d\n\n", active.size()));
-                for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> entry : active.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointTracker.ExceptionBreakpointInfo info = entry.getValue();
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    final String chainInfo = chain != null
-                        ? String.format(", chain=#%d (%s, %s)", chain.triggerId(),
-                            chain.oneShot() ? "one-shot" : "sticky",
-                            info.getRequest().isEnabled() ? "ARMED" : "WAITING") : "";
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s\n",
-                        i++, id, info.getExceptionClass(), info.isCaught(), info.isUncaught(),
-                        info.isLogOnly() ? "log-only" : "suspend",
-                        info.getExpression() != null ? ", expression: " + info.getExpression() : "",
-                        chainInfo));
-                }
-            }
-
-            if (!pending.isEmpty()) {
-                if (!active.isEmpty()) {
-                    result.append('\n');
-                }
-                result.append(String.format("Pending exception breakpoints: %d\n\n", pending.size()));
-                for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> entry : pending.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointTracker.PendingExceptionBreakpoint pb = entry.getValue();
-                    final String status = pb.getFailureReason() != null
-                        ? " [FAILED: " + pb.getFailureReason() + ']' : " [PENDING]";
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    final String chainInfo = chain != null
-                        ? String.format(", chain=#%d (%s)", chain.triggerId(),
-                            chain.oneShot() ? "one-shot" : "sticky") : "";
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s%s\n",
-                        i++, id, pb.getExceptionClass(), pb.isCaught(), pb.isUncaught(),
-                        pb.isLogOnly() ? "log-only" : "suspend",
-                        pb.getExpression() != null ? ", expression: " + pb.getExpression() : "",
-                        chainInfo,
-                        status));
-                }
-            }
-
-            return result.toString();
-        } catch (Exception e) {
-            return "Error: " + e.getMessage();
-        }
-    }
-
     @McpTool(description = "Set a field watchpoint that suspends the firing thread when the field is read " +
         "(mode='access'), written (mode='modification'), or both. Conditions are evaluated against the firing " +
         "frame with $oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode " +
@@ -2328,11 +2224,11 @@ public class JDWPTools {
                 // Static-ness cannot be checked until the class loads — surface a warning so users
                 // who supplied an objectFilterId know the validation is deferred. If the field turns
                 // out to be static on load, the pending entry is marked FAILED and visible via
-                // jdwp_list_field_breakpoints.
+                // jdwp_overview(types="field_breakpoint").
                 final String objectFilterWarning = objectFilterId != null
                     ? "\n  Note: objectFilterId is set — if '" + fieldName
                         + "' turns out to be static on load, the breakpoint will fail; "
-                        + "check jdwp_list_field_breakpoints after the class loads."
+                        + "check jdwp_overview(types=\"field_breakpoint\") after the class loads."
                     : "";
                 return String.format("""
                         Field breakpoint deferred (ID: %d)
@@ -2455,82 +2351,6 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "List all field breakpoints (active and pending), with chain status, mode, filters, and any pending failure reason.")
-    public String jdwp_list_field_breakpoints() {
-        try {
-            final Map<Integer, BreakpointTracker.FieldBreakpointInfo> active = breakpointTracker.getAllFieldBreakpoints();
-            final Map<Integer, BreakpointTracker.PendingFieldBreakpoint> pending = breakpointTracker.getAllPendingFieldBreakpoints();
-
-            if (active.isEmpty() && pending.isEmpty()) {
-                return "No field breakpoints set.\n\nUse jdwp_set_field_breakpoint() to watch a field.";
-            }
-
-            final StringBuilder result = new StringBuilder();
-            int i = 1;
-
-            if (!active.isEmpty()) {
-                result.append(String.format("Active field breakpoints: %d\n\n", active.size()));
-                for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> entry : active.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointTracker.FieldBreakpointSpec spec = entry.getValue().getSpec();
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    final EventRequest req = breakpointTracker.getEventRequestById(id);
-                    final boolean armed = req != null && req.isEnabled();
-                    final String chainInfo = chain != null
-                        ? String.format(", chain=#%d (%s, %s)", chain.triggerId(),
-                            chain.oneShot() ? "one-shot" : "sticky",
-                            armed ? "ARMED" : "WAITING") : "";
-                    result.append(String.format("%d. (ID: %d) %s.%s — mode: %s, %s%s%s%s\n",
-                        i++, id, spec.className(), spec.fieldName(),
-                        spec.mode().name().toLowerCase(Locale.ROOT),
-                        spec.logOnly() ? "log-only" : "suspend",
-                        spec.expression() != null ? ", expression: " + spec.expression() : "",
-                        renderFilters(spec.threadFilterId(), spec.objectFilterId()),
-                        chainInfo));
-                }
-            }
-
-            if (!pending.isEmpty()) {
-                if (!active.isEmpty()) {
-                    result.append('\n');
-                }
-                result.append(String.format("Pending field breakpoints: %d\n\n", pending.size()));
-                for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> entry : pending.entrySet()) {
-                    final int id = entry.getKey();
-                    final BreakpointTracker.PendingFieldBreakpoint pf = entry.getValue();
-                    final BreakpointTracker.FieldBreakpointSpec spec = pf.getSpec();
-                    final String status = pf.getFailureReason() != null
-                        ? " [FAILED: " + pf.getFailureReason() + ']' : " [PENDING]";
-                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
-                    final String chainInfo = chain != null
-                        ? String.format(", chain=#%d (%s)", chain.triggerId(),
-                            chain.oneShot() ? "one-shot" : "sticky") : "";
-                    result.append(String.format("%d. (ID: %d) %s.%s — mode: %s, %s%s%s%s%s\n",
-                        i++, id, spec.className(), spec.fieldName(),
-                        spec.mode().name().toLowerCase(Locale.ROOT),
-                        spec.logOnly() ? "log-only" : "suspend",
-                        spec.expression() != null ? ", expression: " + spec.expression() : "",
-                        renderFilters(spec.threadFilterId(), spec.objectFilterId()),
-                        chainInfo, status));
-                }
-            }
-
-            return result.toString();
-        } catch (Exception e) {
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    private static String renderFilters(@Nullable Long threadFilterId, @Nullable Long objectFilterId) {
-        if (threadFilterId == null && objectFilterId == null) {
-            return "";
-        }
-        final StringBuilder sb = new StringBuilder(", filters:");
-        if (threadFilterId != null) sb.append(" thread=").append(threadFilterId);
-        if (objectFilterId != null) sb.append(" object=").append(objectFilterId);
-        return sb.toString();
-    }
-
     @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
     public String jdwp_reset() {
         final int activeBp = breakpointTracker.getAllBreakpoints().size();
@@ -2575,44 +2395,610 @@ public class JDWPTools {
             activeFieldBp, pendingFieldBp, watchers, events);
     }
 
-    @McpTool(description = "Clear ALL breakpoints (line, exception, and field — active and pending) set by this MCP server")
-    public String jdwp_clear_all_breakpoints() {
+    // ========================================
+    // Marked Instances + Unified Overview / Clear
+    // ========================================
+
+    /**
+     * Type tags accepted by {@link #jdwp_overview} / {@link #jdwp_clear}. The string values are the
+     * stable tokens the agent passes in via the {@code types} parameter; "all" is the wildcard.
+     *
+     * <p>Backed by a {@link LinkedHashSet} (not {@code Set.of}) so iteration order is deterministic
+     * — the order is what surfaces in the {@code "Supported: ..."} error message when an unknown
+     * token is rejected, and a stable order keeps the agent-facing diagnostics reproducible.
+     */
+    private static final Set<String> OVERVIEW_TYPES = Collections.unmodifiableSet(
+        new LinkedHashSet<>(List.of(
+            "breakpoint", "exception_breakpoint", "field_breakpoint",
+            "logpoint", "watcher", "mark")));
+
+    @McpTool(description = "Mark a cached object instance with an agent-chosen label so it can be referenced by name as $label inside conditional-breakpoint, logpoint, watcher, and exception-logpoint expressions. The object is pinned in the target heap (disableCollection) by default so the label remains usable across many events; pass pin=false to allow natural GC. Label must be a valid Java identifier and must not collide with a reserved binding ($exception, $oldValue, $newValue, $object, $fieldName, $mode, _this) or another live mark.")
+    public String jdwp_mark_instance(
+        @McpToolParam(description = "Agent-chosen label (Java identifier, no $ sigil). The expression-side reference is $label.") String label,
+        @McpToolParam(description = "Object unique ID (from jdwp_get_locals or jdwp_get_fields)") long objectId,
+        @McpToolParam(required = false, description = "Pin the object in the target heap so it cannot be GC'd while marked (default: true). Set to false to observe natural collection.") @Nullable Boolean pin) {
         try {
-            final int activeCount = breakpointTracker.getAllBreakpoints().size();
-            final int pendingCount = breakpointTracker.getAllPendingBreakpoints().size();
-            final int exceptionCount = breakpointTracker.getAllExceptionBreakpoints().size()
-                + breakpointTracker.getAllPendingExceptionBreakpoints().size();
-            final int fieldCount = breakpointTracker.getAllFieldBreakpoints().size()
-                + breakpointTracker.getAllPendingFieldBreakpoints().size();
-            final int totalCount = activeCount + pendingCount;
-            if (totalCount == 0 && exceptionCount == 0 && fieldCount == 0) {
-                return "No breakpoints to clear";
+            final ObjectReference ref = jdiService.getCachedObject(objectId);
+            if (ref == null) {
+                return String.format("[ERROR] Object #%d not found in cache. "
+                    + "Use jdwp_get_locals or jdwp_get_fields to discover it first.", objectId);
             }
-
-            final VirtualMachine vm = jdiService.getVM();
-            breakpointTracker.clearAll(vm.eventRequestManager());
-            watcherManager.clearAll();
-
-            // Build the message from the BP kinds that actually had non-zero counts so a session
-            // with only exception or only field BPs reads cleanly instead of leading with "Cleared
-            // 0 breakpoint(s)".
-            String msg;
-            if (totalCount > 0) {
-                msg = String.format(
-                    "Cleared %d breakpoint(s) (%d active, %d pending) and all associated watchers.",
-                    totalCount, activeCount, pendingCount);
-            } else {
-                msg = "All associated watchers cleared.";
+            final String staleVmHint = staleVmHintIfMismatched(objectId, ref);
+            if (staleVmHint != null) {
+                return staleVmHint;
             }
-            if (exceptionCount > 0) {
-                msg += String.format(" Also cleared %d exception breakpoint(s).", exceptionCount);
-            }
-            if (fieldCount > 0) {
-                msg += String.format(" Also cleared %d field breakpoint(s).", fieldCount);
-            }
-            return msg;
+            final boolean effectivePin = pin == null || pin;
+            markedInstances.mark(label, ref, effectivePin);
+            return String.format("✓ Marked Object#%d (%s) as $%s%s",
+                objectId, ref.referenceType().name(), label,
+                effectivePin ? " [pinned]" : " [unpinned — may be GC'd]");
+        } catch (IllegalArgumentException badLabel) {
+            return "[ERROR] " + badLabel.getMessage();
+        } catch (IllegalStateException badState) {
+            return "[ERROR] " + badState.getMessage();
+        } catch (ObjectCollectedException dead) {
+            return "[ERROR] " + dead.getMessage();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Remove a marked instance by its label. Releases the target-heap pin (enableCollection) when one was set. Returns an error if no such mark exists.")
+    public String jdwp_unmark_instance(
+        @McpToolParam(description = "Label to remove (no $ sigil)") String label) {
+        try {
+            if (!markedInstances.unmark(label)) {
+                return String.format("[ERROR] No mark named '%s'. "
+                    + "Use jdwp_overview(types=\"mark\") to list current marks.", label);
+            }
+            return String.format("✓ Removed mark $%s", label);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Rename a marked instance, preserving its pin and underlying object. New label must be valid and not collide with reserved bindings or existing marks.")
+    public String jdwp_rename_mark(
+        @McpToolParam(description = "Existing label (no $ sigil)") String oldLabel,
+        @McpToolParam(description = "New label (Java identifier, no $ sigil)") String newLabel) {
+        try {
+            markedInstances.rename(oldLabel, newLabel);
+            return String.format("✓ Renamed $%s -> $%s", oldLabel, newLabel);
+        } catch (IllegalArgumentException notFound) {
+            return "[ERROR] " + notFound.getMessage();
+        } catch (IllegalStateException collision) {
+            return "[ERROR] " + collision.getMessage();
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive).")
+    public String jdwp_overview(
+        @McpToolParam(required = false, description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark. Defaults to all.") @Nullable String types,
+        @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter) {
+        try {
+            final Set<String> wanted = parseOverviewTypes(types);
+            final String needle = (filter == null || filter.isBlank()) ? null : filter.toLowerCase(Locale.ROOT);
+
+            final StringBuilder out = new StringBuilder();
+            out.append("=== Overview ===\n");
+            if (needle != null) {
+                out.append("(filter: '").append(filter).append("')\n");
+            }
+
+            int totalShown = 0;
+            if (wanted.contains("mark")) {
+                totalShown += appendMarkOverview(out, needle);
+            }
+            if (wanted.contains("breakpoint")) {
+                totalShown += appendBreakpointOverview(out, needle, false);
+            }
+            if (wanted.contains("logpoint")) {
+                totalShown += appendBreakpointOverview(out, needle, true);
+            }
+            if (wanted.contains("exception_breakpoint")) {
+                totalShown += appendExceptionBreakpointOverview(out, needle);
+            }
+            if (wanted.contains("field_breakpoint")) {
+                totalShown += appendFieldBreakpointOverview(out, needle);
+            }
+            if (wanted.contains("watcher")) {
+                totalShown += appendWatcherOverview(out, needle);
+            }
+
+            if (totalShown == 0) {
+                out.append("\n(no entries matched)\n");
+            }
+            return out.toString();
+        } catch (IllegalArgumentException badInput) {
+            return "[ERROR] " + badInput.getMessage();
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Delete debug state by type and/or substring filter. The 'types' arg is REQUIRED so an empty call cannot wipe everything by accident; pass 'all' to clear every supported type. To preview what would be cleared, call jdwp_overview with the same types/filter first.")
+    public String jdwp_clear(
+        @McpToolParam(description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark. Use 'all' for every type. REQUIRED.") String types,
+        @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter) {
+        try {
+            if (types == null || types.isBlank()) {
+                return "[ERROR] 'types' is required. Pass 'all' to clear every supported type, or a comma-separated subset of: "
+                    + String.join(", ", OVERVIEW_TYPES);
+            }
+            final Set<String> wanted = parseOverviewTypes(types);
+            final String needle = (filter == null || filter.isBlank()) ? null : filter.toLowerCase(Locale.ROOT);
+
+            // VM probe drives the server-local warning when BP clears run without a live target.
+            VirtualMachine vm = null;
+            try {
+                vm = jdiService.getVM();
+            } catch (Exception ignored) {
+                // Server-local clears below still work without a live VM.
+            }
+
+            final StringBuilder out = new StringBuilder();
+            out.append("=== Clear ===\n");
+
+            int totalCleared = 0;
+            if (wanted.contains("mark")) {
+                totalCleared += clearMarks(out, needle);
+            }
+            if (wanted.contains("watcher")) {
+                totalCleared += clearWatchers(out, needle);
+            }
+            if (wanted.contains("breakpoint") || wanted.contains("logpoint")) {
+                totalCleared += clearLineBreakpoints(out, needle,
+                    wanted.contains("breakpoint"), wanted.contains("logpoint"));
+            }
+            if (wanted.contains("exception_breakpoint")) {
+                totalCleared += clearExceptionBreakpoints(out, needle);
+            }
+            if (wanted.contains("field_breakpoint")) {
+                totalCleared += clearFieldBreakpoints(out, needle);
+            }
+
+            if (totalCleared == 0) {
+                out.append("\n(nothing matched)\n");
+            } else {
+                out.append(String.format("\nTotal cleared: %d entr%s\n",
+                    totalCleared, totalCleared == 1 ? "y" : "ies"));
+            }
+            if (vm == null && (wanted.contains("breakpoint") || wanted.contains("exception_breakpoint")
+                || wanted.contains("field_breakpoint") || wanted.contains("logpoint"))) {
+                out.append("(note: VM not connected — BP removal is server-local only)\n");
+            }
+            return out.toString();
+        } catch (IllegalArgumentException badInput) {
+            return "[ERROR] " + badInput.getMessage();
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Parses the {@code types} argument shared by {@link #jdwp_overview} and {@link #jdwp_clear}.
+     * Accepts {@code null} / blank as "every type"; accepts {@code "all"} as the explicit wildcard.
+     * Rejects unknown tokens with an {@link IllegalArgumentException} carrying the supported list
+     * so the agent can self-correct.
+     *
+     * <p>Every token is validated before the {@code "all"} wildcard is honoured, so a typo like
+     * {@code "all,bogos"} or {@code "bogos,all"} is rejected symmetrically — otherwise an unknown
+     * token sitting next to the wildcard would silently slip through and the agent would never
+     * learn about the typo.
+     */
+    private Set<String> parseOverviewTypes(@Nullable String types) {
+        if (types == null || types.isBlank() || "all".equalsIgnoreCase(types.trim())) {
+            return OVERVIEW_TYPES;
+        }
+        final Set<String> out = new LinkedHashSet<>();
+        boolean sawAll = false;
+        for (String raw : types.split(",", -1)) {
+            final String tok = raw.trim().toLowerCase(Locale.ROOT);
+            if (tok.isEmpty()) {
+                continue;
+            }
+            if ("all".equals(tok)) {
+                sawAll = true;
+                continue;
+            }
+            if (!OVERVIEW_TYPES.contains(tok)) {
+                throw new IllegalArgumentException(
+                    "Unknown type '" + tok + "'. Supported: " + String.join(", ", OVERVIEW_TYPES) + " (or 'all').");
+            }
+            out.add(tok);
+        }
+        if (sawAll || out.isEmpty()) {
+            return OVERVIEW_TYPES;
+        }
+        return out;
+    }
+
+    /**
+     * Renders the marked-instance section. Returns the number of rows emitted; emits the header
+     * even when no rows match so the agent can confirm the type was actually inspected.
+     */
+    private int appendMarkOverview(StringBuilder out, @Nullable String needle) {
+        final List<MarkInfo> all = markedInstances.list().stream()
+            .sorted(Comparator.comparing(MarkInfo::label))
+            .toList();
+        final List<MarkInfo> shown = all.stream()
+            .filter(m -> matchesFilter(needle, m.label(), m.typeName()))
+            .toList();
+        appendSectionHeader(out, "Marks", shown.size(), all.size());
+        if (shown.isEmpty()) {
+            return 0;
+        }
+        for (MarkInfo m : shown) {
+            out.append(String.format("  $%s -> Object#%d (%s) [%s%s]\n",
+                m.label(), m.objectId(), m.typeName(),
+                m.pinned() ? "pinned" : "unpinned",
+                m.collected() ? ", collected" : ""));
+        }
+        return shown.size();
+    }
+
+    /**
+     * Renders chain dependency suffix ({@code  chain=trigger=#7 (one-shot, ARMED)}) for a BP id, or
+     * an empty string when the BP is not part of a chain. Centralised so all three BP overview
+     * renderers expose the same chain shape.
+     *
+     * @param armed whether the underlying JDI request is currently enabled — {@code null} for
+     *              pending entries where there is no request yet
+     */
+    private String chainSuffix(int id, @Nullable Boolean armed) {
+        final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+        if (chain == null) {
+            return "";
+        }
+        final String mode = chain.oneShot() ? "one-shot" : "sticky";
+        if (armed == null) {
+            return String.format("  chain=trigger=#%d (%s)", chain.triggerId(), mode);
+        }
+        return String.format("  chain=trigger=#%d (%s, %s)", chain.triggerId(), mode,
+            armed ? "ARMED" : "WAITING");
+    }
+
+    /**
+     * Renders the line-breakpoint section. When {@code logpoints} is true, only entries with a
+     * logpoint expression are included; otherwise plain breakpoints (no logpoint expression) are
+     * shown. Pending entries always render with their stored class name.
+     */
+    private int appendBreakpointOverview(StringBuilder out, @Nullable String needle, boolean logpoints) {
+        final Map<Integer, BreakpointRequest> active = breakpointTracker.getAllBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingBreakpoint> pending = breakpointTracker.getAllPendingBreakpoints();
+        final List<String> rows = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointRequest> e : active.entrySet()) {
+            final int id = e.getKey();
+            final String expr = breakpointTracker.getLogpointExpression(id);
+            if (logpoints == (expr != null)) {
+                final BreakpointRequest bp = e.getValue();
+                final Location loc = bp.location();
+                final String className = loc.declaringType().name();
+                final String cond = breakpointTracker.getCondition(id);
+                if (matchesFilter(needle, className, expr, cond)) {
+                    rows.add(String.format("  #%d  %s:%d%s%s%s",
+                        id, className, loc.lineNumber(),
+                        expr != null ? "  expr=\"" + expr + "\"" : "",
+                        cond != null ? "  cond=\"" + cond + "\"" : "",
+                        chainSuffix(id, bp.isEnabled())));
+                }
+            }
+        }
+        // Pending entries cannot have a logpoint expression bound yet — they only carry class/line.
+        if (!logpoints) {
+            for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> e : pending.entrySet()) {
+                final int id = e.getKey();
+                final BreakpointTracker.PendingBreakpoint pb = e.getValue();
+                if (matchesFilter(needle, pb.getClassName(), null)) {
+                    rows.add(String.format("  #%d  %s:%d  [%s]%s",
+                        id, pb.getClassName(), pb.getLineNumber(),
+                        pb.getFailureReason() != null ? "FAILED: " + pb.getFailureReason() : "PENDING",
+                        chainSuffix(id, null)));
+                }
+            }
+        }
+        out.append(logpoints
+            ? String.format("\nLogpoints (%d):\n", rows.size())
+            : String.format("\nBreakpoints (%d):\n", rows.size()));
+        rows.forEach(r -> out.append(r).append('\n'));
+        return rows.size();
+    }
+
+    /**
+     * Renders the exception-breakpoint section. Pending entries (class not yet loaded) are tagged
+     * `[PENDING]` so the agent can tell them apart from active ones at a glance.
+     */
+    private int appendExceptionBreakpointOverview(StringBuilder out, @Nullable String needle) {
+        final Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> active =
+            breakpointTracker.getAllExceptionBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pending =
+            breakpointTracker.getAllPendingExceptionBreakpoints();
+        final List<String> rows = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> e : active.entrySet()) {
+            final int id = e.getKey();
+            final BreakpointTracker.ExceptionBreakpointInfo info = e.getValue();
+            final String name = info.getExceptionClass();
+            final String expr = info.getExpression();
+            final String cond = breakpointTracker.getCondition(id);
+            if (matchesFilter(needle, name, expr, cond)) {
+                rows.add(String.format("  #%d  %s  [%s]%s%s%s",
+                    id, name,
+                    info.isLogOnly() ? "log-only" : "suspend",
+                    expr != null ? "  expr=\"" + expr + "\"" : "",
+                    cond != null ? "  cond=\"" + cond + "\"" : "",
+                    chainSuffix(id, info.getRequest().isEnabled())));
+            }
+        }
+        for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> e : pending.entrySet()) {
+            final int id = e.getKey();
+            final BreakpointTracker.PendingExceptionBreakpoint pb = e.getValue();
+            if (matchesFilter(needle, pb.getExceptionClass(), null)) {
+                rows.add(String.format("  #%d  %s  [PENDING]%s",
+                    id, pb.getExceptionClass(), chainSuffix(id, null)));
+            }
+        }
+        out.append(String.format("\nException breakpoints (%d):\n", rows.size()));
+        rows.forEach(r -> out.append(r).append('\n'));
+        return rows.size();
+    }
+
+    /**
+     * Renders the field-breakpoint section. Pending entries (class not yet loaded) are tagged
+     * `[PENDING]` so the agent can tell them apart from active ones at a glance.
+     */
+    private int appendFieldBreakpointOverview(StringBuilder out, @Nullable String needle) {
+        final Map<Integer, BreakpointTracker.FieldBreakpointInfo> active =
+            breakpointTracker.getAllFieldBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingFieldBreakpoint> pending =
+            breakpointTracker.getAllPendingFieldBreakpoints();
+        final List<String> rows = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> e : active.entrySet()) {
+            final int id = e.getKey();
+            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            final String label = spec.className() + '.' + spec.fieldName();
+            final String cond = breakpointTracker.getCondition(id);
+            if (matchesFilter(needle, label, spec.expression(), cond)) {
+                final EventRequest req = breakpointTracker.getEventRequestById(id);
+                rows.add(String.format("  #%d  %s  mode=%s%s%s%s%s",
+                    id, label, spec.mode(),
+                    spec.logOnly() ? "  [log-only]" : "",
+                    spec.expression() != null ? "  expr=\"" + spec.expression() + "\"" : "",
+                    cond != null ? "  cond=\"" + cond + "\"" : "",
+                    chainSuffix(id, req != null && req.isEnabled())));
+            }
+        }
+        for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> e : pending.entrySet()) {
+            final int id = e.getKey();
+            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            final String label = spec.className() + '.' + spec.fieldName();
+            if (matchesFilter(needle, label, spec.expression())) {
+                rows.add(String.format("  #%d  %s  mode=%s  [PENDING]%s",
+                    id, label, spec.mode(), chainSuffix(id, null)));
+            }
+        }
+        out.append(String.format("\nField breakpoints (%d):\n", rows.size()));
+        rows.forEach(r -> out.append(r).append('\n'));
+        return rows.size();
+    }
+
+    /**
+     * Renders the watcher section. Rows are sorted by owning breakpoint ID so all watchers tied to
+     * the same BP cluster together — the agent typically wants to see "what fires at BP #7" rather
+     * than an alphabetical label list.
+     */
+    private int appendWatcherOverview(StringBuilder out, @Nullable String needle) {
+        final List<Watcher> all = watcherManager.getAllWatchers();
+        final List<Watcher> shown = all.stream()
+            .filter(w -> matchesFilter(needle, w.getLabel(), w.getExpression()))
+            .sorted(Comparator.comparingInt(Watcher::getBreakpointId))
+            .toList();
+        appendSectionHeader(out, "Watchers", shown.size(), all.size());
+        for (Watcher w : shown) {
+            out.append(String.format("  [%s] %s  on BP #%d  \"%s\"\n",
+                w.getId().substring(0, 8), w.getLabel(), w.getBreakpointId(), w.getExpression()));
+        }
+        return shown.size();
+    }
+
+    /**
+     * Appends a single {@code "  removed <descriptor>\n"} row used by every {@code jdwp_clear}
+     * bulk path.
+     */
+    private static void appendBulkClearLine(StringBuilder out, String descriptor) {
+        out.append("  removed ").append(descriptor).append('\n');
+    }
+
+    /**
+     * Appends the {@code "\n<label> (<shown> of <total>):\n"} overview header. The "of total"
+     * tail is omitted when no filter culled rows so unfiltered sections stay terse.
+     */
+    private static void appendSectionHeader(StringBuilder out, String label, int shown, int total) {
+        out.append('\n').append(label).append(" (").append(shown);
+        if (shown != total) {
+            out.append(" of ").append(total);
+        }
+        out.append("):\n");
+    }
+
+    /**
+     * Case-insensitive contains-any. {@code null} entries in {@code haystacks} are skipped so
+     * callers can pass an optional expression without an extra null-guard. A {@code null} needle
+     * means "no filter" and always matches.
+     */
+    private static boolean matchesFilter(@Nullable String needle, @Nullable String... haystacks) {
+        if (needle == null) {
+            return true;
+        }
+        for (String h : haystacks) {
+            if (h != null && h.toLowerCase(Locale.ROOT).contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Bulk-clear marks matching {@code needle}.
+     */
+    private int clearMarks(StringBuilder out, @Nullable String needle) {
+        final List<MarkInfo> matches = markedInstances.list().stream()
+            .filter(m -> matchesFilter(needle, m.label(), m.typeName()))
+            .toList();
+        if (matches.isEmpty()) {
+            return 0;
+        }
+        out.append(String.format("Marks: %d match%s\n", matches.size(), matches.size() == 1 ? "" : "es"));
+        for (MarkInfo m : matches) {
+            appendBulkClearLine(out, String.format("$%s -> Object#%d (%s)",
+                m.label(), m.objectId(), m.typeName()));
+            markedInstances.unmark(m.label());
+        }
+        return matches.size();
+    }
+
+    /**
+     * Bulk-clear watchers matching {@code needle}.
+     */
+    private int clearWatchers(StringBuilder out, @Nullable String needle) {
+        final List<Watcher> matches = watcherManager.getAllWatchers().stream()
+            .filter(w -> matchesFilter(needle, w.getLabel(), w.getExpression()))
+            .toList();
+        if (matches.isEmpty()) {
+            return 0;
+        }
+        out.append(String.format("Watchers: %d match%s\n", matches.size(), matches.size() == 1 ? "" : "es"));
+        for (Watcher w : matches) {
+            appendBulkClearLine(out, String.format("[%s] %s on BP #%d",
+                w.getId().substring(0, 8), w.getLabel(), w.getBreakpointId()));
+            watcherManager.deleteWatcher(w.getId());
+        }
+        return matches.size();
+    }
+
+    /**
+     * Clears line breakpoints and/or logpoints matching the filter. Both kinds live in the same
+     * BP map, so we partition active entries by presence of a logpoint expression to honour the
+     * {@code includeBreakpoints} / {@code includeLogpoints} switches separately. Pending entries
+     * are clearable only as "breakpoints" because a logpoint expression cannot be bound until the
+     * BP is active.
+     */
+    private int clearLineBreakpoints(StringBuilder out, @Nullable String needle,
+                                     boolean includeBreakpoints, boolean includeLogpoints) {
+        final List<Integer> toClear = new ArrayList<>();
+        final Map<Integer, BreakpointRequest> active = breakpointTracker.getAllBreakpoints();
+        for (Map.Entry<Integer, BreakpointRequest> e : active.entrySet()) {
+            final int id = e.getKey();
+            final String expr = breakpointTracker.getLogpointExpression(id);
+            final boolean isLogpoint = expr != null;
+            if ((isLogpoint && !includeLogpoints) || (!isLogpoint && !includeBreakpoints)) {
+                continue;
+            }
+            final Location loc = e.getValue().location();
+            final String className = loc.declaringType().name();
+            if (matchesFilter(needle, className, expr, breakpointTracker.getCondition(id))) {
+                toClear.add(id);
+            }
+        }
+        if (includeBreakpoints) {
+            for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> e :
+                    breakpointTracker.getAllPendingBreakpoints().entrySet()) {
+                if (matchesFilter(needle, e.getValue().getClassName())) {
+                    toClear.add(e.getKey());
+                }
+            }
+        }
+        if (toClear.isEmpty()) {
+            return 0;
+        }
+        final String header = (includeBreakpoints && includeLogpoints) ? "Breakpoints + logpoints"
+            : includeLogpoints ? "Logpoints" : "Breakpoints";
+        out.append(String.format("%s: %d match%s\n", header, toClear.size(), toClear.size() == 1 ? "" : "es"));
+        for (int id : toClear) {
+            appendBulkClearLine(out, "#" + id);
+            clearLineBreakpointById(id);
+        }
+        return toClear.size();
+    }
+
+    /**
+     * Bulk-clear exception breakpoints matching {@code needle}, cascading watcher cleanup per BP.
+     */
+    private int clearExceptionBreakpoints(StringBuilder out, @Nullable String needle) {
+        final List<Integer> toClear = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> e :
+                breakpointTracker.getAllExceptionBreakpoints().entrySet()) {
+            final BreakpointTracker.ExceptionBreakpointInfo info = e.getValue();
+            if (matchesFilter(needle, info.getExceptionClass(), info.getExpression(),
+                    breakpointTracker.getCondition(e.getKey()))) {
+                toClear.add(e.getKey());
+            }
+        }
+        for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> e :
+                breakpointTracker.getAllPendingExceptionBreakpoints().entrySet()) {
+            if (matchesFilter(needle, e.getValue().getExceptionClass())) {
+                toClear.add(e.getKey());
+            }
+        }
+        if (toClear.isEmpty()) {
+            return 0;
+        }
+        out.append(String.format("Exception breakpoints: %d match%s\n",
+            toClear.size(), toClear.size() == 1 ? "" : "es"));
+        for (int id : toClear) {
+            appendBulkClearLine(out, "#" + id);
+            breakpointTracker.removeExceptionBreakpoint(id);
+            watcherManager.deleteWatchersForBreakpoint(id);
+        }
+        return toClear.size();
+    }
+
+    /**
+     * Bulk-clear field breakpoints matching {@code needle}, cascading watcher cleanup per BP.
+     */
+    private int clearFieldBreakpoints(StringBuilder out, @Nullable String needle) {
+        final List<Integer> toClear = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> e :
+                breakpointTracker.getAllFieldBreakpoints().entrySet()) {
+            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            if (matchesFilter(needle, spec.className() + '.' + spec.fieldName(), spec.expression(),
+                    breakpointTracker.getCondition(e.getKey()))) {
+                toClear.add(e.getKey());
+            }
+        }
+        for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> e :
+                breakpointTracker.getAllPendingFieldBreakpoints().entrySet()) {
+            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            if (matchesFilter(needle, spec.className() + '.' + spec.fieldName(), spec.expression())) {
+                toClear.add(e.getKey());
+            }
+        }
+        if (toClear.isEmpty()) {
+            return 0;
+        }
+        out.append(String.format("Field breakpoints: %d match%s\n",
+            toClear.size(), toClear.size() == 1 ? "" : "es"));
+        for (int id : toClear) {
+            appendBulkClearLine(out, "#" + id);
+            breakpointTracker.removeFieldBreakpoint(id);
+            watcherManager.deleteWatchersForBreakpoint(id);
+        }
+        return toClear.size();
+    }
+
+    /**
+     * Per-id line/logpoint removal — picks the right BreakpointTracker mutator and cleans up any
+     * attached watchers, mirroring {@link #jdwp_clear_breakpoint}'s contract. The chain-break
+     * cascade still runs via {@link #cascadeChainBreak(int)}; only its narration is suppressed
+     * here so the bulk-clear report stays compact (the agent can re-render via the next overview).
+     */
+    private void clearLineBreakpointById(int id) {
+        if (breakpointTracker.getBreakpoint(id) != null
+                || breakpointTracker.getPendingBreakpoint(id) != null) {
+            cascadeChainBreak(id);
+            breakpointTracker.removeBreakpoint(id);
+            watcherManager.deleteWatchersForBreakpoint(id);
         }
     }
 
@@ -2711,6 +3097,7 @@ public class JDWPTools {
                 sb.append("--- this --- (static method, no this)\n");
             }
 
+            appendMarkedInstancesFooter(sb);
             return sb.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -2737,7 +3124,7 @@ public class JDWPTools {
 
     @McpTool(description = "Attach a watcher to a breakpoint to evaluate a Java expression when hit. Returns the watcher ID.")
     public String jdwp_attach_watcher(
-        @McpToolParam(description = "Breakpoint request ID (from jdwp_list_breakpoints)") int breakpointId,
+        @McpToolParam(description = "Breakpoint request ID (from jdwp_overview)") int breakpointId,
         @McpToolParam(description = "Descriptive label for this watcher (e.g., 'Trace entity ID', 'Check user name')") String label,
         @McpToolParam(description = "Java expression to evaluate (e.g., 'entity.id', 'user.name', 'items.size()')") String expression) {
         try {
@@ -2776,7 +3163,7 @@ public class JDWPTools {
             final Watcher watcher = watcherManager.getWatcher(watcherId);
             if (watcher == null) {
                 return String.format(
-                    "Error: Watcher '%s' not found.\n\nUse jdwp_list_all_watchers() to see active watchers.", watcherId
+                    "Error: Watcher '%s' not found.\n\nUse jdwp_overview(types=\"watcher\") to see active watchers.", watcherId
                 );
             }
 
@@ -2821,57 +3208,6 @@ public class JDWPTools {
 
         } catch (Exception e) {
             log.error("[Watcher] Error listing watchers for breakpoint", e);
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    @McpTool(description = "List all active watchers across all breakpoints")
-    public String jdwp_list_all_watchers() {
-        try {
-            final List<Watcher> watchers = watcherManager.getAllWatchers();
-
-            if (watchers.isEmpty()) {
-                return """
-                    No watchers configured.
-                    
-                    Use jdwp_attach_watcher(breakpointId, label, expression) to create a watcher.""";
-            }
-
-            final Map<String, Object> stats = watcherManager.getStats();
-            final StringBuilder result = new StringBuilder();
-            result.append(String.format("Active watchers: %d across %d breakpoints\n\n",
-                (Integer) stats.get("totalWatchers"), (Integer) stats.get("breakpointsWithWatchers")));
-
-            // Group by breakpoint
-            final Map<Integer, List<Watcher>> grouped = watchers.stream()
-                .collect(Collectors.groupingBy(Watcher::getBreakpointId));
-
-            for (Map.Entry<Integer, List<Watcher>> entry : grouped.entrySet()) {
-                result.append(String.format("Breakpoint %d (%d watchers):\n", entry.getKey(), entry.getValue().size()));
-                for (Watcher w : entry.getValue()) {
-                    result.append(String.format("  • [%s] %s\n", w.getId().substring(0, 8), w.getLabel()));
-                    result.append(String.format("    Expression: %s\n", w.getExpression()));
-                }
-                result.append('\n');
-            }
-
-            return result.toString();
-
-        } catch (Exception e) {
-            log.error("[Watcher] Error listing all watchers", e);
-            return "Error: " + e.getMessage();
-        }
-    }
-
-    @McpTool(description = "Clear all watchers from all breakpoints")
-    public String jdwp_clear_all_watchers() {
-        try {
-            final int count = watcherManager.getAllWatchers().size();
-            watcherManager.clearAll();
-            return String.format("✓ Cleared %d watcher(s)", count);
-
-        } catch (Exception e) {
-            log.error("[Watcher] Error clearing watchers", e);
             return "Error: " + e.getMessage();
         }
     }
@@ -2972,10 +3308,11 @@ public class JDWPTools {
         result.append(String.format("─── Current Frame #0: %s:%d (Breakpoint ID: %d) ───\n\n",
             location.declaringType().name(), location.lineNumber(), breakpointId));
 
+        final Map<String, Value> markBindings = markedInstances.buildBindings();
         for (Watcher watcher : watchers) {
             result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
             try {
-                final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression());
+                final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression(), markBindings);
                 result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
                 watchersEvaluated++;
             } catch (Exception e) {
@@ -3002,6 +3339,7 @@ public class JDWPTools {
 
         int watchersEvaluated = 0;
         final List<StackFrame> frames = thread.frames();
+        final Map<String, Value> markBindings = markedInstances.buildBindings();
 
         for (int frameIndex = 0; frameIndex < frames.size(); frameIndex++) {
             final StackFrame frame = frames.get(frameIndex);
@@ -3024,7 +3362,7 @@ public class JDWPTools {
             for (Watcher watcher : watchers) {
                 result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
                 try {
-                    final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression());
+                    final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression(), markBindings);
                     result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
                     watchersEvaluated++;
                 } catch (Exception e) {
