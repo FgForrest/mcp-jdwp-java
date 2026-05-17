@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "mcp-jdwp-java",
   "description": "Java JDWP debugger plugin for Claude Code",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "owner": {
     "name": "FG Forrest"
   },
@@ -10,7 +10,7 @@
     {
       "name": "jdwp-debugging",
       "description": "Java JDWP debugger via MCP — set breakpoints, inspect runtime state, evaluate expressions, mutate variables, catch exceptions at throw site, trace execution with logpoints.",
-      "version": "1.0.3",
+      "version": "2.0.0",
       "author": {
         "name": "Jan (Novoj) Novotný"
       },

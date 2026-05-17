@@ -2,6 +2,8 @@
 
 MCP server that gives AI agents full debugger control over running Java applications — inspect state, set breakpoints, evaluate expressions, and mutate values at runtime via JDWP/JDI.
 
+> **Release notes** — see [`CHANGELOG.md`](CHANGELOG.md). 2.0.0 is a breaking release: several `jdwp_clear_*` tools were unified, and field watchpoints are new.
+
 **Built on the foundations of [mcp-jdwp-java](https://github.com/NicolasVautrin/mcp-jdwp-java) by [Nicolas Vautrin](https://github.com/NicolasVautrin)** — the original project that provided core JDI connectivity, thread/stack/variable inspection, stepping, and basic breakpoint management. Everything described below as "beyond standard JDWP" was built on top of that base.
 
 ## Security & trust
