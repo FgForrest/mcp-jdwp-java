@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+	<title>mcp-jdwp-inspector</title>
+
+	<link rel="stylesheet" href="reveal.js/dist/reset.css">
+	<link rel="stylesheet" href="reveal.js/dist/reveal.css">
+	<link rel="stylesheet" href="reveal.js/dist/theme/black.css" id="theme">
+	<link rel="stylesheet" href="reveal.js/dist/plugin/highlight/monokai.css">
+
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<div class="reveal">
+		<div class="slides">
+
+			<section data-markdown="slides/00-title.md"
+			         data-separator="^\n---\n$"
+			         data-separator-vertical="^\n--\n$"
+			         data-separator-notes="^Note:"></section>
+
+			<section data-markdown="slides/01-intro.md"
+			         data-separator="^\n---\n$"
+			         data-separator-vertical="^\n--\n$"
+			         data-separator-notes="^Note:"></section>
+
+		</div>
+	</div>
+
+	<script src="reveal.js/dist/reveal.js"></script>
+	<script src="reveal.js/dist/plugin/notes.js"></script>
+	<script src="reveal.js/dist/plugin/markdown.js"></script>
+	<script src="reveal.js/dist/plugin/highlight.js"></script>
+	<script src="reveal.js/dist/plugin/search.js"></script>
+	<script src="reveal.js/dist/plugin/zoom.js"></script>
+	<script>
+		Reveal.initialize({
+			hash: true,
+			slideNumber: 'c/t',
+			controls: true,
+			progress: true,
+			history: true,
+			center: true,
+			transition: 'slide',
+			plugins: [ RevealMarkdown, RevealHighlight, RevealNotes, RevealSearch, RevealZoom ]
+		});
+	</script>
+</body>
+</html>
