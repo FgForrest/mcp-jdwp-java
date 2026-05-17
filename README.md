@@ -122,13 +122,25 @@ Starts the JVM with JDWP on port 5005, suspended until a debugger connects.
 
 ## Find the Bug — test flights
 
-The `jdwp-sandbox` module ships 5 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
+The `jdwp-sandbox` module ships 6 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
 
 This doubles as a setup verification — if you can solve these, everything works.
 
+### Just installed the plugin? Grab the sandbox zip
+
+The fastest path for fresh plugin users is a self-contained zip — no clone, no reactor build:
+
+```bash
+curl -L -o jdwp-sandbox.zip \
+  https://github.com/FgForrest/mcp-jdwp-java/releases/latest/download/jdwp-sandbox.zip
+unzip jdwp-sandbox.zip && cd jdwp-sandbox
+```
+
+Inside, you get a parentless Maven project with `src/`, a `pom.xml`, a flight-game `README.md`, and a `CLAUDE.md` that briefs the agent on the game's house rules. Open the folder in Claude Code and ask it to play flight #1 — the bundled `CLAUDE.md` keeps it honest (no peeking at source, no spoiler-fetching). Continue with the workflow below.
+
 ### How to launch a test flight
 
-Start Claude Code from the repo root and type:
+Start Claude Code from the sandbox folder (or this repo's root, if you cloned) and type:
 
 ```
 Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing, find the root cause.

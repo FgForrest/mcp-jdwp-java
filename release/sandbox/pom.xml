@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>one.edee.mcp.jdwp</groupId>
+    <artifactId>jdwp-sandbox</artifactId>
+    <version>2.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>JDWP Debugging Sandbox</name>
+    <description>
+        Deliberately buggy Java classes used as debugging targets for the jdwp-debugging
+        Claude Code plugin. Standalone variant — no parent POM, no Spring Boot, no extra
+        modules. Compiles to plain Java 17 bytecode and is driven by Surefire.
+    </description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
+
+        <junit.version>5.10.2</junit.version>
+        <assertj.version>3.25.3</assertj.version>
+
+        <surefire.version>3.2.5</surefire.version>
+        <compiler-plugin.version>3.13.0</compiler-plugin.version>
+
+        <!-- Sandbox tests are expected-to-fail by design (they exist so an agent can
+             diagnose them live under JDWP). Skip them by default; users override with
+             -DskipTests=false when launching a flight. -->
+        <skipTests>true</skipTests>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${compiler-plugin.version}</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${surefire.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

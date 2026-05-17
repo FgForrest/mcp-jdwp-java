@@ -21,3 +21,6 @@ Thumbs.db
 # Runtime logs
 mcp-jdwp-inspector.log
 *.log
+
+# Sandbox release artifacts (produced by release/sandbox/assemble.sh)
+release/sandbox/dist/
