@@ -231,14 +231,33 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ---
 
+### #6 The Field That Lies
+
+**Difficulty:** Moderate | **Test:** `UserProfileTest` | **Package:** `userprofile`
+
+**Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
+
+**Hint:** The "read-only" formatter you handed the profile to is not as read-only as its name suggests. Don't try to find the write by reading the call chain — let the JVM tell you when the field changes.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`LoginNormalizer.welcomeMessage` calls a private `normalizeForDisplay` helper that writes the lower-cased form back to `UserProfile.displayName` "to keep a canonical version on the profile". From the test's perspective the formatter is read-only — but the side effect mutates the caller's data.
+
+**Debug path:** `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")` — the next write to the field suspends the thread at the actual mutation line. `jdwp_get_stack` shows `LoginNormalizer.normalizeForDisplay` is the culprit. No line-BP-spelunking required.
+
+</details>
+
+---
+
 ### Scorecard
 
 | Solved | Rating                                                               |
 |--------|----------------------------------------------------------------------|
 | 0-1    | The JVM is winning. Check your setup.                                |
 | 2-3    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 4      | Impressive. You found bugs that would take hours with println.       |
-| 5      | Bug terminator. Nothing survives your debugger.                      |
+| 4-5    | Impressive. You found bugs that would take hours with println.       |
+| 6      | Bug terminator. Nothing survives your debugger.                      |
 
 ## Features beyond standard JDWP
 
