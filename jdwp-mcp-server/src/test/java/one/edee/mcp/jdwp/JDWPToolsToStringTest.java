@@ -15,6 +15,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.io.IOException;
+import java.net.SocketException;
 import java.util.Collections;
 import java.util.List;
 
@@ -244,5 +246,71 @@ class JDWPToolsToStringTest {
 		assertThat(out).contains("jdwp_to_string");
 		assertThat(out).contains("jdwp_connect");
 		assertThat(out).contains("jdwp_wait_for_attach");
+	}
+
+	/**
+	 * F-RA1: a {@link SocketException} buried in the cause chain of the unchecked throwable that
+	 * JDI raises mid-{@code invokeMethod} must be recognised by the catch block and rendered as
+	 * the canonical {@code [VM_DEATH]} envelope. Without the cause-chain walk the wrapped form
+	 * leaked through as {@code "Error invoking toString(): wrapper"} and the agent's re-attach
+	 * recipe was hidden.
+	 */
+	@Test
+	@DisplayName("F-RA1: surfaces wrapped SocketException as the canonical [VM_DEATH] hint")
+	void shouldSurfaceSocketExceptionAsCanonicalHint() throws Exception {
+		final ObjectReference obj = mock(ObjectReference.class);
+		final ReferenceType type = mock(ReferenceType.class);
+		final Method toStringMethod = mock(Method.class);
+		final ThreadReference thread = suspendedThread(1L);
+
+		when(jdiService.getCachedObject(42L)).thenReturn(obj);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(obj.referenceType()).thenReturn(type);
+		when(type.name()).thenReturn("Foo");
+		when(type.methodsByName("toString", "()Ljava/lang/String;"))
+			.thenReturn(List.of(toStringMethod));
+		when(obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
+			ObjectReference.INVOKE_SINGLE_THREADED))
+			.thenThrow(new RuntimeException("wrapper", new SocketException("Broken pipe")));
+
+		final String out = tools.jdwp_to_string(42L, 1L);
+
+		assertThat(out).startsWith("[VM_DEATH]");
+		assertThat(out).contains("jdwp_to_string");
+	}
+
+	/**
+	 * F-RA1: transport failures that surface only as a generic {@link IOException} (no
+	 * {@code SocketException} or {@code VMDisconnectedException} in the chain) must still be
+	 * recognised via the message-substring fallback inside {@code isVmGone}. Pins the
+	 * "Connection reset" branch of the message scan.
+	 */
+	@Test
+	@DisplayName("F-RA1: surfaces message-only transport failure as the canonical [VM_DEATH] hint")
+	void shouldSurfaceMessageOnlyTransportFailureAsCanonicalHint() throws Exception {
+		final ObjectReference obj = mock(ObjectReference.class);
+		final ReferenceType type = mock(ReferenceType.class);
+		final Method toStringMethod = mock(Method.class);
+		final ThreadReference thread = suspendedThread(1L);
+
+		when(jdiService.getCachedObject(42L)).thenReturn(obj);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(obj.referenceType()).thenReturn(type);
+		when(type.name()).thenReturn("Foo");
+		when(type.methodsByName("toString", "()Ljava/lang/String;"))
+			.thenReturn(List.of(toStringMethod));
+		// Wrap the IOException in an unchecked exception — invokeMethod doesn't declare IOException
+		// so Mockito refuses to plant it raw, but production code sees the same unchecked wrapper
+		// shape any time JDI bubbles a transport failure out of a non-throwing method.
+		when(obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
+			ObjectReference.INVOKE_SINGLE_THREADED))
+			.thenThrow(new RuntimeException(new IOException("Connection reset")));
+
+		final String out = tools.jdwp_to_string(42L, 1L);
+
+		assertThat(out).startsWith("[VM_DEATH]");
+		assertThat(out).contains("jdwp_to_string");
 	}
 }

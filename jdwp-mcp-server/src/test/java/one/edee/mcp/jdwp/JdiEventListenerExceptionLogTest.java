@@ -180,6 +180,12 @@ class JdiEventListenerExceptionLogTest {
 		assertThat(tracker.getLastBreakpointThread()).isSameAs(thread);
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
 		assertLatestEventType(eventHistory, "EXCEPTION");
+		// F-RA2: the snapshot kind must be EXCEPTION with no BP id so the renderer can produce
+		// "via=exception" instead of echoing a stale breakpoint id from a previous BP hit.
+		BreakpointTracker.LastBreakpoint snapshot = tracker.getLastBreakpoint();
+		assertThat(snapshot).isNotNull();
+		assertThat(snapshot.kind()).isEqualTo(BreakpointTracker.EventKind.EXCEPTION);
+		assertThat(snapshot.id()).isNull();
 	}
 
 	@Test

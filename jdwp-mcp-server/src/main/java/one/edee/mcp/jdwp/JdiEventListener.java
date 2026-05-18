@@ -21,13 +21,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * server MUST consume every event the target VM emits — JDI blocks the target on a full event
  * queue, so this listener has to keep up.
  * <p>
- * Per-event behaviour:
- * - `BreakpointEvent` → record to {@link EventHistory}, update {@link BreakpointTracker#setLastBreakpointThread},
- * fire the resume-until-event latch, and KEEP the thread suspended (auto-resume only for logpoints
- * and false conditional breakpoints).
- * - `StepEvent` → delete the one-shot StepRequest (JDI requirement), record, fire the latch.
- * - `ExceptionEvent` → record with throw/catch metadata, set `lastBreakpointThread` with sentinel
- * BP id `-1`, fire the latch.
+ * Per-event behaviour (every suspending handler follows the order
+ * snapshot → history → latch so a concurrent reader observing the {@link EventHistory} tail
+ * never sees it ahead of {@link BreakpointTracker#getLastBreakpoint()}):
+ * - `BreakpointEvent` → publish snapshot via {@link BreakpointTracker#setLastBreakpointThread},
+ * record to {@link EventHistory}, fire the resume-until-event latch, and KEEP the thread suspended
+ * (auto-resume only for logpoints and false conditional breakpoints).
+ * - `StepEvent` → delete the one-shot StepRequest (JDI requirement), tag the snapshot via
+ * {@link BreakpointTracker#setLastSuspendingEvent} with {@link BreakpointTracker.EventKind#STEP}
+ * (the STEP snapshot inherits the prior BP id so watcher fallbacks still resolve), record, fire.
+ * - `ExceptionEvent` → tag the snapshot via {@link BreakpointTracker#setLastSuspendingEvent} with
+ * {@link BreakpointTracker.EventKind#EXCEPTION} (id null), record throw/catch metadata, fire.
  * - `ClassPrepareEvent` → promote pending line and exception breakpoints for the loaded class.
  * - `VMStartEvent` → keep the VM suspended so the user can finish wiring up breakpoints.
  * - `VMDisconnectEvent` / `VMDeathEvent` → record `VM_DEATH`, fire the resume-until-event latch so
@@ -484,6 +488,12 @@ public class JdiEventListener {
             final int lineNumber = event.location().lineNumber();
             final String threadName = event.thread().name();
 
+            // Consistent ordering across all three handlers (BP / STEP / EXCEPTION):
+            //   1. publish snapshot   2. record event-history entry   3. fire the latch
+            // A waiter woken by fireNextEvent then sees a snapshot/history pair that match,
+            // and an opportunistic reader that polls history-tail can't observe history
+            // ahead of snapshot. F-RA2: tag STEP explicitly so the renderer surfaces "via=step".
+            breakpointTracker.setLastSuspendingEvent(event.thread(), BreakpointTracker.EventKind.STEP);
             eventHistory.record(new EventHistory.DebugEvent("STEP",
                 String.format("Step to %s:%d on thread %s", className, lineNumber, threadName),
                 Map.of("class", className, "line", String.valueOf(lineNumber), "thread", threadName)));
@@ -571,14 +581,15 @@ public class JdiEventListener {
                 return false;
             }
 
-            breakpointTracker.setLastBreakpointThread(event.thread(), -1);
-            breakpointTracker.fireNextEvent();
-
+            // Consistent ordering: snapshot → history → latch (see handleStepEvent for the why).
+            // F-RA2: tag EXCEPTION explicitly so the renderer surfaces "via=exception".
+            breakpointTracker.setLastSuspendingEvent(event.thread(), BreakpointTracker.EventKind.EXCEPTION);
             eventHistory.record(new EventHistory.DebugEvent("EXCEPTION",
                 String.format("%s thrown at %s, caught at %s on thread %s",
                     exceptionType, throwInfo, catchInfo, threadName),
                 Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
                     "catchLocation", catchInfo, "thread", threadName)));
+            breakpointTracker.fireNextEvent();
 
             log.info("[JDI] Exception {} thrown at {}, caught at {} on thread {}",
                 exceptionType, throwInfo, catchInfo, threadName);
@@ -941,8 +952,7 @@ public class JdiEventListener {
      * Marks the pending line BP as failed in the registry AND records a {@code BP_PROMOTION_FAILED}
      * event in {@link EventHistory}. Without the event record, the failure is visible only by
      * inspecting {@code jdwp_overview} — agents driving {@code jdwp_resume_until_event} would see
-     * {@code [VM_DEATH]} without any indication that their BP was never going to fire. See P0-1
-     * in plans/audit-2026-05-17/VERDICTS.md.
+     * {@code [VM_DEATH]} without any indication that their BP was never going to fire.
      */
     private void recordPromotionFailure(int id, String className, int lineNumber, @Nullable String reason) {
         breakpointTracker.markPendingFailed(id, reason);

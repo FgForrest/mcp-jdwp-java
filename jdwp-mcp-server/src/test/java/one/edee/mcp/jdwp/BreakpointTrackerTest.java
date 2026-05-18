@@ -4,6 +4,8 @@ import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequestManager;
+import one.edee.mcp.jdwp.BreakpointTracker.EventKind;
+import one.edee.mcp.jdwp.BreakpointTracker.LastBreakpoint;
 import one.edee.mcp.jdwp.BreakpointTracker.PendingBreakpoint;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -285,6 +287,60 @@ class BreakpointTrackerTest {
 		void shouldReturnNullThreadByDefault() {
 			assertThat(tracker.getLastBreakpointThread()).isNull();
 			assertThat(tracker.getLastBreakpointId()).isNull();
+		}
+
+		@Test
+		void shouldDefaultLastBreakpointKindToBreakpointForTwoArgConstructor() {
+			ThreadReference mockThread = mock(ThreadReference.class);
+			tracker.setLastBreakpointThread(mockThread, 5);
+
+			LastBreakpoint snapshot = tracker.getLastBreakpoint();
+			assertThat(snapshot).isNotNull();
+			assertThat(snapshot.kind()).isEqualTo(EventKind.BREAKPOINT);
+			assertThat(snapshot.id()).isEqualTo(5);
+		}
+
+		@Test
+		void shouldAutoClassifyMinusOneSentinelAsExceptionKind() {
+			ThreadReference mockThread = mock(ThreadReference.class);
+			LastBreakpoint snapshot = new LastBreakpoint(mockThread, -1);
+
+			// The 2-arg back-compat constructor maps id=-1 → kind=EXCEPTION; the canonical
+			// constructor then normalises the id to null (EXCEPTION snapshots carry no BP id).
+			assertThat(snapshot.kind()).isEqualTo(EventKind.EXCEPTION);
+			assertThat(snapshot.id()).isNull();
+		}
+
+		@Test
+		void shouldDefaultKindToBreakpointWhenIdIsNull() {
+			ThreadReference mockThread = mock(ThreadReference.class);
+			LastBreakpoint snapshot = new LastBreakpoint(mockThread, null);
+
+			assertThat(snapshot.kind()).isEqualTo(EventKind.BREAKPOINT);
+		}
+
+		@Test
+		void shouldRecordStepKindViaSetLastSuspendingEvent() {
+			ThreadReference mockThread = mock(ThreadReference.class);
+			tracker.setLastSuspendingEvent(mockThread, EventKind.STEP);
+
+			LastBreakpoint snapshot = tracker.getLastBreakpoint();
+			assertThat(snapshot).isNotNull();
+			assertThat(snapshot.kind()).isEqualTo(EventKind.STEP);
+			assertThat(snapshot.id()).isNull();
+			assertThat(snapshot.thread()).isSameAs(mockThread);
+		}
+
+		@Test
+		void shouldRecordExceptionKindViaSetLastSuspendingEvent() {
+			ThreadReference mockThread = mock(ThreadReference.class);
+			tracker.setLastSuspendingEvent(mockThread, EventKind.EXCEPTION);
+
+			LastBreakpoint snapshot = tracker.getLastBreakpoint();
+			assertThat(snapshot).isNotNull();
+			assertThat(snapshot.kind()).isEqualTo(EventKind.EXCEPTION);
+			assertThat(snapshot.id()).isNull();
+			assertThat(snapshot.thread()).isSameAs(mockThread);
 		}
 	}
 

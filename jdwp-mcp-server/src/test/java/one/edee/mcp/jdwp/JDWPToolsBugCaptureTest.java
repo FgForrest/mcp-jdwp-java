@@ -217,4 +217,91 @@ class JDWPToolsBugCaptureTest {
 		assertThat(result).contains("name = <unavailable");
 		assertThat(result).contains("ObjectCollectedException");
 	}
+
+	/**
+	 * F-RA2: {@code jdwp_get_breakpoint_context} must render the snapshot kind explicitly after a
+	 * STEP landing. The snapshot carries {@code kind=STEP} and {@code id=null}, so the "Thread:"
+	 * line must surface {@code via=step} rather than a stale {@code breakpoint=N} echo of whatever
+	 * BP last fired on the thread.
+	 */
+	@Test
+	void shouldFormatBreakpointContextAfterStepWithoutStaleBpEcho() throws Exception {
+		final com.sun.jdi.ThreadReference thread = mock(com.sun.jdi.ThreadReference.class);
+		when(thread.name()).thenReturn("main");
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+
+		final com.sun.jdi.StackFrame frame = mock(com.sun.jdi.StackFrame.class);
+		when(thread.frames()).thenReturn(List.of(frame));
+		final com.sun.jdi.Location loc = mock(com.sun.jdi.Location.class);
+		final com.sun.jdi.ReferenceType decl = mock(com.sun.jdi.ReferenceType.class);
+		when(frame.location()).thenReturn(loc);
+		when(loc.declaringType()).thenReturn(decl);
+		when(decl.name()).thenReturn("com.example.User");
+		final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+		when(loc.method()).thenReturn(method);
+		when(method.name()).thenReturn("m");
+		when(loc.sourceName()).thenReturn("User.java");
+		when(loc.lineNumber()).thenReturn(20);
+		when(frame.thisObject()).thenReturn(null);
+		when(frame.visibleVariables()).thenReturn(List.of());
+		when(frame.getValues(List.of())).thenReturn(java.util.Map.of());
+
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(
+				thread, null, BreakpointTracker.EventKind.STEP));
+
+		final String result = tools.jdwp_get_breakpoint_context(5, false);
+
+		assertThat(result).contains("via=step");
+		assertThat(result).doesNotContain("breakpoint=");
+	}
+
+	/**
+	 * F-RA2: {@code jdwp_evaluate_watchers} called without an explicit {@code breakpointId} after
+	 * a STEP landing must still resolve watchers attached to the BP the user stepped FROM. The
+	 * tracker's STEP snapshot inherits the prior BP id so {@code getLastBreakpointId()} keeps
+	 * pointing at the original BP context; only the renderer surface ("via=step") suppresses the
+	 * id display. Without the inheritance, watchers silently stopped resolving after the first
+	 * step on the suspended thread.
+	 */
+	@Test
+	void shouldResolveWatchersAtStepLandingFromPreviousBp() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final com.sun.jdi.ThreadReference thread = mock(com.sun.jdi.ThreadReference.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(7L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.name()).thenReturn("main");
+		when(thread.frameCount()).thenReturn(2);
+		final com.sun.jdi.StackFrame frame = mock(com.sun.jdi.StackFrame.class);
+		final com.sun.jdi.Location loc = mock(com.sun.jdi.Location.class);
+		final com.sun.jdi.ReferenceType decl = mock(com.sun.jdi.ReferenceType.class);
+		when(thread.frame(0)).thenReturn(frame);
+		when(frame.location()).thenReturn(loc);
+		when(loc.declaringType()).thenReturn(decl);
+		when(decl.name()).thenReturn("com.example.Foo");
+		when(loc.lineNumber()).thenReturn(42);
+		// STEP-snapshot's id inherits the prior BP — see BreakpointTracker.setLastSuspendingEvent.
+		when(breakpointTracker.getLastBreakpointId()).thenReturn(11);
+		// A watcher exists on BP #11; the evaluator returns a value so the rendered output
+		// contains the watcher label, not the "No breakpoint ID available" fallback.
+		final one.edee.mcp.jdwp.watchers.Watcher watcher = mock(one.edee.mcp.jdwp.watchers.Watcher.class);
+		when(watcher.getId()).thenReturn("abcdef01-aaaa-bbbb-cccc-deadbeef0000");
+		when(watcher.getLabel()).thenReturn("trace-x");
+		when(watcher.getExpression()).thenReturn("x");
+		when(watcherManager.getWatchersForBreakpoint(11)).thenReturn(List.of(watcher));
+		final com.sun.jdi.IntegerValue intVal = mock(com.sun.jdi.IntegerValue.class);
+		when(intVal.intValue()).thenReturn(42);
+		when(evaluator.evaluate(org.mockito.ArgumentMatchers.eq(frame),
+			org.mockito.ArgumentMatchers.eq("x"),
+			org.mockito.ArgumentMatchers.anyMap())).thenReturn(intVal);
+
+		final String result = tools.jdwp_evaluate_watchers(7L, "current_frame", null);
+
+		assertThat(result).doesNotContain("No breakpoint ID available");
+		assertThat(result).contains("trace-x");
+		assertThat(result).contains("Breakpoint ID: 11");
+	}
 }

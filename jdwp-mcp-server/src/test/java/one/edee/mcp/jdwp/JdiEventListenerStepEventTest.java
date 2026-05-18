@@ -53,7 +53,7 @@ class JdiEventListenerStepEventTest {
 	}
 
 	@Test
-	@DisplayName("Normal step: STEP recorded, latch fired, StepRequest deleted")
+	@DisplayName("Normal step: STEP recorded, latch fired, StepRequest deleted, snapshot tagged STEP (F-RA2)")
 	void shouldRecordStepAndFireLatchAndDeleteRequest() throws Exception {
 		ThreadReference thread = mockThread("worker", 100L);
 		StepRequest stepRequest = mock(StepRequest.class);
@@ -76,6 +76,13 @@ class JdiEventListenerStepEventTest {
 		assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
 		// EventSet should NOT be resumed (step stays suspended)
 		verify(eventSet, never()).resume();
+		// F-RA2: snapshot must be tagged STEP (id null) so the "Event fired" renderer doesn't
+		// echo a stale breakpoint=N from whatever last suspended this thread.
+		final BreakpointTracker.LastBreakpoint snapshot = tracker.getLastBreakpoint();
+		assertThat(snapshot).isNotNull();
+		assertThat(snapshot.kind()).isEqualTo(BreakpointTracker.EventKind.STEP);
+		assertThat(snapshot.id()).isNull();
+		assertThat(snapshot.thread()).isSameAs(thread);
 	}
 
 	@Test

@@ -13,6 +13,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.net.ConnectException;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -188,5 +189,28 @@ class JDWPToolsAssertExpressionTest {
 		assertThat(out).startsWith("[VM_DEATH]");
 		assertThat(out).contains("jdwp_assert_expression");
 		assertThat(out).contains("jdwp_connect");
+	}
+
+	/**
+	 * F-RA1: an evaluator failure whose cause chain contains a {@link ConnectException}
+	 * (transport down) must be re-classified as VM death rather than rendered as a generic
+	 * {@code "Error: ..."} prefix. Without the cause-chain walk, the wrapper
+	 * {@link JdiEvaluationException} leaked through and the agent missed the re-attach hint.
+	 */
+	@Test
+	@DisplayName("F-RA1: surfaces wrapped SocketException as the canonical [VM_DEATH] hint")
+	void shouldSurfaceSocketExceptionAsCanonicalHint() throws Exception {
+		final ThreadReference thread = suspendedThread(1L);
+		final StackFrame frame = mock(StackFrame.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.frame(0)).thenReturn(frame);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap()))
+			.thenThrow(new JdiEvaluationException("eval failed", new ConnectException("Connection refused")));
+
+		final String out = tools.jdwp_assert_expression("x", "5", 1L, null);
+
+		assertThat(out).startsWith("[VM_DEATH]");
+		assertThat(out).contains("jdwp_assert_expression");
 	}
 }

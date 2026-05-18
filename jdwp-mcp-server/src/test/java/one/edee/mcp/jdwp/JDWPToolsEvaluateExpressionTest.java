@@ -11,6 +11,8 @@ import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+
+import java.net.ConnectException;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
@@ -201,6 +203,36 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(0)).thenReturn(frame);
 		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenThrow(new VMDisconnectedException("gone"));
+
+		final String result = tools.jdwp_evaluate_expression(1L, "x", null);
+
+		assertThat(result).startsWith("[VM_DEATH]");
+		assertThat(result).contains("jdwp_evaluate_expression");
+		assertThat(result).contains("jdwp_connect");
+		assertThat(result).contains("jdwp_wait_for_attach");
+	}
+
+	/**
+	 * F-RA1: a raw transport failure (SIGKILL of the target JVM) surfaces as a
+	 * {@link ConnectException} / {@link java.net.SocketException} wrapped in a
+	 * {@link JdiEvaluationException} — JDI never wraps it in
+	 * {@link VMDisconnectedException} when the socket dies between calls. The tool must
+	 * still land on the canonical {@code [VM_DEATH]} envelope so the agent's recovery
+	 * recipe ({@code jdwp_connect} / {@code jdwp_wait_for_attach}) is suggested instead
+	 * of an opaque {@code "Error evaluating expression: Connection refused"} message.
+	 */
+	@Test
+	@DisplayName("surfaces SocketException-in-cause-chain as the canonical [VM_DEATH] hint (F-RA1)")
+	void shouldSurfaceSocketExceptionAsCanonicalHint() throws Exception {
+		final ThreadReference thread = mock(ThreadReference.class);
+		final StackFrame frame = mock(StackFrame.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frame(0)).thenReturn(frame);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap()))
+			.thenThrow(new JdiEvaluationException("eval failed", new ConnectException("Connection refused")));
 
 		final String result = tools.jdwp_evaluate_expression(1L, "x", null);
 

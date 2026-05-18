@@ -115,10 +115,11 @@ public class BreakpointTracker {
     private final ConcurrentHashMap<Integer, PendingFieldBreakpoint> pendingFieldBreakpointsById = new ConcurrentHashMap<>();
 
     /**
-     * Atomic snapshot of the last suspending JDI event: the firing {@link ThreadReference} paired
-     * with the synthetic breakpoint ID (or {@code -1} sentinel for non-breakpoint events such as
-     * exceptions). Stored in a single volatile field so readers cannot observe a torn pair from
-     * two different writes. {@code null} until the first event lands or after a reset.
+     * Atomic snapshot of the last suspending JDI event: the firing {@link ThreadReference}, the
+     * {@link EventKind} that produced the suspension, and (for {@link EventKind#BREAKPOINT} and
+     * STEP-inherited contexts) the synthetic breakpoint id. Stored in a single volatile field
+     * so readers cannot observe a torn triple from two different writes. {@code null} until the
+     * first event lands or after a reset.
      */
     @Nullable
     private volatile LastBreakpoint lastBreakpoint;
@@ -144,8 +145,7 @@ public class BreakpointTracker {
      * the STEP fires while no latch is armed (or while a stale latch is in the slot), the flag
      * latches the fact that something happened, and {@link JDWPTools#jdwp_resume_until_event}
      * can return immediately based on {@link #lastBreakpoint} instead of issuing a second
-     * {@code vm.resume()} that would overshoot the suspended state. See P0-2/P0-3 in
-     * plans/audit-2026-05-17/VERDICTS.md.
+     * {@code vm.resume()} that would overshoot the suspended state.
      */
     private volatile boolean pendingFire = false;
 
@@ -1433,18 +1433,46 @@ public class BreakpointTracker {
     // ── Thread tracking ──
 
     /**
-     * Records which thread last fired a suspending event so {@link #getLastBreakpointThread} and
-     * `jdwp_get_current_thread` can resolve a default thread when none is supplied. Pass `-1` for
-     * `breakpointId` for non-breakpoint events (currently used by exception events).
+     * Records the thread + BP id of a {@link EventKind#BREAKPOINT} hit so
+     * {@link #getLastBreakpointThread} and {@code jdwp_get_current_thread} can resolve a default
+     * thread when none is supplied. Use {@link #setLastSuspendingEvent} for STEP / EXCEPTION
+     * events; the {@code -1} sentinel is preserved here only for back-compat with pre-{@link
+     * EventKind} callers and is auto-classified to {@link EventKind#EXCEPTION} (with the id
+     * normalised to {@code null}) by the {@link LastBreakpoint} compact constructor.
      * <p>
-     * Publishes the {@code (thread, id)} pair atomically via a single volatile reference so
-     * concurrent readers cannot observe a crossed pair (thread from event N with id from event N+1).
+     * Publishes the snapshot atomically via a single volatile reference so concurrent readers
+     * cannot observe a crossed pair (thread from event N with id from event N+1).
      *
-     * @param thread       the thread that hit the suspending event
-     * @param breakpointId synthetic breakpoint ID, or {@code -1} for non-breakpoint events
+     * @param thread       the thread that hit the BP
+     * @param breakpointId synthetic breakpoint ID
+     * @see #setLastSuspendingEvent(ThreadReference, EventKind)
      */
     public void setLastBreakpointThread(ThreadReference thread, int breakpointId) {
         this.lastBreakpoint = new LastBreakpoint(thread, breakpointId);
+    }
+
+    /**
+     * Kind-aware variant of {@link #setLastBreakpointThread(ThreadReference, int)}. Used by the
+     * JDI listener for STEP and EXCEPTION events so the renderer can label the suspension
+     * source ("via=step" / "via=exception") instead of echoing the last-hit BP id verbatim.
+     * <p>
+     * STEP snapshots <b>inherit</b> the previous snapshot's BP id when one exists. The renderer
+     * keys on {@link EventKind} (not on the id) when formatting the tag, so the inherited id is
+     * invisible in user-facing output — but {@link #getLastBreakpointId()} still resolves to the
+     * BP the user stepped FROM, which is the contract {@code jdwp_evaluate_watchers} relies on
+     * when no explicit breakpointId is supplied. EXCEPTION snapshots carry {@code id=null}
+     * because there is no associated BP context. Without the STEP id-inheritance, watchers
+     * attached to a BP silently stopped resolving after the first step on the suspended thread.
+     *
+     * @param thread the thread that hit the suspending event
+     * @param kind   the {@link EventKind} that produced the suspension (use the two-arg form for
+     *               {@link EventKind#BREAKPOINT})
+     * @see #setLastBreakpointThread(ThreadReference, int)
+     */
+    public void setLastSuspendingEvent(ThreadReference thread, EventKind kind) {
+        final LastBreakpoint prior = this.lastBreakpoint;
+        final Integer inheritedId = (kind == EventKind.STEP && prior != null) ? prior.id() : null;
+        this.lastBreakpoint = new LastBreakpoint(thread, inheritedId, kind);
     }
 
     /**
@@ -1545,11 +1573,55 @@ public class BreakpointTracker {
     }
 
     /**
-     * Immutable {@code (thread, id)} pair published atomically in {@link #lastBreakpoint}. Using a
-     * record means readers either see a complete pair from one write or no pair at all — never a
-     * crossed pair from two different writes.
+     * Classifies the JDI event behind a {@link LastBreakpoint} snapshot so the renderer can
+     * distinguish "thread is parked because BP #N fired" from "thread is parked because a step
+     * landed" or "…because an exception was thrown". Prior to F-RA2 every snapshot was implicitly
+     * {@link #BREAKPOINT} and a {@link #STEP} landing leaked the *previous* BP id into the
+     * "Event fired" line as a stale {@code breakpoint=N}.
      */
-    public record LastBreakpoint(ThreadReference thread, Integer id) {
+    public enum EventKind {
+        /** A line / field / conditional breakpoint hit. */
+        BREAKPOINT,
+        /** A {@code StepRequest} landed (step into / over / out). No BP id is associated. */
+        STEP,
+        /** An exception event matched a tracked filter. No BP id is associated. */
+        EXCEPTION
+    }
+
+    /**
+     * Immutable {@code (thread, id, kind)} triple published atomically in {@link #lastBreakpoint}.
+     * Using a record means readers either see a complete value from one write or no value at all
+     * — never a crossed triple from two different writes. The {@code id} is the synthetic
+     * breakpoint id when {@code kind == BREAKPOINT}; {@code null} for STEP / EXCEPTION snapshots.
+     *
+     * @param thread the thread that hit the suspending event
+     * @param id     synthetic BP id for {@link EventKind#BREAKPOINT}; inherited from the prior
+     *               snapshot for {@link EventKind#STEP}; always {@code null} for
+     *               {@link EventKind#EXCEPTION} (normalised by the canonical constructor)
+     * @param kind   the {@link EventKind} that produced the suspension
+     */
+    public record LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind) {
+        /**
+         * Canonical constructor. Normalises {@code (kind, id)} consistency: EXCEPTION snapshots
+         * always carry {@code id=null} because there is no associated BP context. BREAKPOINT and
+         * STEP can carry an id (BREAKPOINT for the BP that fired; STEP for the BP the user
+         * stepped FROM, inherited by {@link #setLastSuspendingEvent}).
+         */
+        public LastBreakpoint {
+            if (kind == EventKind.EXCEPTION) {
+                id = null;
+            }
+        }
+
+        /**
+         * Back-compat alternate constructor for callers (and existing tests) that predate
+         * {@link EventKind}. Implicit kind is {@link EventKind#BREAKPOINT}. A planted
+         * {@code id == -1} from the legacy exception sentinel is auto-upgraded to
+         * {@link EventKind#EXCEPTION} (the canonical constructor will then null the id).
+         */
+        public LastBreakpoint(ThreadReference thread, @Nullable Integer id) {
+            this(thread, id, id != null && id == -1 ? EventKind.EXCEPTION : EventKind.BREAKPOINT);
+        }
     }
 
     /**

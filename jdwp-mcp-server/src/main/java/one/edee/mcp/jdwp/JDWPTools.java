@@ -19,9 +19,11 @@ import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Service;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Modifier;
+import java.net.SocketException;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
@@ -636,10 +638,18 @@ public class JDWPTools {
     }
 
     /**
-     * Canonical {@code [VM_DEATH]} response for tools that hit a {@link VMDisconnectedException}
-     * mid-call. JDI throws this unchecked exception when the target VM dies during an in-flight
-     * operation (e.g. {@code invokeMethod}, expression evaluation). Surfacing it as a generic
-     * {@code "Error: ..."} loses the actionable hint that the cure is to re-attach.
+     * Canonical {@code [VM_DEATH]} response for <b>in-flight tool invocations</b>
+     * ({@code jdwp_to_string}, {@code jdwp_evaluate_expression}, {@code jdwp_assert_expression},
+     * {@code jdwp_evaluate_watchers}) that hit a transport-loss exception mid-call. Callers
+     * detect the condition via {@link #isVmGone(Throwable)} and route every flavour of
+     * disconnect (VMDisconnectedException, SocketException, "Connection refused" messages, ...)
+     * through this single envelope so the agent's recovery recipe is always discoverable.
+     * <p>
+     * Pair function {@link #vmGoneEnvelope(String, Throwable)} is the equivalent envelope for
+     * the {@code jdwp_resume_until_event} watchdog path. The two share semantics but encode the
+     * subtle distinction: {@code [VM_DEATH]} (this method) is what an in-flight tool returns when
+     * its invocation fails; {@code [VM_GONE]} is what the resume-waiter returns when the wait
+     * is cut short by the VM going away.
      */
     private static String vmDisconnectedMessage(String operation) {
         return "[VM_DEATH] target VM disconnected during " + operation
@@ -714,9 +724,10 @@ public class JDWPTools {
             }
             return String.format("Object #%d (%s).toString() = %s",
                 objectId, obj.referenceType().name(), formatValue(result));
-        } catch (VMDisconnectedException vmDead) {
-            return vmDisconnectedMessage("jdwp_to_string");
         } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmDisconnectedMessage("jdwp_to_string");
+            }
             return "Error invoking toString(): " + e.getMessage();
         }
     }
@@ -756,9 +767,10 @@ public class JDWPTools {
             // P3-5: echo the expression so the agent can attribute results when several evals are
             // batched in one turn ("Result of foo.bar(): 42" instead of just "Result: 42").
             return String.format("Result of %s: %s", expression, formatValue(result));
-        } catch (VMDisconnectedException vmDead) {
-            return vmDisconnectedMessage("jdwp_evaluate_expression");
         } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmDisconnectedMessage("jdwp_evaluate_expression");
+            }
             final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             final String enriched = enrichEvaluationError(msg, threadId, frameIndex);
             return "Error evaluating expression: " + enriched;
@@ -804,9 +816,10 @@ public class JDWPTools {
                 return String.format("OK — %s = %s", expression, actual);
             }
             return String.format("MISMATCH — %s\n  expected: %s\n  actual:   %s", expression, expected, actual);
-        } catch (VMDisconnectedException vmDead) {
-            return vmDisconnectedMessage("jdwp_assert_expression");
         } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmDisconnectedMessage("jdwp_assert_expression");
+            }
             return "Error: " + e.getMessage();
         }
     }
@@ -929,7 +942,6 @@ public class JDWPTools {
                 return "Event fired but no breakpoint thread recorded (this should not happen — check the listener logs).";
             }
             final ThreadReference thread = snapshot.thread();
-            final Integer bpId = snapshot.id();
             // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
             // line forced the agent to follow up with get_breakpoint_context just to learn which
             // line they landed on. Capturing it here saves one round-trip per BP hit.
@@ -945,11 +957,11 @@ public class JDWPTools {
                     // Best-effort enrichment — fall back to the bare line when frame() throws.
                 }
             }
-            final String base = String.format("Event fired%s. Thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
+            final String base = String.format("Event fired%s. Thread: %s (ID=%d, suspended=%s, frames=%d, %s)",
                 locationSuffix,
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 thread.isSuspended() ? thread.frameCount() : -1,
-                bpId);
+                formatEventTag(snapshot));
             if (vmDeathTail) {
                 return base + " (VM has since disconnected — this is the last captured breakpoint)";
             }
@@ -957,13 +969,14 @@ public class JDWPTools {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return "Wait interrupted";
-        } catch (VMDisconnectedException vmDead) {
-            return vmGoneEnvelope("jdwp_resume_until_event", vmDead);
         } catch (IllegalStateException disposed) {
             // JDIConnectionService.getVM() throws this when the VM has been disposed underneath us.
             // Treat it identically to a JDI-side disconnect — the user wants to re-attach either way.
             return vmGoneEnvelope("jdwp_resume_until_event", disposed);
         } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmGoneEnvelope("jdwp_resume_until_event", e);
+            }
             // Defensive: never let a null-message exception render as "Error: null" — the previous
             // behaviour confused agents into thinking the call had a literal "null" error. Always
             // include the exception class name so the cause is identifiable even with no message.
@@ -1000,11 +1013,124 @@ public class JDWPTools {
      * raw exception messages drift wildly across JDI implementations ("Connection refused",
      * "connection is closed", null, etc.) and the agent needs one stable string to recover on.
      */
+    /**
+     * Substrings observed on real JDI transport-loss messages across JDK versions and providers.
+     * Centralised so {@link #isVmGone(Throwable)} and {@link #vmGoneEnvelope(String, Throwable)}
+     * stay in lock-step — adding a new variant only requires editing this one array.
+     */
+    private static final String[] VM_GONE_MESSAGE_FRAGMENTS = {
+        "Connection refused",
+        "Connection reset",
+        "Connection closed by peer",
+        "Broken pipe",
+        "Pipe closed",
+        "closed by the remote host",
+        "handshake failed",
+        "Bad file descriptor"
+    };
+
+    /**
+     * Hard cap on how many cause-chain hops {@link #isVmGone(Throwable)} and
+     * {@link #vmGoneEnvelope(String, Throwable)} will follow. Bounded depth is the cheapest
+     * correct guard against length-≥2 cycles (A→B→A) that {@code Throwable(message, cause)}
+     * can construct by bypassing {@code initCause}'s self-reference check. Eight frames covers
+     * every JDI-wrap stack seen in the wild with margin.
+     */
+    private static final int MAX_CAUSE_DEPTH = 8;
+
+    /**
+     * Canonical {@code [VM_GONE]} response for the {@code jdwp_resume_until_event} watchdog when
+     * the wait is cut short by the target VM going away. Pair function of
+     * {@link #vmDisconnectedMessage(String)} (which serves in-flight tool invocations); both
+     * cover the same recovery recipe but encode the surface ("waiter cut short" vs "invocation
+     * failed") so an agent can tell at a glance whether the call had executed any work before
+     * the disconnect.
+     */
     private static String vmGoneEnvelope(String tool, Throwable cause) {
-        final String reason = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+        // Walk to the deepest matching transport cause so the rendered reason names the actual
+        // failure (e.g. "Connection refused") instead of an outer wrapper's generic message
+        // (e.g. "eval failed"). Mirrors the cause walk in isVmGone.
+        Throwable best = cause;
+        Throwable cur = cause;
+        for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
+            if (isTransportFailureFrame(cur)) {
+                best = cur;
+            }
+            final Throwable next = cur.getCause();
+            if (next == cur) break;
+            cur = next;
+        }
+        final String reason = best.getMessage() != null ? best.getMessage() : best.getClass().getSimpleName();
         return String.format("[VM_GONE] %s: target VM is no longer reachable (%s). "
             + "Run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach.",
             tool, reason);
+    }
+
+    /**
+     * Recognises every shape of "target VM is no longer reachable" that JDI can surface to a tool
+     * mid-call. Walks the cause chain because providers wrap transport failures inconsistently:
+     * sometimes as {@link VMDisconnectedException} (the canonical type), sometimes as a raw
+     * {@link SocketException} / {@link java.net.ConnectException} / {@link EOFException} bubbling
+     * out of the transport, and sometimes as a generic {@link IOException} whose message is the
+     * only clue. F-RA1: without this predicate, a {@code SIGKILL} of the target JVM surfaced as
+     * {@code "Error evaluating expression: Connection refused"} instead of the canonical
+     * {@code [VM_DEATH]} envelope, and the agent's recovery recipe was hidden.
+     * <p>
+     * A {@code true} answer means the caller should route through {@link #vmDisconnectedMessage}
+     * (in-flight tool invocations: to_string / evaluate_expression / assert_expression /
+     * evaluate_watchers) or {@link #vmGoneEnvelope} (the resume-until-event watchdog path).
+     * <p>
+     * Cause-chain traversal is depth-bounded by {@link #MAX_CAUSE_DEPTH} so a malformed
+     * length-≥2 cycle cannot livelock the catch handler.
+     */
+    private static boolean isVmGone(@Nullable Throwable t) {
+        Throwable cur = t;
+        for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
+            if (isTransportFailureFrame(cur)) {
+                return true;
+            }
+            final Throwable next = cur.getCause();
+            if (next == cur) {
+                return false;
+            }
+            cur = next;
+        }
+        return false;
+    }
+
+    /**
+     * Whether a single frame of a cause chain looks like a transport-loss signal. Class-based
+     * check first (cheapest, most specific), message-substring fallback second.
+     */
+    private static boolean isTransportFailureFrame(Throwable t) {
+        if (t instanceof VMDisconnectedException
+            || t instanceof SocketException
+            || t instanceof EOFException) {
+            return true;
+        }
+        final String msg = t.getMessage();
+        if (msg == null) return false;
+        for (String fragment : VM_GONE_MESSAGE_FRAGMENTS) {
+            if (msg.contains(fragment)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Renders the {@code (kind, id)} half of the "Event fired" / "Current thread" / "Breakpoint
+     * Context" headers. STEP and EXCEPTION snapshots show {@code via=step} / {@code via=exception}
+     * because the BP id on those snapshots either is null (EXCEPTION) or names the BP the user
+     * stepped FROM (STEP) — both would surface as a stale {@code breakpoint=N} echo at the new
+     * location. BREAKPOINT snapshots show the actual id. Centralised so the three renderers in
+     * {@code jdwp_resume_until_event}, {@code jdwp_get_current_thread}, and
+     * {@code jdwp_get_breakpoint_context} stay in lock-step.
+     */
+    private static String formatEventTag(BreakpointTracker.LastBreakpoint snapshot) {
+        return switch (snapshot.kind()) {
+            case STEP -> "via=step";
+            case EXCEPTION -> "via=exception";
+            case BREAKPOINT -> "breakpoint=" + snapshot.id();
+        };
     }
 
     @McpTool(description = "Read-only snapshot of the WHOLE world: (1) this MCP server's status, (2) the JDWP connection (or last-attempt error if disconnected), (3) local JVMs visible to the user with their JDWP ports — answering 'did my target JVM come up, and on which port?' without ps/lsof/jps. When connected, the existing breakpoint+events report continues to appear inside block #2. Run this first when something isn't working.")
@@ -3258,11 +3384,10 @@ public class JDWPTools {
                 return String.format("Thread %s (ID=%d) is no longer suspended.", thread.name(), thread.uniqueID());
             }
 
-            final Integer bpId = snapshot.id();
             final StringBuilder sb = new StringBuilder();
             sb.append("=== Breakpoint Context ===\n");
-            sb.append(String.format("Thread: %s (ID=%d, breakpoint=%s)\n\n",
-                thread.name(), thread.uniqueID(), bpId));
+            sb.append(String.format("Thread: %s (ID=%d, %s)\n\n",
+                thread.name(), thread.uniqueID(), formatEventTag(snapshot)));
 
             // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
             final List<StackFrame> frames = thread.frames();
@@ -3343,11 +3468,6 @@ public class JDWPTools {
                 return "No current breakpoint detected. Set a breakpoint and trigger it first.";
             }
             final ThreadReference thread = snapshot.thread();
-            final Integer bpId = snapshot.id();
-            // P1-7: render the synthetic exception sentinel (id = -1, planted by handleExceptionEvent)
-            // as a human-readable event tag instead of "breakpoint=-1". Same surface for the agent;
-            // none of the downstream tools key on the sentinel value.
-            final String bpDisplay = bpId != null && bpId == -1 ? "event=EXCEPTION" : "breakpoint=" + bpId;
             // P1-8: when the thread is RUNNING but a snapshot exists, the captured BP id is stale —
             // it points at the LAST place the thread suspended, which the thread has since moved
             // past. Annotate so the agent doesn't mistake "snapshot exists" for "thread is parked".
@@ -3356,7 +3476,7 @@ public class JDWPTools {
             return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s",
                 thread.name(), thread.uniqueID(), suspended,
                 suspended ? String.valueOf(thread.frameCount()) : "N/A",
-                bpDisplay, staleNote);
+                formatEventTag(snapshot), staleNote);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3510,9 +3630,10 @@ public class JDWPTools {
 
             return result.toString();
 
-        } catch (VMDisconnectedException vmDead) {
-            return vmDisconnectedMessage("jdwp_evaluate_watchers");
         } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmDisconnectedMessage("jdwp_evaluate_watchers");
+            }
             log.error("[Watcher] Error evaluating watchers", e);
             return "Error: " + e.getMessage();
         }
@@ -3536,7 +3657,6 @@ public class JDWPTools {
         // this reference inside the per-watcher loop. JDI invalidates every StackFrame on the
         // thread the moment invokeMethod returns, so a reused frame would throw
         // InvalidStackFrameException("Thread has been resumed") on every watcher after the first.
-        // See P0-5 in plans/audit-2026-05-17/VERDICTS.md.
         final Location location = thread.frame(0).location();
         int succeeded = 0;
         int errored = 0;

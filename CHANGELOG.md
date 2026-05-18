@@ -5,7 +5,89 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.1.0] — 2026-05-18
+
+### Fixed — output clarity and error envelopes (audit follow-ups)
+
+A re-audit caught two leaks in the prior audit fix bundle plus a handful of
+medium-severity polish items.
+
+- **`jdwp_get_breakpoint_context` now uses the kind-aware event tag** —
+  previously it still formatted `breakpoint=null` after a STEP or
+  EXCEPTION snapshot (the F-RA2 sweep missed this third renderer).
+- **`jdwp_evaluate_watchers` after STEP** — the STEP snapshot now
+  inherits the BP id it stepped FROM, so watchers attached to that BP
+  resolve at the step landing instead of silently emitting
+  `No breakpoint ID available`.
+- **Transport-loss exceptions now land on `[VM_DEATH]` / `[VM_GONE]`** —
+  `SIGKILL` of the target JVM used to surface as
+  `Error evaluating expression: Connection refused` (raw `IOException`).
+  A new `isVmGone(Throwable)` predicate walks the cause chain matching
+  `VMDisconnectedException`, `SocketException`, `EOFException`, plus
+  observed message fragments (`Connection refused`, `Connection reset`,
+  `Connection closed by peer`, `Broken pipe`, `Pipe closed`,
+  `closed by the remote host`, `handshake failed`,
+  `Bad file descriptor`). Walk is depth-bounded to defeat cause-chain
+  cycles. `vmGoneEnvelope` walks to the deepest matching cause so the
+  rendered reason names the actual transport failure instead of an outer
+  wrapper's generic message.
+- **STEP / EXCEPTION tag instead of stale `breakpoint=N`** — three
+  renderers (`jdwp_resume_until_event`, `jdwp_get_current_thread`,
+  `jdwp_get_breakpoint_context`) now show `via=step` / `via=exception`
+  for STEP and EXCEPTION snapshots. BP snapshots keep `breakpoint=N`.
+
+### Fixed — earlier audit bundle (already shipped in code; documenting here)
+
+The fix bundle landed in code via the prior audit pass. Summary for the
+release notes:
+
+- Re-fetch `StackFrame` per watcher iteration so two watchers on one BP
+  no longer crash the second with `InvalidStackFrameException`.
+- `evaluate_expression` / `assert_expression` now thread marked-instance
+  bindings so `$mark` identifiers resolve.
+- Field watchpoint events bind `$oldValue` / `$newValue` / `$object`
+  unconditionally — null-valued fields are observable.
+- `BP_PROMOTION_FAILED` event recorded + surfaced inside `[VM_DEATH]`
+  so deferred BPs on comment / blank lines report the failure to the
+  agent instead of going dark.
+- `resume_until_event` short-circuits via a `pendingFire` flag so a
+  `step → otherTool → resume_until_event` sequence does not lose the
+  STEP signal or overshoot the suspended state.
+- `jdwp_attach_watcher` rejects unknown BP ids with an `[ERROR]`
+  envelope instead of silently registering an inert watcher.
+- `jdwp_diagnose` suppresses the disconnected `[DIAGNOSTIC]` block and
+  filters the MCP server's own PID out of the JVM list.
+
+### Output token savings
+
+Output formats tightened so common turns spend fewer tokens:
+
+- `jdwp_get_threads` defaults to a compact one-line-per-thread table
+  (~25 lines for a 200-thread Tomcat vs ~1000 lines verbose); pass
+  `verbose=true` for the legacy block format.
+- `jdwp_overview` hides empty category headers by default; pass
+  `showEmpty=true` to restore them.
+- `jdwp_attach_watcher`, `jdwp_get_version`, empty `jdwp_get_events`,
+  and empty `jdwp_reset` collapsed to one-line responses.
+- `jdwp_diagnose` filters disconnected JVMs from the local-JVM list
+  when a connection is live.
+
+### Output gaps closed
+
+- `jdwp_resume_until_event` includes `at Class:line` in the "Event
+  fired" line — saves one round-trip per hit.
+- `jdwp_step_*` responses include the start location so the agent can
+  see where the step originated.
+- `jdwp_evaluate_expression` echoes the expression
+  (`Result of <expr>: <value>`) so several batched evals can be
+  attributed.
+- `jdwp_to_string` flags the default `Object.toString` form
+  (`ClassName@hexhash`) so the agent knows to use `jdwp_get_fields`
+  instead of trusting the string.
+- `jdwp_wait_for_attach` success points at `jdwp_resume_until_event` as
+  the next call.
+- `jdwp_mark_instance` lists the tools that accept `$label` identifiers
+  in its success footer.
 
 ### New — marked instances
 

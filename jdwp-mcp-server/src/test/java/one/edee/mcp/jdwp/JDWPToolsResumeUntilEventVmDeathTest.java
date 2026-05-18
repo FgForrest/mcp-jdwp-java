@@ -10,6 +10,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.net.SocketException;
 import java.util.concurrent.CountDownLatch;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -368,6 +369,107 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(result).startsWith("Event fired.");
 		org.mockito.Mockito.verify(vm).resume();
 		org.mockito.Mockito.verify(breakpointTracker).armNextEventLatch();
+	}
+
+	/**
+	 * F-RA2: after a step landing, the snapshot kind is {@code STEP} and the renderer must
+	 * surface "via=step" instead of echoing the stale last-hit breakpoint id. The previous
+	 * "breakpoint=N" rendering misled agents into thinking BP #N had re-fired at the step
+	 * target line, when in reality the BP was the *previous* suspension that the step ran
+	 * away from.
+	 */
+	@Test
+	@DisplayName("F-RA2: step landing renders 'via=step' instead of stale 'breakpoint=N'")
+	void shouldRenderStepKindAsViaStep() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+		eventHistory.record(new EventHistory.DebugEvent("STEP", "Step to Foo:42"));
+
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.name()).thenReturn("main");
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frameCount()).thenReturn(3);
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(
+				thread, null, BreakpointTracker.EventKind.STEP));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("Event fired");
+		assertThat(result).contains("via=step");
+		assertThat(result).doesNotContain("breakpoint=");
+	}
+
+	/**
+	 * F-RA2: exception events similarly render as "via=exception". This subsumes the older
+	 * P1-7 sentinel that planted {@code id = -1} and special-cased it in the renderer —
+	 * the new {@link BreakpointTracker.EventKind#EXCEPTION} kind carries the same information
+	 * cleanly. The id-sentinel path is still tolerated by the renderer for back-compat.
+	 */
+	@Test
+	@DisplayName("F-RA2: exception event renders 'via=exception'")
+	void shouldRenderExceptionKindAsViaException() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+		eventHistory.record(new EventHistory.DebugEvent("EXCEPTION", "NPE at Foo:42"));
+
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.name()).thenReturn("worker");
+		when(thread.uniqueID()).thenReturn(2L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frameCount()).thenReturn(5);
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(
+				thread, null, BreakpointTracker.EventKind.EXCEPTION));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).contains("via=exception");
+		assertThat(result).doesNotContain("breakpoint=");
+	}
+
+	/**
+	 * F-RA1: a raw {@link SocketException} thrown straight out of {@code getVM()} (transport
+	 * down before JDI wraps it) must be classified by {@code isVmGone} as VM death and routed
+	 * through the {@code [VM_GONE]} envelope, not the generic {@code "Error in ..."} prefix.
+	 */
+	@Test
+	@DisplayName("F-RA1: SocketException routes through [VM_GONE] envelope")
+	void shouldRouteSocketExceptionThroughVmGoneEnvelope() throws Exception {
+		when(jdiService.getVM()).thenThrow(new SocketException("Connection refused"));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_GONE]");
+		assertThat(result).contains("jdwp_resume_until_event");
+		assertThat(result).contains("jdwp_connect");
+	}
+
+	/**
+	 * F-RA1: when the transport message {@code "closed by the remote host"} is buried inside a
+	 * cause chain, the message-substring fallback inside {@code isVmGone} must still classify
+	 * the failure as VM death.
+	 */
+	@Test
+	@DisplayName("F-RA1: wrapped 'closed by the remote host' routes through [VM_GONE] envelope")
+	void shouldRouteWrappedClosedByRemoteHostThroughVmGoneEnvelope() throws Exception {
+		when(jdiService.getVM())
+			.thenThrow(new RuntimeException("wrapper",
+				new RuntimeException("An existing connection was forcibly closed by the remote host")));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_GONE]");
+		assertThat(result).contains("jdwp_resume_until_event");
 	}
 
 	@Test
