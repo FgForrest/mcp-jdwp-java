@@ -5,6 +5,25 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] — 2026-05-18
+
+### Fixed — log file no longer dirties the user's working directory
+
+The `mcp-jdwp-inspector.log` file used to land in whatever directory Claude
+Code was launched from (typically the user's project root), because the
+logback `FileAppender` resolved a relative path against CWD.
+
+- **`.mcp.json` now passes `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log`**
+  so plugin-launched runs write the log next to the plugin install. Logback
+  creates the `logs/` subdirectory automatically.
+- **`logback-spring.xml` fallback changed from CWD to `${java.io.tmpdir}`** —
+  bare `java -jar` runs (tests, dev, debugging the server itself) now land
+  the log in the OS temp dir instead of polluting CWD when `LOG_PATH` is
+  unset.
+
+`application.properties` documents the wiring so future readers know where
+the log lives and why.
+
 ## [2.1.0] — 2026-05-18
 
 ### Fixed — output clarity and error envelopes (audit follow-ups)

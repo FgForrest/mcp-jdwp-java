@@ -2,7 +2,11 @@
   "mcpServers": {
     "jdwp-inspector": {
       "command": "java",
-      "args": ["--add-modules", "jdk.jdi,jdk.attach", "-jar", "${CLAUDE_PLUGIN_ROOT}/jdwp-mcp-server/target/mcp-jdwp-java.jar"],
+      "args": [
+        "--add-modules", "jdk.jdi,jdk.attach",
+        "-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log",
+        "-jar", "${CLAUDE_PLUGIN_ROOT}/jdwp-mcp-server/target/mcp-jdwp-java.jar"
+      ],
       "env": {
         "MCP_TIMEOUT": "30000",
         "MCP_TOOL_TIMEOUT": "120000"
