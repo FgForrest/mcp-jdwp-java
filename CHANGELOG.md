@@ -5,6 +5,33 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.10.1] — 2026-07-11
+
+### Fixed — locals survive missing debug info, and attach/error messages stop lying
+
+Two diagnostics defects predating 2.10.0, found while revalidating the 2.10.0 fixes.
+`jdwp_get_locals` returned the opaque `Error: null` — discarding even the `this`
+receiver it had already resolved — whenever the current method was compiled without a
+local-variable table (`-g:vars`), because the underlying `AbsentInformationException`
+carries no message. Separately, `jdwp_wait_for_attach` labelled an already-connected
+session as "suspended at VM_START", which is actively misleading after a same-port
+target restart, where the fast-path can hand back a stale handle.
+
+- **`jdwp_get_locals` degrades gracefully** — a missing `LocalVariableTable` now keeps
+  the `this` line and appends a frame-tailored hint (instance frames point at the
+  receiver and `jdwp_get_fields`; static frames say there is no receiver) instead of
+  replacing the whole response with `Error: null`.
+- **No more `Error: null` or bare `Error:`** — tool error replies now fall back to the
+  exception's simple class name when the detail message is null or blank (~35 catch
+  sites across `JDWPTools` and `JDIConnectionService`).
+- **`jdwp_wait_for_attach` is honest about already-connected sessions** — the
+  `VM_START` guidance is emitted only on a genuine fresh attach; a pre-existing session
+  is described as such and points at `jdwp_diagnose` / `jdwp_disconnect` for the
+  same-port-restart recovery path.
+
+Follow-up defects tracked in #36; the two deferred items there (attach PID-identity
+race, off-classpath expression-eval diagnostics) remain open.
+
 ## [2.10.0] — 2026-07-11
 
 ### Fixed — exception breakpoints no longer NPE, and broken conditions fail loud
