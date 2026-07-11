@@ -70,6 +70,34 @@ class JDWPToolsSetExceptionLogpointTest {
 		verify(jdiService, never()).getVM();
 	}
 
+	/**
+	 * Canary — see {@code JDWPToolsSetExceptionBreakpointTest} for the full rationale: the class
+	 * argument MUST reflect as {@code className} so it stays consistent with the sibling breakpoint
+	 * tools and binds from the MCP schema instead of dropping to null.
+	 */
+	@Test
+	@DisplayName("exposes its class parameter as 'className' (schema binding contract)")
+	void shouldExposeClassParameterAsClassName() throws Exception {
+		final java.lang.reflect.Parameter first = JDWPTools.class
+			.getMethod("jdwp_set_exception_logpoint",
+				String.class, String.class, String.class, Boolean.class, Boolean.class,
+				Integer.class, Boolean.class, Boolean.class)
+			.getParameters()[0];
+
+		assertThat(first.getName()).isEqualTo("className");
+	}
+
+	@Test
+	@DisplayName("rejects a null class name even with a valid expression, and never touches the VM")
+	void shouldRejectNullClassName() throws Exception {
+		final String result = tools.jdwp_set_exception_logpoint(
+			null, "$exception", null, null, null, null, null, null);
+
+		assertThat(result).startsWith("Error:").contains("required");
+		verify(jdiService, never()).getVM();
+		assertThat(tracker.getAllPendingExceptionBreakpoints()).isEmpty();
+	}
+
 	@Test
 	@DisplayName("active path — renders log-only mode and the expression in the response")
 	void shouldRenderLogOnlyModeAndExpression() throws Exception {

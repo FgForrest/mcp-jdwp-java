@@ -494,8 +494,10 @@ public class JdiEventListener {
             final String logpointExpr = breakpointTracker.getLogpointExpression(bpId);
             final String condition = breakpointTracker.getCondition(bpId);
 
+            final String conditionLocation = className + ':' + lineNumber;
+
             if (logpointExpr != null) {
-                if (condition != null && !evaluateCondition(event, condition)) {
+                if (condition != null && !evaluateCondition(event, condition, bpId, conditionLocation)) {
                     log.debug("[JDI] Conditional logpoint {} at {}:{} — condition false, skipping",
                         bpId, className, lineNumber);
                     // Condition-false is not a meaningful hit, so the chain trigger does not propagate.
@@ -507,7 +509,7 @@ public class JdiEventListener {
             }
 
             if (condition != null) {
-                final boolean conditionResult = evaluateCondition(event, condition);
+                final boolean conditionResult = evaluateCondition(event, condition, bpId, conditionLocation);
                 if (!conditionResult) {
                     log.debug("[JDI] Conditional breakpoint {} at {}:{} — condition false, resuming",
                         bpId, className, lineNumber);
@@ -652,8 +654,9 @@ public class JdiEventListener {
             if (info != null && info.isLogOnly()) {
                 final String condition = firingId != null
                     ? breakpointTracker.getCondition(firingId) : null;
-                if (condition != null && !evaluateConditionWithBindings(
-                        event.thread(), condition, Map.of("$exception", exception))) {
+                if (condition != null && firingId != null && !evaluateConditionWithBindings(
+                        event.thread(), condition, Map.of("$exception", exception),
+                        firingId, exceptionType)) {
                     // Condition false — skip the log AND chain effects. Same rationale as the
                     // line-BP path: a skipped condition is not a meaningful trigger.
                     log.debug("[JDI] Exception logpoint {} condition false, skipping", firingId);
@@ -827,7 +830,8 @@ public class JdiEventListener {
             }
 
             final String condition = breakpointTracker.getCondition(bpId);
-            if (condition != null && !evaluateConditionWithBindings(event.thread(), condition, bindings)) {
+            if (condition != null && !evaluateConditionWithBindings(event.thread(), condition, bindings,
+                    bpId, className + '.' + fieldName)) {
                 log.debug("[JDI] Field BP {} condition false, skipping", bpId);
                 // Condition-false is not a meaningful hit — chain trigger does not propagate.
                 return false;
@@ -1011,8 +1015,9 @@ public class JdiEventListener {
      * Delegates to {@link #evaluateConditionWithBindings} — kept as a narrow entry point for the
      * line-BP path where {@code $exception} / field-event bindings are not in scope.
      */
-    private boolean evaluateCondition(BreakpointEvent event, String condition) {
-        return evaluateConditionWithBindings(event.thread(), condition, Map.of());
+    private boolean evaluateCondition(BreakpointEvent event, String condition,
+                                      int breakpointId, String location) {
+        return evaluateConditionWithBindings(event.thread(), condition, Map.of(), breakpointId, location);
     }
 
     /**
@@ -1023,9 +1028,20 @@ public class JdiEventListener {
      * investigate the problem rather than silently skipping it. Recognises both primitive
      * {@link BooleanValue} and the boxed {@code java.lang.Boolean} returned via the wrapper class's
      * {@code (Object)(...)} autoboxing cast.
+     *
+     * <p>Fail-open is not the same as fail-silent: a condition that a private-field reference
+     * cannot compile must not masquerade as an always-true filter. On any evaluation failure this
+     * method records a {@code CONDITION_ERROR} event (via {@link #recordConditionError}) BEFORE
+     * returning {@code true}, so an agent driving {@code jdwp_resume_until_event} can see that its
+     * condition never filtered anything instead of silently believing it did.
+     *
+     * @param breakpointId the synthetic ID of the firing breakpoint, for the error event
+     * @param location     a human-readable firing location ({@code Class:line} or exception type),
+     *                     for the error event
      */
     private boolean evaluateConditionWithBindings(ThreadReference thread, String condition,
-                                                  Map<String, Value> extraBindings) {
+                                                  Map<String, Value> extraBindings,
+                                                  int breakpointId, String location) {
         try {
             expressionEvaluator.configureCompilerClasspath(thread);
             final StackFrame frame = thread.frame(0);
@@ -1048,12 +1064,32 @@ public class JdiEventListener {
                 }
             }
 
-            log.warn("[JDI] Condition '{}' returned non-boolean: {}. Suspending.", condition, result);
+            recordConditionError(breakpointId, location, condition,
+                "condition returned a non-boolean value: " + result);
             return true;
         } catch (Exception e) {
-            log.warn("[JDI] Error evaluating condition '{}': {}. Suspending.", condition, e.getMessage());
+            recordConditionError(breakpointId, location, condition,
+                e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
             return true;
         }
+    }
+
+    /**
+     * Records a {@code CONDITION_ERROR} event for a breakpoint condition that failed to evaluate
+     * (compile failure, thrown exception, or non-boolean result). The firing thread stays suspended
+     * (fail-open), but the event makes that decision loud: it states plainly that the condition did
+     * NOT filter the hit, so the agent does not mistake an always-suspending BP for a working filter.
+     */
+    private void recordConditionError(int breakpointId, String location, String condition, String cause) {
+        eventHistory.record(new EventHistory.DebugEvent("CONDITION_ERROR",
+            String.format("Breakpoint #%d condition failed to evaluate at %s — SUSPENDING (fail-open); "
+                + "the condition did NOT filter this hit. Cause: %s", breakpointId, location, cause),
+            Map.of("breakpointId", String.valueOf(breakpointId),
+                "location", location,
+                "condition", condition,
+                "error", cause)));
+        log.warn("[JDI] Breakpoint {} condition '{}' failed to evaluate at {}: {}. Suspending (fail-open).",
+            breakpointId, condition, location, cause);
     }
 
     /**
