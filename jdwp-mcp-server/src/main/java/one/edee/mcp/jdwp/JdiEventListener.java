@@ -1075,21 +1075,24 @@ public class JdiEventListener {
     }
 
     /**
-     * Records a {@code CONDITION_ERROR} event for a breakpoint condition that failed to evaluate
-     * (compile failure, thrown exception, or non-boolean result). The firing thread stays suspended
-     * (fail-open), but the event makes that decision loud: it states plainly that the condition did
-     * NOT filter the hit, so the agent does not mistake an always-suspending BP for a working filter.
+     * Records a {@code CONDITION_ERROR} event for a condition that failed to evaluate (compile
+     * failure, thrown exception, or non-boolean result). The event makes the fail-open decision
+     * loud: the hit is treated as UNFILTERED — processed as though the condition passed — so the
+     * agent does not mistake a broken condition for a working filter. What "processed" means depends
+     * on the tool the condition is attached to (a suspending breakpoint stays stopped; a logpoint /
+     * field-logpoint records its log and auto-resumes), so the wording here is deliberately
+     * mode-neutral rather than claiming the thread suspended.
      */
     private void recordConditionError(int breakpointId, String location, String condition, String cause) {
         eventHistory.record(new EventHistory.DebugEvent("CONDITION_ERROR",
-            String.format("Breakpoint #%d condition failed to evaluate at %s — SUSPENDING (fail-open); "
-                + "the condition did NOT filter this hit. Cause: %s", breakpointId, location, cause),
+            String.format("Condition for #%d failed to evaluate at %s — treated as UNFILTERED "
+                + "(hit NOT skipped). Cause: %s", breakpointId, location, cause),
             Map.of("breakpointId", String.valueOf(breakpointId),
                 "location", location,
                 "condition", condition,
                 "error", cause)));
-        log.warn("[JDI] Breakpoint {} condition '{}' failed to evaluate at {}: {}. Suspending (fail-open).",
-            breakpointId, condition, location, cause);
+        log.warn("[JDI] Condition for #{} failed to evaluate at {}: '{}' — {}. Treating as unfiltered (hit not skipped).",
+            breakpointId, location, condition, cause);
     }
 
     /**
