@@ -26,7 +26,7 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * Documented event type strings (exhaustive for production code — keep in sync; tests may record
  * ad-hoc types that are intentionally not listed here): `BREAKPOINT`, `BREAKPOINT_SUPPRESSED`, `STEP`, `STEP_SUPPRESSED`,
  * `EXCEPTION`, `EXCEPTION_SUPPRESSED`, `EXCEPTION_LOG`, `EXCEPTION_LOG_ERROR`, `LOGPOINT`,
- * `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
+ * `LOGPOINT_ERROR`, `CONDITION_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
  * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`,
  * `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`, `RECONNECT`, `VM_START`, `VM_DEATH`.
  * These are the keys clients can grep on or filter by.

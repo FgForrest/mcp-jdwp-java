@@ -2940,14 +2940,14 @@ public class JDWPTools {
         "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
         "running `<clinit>` in the target VM.")
     public String jdwp_set_exception_breakpoint(
-        @McpToolParam(description = "Exception class name (e.g., 'java.lang.NullPointerException', 'java.lang.Exception' for all)") String exceptionClass,
+        @McpToolParam(description = "Fully-qualified exception class name (e.g., 'java.lang.NullPointerException', 'java.lang.Exception' for all)") String className,
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced (ClassPrepareEvent is not delivered for bootstrap classes, so the deferred path will never activate).") @Nullable Boolean forceLoad) {
         return registerExceptionBreakpointInternal(
-            exceptionClass, caught, uncaught,
+            className, caught, uncaught,
             /* expression */ null, /* condition */ null,
             triggerBreakpointId, oneShot, forceLoad);
     }
@@ -2964,7 +2964,7 @@ public class JDWPTools {
         "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
         "running `<clinit>` in the target VM.")
     public String jdwp_set_exception_logpoint(
-        @McpToolParam(description = "Exception class name (e.g., 'java.sql.SQLException')") String exceptionClass,
+        @McpToolParam(description = "Fully-qualified exception class name (e.g., 'java.sql.SQLException')") String className,
         @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object — supports `{ ...; return X; }` block syntax") String expression,
         @McpToolParam(required = false, description = "Optional condition with $exception bound — only log when this evaluates to true — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Log caught exceptions (default: true)") @Nullable Boolean caught,
@@ -2977,7 +2977,7 @@ public class JDWPTools {
                 + "Use jdwp_set_exception_breakpoint for a suspending exception BP without expression evaluation.";
         }
         return registerExceptionBreakpointInternal(
-            exceptionClass, caught, uncaught,
+            className, caught, uncaught,
             expression, condition,
             triggerBreakpointId, oneShot, forceLoad);
     }
@@ -2999,6 +2999,15 @@ public class JDWPTools {
         @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot,
         @Nullable Boolean forceLoad) {
         try {
+            // Fail loud on a missing class name BEFORE any registry / VM work. A null slips through
+            // when the MCP client sends the argument under a different key (the sibling breakpoint
+            // tools use `className`); left unguarded it reaches hasClassPrepareRequest(null) →
+            // ConcurrentHashMap.containsKey(null), which NPEs with the opaque "key is null" and
+            // leaves a null-named pending entry behind.
+            if (exceptionClass == null || exceptionClass.isBlank()) {
+                return "Error: className is required — pass the fully-qualified exception class name "
+                    + "(e.g. 'java.lang.IllegalStateException').";
+            }
             final boolean effectiveCaught = caught == null || caught;
             final boolean effectiveUncaught = uncaught == null || uncaught;
             if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {

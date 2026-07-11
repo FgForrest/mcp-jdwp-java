@@ -5,6 +5,45 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.10.0] — 2026-07-11
+
+### Fixed — exception breakpoints no longer NPE, and broken conditions fail loud
+
+`jdwp_set_exception_breakpoint` and `jdwp_set_exception_logpoint` could fail with
+the opaque `Cannot invoke "Object.hashCode()" because "key" is null` and leave
+null-named pending entries behind — whenever the exception class name arrived
+`null`. A null class took the deferred "class not loaded" path and then reached
+`ConcurrentHashMap.containsKey(null)`. The class argument now short-circuits with a
+clear error before any registry or VM work, and — see Breaking below — the tools
+accept the class under the same `className` parameter the other breakpoint tools
+use, so a client that reuses `className` everywhere binds correctly instead of
+dropping the value to `null`. Resolves #34.
+
+Separately, a breakpoint / logpoint / field-watchpoint **condition** that failed to
+compile or threw at runtime used to suspend on every hit while only logging
+server-side — so an agent could believe it was filtering when it was not (most
+often a private-field reference, which the bare-field auto-rewrite cannot touch).
+Such failures now record a `CONDITION_ERROR` event, making the fall-open decision
+visible in `jdwp_get_events` / `jdwp_resume_until_event`.
+
+- **Fail-fast class guard** — a null or blank class name returns
+  `Error: className is required …` instead of an NPE, leaving the breakpoint
+  registry untouched.
+- **Loud, not silent, fail-open** — conditions still suspend on evaluation failure
+  (so nothing is missed), but each failure emits a `CONDITION_ERROR` event naming
+  the breakpoint, location, condition, and cause. The `java-debug` skill now
+  documents the `getDeclaredField` / `setAccessible` block-form workaround for
+  private-field conditions.
+
+### Breaking — exception-tool class parameter renamed to `className`
+
+`jdwp_set_exception_breakpoint` and `jdwp_set_exception_logpoint` previously named
+their class argument `exceptionClass`; it is now `className`, consistent with
+`jdwp_set_breakpoint` and `jdwp_set_field_breakpoint`. Clients that read the tool
+schema on each call (all LLM-driven clients) adapt automatically; only a caller
+hard-coded to send `exceptionClass=` needs updating. This naming inconsistency was
+the root cause of the null-class NPE fixed above.
+
 ## [2.9.0] — 2026-05-28
 
 ### New — expression evaluation resolves types the remote classpath can't see

@@ -172,6 +172,9 @@ Test fails at one input, passes at another. Stepping through every iteration is 
 **Approach C — conditional logpoint (best of both):**
 `jdwp_set_logpoint("MyClass", 42, "\"i=\" + i + \" v=\" + value", condition="value < 0")` — logs only when the suspicious shape appears.
 
+**When a condition fails to compile or throws, it does not filter — the hit is processed as if the condition had passed (a suspending BP stops; a logpoint records its log and auto-resumes) and a `CONDITION_ERROR` event is recorded.** If you see `CONDITION_ERROR` in `jdwp_get_events`, the condition isn't doing what you think — fix it rather than trusting the hits. The most common cause is a **private field** of `this`: the bare-field auto-rewrite is skipped for non-public fields, so `condition="myPrivateFlag == false"` won't compile. Use the block-form reflection instead:
+`condition="{ java.lang.reflect.Field f = this.getClass().getDeclaredField(\"myPrivateFlag\"); f.setAccessible(true); return f.getBoolean(this) == false; }"`
+
 ### "Trace many call sites without stopping"
 
 A value gets set in many places and you want to know which write produced the bad value.
