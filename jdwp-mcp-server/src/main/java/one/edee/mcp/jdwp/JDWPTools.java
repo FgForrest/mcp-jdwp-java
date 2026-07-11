@@ -411,6 +411,19 @@ public class JDWPTools {
             attempts++;
             try {
                 final String result = jdiService.connect(resolvedHost, resolvedPort);
+                // connect()'s "Already connected" fast-path returns a pre-existing, mid-execution
+                // session — NOT a fresh attach parked at VM_START. Labelling it as VM_START is wrong,
+                // and actively misleading after a same-port target restart, where the fast-path may
+                // hand back a stale handle (it passed a point-in-time liveness probe but the old JVM
+                // is exiting). Point at the recovery path instead of asserting a false suspension state.
+                if (result.startsWith("Already connected")) {
+                    return String.format("%s (attached after %d attempt(s))%n"
+                        + "This is a pre-existing session (not a fresh VM_START attach). If a breakpoint "
+                        + "is already hit you can inspect/evaluate now; otherwise set breakpoints and call "
+                        + "jdwp_resume_until_event. If you restarted the target on this port, run "
+                        + "jdwp_diagnose to confirm identity (or jdwp_disconnect, then reconnect, for a clean attach).",
+                        result, attempts);
+                }
                 // P3-4: tell the agent what to do next. At VM_START (the common suspend=y case),
                 // no thread is parked at a method-invocation event yet, so jdwp_evaluate_expression
                 // / jdwp_to_string would fail with IncompatibleThreadStateException — the agent
@@ -560,7 +573,7 @@ public class JDWPTools {
             // info beyond vm.name() + vm.version(). One line is sufficient.
             return String.format("VM: %s %s", vm.name(), vm.version());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -592,7 +605,7 @@ public class JDWPTools {
             result.append("\n→ jdwp_get_stack(id) for a suspended thread.");
             return result.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -685,7 +698,7 @@ public class JDWPTools {
                 vm.resume();
             }
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -825,7 +838,7 @@ public class JDWPTools {
             result.append("\n→ jdwp_get_locals(threadId, frameIndex) for a frame's variables.");
             return result.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -857,20 +870,33 @@ public class JDWPTools {
                     formatValue(thisObj)));
             }
 
-            final Map<LocalVariable, Value> vars = frame.getValues(frame.visibleVariables());
-            for (Map.Entry<LocalVariable, Value> entry : vars.entrySet()) {
-                final LocalVariable var = entry.getKey();
-                final Value value = entry.getValue();
-                result.append(String.format("%s (%s) = %s\n",
-                    var.name(),
-                    var.typeName(),
-                    formatValue(value)));
+            try {
+                final Map<LocalVariable, Value> vars = frame.getValues(frame.visibleVariables());
+                for (Map.Entry<LocalVariable, Value> entry : vars.entrySet()) {
+                    final LocalVariable var = entry.getKey();
+                    final Value value = entry.getValue();
+                    result.append(String.format("%s (%s) = %s\n",
+                        var.name(),
+                        var.typeName(),
+                        formatValue(value)));
+                }
+            } catch (AbsentInformationException absent) {
+                // Method compiled without -g:vars, so there is no LocalVariableTable. Keep the
+                // 'this' line already appended and degrade with an actionable hint instead of
+                // letting the outer catch replace the whole response with "Error: null" — the same
+                // partial-output principle as appendMarkedInstancesFooter, and mirroring the graceful
+                // degrade jdwp_get_breakpoint_context already does for the same exception.
+                result.append(String.format(
+                    "(named local variables unavailable — %s has no LocalVariableTable; compiled "
+                    + "without -g:vars. 'this' and fields still work — use jdwp_get_fields, or "
+                    + "recompile with -g.)%n",
+                    describeFrameMethod(frame)));
             }
 
             appendMarkedInstancesFooter(result);
             return result.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -907,6 +933,30 @@ public class JDWPTools {
         }
     }
 
+    /**
+     * Renders {@code <declaringType>.<method>} for the frame's current location, used only to enrich
+     * a diagnostic hint. Location metadata can itself be absent on synthetic frames, so any failure
+     * degrades to a neutral phrase rather than propagating.
+     */
+    private static String describeFrameMethod(StackFrame frame) {
+        try {
+            final Location loc = frame.location();
+            return loc.declaringType().name() + "." + loc.method().name();
+        } catch (Exception e) {
+            return "this method";
+        }
+    }
+
+    /**
+     * Builds the {@code "Error: ..."} reply shown to the agent, guarding against the JDI exceptions
+     * (e.g. {@link AbsentInformationException}) that carry no detail message — those would otherwise
+     * render the useless literal {@code "Error: null"}. Falls back to the exception's simple class name.
+     */
+    private static String errorReply(Throwable t) {
+        final String msg = t.getMessage();
+        return "Error: " + (msg != null ? msg : t.getClass().getSimpleName());
+    }
+
     @McpTool(description = "Get fields (properties) of an object by its object ID (obtained from jdwp_get_locals). Returns '[ERROR] Object #N belongs to a previous VM session ...' if the ID came from a prior connection — re-fetch via jdwp_get_locals after re-attach.")
     public String jdwp_get_fields(@McpToolParam(description = "Object unique ID") long objectId) {
         try {
@@ -921,7 +971,7 @@ public class JDWPTools {
             }
             return fields + "\n→ drill Object#N with jdwp_get_fields(N) or jdwp_to_string(N).";
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -1164,7 +1214,7 @@ public class JDWPTools {
             if (isVmGone(e)) {
                 return vmDisconnectedMessage("jdwp_assert_expression");
             }
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -1229,7 +1279,7 @@ public class JDWPTools {
             vm.resume();
             return "All threads resumed. To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -1599,7 +1649,7 @@ public class JDWPTools {
             final boolean doInspectAll = inspectAll != null && inspectAll;
             return buildFullDiagnosticReport(doInspectAll);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -1613,7 +1663,7 @@ public class JDWPTools {
         try {
             return buildFullDiagnosticReport(false);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -1634,7 +1684,7 @@ public class JDWPTools {
             }
             return renderLocalJvmsBlock(status, false);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2143,7 +2193,7 @@ public class JDWPTools {
             thread.suspend();
             return String.format("Thread %d (%s) suspended. Inspect with jdwp_get_stack.", threadId, thread.name());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2163,7 +2213,7 @@ public class JDWPTools {
             thread.resume();
             return String.format("Thread %d (%s) resumed. Use jdwp_resume_until_event to wait for the next event.", threadId, thread.name());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2327,7 +2377,7 @@ public class JDWPTools {
             return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
                 label, startLocation, thread.uniqueID(), thread.name());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2511,7 +2561,7 @@ public class JDWPTools {
             return "Error: No line number information available for this class. Compile with debug info (-g).";
         } catch (Exception e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2635,7 +2685,7 @@ public class JDWPTools {
             return "Error: No line number information available. Compile with debug info (-g).";
         } catch (Exception e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2741,7 +2791,7 @@ public class JDWPTools {
             }
             return msg;
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2830,7 +2880,7 @@ public class JDWPTools {
                     ? "Disarmed — will arm when trigger fires."
                     : "Dependent is still pending; will come up disarmed when its class loads.");
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2855,7 +2905,7 @@ public class JDWPTools {
             return String.format("BP #%d chain to trigger #%d cleared; BP is now armed independently.",
                 dependentId, previous.triggerId());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2875,7 +2925,7 @@ public class JDWPTools {
             return String.format("BP #%d re-disarmed; waiting on trigger BP #%d to fire again.",
                 dependentId, link.triggerId());
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -2922,7 +2972,7 @@ public class JDWPTools {
             result.append("\n→ jdwp_get_breakpoint_context for BREAKPOINT entries; logpoint/exception results are inline above.");
             return result.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3089,7 +3139,7 @@ public class JDWPTools {
                 chainInfo)
                 + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3340,7 +3390,7 @@ public class JDWPTools {
                 expressionLine, conditionLine, filterLine, chainInfo, excludeLine)
                 + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3478,7 +3528,7 @@ public class JDWPTools {
         } catch (ObjectCollectedException dead) {
             return "[ERROR] " + dead.getMessage();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3492,7 +3542,7 @@ public class JDWPTools {
             }
             return String.format("✓ Removed mark $%s — jdwp_overview(types=\"mark\") for remaining marks.", label);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3508,7 +3558,7 @@ public class JDWPTools {
         } catch (IllegalStateException collision) {
             return "[ERROR] " + collision.getMessage();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3558,7 +3608,7 @@ public class JDWPTools {
         } catch (IllegalArgumentException badInput) {
             return "[ERROR] " + badInput.getMessage();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -3617,7 +3667,7 @@ public class JDWPTools {
         } catch (IllegalArgumentException badInput) {
             return "[ERROR] " + badInput.getMessage();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4165,7 +4215,7 @@ public class JDWPTools {
             appendMarkedInstancesFooter(sb);
             return sb.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4187,7 +4237,7 @@ public class JDWPTools {
                 suspended ? String.valueOf(thread.frameCount()) : "N/A",
                 formatEventTag(snapshot), staleNote);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4222,7 +4272,7 @@ public class JDWPTools {
 
         } catch (Exception e) {
             log.error("[Watcher] Error attaching watcher", e);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4248,7 +4298,7 @@ public class JDWPTools {
 
         } catch (Exception e) {
             log.error("[Watcher] Error detaching watcher", e);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4278,7 +4328,7 @@ public class JDWPTools {
 
         } catch (Exception e) {
             log.error("[Watcher] Error listing watchers for breakpoint", e);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 
@@ -4349,7 +4399,7 @@ public class JDWPTools {
                 return vmDisconnectedMessage("jdwp_evaluate_watchers");
             }
             log.error("[Watcher] Error evaluating watchers", e);
-            return "Error: " + e.getMessage();
+            return errorReply(e);
         }
     }
 

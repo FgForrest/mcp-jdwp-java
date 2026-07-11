@@ -947,7 +947,9 @@ public class JDIConnectionService {
 
             return result.toString();
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            // Never surface the useless literal "Error: null": some JDI exceptions carry no detail
+            // message. Same fallback idiom this class already uses for connect() failures.
+            return "Error: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
         }
     }
 
