@@ -141,8 +141,8 @@ class JDWPToolsGetLocalsAndFieldsTest {
 		}
 
 		@Test
-		@DisplayName("returns 'Error:' message when the frame lacks debug info")
-		void shouldReturnErrorWhenFrameLacksDebugInfo() throws Exception {
+		@DisplayName("frame lacks debug info → degrades gracefully with a hint, not 'Error: null'")
+		void shouldDegradeGracefullyWhenFrameLacksDebugInfo() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
 			final StackFrame frame = mock(StackFrame.class);
 			when(jdiService.getVM()).thenReturn(vm);
@@ -153,7 +153,12 @@ class JDWPToolsGetLocalsAndFieldsTest {
 
 			final String result = tools.jdwp_get_locals(1L, 0);
 
-			assertThat(result).startsWith("Error:");
+			// The missing LocalVariableTable no longer collapses the whole response into "Error: null";
+			// it degrades to a hint (see JDWPToolsGetLocalsAbsentInfoTest for the full contract).
+			assertThat(result)
+				.doesNotStartWith("Error:")
+				.doesNotContain("Error: null")
+				.contains("no LocalVariableTable");
 		}
 	}
 
