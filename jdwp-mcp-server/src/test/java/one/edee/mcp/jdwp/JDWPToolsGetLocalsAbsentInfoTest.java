@@ -102,7 +102,7 @@ class JDWPToolsGetLocalsAbsentInfoTest {
 	}
 
 	@Test
-	@DisplayName("static method (no 'this') → still returns the hint, not 'Error: null'")
+	@DisplayName("static method (no 'this') → hint does not falsely claim 'this' is available")
 	void shouldDegradeGracefullyForStaticMethod() throws Exception {
 		primeFrameWithAbsentVariables(1L, null);
 
@@ -111,7 +111,28 @@ class JDWPToolsGetLocalsAbsentInfoTest {
 		assertThat(out)
 			.doesNotContain("Error: null")
 			.contains("Local variables in frame 0")
-			.contains("no LocalVariableTable");
+			.contains("no LocalVariableTable")
+			// A static frame has no receiver — the hint must not claim 'this' still works.
+			.contains("static frame")
+			.doesNotContain("'this' (above)");
+	}
+
+	@Test
+	@DisplayName("blank exception message in the outer catch falls back to the class name")
+	void shouldFallBackToClassNameForBlankMessage() throws Exception {
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		// A whitespace-only message must be treated the same as null: "Error: " alone is useless.
+		when(thread.frame(0)).thenThrow(new IllegalStateException("   "));
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+
+		final String out = tools.jdwp_get_locals(1L, 0);
+
+		assertThat(out)
+			.startsWith("Error:")
+			.contains("IllegalStateException");
 	}
 
 	@Test

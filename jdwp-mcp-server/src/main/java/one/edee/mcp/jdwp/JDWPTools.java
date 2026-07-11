@@ -882,15 +882,19 @@ public class JDWPTools {
                 }
             } catch (AbsentInformationException absent) {
                 // Method compiled without -g:vars, so there is no LocalVariableTable. Keep the
-                // 'this' line already appended and degrade with an actionable hint instead of
-                // letting the outer catch replace the whole response with "Error: null" — the same
+                // 'this' line already appended (if any) and degrade with an actionable hint instead
+                // of letting the outer catch replace the whole response with "Error: null" — the same
                 // partial-output principle as appendMarkedInstancesFooter, and mirroring the graceful
-                // degrade jdwp_get_breakpoint_context already does for the same exception.
+                // degrade jdwp_get_breakpoint_context already does for the same exception. The hint
+                // is tailored to the frame: an instance frame still has its receiver to inspect; a
+                // static frame has none, so we must not claim 'this' is available.
+                final String receiverHint = thisObj != null
+                    ? "'this' (above) and its fields still work — use jdwp_get_fields"
+                    : "this is a static frame with no receiver";
                 result.append(String.format(
                     "(named local variables unavailable — %s has no LocalVariableTable; compiled "
-                    + "without -g:vars. 'this' and fields still work — use jdwp_get_fields, or "
-                    + "recompile with -g.)%n",
-                    describeFrameMethod(frame)));
+                    + "without -g:vars. %s; or recompile with -g.)%n",
+                    describeFrameMethod(frame), receiverHint));
             }
 
             appendMarkedInstancesFooter(result);
@@ -950,11 +954,12 @@ public class JDWPTools {
     /**
      * Builds the {@code "Error: ..."} reply shown to the agent, guarding against the JDI exceptions
      * (e.g. {@link AbsentInformationException}) that carry no detail message — those would otherwise
-     * render the useless literal {@code "Error: null"}. Falls back to the exception's simple class name.
+     * render a useless {@code "Error: null"} or blank {@code "Error: "}. Falls back to the
+     * exception's simple class name when the detail message is null or blank.
      */
     private static String errorReply(Throwable t) {
         final String msg = t.getMessage();
-        return "Error: " + (msg != null ? msg : t.getClass().getSimpleName());
+        return "Error: " + (msg != null && !msg.isBlank() ? msg : t.getClass().getSimpleName());
     }
 
     @McpTool(description = "Get fields (properties) of an object by its object ID (obtained from jdwp_get_locals). Returns '[ERROR] Object #N belongs to a previous VM session ...' if the ID came from a prior connection — re-fetch via jdwp_get_locals after re-attach.")
