@@ -1,0 +1,27 @@
+{
+  "sessionId": "wafer-scheduler-order-analysis",
+  "target": {
+    "host": "localhost",
+    "port": 5005
+  },
+  "resumeOnAttach": true,
+  "idleTimeoutMillis": 120000,
+  "maxEvents": 10000,
+  "tracepoints": [
+    {
+      "id": "scheduler-decision-loop",
+      "className": "org.example.scheduler.wafer.SimpleWaferScheduler",
+      "line": 120,
+      "methodName": "scheduleWafer",
+      "maxHits": 500,
+      "capture": {
+        "locals": true,
+        "stack": true,
+        "maxFrames": 8,
+        "maxDepth": 2,
+        "maxItems": 20,
+        "maxStringLength": 2000
+      }
+    }
+  ]
+}

@@ -33,5 +33,5 @@ mcp-jdwp-inspector.log
 release/sandbox/dist/
 
 # Core dumps (e.g. from a crashing CLI proxy dropping `core` into the tree)
-core
-core.*
+/core
+/core.*

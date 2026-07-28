@@ -6,6 +6,8 @@ import com.sun.jdi.connect.Connector;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
+import one.edee.mcp.jdwp.core.JdiSocketAttacher;
+import one.edee.mcp.jdwp.core.JdwpEndpoint;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
@@ -351,27 +353,8 @@ public class JDIConnectionService {
             cleanupSessionState();
         }
 
-        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-        AttachingConnector connector = null;
-
-        for (AttachingConnector ac : vmm.attachingConnectors()) {
-            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                connector = ac;
-                break;
-            }
-        }
-
-        if (connector == null) {
-            lastConnectError = "SocketAttach connector not found";
-            throw new RuntimeException("SocketAttach connector not found");
-        }
-
-        final Map<String, Connector.Argument> args = connector.defaultArguments();
-        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
-
         try {
-            vm = connector.attach(args);
+            vm = new JdiSocketAttacher().attach(new JdwpEndpoint(host, port));
         } catch (Exception e) {
             lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             // Do NOT seed lastHost/lastPort on failure — ensureConnected() uses those for the

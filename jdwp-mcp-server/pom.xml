@@ -18,6 +18,13 @@
     <description>MCP Server for JDWP inspection using JDI</description>
 
     <dependencies>
+        <!-- Framework-independent JDI primitives shared with the batch collector. -->
+        <dependency>
+            <groupId>one.edee.mcp.jdwp</groupId>
+            <artifactId>jdwp-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <!-- JSpecify nullness annotations -->
         <dependency>
             <groupId>org.jspecify</groupId>
