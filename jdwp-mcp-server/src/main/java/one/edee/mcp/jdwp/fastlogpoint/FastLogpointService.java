@@ -148,6 +148,11 @@ public class FastLogpointService {
      */
     private final AtomicLong sessionEpoch = new AtomicLong();
     /**
+     * Makes {@link #forgetAll}'s epoch bump and wipe atomic with {@link #publish}'s epoch check and
+     * insertion. Never held across a JDWP call.
+     */
+    private final Object epochLock = new Object();
+    /**
      * Set when the last discovery did not finish; {@link #discoverIfIncomplete} retries it.
      */
     private volatile boolean discoveryIncomplete;
@@ -376,8 +381,13 @@ public class FastLogpointService {
             // The captured entries, not their IDs: a worker that outlives the deadline must not clear
             // a logpoint a later session registered under a reused ID.
             final Future<?> teardown = executor.submit(() -> {
-                for (FastLogpoint flp : own) {
-                    clearIfCurrent(flp);
+                try {
+                    for (FastLogpoint flp : own) {
+                        clearIfCurrent(flp);
+                    }
+                } finally {
+                    // A worker that outlived the deadline no longer holds the monitor from here on.
+                    teardownStuck = false;
                 }
             });
             teardown.get(TEARDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -408,14 +418,17 @@ public class FastLogpointService {
 
     /**
      * Drops all state without touching the VM — for when the VM is gone or about to be released.
-     * Deliberately unsynchronized: it must work while a stuck teardown holds the monitor.
+     * Does not take the service monitor: it must work while a stuck teardown holds it. The epoch
+     * lock only serialises it with {@link #publish}, which never makes a JDWP call while holding it.
      */
     public void forgetAll() {
-        sessionEpoch.incrementAndGet();
-        discoveryIncomplete = false;
-        logpoints.clear();
-        byArmingRequest.clear();
-        instrumentedClasses.clear();
+        synchronized (epochLock) {
+            sessionEpoch.incrementAndGet();
+            discoveryIncomplete = false;
+            logpoints.clear();
+            byArmingRequest.clear();
+            instrumentedClasses.clear();
+        }
     }
 
     /**
@@ -429,9 +442,10 @@ public class FastLogpointService {
     /**
      * Snapshot of every fast logpoint for {@code jdwp_overview}. {@code written} is the live
      * sequence counter (a static-field read) of every probe that exists; {@code -1} when there is
-     * none or it is unreadable.
+     * none or it is unreadable. Read-only and deliberately unsynchronized, so the overview never
+     * waits behind a teardown stuck in the VM; counters may be a moment stale.
      */
-    public synchronized List<Info> list() {
+    public List<Info> list() {
         final List<Info> out = new ArrayList<>();
         for (FastLogpoint flp : logpoints.values()) {
             long written = -1;
@@ -465,6 +479,11 @@ public class FastLogpointService {
      *         was found
      */
     public String discover(VirtualMachine vm) {
+        if (teardownStuck) {
+            discoveryIncomplete = true;
+            return "\n\nLooking for fast logpoints left by an earlier session was skipped: an earlier teardown is still "
+                + "waiting for the VM — jdwp_overview retries it.";
+        }
         final long epoch = sessionEpoch.get();
         final ExecutorService executor = daemonExecutor("fast-logpoint-discovery");
         final List<Discovered> found;
@@ -510,10 +529,10 @@ public class FastLogpointService {
 
     /**
      * The refusal for arming in a class that still carries leftovers of an earlier session, or
-     * {@code null} when it carries none.
+     * {@code null} when it carries none. Read-only; arming calls it again under the monitor.
      */
     @Nullable
-    public synchronized String leftoversIn(ReferenceType refType) {
+    public String leftoversIn(ReferenceType refType) {
         final List<String> names = new ArrayList<>();
         boolean restorable = false;
         for (FastLogpoint flp : logpoints.values()) {
@@ -608,15 +627,17 @@ public class FastLogpointService {
             return "Restoring the original bytecode of " + flp.className() + " FAILED: " + describe(e) + ". Its fast "
                 + "logpoints stay listed, disabled by their kill switches.";
         }
-        final Set<String> wired = observeWiring(flp.refType, readBack(flp.refType, record.original()));
+        final Map<String, byte[]> installed = readBack(flp.refType);
+        final Set<String> wired = installed != null ? observeWiring(flp.refType, installed) : null;
         final List<String> ids = new ArrayList<>();
         final List<String> kept = new ArrayList<>();
         for (FastLogpoint member : group) {
-            final ClassType probeType = member.probeType;
-            if (wired != null && probeType != null && wired.contains(probeType.name())) {
+            if (!provenRemoved(flp.refType, record.original(), installed, wired, member.probeType)) {
+                // Kept listed (disabled): either a transformer kept the call, or the removal could not be observed.
                 member.state = State.STRANDED;
-                member.failureReason = "still called after restoring the class — an agent transforming the class kept "
-                    + "the call";
+                member.failureReason = installed != null && wired != null
+                    ? "still called after restoring the class — an agent transforming the class kept the call"
+                    : "the class was restored, but whether it still calls the probe could not be checked";
                 member.record = null;
                 kept.add("#" + member.id);
                 continue;
@@ -634,8 +655,8 @@ public class FastLogpointService {
         final String restored = String.format("Restored the class file of %s recorded by %s on %s — removed fast "
                 + "logpoint(s) %s.", flp.className(), flp.armedBy, Instant.ofEpochMilli(flp.armedAt),
             ids.isEmpty() ? "none" : String.join(", ", ids));
-        return kept.isEmpty() ? restored : restored + " The class still calls " + String.join(", ", kept)
-            + " — an agent transforming the class kept those calls; they stay listed as STRANDED, disabled.";
+        return kept.isEmpty() ? restored : restored + " Not confirmed removed: " + String.join(", ", kept)
+            + " — they stay listed as STRANDED, disabled (jdwp_overview says why).";
     }
 
     private static String restoreBriefing(FastLogpoint flp, List<FastLogpoint> group, GenerationRecord record) {
@@ -753,46 +774,57 @@ public class FastLogpointService {
     }
 
     /**
-     * Lists the discovered leftovers under fresh IDs unless the session was dropped meanwhile.
+     * Lists the discovered leftovers under fresh IDs unless the session was dropped meanwhile. Makes
+     * no JDWP call and does not wait for the service monitor (a stuck teardown may hold it); the
+     * epoch check and the insertion are atomic with {@link #forgetAll}.
      */
-    private synchronized String publish(VirtualMachine vm, List<Discovered> discovered, long epoch) {
-        if (sessionEpoch.get() != epoch || discovered.isEmpty()) {
+    private String publish(VirtualMachine vm, List<Discovered> discovered, long epoch) {
+        if (discovered.isEmpty()) {
             return "";
         }
-        final Set<String> known = new HashSet<>();
-        for (FastLogpoint flp : logpoints.values()) {
-            if (flp.probeType != null) {
-                known.add(flp.probeType.name());
+        final List<FastLogpoint> added = new ArrayList<>();
+        synchronized (epochLock) {
+            if (sessionEpoch.get() != epoch) {
+                return "";
+            }
+            final Set<String> known = new HashSet<>();
+            for (FastLogpoint flp : logpoints.values()) {
+                final ClassType probeType = flp.probeType;
+                if (probeType != null) {
+                    known.add(probeType.name());
+                }
+            }
+            for (Discovered found : discovered) {
+                final FoundProbe probe = found.probe();
+                if (!known.add(probe.facts().name())) {
+                    continue;
+                }
+                final FastLogpoint flp = new FastLogpoint(breakpointTracker.allocateId(), vm,
+                    found.target() != null ? found.target() : probe.type(), probe.targetClass(), probe.line(),
+                    probe.method(), probe.descriptor(), probe.expression(), probe.condition(), probe.bufferSize());
+                flp.state = found.verdict().kind() == LeftoverClassifier.Kind.RECOVERED ? State.RECOVERED : State.STRANDED;
+                flp.failureReason = found.verdict().reason();
+                flp.provenUnwired = found.verdict().provenUnwired();
+                flp.record = flp.state == State.RECOVERED ? found.record() : null;
+                flp.attach(probe.type(), probe.ring(), probe.seq(), probe.seqValue());
+                flp.enabled = probe.facts().enabled();
+                flp.nextSeq = probe.written();
+                flp.retained = Math.min(probe.written(), probe.bufferSize());
+                flp.armedAt = probe.armedAt();
+                flp.armedBy = probe.armedBy();
+                flp.loader = probe.loader();
+                logpoints.put(flp.id, flp);
+                added.add(flp);
             }
         }
-        final List<FastLogpoint> added = new ArrayList<>();
-        for (Discovered found : discovered) {
-            final FoundProbe probe = found.probe();
-            if (!known.add(probe.facts().name())) {
-                continue;
-            }
-            final FastLogpoint flp = new FastLogpoint(breakpointTracker.allocateId(), vm,
-                found.target() != null ? found.target() : probe.type(), probe.targetClass(), probe.line(),
-                probe.method(), probe.descriptor(), probe.expression(), probe.condition(), probe.bufferSize());
-            flp.state = found.verdict().kind() == LeftoverClassifier.Kind.RECOVERED ? State.RECOVERED : State.STRANDED;
-            flp.failureReason = found.verdict().reason();
-            flp.provenUnwired = found.verdict().provenUnwired();
-            flp.record = flp.state == State.RECOVERED ? found.record() : null;
-            flp.attach(probe.type(), probe.ring(), probe.seq(), probe.seqValue());
-            flp.enabled = probe.facts().enabled();
-            flp.nextSeq = probe.written();
-            flp.retained = Math.min(probe.written(), probe.bufferSize());
-            flp.armedAt = probe.armedAt();
-            flp.armedBy = probe.armedBy();
-            flp.loader = loaderLabel(probe.type().classLoader());
-            logpoints.put(flp.id, flp);
-            added.add(flp);
+        for (FastLogpoint flp : added) {
             eventHistory.record(new EventHistory.DebugEvent("FAST_LOGPOINT_RECOVERED",
                 String.format("[FastLogpoint %d] left by an earlier session at %s:%d — %s%s, expr=\"%s\" (armed %s by %s)",
                     flp.id, flp.className(), flp.line, flp.state, flp.enabled ? ", evaluating" : ", kill switch set",
                     flp.expression, Instant.ofEpochMilli(flp.armedAt), flp.armedBy),
                 Map.of("breakpointId", String.valueOf(flp.id), "class", flp.className(),
-                    "line", String.valueOf(flp.line), "state", flp.state.name(), "probe", probe.type().name())));
+                    "line", String.valueOf(flp.line), "state", flp.state.name(),
+                    "probe", Objects.requireNonNull(flp.probeType).name())));
         }
         if (added.isEmpty()) {
             return "";
@@ -850,7 +882,7 @@ public class FastLogpointService {
             stringStatic(type, FastLogpointProbeSource.EXPRESSION_FIELD, "?"),
             condition.isEmpty() ? null : condition, armedAt,
             stringStatic(type, FastLogpointProbeSource.ARMED_BY_FIELD, "unknown session"),
-            image, ring, seq, seqValue, written, ring != null ? ring.length() : 0);
+            image, ring, seq, seqValue, written, ring != null ? ring.length() : 0, loaderLabel(type.classLoader()));
     }
 
     private static int intStatic(ClassType type, String name, int fallback) {
@@ -969,8 +1001,11 @@ public class FastLogpointService {
             // From here on the class is modified: a failure leaves the logpoint installed and listed.
             instrumentedClasses.putIfAbsent(refType, target);
             target.sites = sites;
-            target.installed = readBack(refType, instrumented);
-            final Set<String> wired = observeWiring(refType, target.installed);
+            final Map<String, byte[]> installed = readBack(refType);
+            // Without a read-back the guard falls back to the bytes sent (erring towards refusing the
+            // next change); the wiring is then unknown — never decoded from the bytes sent.
+            target.installed = installed != null ? installed : ClassFileMethods.codeByMethod(instrumented);
+            final Set<String> wired = installed != null ? observeWiring(refType, installed) : null;
             final String unrecorded = recordInstall(vm, refType, target, wired);
             if (wired != null && !wired.contains(probe.type().name())) {
                 flp.state = State.DISABLED;
@@ -1246,16 +1281,46 @@ public class FastLogpointService {
 
     /**
      * Reads back what HotSpot installed — it renumbers constant-pool entries, and rewrites their
-     * operands, when the new pool is not an extension of the old one. Falls back to the bytes sent,
-     * which errs towards refusing the next change rather than allowing a wrong one.
+     * operands, when the new pool is not an extension of the old one.
+     *
+     * @return the live code per method, or {@code null} when it could not be read
      */
-    private static Map<String, byte[]> readBack(ReferenceType refType, byte[] sent) {
+    @Nullable
+    private static Map<String, byte[]> readBack(ReferenceType refType) {
         try {
             return liveCode(refType);
         } catch (Exception e) {
             log.warn("[FastLogpoint] Could not read back the bytecode installed in {}: {}", refType.name(), describe(e));
-            return ClassFileMethods.codeByMethod(sent);
+            return null;
         }
+    }
+
+    /**
+     * Whether the class provably no longer calls {@code probeType} after a redefinition: its code is
+     * the original's (which never called a probe — identical code bytes reference identical
+     * constants), or the decoded wiring omits it. Unknown counts as still called.
+     */
+    private static boolean provenRemoved(ReferenceType refType, byte[] original, @Nullable Map<String, byte[]> installed,
+                                         @Nullable Set<String> wired, @Nullable ClassType probeType) {
+        if (installed == null || probeType == null) {
+            return false;
+        }
+        if (sameCode(ClassFileMethods.codeByMethod(original), installed)) {
+            return true;
+        }
+        return wired != null && !wired.contains(probeType.name());
+    }
+
+    private static boolean sameCode(Map<String, byte[]> expected, Map<String, byte[]> live) {
+        if (expected.size() != live.size()) {
+            return false;
+        }
+        for (Map.Entry<String, byte[]> method : expected.entrySet()) {
+            if (!Arrays.equals(method.getValue(), live.get(method.getKey()))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1588,23 +1653,26 @@ public class FastLogpointService {
             ? target.originalBytes
             : ProbeInstrumenter.instrument(target.originalBytes, remaining.values());
         redefine(flp.vm, refType, classFile);
-        final Map<String, byte[]> installed = readBack(refType, classFile);
-        final Set<String> wired = observeWiring(refType, installed);
-        final ClassType probeType = flp.probeType;
-        // A transformer running during the redefinition can keep the call this server removed.
-        final boolean stillCalled = wired != null && probeType != null && wired.contains(probeType.name());
-        if (remaining.isEmpty() && !stillCalled) {
+        final Map<String, byte[]> installed = readBack(refType);
+        final Set<String> wired = installed != null ? observeWiring(refType, installed) : null;
+        // A transformer running during the redefinition can keep the call this server removed, and a
+        // removal that cannot be observed is not taken for one.
+        final boolean removed = provenRemoved(refType, target.originalBytes, installed, wired, flp.probeType);
+        if (remaining.isEmpty() && removed) {
             instrumentedClasses.remove(refType);
             return;
         }
-        if (!stillCalled) {
+        if (removed) {
             target.sites = remaining;
         }
-        target.installed = installed;
+        target.installed = installed != null ? installed : ClassFileMethods.codeByMethod(classFile);
         final String unrecorded = recordInstall(flp.vm, refType, target, wired);
-        if (stillCalled) {
-            throw new FastLogpointException("after the redefinition " + refType.name() + " still calls the probe — an "
-                + "agent transforming the class (a ClassFileTransformer) kept the call");
+        if (!removed) {
+            throw new FastLogpointException(installed != null && wired != null
+                ? "after the redefinition " + refType.name() + " still calls the probe — an agent transforming the "
+                + "class (a ClassFileTransformer) kept the call"
+                : "the redefinition of " + refType.name() + " went through, but whether the class still calls the "
+                + "probe could not be checked");
         }
         if (unrecorded != null) {
             recordWarning(flp, "the remaining fast logpoints of " + refType.name() + " could not be re-recorded in the "
@@ -2087,7 +2155,7 @@ public class FastLogpointService {
                               String descriptor, int line, String expression, @Nullable String condition,
                               long armedAt, String armedBy, @Nullable ArrayReference image,
                               @Nullable ArrayReference ring, @Nullable ObjectReference seq, @Nullable Field seqValue,
-                              long written, int bufferSize) {
+                              long written, int bufferSize, String loader) {
     }
 
     /**

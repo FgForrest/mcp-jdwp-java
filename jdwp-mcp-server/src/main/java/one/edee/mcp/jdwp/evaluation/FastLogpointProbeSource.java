@@ -35,8 +35,10 @@ import java.util.stream.Collectors;
  * <p>
  * Nothing the user code throws propagates into the application: every {@link Throwable} is caught
  * and recorded as an error entry. Results are rendered without calling {@code toString()} on
- * arbitrary objects — strings, boxed primitives and enums print their value, anything else prints
- * as {@code type@identityHash} — so the probe never runs user code the expression did not ask for.
+ * arbitrary objects — strings, boxed primitives, {@code BigDecimal} / {@code BigInteger} (exact
+ * classes, not subclasses) and enums print their value, anything else prints as
+ * {@code type@identityHash}; a thrown application exception is recorded by class name only (JDK
+ * exceptions with their message) — so the probe never runs user code the expression did not ask for.
  */
 public final class FastLogpointProbeSource {
     /**
@@ -197,9 +199,13 @@ public final class FastLogpointProbeSource {
             .append(JdiExpressionEvaluator.generateMethodBody(expression))
             .append("    }\n\n")
             // Recording a failure must not fail in turn (e.g. OutOfMemoryError while concatenating).
+            // JDK throwables print their message; an application's own Throwable may override
+            // toString()/getMessage(), so only its class name is recorded.
             .append("    private static void __mcpRecordFailure(char kind, Throwable failure) {\n")
             .append("        try {\n")
-            .append("            __mcpRecord(kind, String.valueOf(failure));\n")
+            .append("            final String type = failure.getClass().getName();\n")
+            .append("            __mcpRecord(kind, type.startsWith(\"java.\") || type.startsWith(\"javax.\")\n")
+            .append("                ? String.valueOf(failure) : type + \" (message not rendered: application exception type)\");\n")
             .append("        } catch (Throwable ignored) {\n")
             .append("        }\n")
             .append("    }\n\n")
@@ -213,14 +219,18 @@ public final class FastLogpointProbeSource {
             .append("        if (value == null) {\n")
             .append("            return \"null\";\n")
             .append("        }\n")
-            .append("        if (value instanceof String || value instanceof Number || value instanceof Boolean\n")
-            .append("            || value instanceof Character) {\n")
+            // Exact JDK value types only: an application subclass of Number could override toString().
+            .append("        final Class<?> type = value.getClass();\n")
+            .append("        if (type == String.class || type == Integer.class || type == Long.class || type == Short.class\n")
+            .append("            || type == Byte.class || type == Double.class || type == Float.class || type == Boolean.class\n")
+            .append("            || type == Character.class || type == java.math.BigDecimal.class\n")
+            .append("            || type == java.math.BigInteger.class) {\n")
             .append("            return String.valueOf(value);\n")
             .append("        }\n")
             .append("        if (value instanceof Enum) {\n")
             .append("            return ((Enum<?>) value).name();\n")
             .append("        }\n")
-            .append("        return value.getClass().getName() + '@' + Integer.toHexString(System.identityHashCode(value));\n")
+            .append("        return type.getName() + '@' + Integer.toHexString(System.identityHashCode(value));\n")
             .append("    }\n")
             .append("}\n");
         return source.toString();

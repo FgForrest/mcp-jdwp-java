@@ -17,8 +17,8 @@ import java.util.Set;
  * <p>
  * Wiring is observed ({@link ProbeCallScanner}), not inferred from bookkeeping. A probe is hidden
  * only when it is inert: the class's code provably does not call it and its kill switch is off.
- * When the wiring cannot be observed, every probe that might matter is listed as
- * {@link Kind#STRANDED}.
+ * When the wiring cannot be observed (and no matching record proves it), every probe of the class
+ * is listed as {@link Kind#STRANDED}.
  */
 final class LeftoverClassifier {
     /**
@@ -52,10 +52,11 @@ final class LeftoverClassifier {
                            Map<Object, GenerationRecord> records) {
         final Map<String, Verdict> verdicts = new LinkedHashMap<>();
         if (live == null) {
+            // Without the class's code nothing proves a probe uncalled — a disabled probe without a
+            // record is exactly what a crash right after the first redefinition leaves.
             final String reason = unreadable != null ? unreadable : "its target class is not loaded by the probe's class loader";
             for (Probe probe : probes) {
-                verdicts.put(probe.name(), probe.enabled() || probe.imageKey() != null
-                    ? new Verdict(Kind.STRANDED, reason, false) : Verdict.HIDDEN);
+                verdicts.put(probe.name(), new Verdict(Kind.STRANDED, reason, false));
             }
             return new Result(verdicts, null);
         }
@@ -100,8 +101,8 @@ final class LeftoverClassifier {
         for (Probe probe : probes) {
             final boolean known = probe.format() == FastLogpointProbeSource.FORMAT;
             if (calls == null) {
-                verdicts.put(probe.name(), probe.enabled() || probe.imageKey() != null
-                    ? new Verdict(Kind.STRANDED, known ? reason : unknownFormat(probe), false) : Verdict.HIDDEN);
+                // Wiring unknown: nothing is proven uncalled, so nothing is hidden.
+                verdicts.put(probe.name(), new Verdict(Kind.STRANDED, known ? reason : unknownFormat(probe), false));
             } else if (calls.contains(probe.name())) {
                 verdicts.put(probe.name(), verified != null && known
                     ? new Verdict(Kind.RECOVERED, null, false)

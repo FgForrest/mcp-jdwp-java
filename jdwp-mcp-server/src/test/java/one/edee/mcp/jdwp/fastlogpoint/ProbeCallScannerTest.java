@@ -36,6 +36,18 @@ class ProbeCallScannerTest {
 	}
 
 	@Test
+	@DisplayName("a method ending in a lookupswitch without pairs decodes (8 operand bytes, not 12)")
+	void decodesTerminalEmptyLookupSwitch() throws Exception {
+		final byte[] classFile = hostClass();
+		final ClassReader reader = new ClassReader(classFile);
+		final byte[] pool = Arrays.copyOfRange(classFile, 10, reader.header);
+		// iload_0 (pc 0); lookupswitch (pc 1) padded to 4: default = -1 (back to pc 0), npairs = 0.
+		final byte[] code = {0x1A, (byte) 0xAB, 0, 0, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0, 0, 0, 0};
+
+		assertThat(ProbeCallScanner.probeCalls(pool, reader.readUnsignedShort(8), List.of(code))).isEmpty();
+	}
+
+	@Test
 	@DisplayName("undecodable code or pool is an error, not an empty answer")
 	void rejectsGarbage() throws Exception {
 		final byte[] classFile = hostClass();

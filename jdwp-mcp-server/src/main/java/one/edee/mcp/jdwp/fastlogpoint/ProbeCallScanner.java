@@ -113,9 +113,11 @@ final class ProbeCallScanner {
             return pc + 1 < code.length && (code[pc + 1] & 0xFF) == IINC ? 6 : 4;
         }
         if (op == TABLESWITCH || op == LOOKUPSWITCH) {
-            // Operands start at the next multiple of four from the method start.
+            // Operands start at the next multiple of four from the method start: default + low + high
+            // for tableswitch, default + npairs for lookupswitch (which may have no pairs at all).
             final int operands = (pc + 4) & ~3;
-            if (operands + 12 > code.length) {
+            final int header = op == TABLESWITCH ? 12 : 8;
+            if (operands + header > code.length) {
                 throw new FastLogpointException("truncated switch at bytecode offset " + pc);
             }
             if (op == TABLESWITCH) {

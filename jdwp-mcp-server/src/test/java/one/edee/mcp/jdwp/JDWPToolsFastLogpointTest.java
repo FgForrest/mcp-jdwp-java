@@ -94,9 +94,26 @@ class JDWPToolsFastLogpointTest {
 	}
 
 	@Test
+	@DisplayName("approval does not carry over to a JVM the call re-attached to")
+	void approvalDoesNotFollowAReconnect() throws Exception {
+		final VirtualMachine replacement = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(mock(VirtualMachine.class));
+		when(jdiService.getVM()).thenReturn(replacement);
+		when(jdiService.getConnectionStatus()).thenReturn(
+			new JDIConnectionService.ConnectionStatus(true, "localhost", 5005, Instant.now(), null));
+
+		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
+			.startsWith("[CONSENT REQUIRED AGAIN] Nothing was armed")
+			.contains("[CONSENT REQUIRED] Nothing was armed.");
+		verify(fastLogpoints, never()).register(any(), any(), anyString(), any(), anyInt());
+		verifyNoInteractions(replacement);
+	}
+
+	@Test
 	@DisplayName("a VM without class redefinition is refused")
 	void requiresRedefinition() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.canRedefineClasses()).thenReturn(false);
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
@@ -108,6 +125,7 @@ class JDWPToolsFastLogpointTest {
 	@DisplayName("an unloaded class is refused with a hint")
 	void requiresLoadedClass() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
@@ -121,6 +139,7 @@ class JDWPToolsFastLogpointTest {
 	@DisplayName("a VM without constant pools is refused: the probe wiring could not be verified")
 	void requiresConstantPool() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
@@ -134,6 +153,7 @@ class JDWPToolsFastLogpointTest {
 	void refusesClassWithLeftovers() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
 		final ReferenceType type = mock(ReferenceType.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
@@ -186,6 +206,7 @@ class JDWPToolsFastLogpointTest {
 	void resetHandlesLeftoversAroundTheIdReset() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
 		when(vm.eventRequestManager()).thenReturn(mock(EventRequestManager.class));
+		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(fastLogpoints.disableLeftovers()).thenReturn(1);
 		when(fastLogpoints.discover(vm)).thenReturn("\n\nFAST LOGPOINTS LEFT BY AN EARLIER SESSION — 1 found");

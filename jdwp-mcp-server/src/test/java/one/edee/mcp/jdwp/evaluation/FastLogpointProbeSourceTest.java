@@ -137,6 +137,15 @@ class FastLogpointProbeSourceTest {
 		final Probe explicitToString = compile("java.util.List.of(label).toString()", null, 16);
 		explicitToString.hit(0, "x");
 		assertThat(explicitToString.value(0)).isEqualTo("[x]");
+
+		// A Number that is not one of the exact boxed types could override toString(): identity form.
+		final Probe numberSubclass = compile("new java.util.concurrent.atomic.AtomicInteger(5)", null, 16);
+		numberSubclass.hit(0, "x");
+		assertThat(numberSubclass.value(0)).matches("java\\.util\\.concurrent\\.atomic\\.AtomicInteger@[0-9a-f]+");
+
+		final Probe bigDecimal = compile("new java.math.BigDecimal(\"1.50\")", null, 16);
+		bigDecimal.hit(0, "x");
+		assertThat(bigDecimal.value(0)).isEqualTo("1.50");
 	}
 
 	@Test

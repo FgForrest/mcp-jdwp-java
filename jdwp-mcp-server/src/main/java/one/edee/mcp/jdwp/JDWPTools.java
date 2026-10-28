@@ -2748,7 +2748,16 @@ public class JDWPTools {
                 FastLogpointService.MIN_BUFFER_SIZE, FastLogpointService.MAX_BUFFER_SIZE, effectiveBufferSize);
         }
         try {
+            // The approval was given for the JVM the briefing named. If getting the VM re-attaches
+            // (auto-reconnect after the target died), it may be another JVM on the same port.
+            final VirtualMachine approvedFor = jdiService.getRawVM();
             final VirtualMachine vm = jdiService.getVM();
+            if (vm != approvedFor) {
+                return "[CONSENT REQUIRED AGAIN] Nothing was armed: the connection to the target JVM was re-established "
+                    + "during this call, so the approval may have been given for another JVM.\n\n"
+                    + FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
+                    describeAttachedTarget());
+            }
             if (!vm.canRedefineClasses()) {
                 return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_logpoint.";
             }

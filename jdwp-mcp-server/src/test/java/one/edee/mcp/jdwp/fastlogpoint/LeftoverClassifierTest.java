@@ -121,24 +121,31 @@ class LeftoverClassifierTest {
 	}
 
 	@Test
-	@DisplayName("wiring unobservable: a matching record still verifies; otherwise anything that may matter is listed")
+	@DisplayName("wiring unobservable: a matching record still verifies; otherwise nothing is hidden")
 	void wiringUnknown() {
 		assertThat(kind(classify(List.of(probe(A, false, RECORD_KEY)), INSTALLED, null, record(A)), A))
 			.isEqualTo(Kind.RECOVERED);
 		final Result unverified = classify(List.of(probe(A, false, RECORD_KEY), probe(B, false, null)), CHANGED, null,
 			record(A));
 		assertThat(kind(unverified, A)).isEqualTo(Kind.STRANDED);
-		assertThat(kind(unverified, B)).as("disabled, no record — inert even without wiring").isEqualTo(Kind.HIDDEN);
+		assertThat(kind(unverified, B)).as("disabled without a record is also what a crash after the first redefinition "
+			+ "leaves — without wiring it is not proven uncalled").isEqualTo(Kind.STRANDED);
 	}
 
 	@Test
-	@DisplayName("target class unreadable: probes that may matter are STRANDED with the reason")
+	@DisplayName("crash right after the first redefinition, wiring unobservable: the wired, recordless probe is listed")
+	void firstArmCrashWithoutWiring() {
+		assertThat(kind(classify(List.of(probe(A, false, null)), INSTALLED, null, Map.of()), A)).isEqualTo(Kind.STRANDED);
+	}
+
+	@Test
+	@DisplayName("target class unreadable: every probe is STRANDED with the reason")
 	void targetUnreadable() {
 		final Result result = LeftoverClassifier.classify(TARGET, List.of(probe(A, true, null), probe(B, false, null)),
 			null, null, "its target class could not be read: boom", Map.of());
 		assertThat(kind(result, A)).isEqualTo(Kind.STRANDED);
 		assertThat(result.verdicts().get(A).reason()).contains("boom");
-		assertThat(kind(result, B)).isEqualTo(Kind.HIDDEN);
+		assertThat(kind(result, B)).isEqualTo(Kind.STRANDED);
 	}
 
 	@Test
