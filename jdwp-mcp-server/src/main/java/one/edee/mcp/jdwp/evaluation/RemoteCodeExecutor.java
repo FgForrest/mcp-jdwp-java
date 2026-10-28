@@ -114,6 +114,35 @@ public final class RemoteCodeExecutor {
     }
 
     /**
+     * Defines {@code bytecode} as {@code className} through {@code classLoader} and initializes it,
+     * without invoking anything on it. Used for fast-logpoint probes, which must be resolvable and
+     * initialized <em>before</em> the instrumented class starts calling them — a resolution or
+     * {@code <clinit>} failure at that point would surface at the application's call site.
+     * <p>
+     * Also verifies that {@code Class.forName(className, true, classLoader)} — the same
+     * {@code loadClass} path the JVM takes when the instrumented class resolves the probe — yields
+     * the class just defined, not some other class or a {@code ClassNotFoundException}.
+     *
+     * @param thread a thread suspended by an event, used for the {@code invokeMethod} calls
+     * @return the defined, initialized class
+     * @throws JdiClassDefinitionException when {@code defineClass} rejects the class (e.g. a sealed
+     *                                     or signed package)
+     * @throws JdiEvaluationException      when initialization fails or the loader resolves the name to
+     *                                     a different class
+     */
+    public static ClassType defineAndInitialize(VirtualMachine vm, ThreadReference thread,
+                                                ClassLoaderReference classLoader, String className,
+                                                byte[] bytecode) throws JdiEvaluationException {
+        final ClassType defined = loadClass(vm, thread, classLoader, className, bytecode);
+        final Value resolved = forceClassInitialization(vm, thread, classLoader, className);
+        if (!(resolved instanceof ClassObjectReference classObject) || !defined.equals(classObject.reflectedType())) {
+            throw new JdiEvaluationException("Class loader " + classLoader.referenceType().name()
+                + " does not resolve '" + className + "' to the class just defined into it");
+        }
+        return defined;
+    }
+
+    /**
      * Defines `bytecode` as `className` in the target VM via the supplied classloader. Idempotent:
      * if the class is already loaded (cached compilation reuse), the existing definition is
      * returned unchanged — calling `defineClass` twice would throw `LinkageError`.
@@ -143,23 +172,35 @@ public final class RemoteCodeExecutor {
             }
             final Method defineClassMethod = defineClassMethods.get(0);
 
-            // Create a remote byte array in the target VM to hold our bytecode
+            // Create a remote byte array in the target VM to hold our bytecode. Objects created
+            // through JDI are unreferenced in the target, so a GC between creating them and the
+            // defineClass call would collect them (ObjectCollectedException) — pin both mirrors
+            // for the duration of the call.
             final ArrayReference remoteByteArray = createRemoteByteArray(vm, bytecode);
             log.debug("[Executor] Created remote byte array of {} bytes", bytecode.length);
+            final StringReference remoteClassName = vm.mirrorOf(className);
+            final Value loadedClassObject;
+            try {
+                disableCollectionQuietly(remoteByteArray);
+                disableCollectionQuietly(remoteClassName);
 
-            // Prepare arguments for defineClass: (className, remoteByteArray, 0, bytecode.length)
-            final List<Value> args = List.of(
-                vm.mirrorOf(className),
-                remoteByteArray,
-                vm.mirrorOf(0),
-                vm.mirrorOf(bytecode.length)
-            );
+                // Prepare arguments for defineClass: (className, remoteByteArray, 0, bytecode.length)
+                final List<Value> args = List.of(
+                    remoteClassName,
+                    remoteByteArray,
+                    vm.mirrorOf(0),
+                    vm.mirrorOf(bytecode.length)
+                );
 
-            // Invoke ClassLoader.defineClass(...)
-            log.debug("[Executor] Invoking defineClass on classloader");
-            final Value loadedClassObject = classLoader.invokeMethod(
-                thread, defineClassMethod, args, ClassType.INVOKE_SINGLE_THREADED
-            );
+                // Invoke ClassLoader.defineClass(...)
+                log.debug("[Executor] Invoking defineClass on classloader");
+                loadedClassObject = classLoader.invokeMethod(
+                    thread, defineClassMethod, args, ClassType.INVOKE_SINGLE_THREADED
+                );
+            } finally {
+                enableCollectionQuietly(remoteByteArray);
+                enableCollectionQuietly(remoteClassName);
+            }
             if (!(loadedClassObject instanceof ClassObjectReference classObjectReference)) {
                 log.error("[Executor] defineClass returned unexpected type: {}",
                     loadedClassObject != null ? loadedClassObject.getClass().getName() : "null");
@@ -178,6 +219,26 @@ public final class RemoteCodeExecutor {
             final String exceptionType = exception != null ? exception.type().name() : "unknown";
             log.error("[Executor] defineClass threw exception {}: {}", exceptionType, e.getMessage(), e);
             throw new JdiClassDefinitionException("Failed to load class '" + className + "': " + exceptionType, e);
+        }
+    }
+
+    /**
+     * Pins {@code object} against garbage collection in the target. Best-effort: an object already
+     * collected surfaces on its next use, where the caller's error handling applies.
+     */
+    private static void disableCollectionQuietly(ObjectReference object) {
+        try {
+            object.disableCollection();
+        } catch (ObjectCollectedException | UnsupportedOperationException ignored) {
+            // Collected already, or the VM cannot pin — the following call reports it.
+        }
+    }
+
+    private static void enableCollectionQuietly(ObjectReference object) {
+        try {
+            object.enableCollection();
+        } catch (RuntimeException ignored) {
+            // Collected or VM gone — nothing left to release.
         }
     }
 
@@ -222,8 +283,11 @@ public final class RemoteCodeExecutor {
      * been defined but not yet prepared/initialized. An exception thrown by the class's `<clinit>`
      * bubbles up as an `InvocationException` and is wrapped into {@link JdiEvaluationException}
      * with the original exception type in the message.
+     *
+     * @return the {@code Class} object {@code forName} returned
      */
-    private static void forceClassInitialization(
+    @Nullable
+    private static Value forceClassInitialization(
         VirtualMachine vm,
         ThreadReference thread,
         ClassLoaderReference classLoader,
@@ -247,9 +311,10 @@ public final class RemoteCodeExecutor {
             final List<Value> args = List.of(classNameRef, initializeRef, classLoader);
 
             // Invoke Class.forName() to force initialization
-            classClass.invokeMethod(thread, forNameMethod, args, ClassType.INVOKE_SINGLE_THREADED);
+            final Value classObject = classClass.invokeMethod(thread, forNameMethod, args, ClassType.INVOKE_SINGLE_THREADED);
 
             log.debug("[Executor] Class {} initialization completed", className);
+            return classObject;
 
         } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException e) {
             log.error("[Executor] Failed to initialize class {}: {}", className, e.getClass().getSimpleName(), e);

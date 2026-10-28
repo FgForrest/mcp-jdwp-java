@@ -54,6 +54,10 @@ Evaluates arbitrary Java expressions at breakpoints by compiling and injecting b
 
 Watchers are MCP-side only — they store expressions that get evaluated via the expression pipeline when a breakpoint is hit.
 
+### Fast Logpoints (`fastlogpoint/` package)
+
+`jdwp_set_fast_logpoint` evaluates a logpoint inside the target JVM: on the first hit, **FastLogpointService** compiles a probe class (`FastLogpointProbeSource`), defines it in the declaring class's loader, and redefines the class with a call to it (**ProbeInstrumenter**, ASM). Hits append to an in-target ring buffer that `jdwp_get_events` drains via plain field reads (**ProbeRing**). It rewrites the application's bytecode, so the tool arms nothing without `userApproved=true` (it returns **FastLogpointRiskBriefing** instead). Arming is refused when the live bytecode differs from the class file (**ClassFileMethods**); tracked breakpoints in the class are re-created after every redefinition; clear / reset / disconnect / reconnect / shutdown restore the original bytes. Each probe describes itself (`MCP_*` constants) and carries the class's install record (**GenerationRecord**: original bytes + the bytecode HotSpot installed), so the next attach finds fast logpoints a dead server left behind (**LeftoverClassifier**, wiring observed by **ProbeCallScanner**) and lists them as RECOVERED / STRANDED; they are never owned by the new session — clear only disables them, and `jdwp_restore_fast_logpoints` restores their class only with `userApproved=true`. See `docs/breakpoints.md` § 5a and § 5b.
+
 ### Nullness
 
 `jdwp-mcp-server` is `@NullMarked` at the package level — every type, field, parameter and return in the module is **non-null by default**. The small number of legitimately nullable slots are annotated with `org.jspecify.annotations.Nullable`. The convention is enforced at compile time by NullAway running as an Error Prone plugin in `maven-compiler-plugin` (see `jdwp-mcp-server/pom.xml`); a `./mvnw -pl jdwp-mcp-server compile` that emits any `[NullAway]` diagnostic fails the build.

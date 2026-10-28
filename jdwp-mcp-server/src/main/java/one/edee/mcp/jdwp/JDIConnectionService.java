@@ -11,6 +11,7 @@ import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService.JdkNotFoundException;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
@@ -87,6 +88,16 @@ public class JDIConnectionService {
      * — otherwise stale pins would survive a reconnect and leak across sessions.
      */
     private final MarkedInstanceRegistry markedInstances;
+    /**
+     * Restores bytecode that fast logpoints rewrote before the VM handle is disposed; registered by
+     * {@link FastLogpointService} itself, null in tests that build the service without it.
+     */
+    @Nullable
+    private volatile FastLogpointService fastLogpoints;
+    /**
+     * Leftover-fast-logpoint notice of the latest attach, until {@link #takeAttachNotice} takes it.
+     */
+    private volatile String attachNotice = "";
     /**
      * Maps {@link ObjectReference#uniqueID()} to the live JDI mirror so MCP tools can reference
      * objects by ID across multiple calls. Populated as a side effect of {@link #formatFieldValue}
@@ -317,6 +328,35 @@ public class JDIConnectionService {
     }
 
     /**
+     * Registers the service whose instrumentation must be reverted before every VM dispose.
+     */
+    public void setFastLogpointService(@Nullable FastLogpointService service) {
+        this.fastLogpoints = service;
+    }
+
+    /**
+     * Returns and clears the notice about fast logpoints an earlier session left in the target,
+     * found by the latest attach ({@code ""} when none). Kept until taken, so a notice from an
+     * {@link #ensureConnected} auto-reconnect — whose reply nobody sees — reaches the next attach
+     * reply that asks for it.
+     */
+    public String takeAttachNotice() {
+        final String notice = attachNotice;
+        attachNotice = "";
+        return notice;
+    }
+
+    /**
+     * Lists fast logpoints left in {@code attached} by an earlier session; never fails the attach.
+     */
+    private void discoverLeftovers(VirtualMachine attached) {
+        final FastLogpointService flps = fastLogpoints;
+        if (flps != null) {
+            attachNotice = flps.discover(attached);
+        }
+    }
+
+    /**
      * Attaches to a JDWP server. If a live connection to the same {@code host}/{@code port} already
      * exists this is a no-op; if the requested target differs from the current one the existing
      * session is torn down via {@link #cleanupSessionState()} before the fresh attach so breakpoints,
@@ -393,6 +433,7 @@ public class JDIConnectionService {
         // monitor seeds lastTrafficAt to now and only escalates to an active probe if the
         // listener subsequently sees a full silence window.
         healthMonitor.start(vm);
+        discoverLeftovers(vm);
 
         return releasedNotice + String.format("Connected to %s (version %s)", vm.name(), vm.version());
     }
@@ -527,6 +568,11 @@ public class JDIConnectionService {
             // VM already gone — nothing to dispose.
         }
         vm = null;
+        // The instrumented classes died with the VM — nothing to restore, only state to drop.
+        final FastLogpointService flps = fastLogpoints;
+        if (flps != null) {
+            flps.forgetAll();
+        }
         breakpointTracker.reset();
         watcherManager.clearAll();
         markedInstances.clearAll();
@@ -548,6 +594,19 @@ public class JDIConnectionService {
      * re-attach) see {@link #notifyVmDied()}.
      */
     private void cleanupSessionState() {
+        // Restore rewritten bytecode while the VM handle still exists — vm.dispose() does not revert
+        // class redefinitions. Must precede eventListener.stop(): stop() may run the VM-death hook
+        // (notifyVmDied) on this thread, which disposes the VM and forgets the instrumentation.
+        // Bounded, so a dead or wedged VM cannot stall the teardown.
+        final FastLogpointService flps = fastLogpoints;
+        if (flps != null) {
+            if (vm != null) {
+                flps.disarmAll("session teardown");
+            } else {
+                flps.forgetAll();
+            }
+        }
+
         eventListener.stop();
 
         if (vm == null) {
@@ -633,6 +692,12 @@ public class JDIConnectionService {
         }
 
         healthMonitor.stop();
+        // Fast logpoints are not carried across a reconnect: their instrumentation is reverted here
+        // (bounded — reconnect exists for wedged VMs) and consent never transfers to the fresh attach.
+        final FastLogpointService flps = fastLogpoints;
+        if (flps != null) {
+            flps.disarmAll("jdwp_reconnect");
+        }
         if (vm != null) {
             try {
                 vm.dispose();
@@ -690,6 +755,7 @@ public class JDIConnectionService {
         eventHistory.beginNewSession();
         eventListener.start(vm);
         healthMonitor.start(vm);
+        discoverLeftovers(vm);
 
         // Register a ClassPrepareRequest per unique pending class name so the listener picks
         // up subsequent loads. The pending entries themselves were already restored above;

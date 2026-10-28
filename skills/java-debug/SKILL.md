@@ -184,6 +184,31 @@ A value gets set in many places and you want to know which write produced the ba
 3. `jdwp_get_events(50)` -> all logpoint hits in chronological order.
 4. The last entry before the test fails is the culprit.
 
+### "Suspending on every hit changes the bug" — fast logpoint (rare, needs the user's consent)
+
+Every `jdwp_set_logpoint` hit pauses the hitting thread for milliseconds while the server evaluates — even when the condition is false — and hits are processed one at a time. In a race, lock contention, a latency-sensitive path or a hot loop with a rarely-true condition, that pause reshuffles the very interleaving you are trying to see (the suspended thread keeps its monitors; the other threads queue behind it). `jdwp_set_fast_logpoint` evaluates the condition and expression **inside the target JVM** by rewriting the class's bytecode, so hits never suspend.
+
+This is a situational tool, not an upgrade: `jdwp_set_logpoint` stays the default. Use the fast variant only when the per-hit pause would distort the behaviour under investigation.
+
+**Consent protocol — mandatory:**
+1. Call `jdwp_set_fast_logpoint(className, lineNumber, expression, condition?)` **without** `userApproved`. Nothing is armed; you get a risk briefing.
+2. Relay the briefing to the user **word for word** and ask whether to proceed.
+3. Only after the user has explicitly agreed **in this conversation**, call again with the same arguments and `userApproved=true`.
+4. Never infer consent ("the user asked me to debug the race" is not consent), never reuse consent given for a different class, line or target VM, and never pass `userApproved=true` on the first call. If the user declines, use `jdwp_set_logpoint`.
+
+**Then:**
+- The class must already be loaded (or pass `forceLoad=true`). The next hit of the line arms the probe: that one thread pauses briefly, and that hit is logged through the debugger (`armingHit`).
+- Read hits with `jdwp_get_events` — `FAST_LOGPOINT` / `FAST_LOGPOINT_ERROR` entries carry the in-target thread, `seq` and `nanoTime`. `FAST_LOGPOINT_DROPPED` means entries were overwritten before you read them: read more often, raise `bufferSize` (power of two, ≤ 65536) or narrow the condition. `jdwp_overview(types="fast_logpoint")` shows the state and counters.
+- `FAST_LOGPOINT_ARM_FAILED` explains a refused arm — most often "the class bytes ... differ from the live bytecode": another agent (JaCoCo, Mockito inline mocks, an enhancer) rewrote the class. That refusal is the safety check working; fall back to `jdwp_set_logpoint`.
+- Results render without calling `toString()` on arbitrary objects (`type@hash`); call it yourself in the expression if you need it. Marked-instance labels (`$label`) and private members are not available.
+- Threads already inside the method keep running the old code until they call it again — a line inside a method that never returns (a worker's main loop) will not log; put the fast logpoint in a method the loop calls.
+- Clear it as soon as you have your answer: `jdwp_clear_breakpoint(id)` restores the original bytecode (so do `jdwp_reset`, `jdwp_disconnect` and server shutdown). Tell the user if a `FAST_LOGPOINT_WARNING` says the bytecode could not be restored — the logpoint then stays listed as `DISABLED` and clearing it again retries.
+
+**Fast logpoints left by an earlier session.** If an attach reply (or `jdwp_overview`, or a `FAST_LOGPOINT_RECOVERED` event) reports fast logpoints left by an earlier debugging session, a previous server died without restoring the class — they keep evaluating in the target. Tell the user what was found (class, line, expression, who armed it when) and **leave them alone unless the user asks**: the earlier investigation may still want them.
+- `RECOVERED` — the class is exactly as that session left it. `jdwp_clear_breakpoint(id)` switches it off without touching the bytecode (no consent needed). `jdwp_restore_fast_logpoints(id)` restores the class's original bytecode, removing every leftover in it — it follows the same consent protocol as arming: call it without `userApproved`, relay the briefing word for word, and pass `userApproved=true` only after the user agreed.
+- `STRANDED` — the class changed after the probe was installed, or its wiring is unknown. Only `jdwp_clear_breakpoint(id)` (the kill switch) is offered; the injected call stays until the JVM restarts.
+- A class with leftovers refuses new fast logpoints until they are restored; use `jdwp_set_logpoint` meanwhile.
+
 ### "Track a specific instance across many breakpoints"
 
 You found the interesting object at one breakpoint (a particular `Cart`, `Session`, `User`, etc.) and want to reference it by name later — in conditions, in logpoint expressions, in watchers — even from frames where the variable name is different or absent.
@@ -282,7 +307,7 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 - **Exception breakpoints on bootstrap classes** (`NullPointerException`, `IllegalStateException`, etc.) start as `[PENDING]`. They auto-promote when any tool runs while a thread is suspended at a breakpoint. Pair with a regular line BP upstream — see the "Exception buried under wrappers" recipe.
 - **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but no thread is at a breakpoint yet. `evaluate_expression`, `to_string`, and `set_exception_breakpoint` cannot work until at least one BP has been hit. Set breakpoints first, then resume.
 - **First `evaluate_expression` is slow** (~1-3s) — the expression compiler discovers the target's classpath lazily. Subsequent evals are fast (cached).
-- **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations.
+- **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations. If the per-hit pause itself is the problem (a race that disappears under a logpoint), see the fast-logpoint recipe — but only with the user's explicit consent.
 - **Field watchpoints are expensive.** Each access/modification of a watched field traps into the debugger; on a hot field this can dominate target-VM CPU. Use the narrowest mode that answers your question (`modification` is usually enough), and add `threadFilterId` / `objectFilterId` / `condition` to scope the catches. `jdwp_diagnose` reports `canWatchFieldAccess` / `canWatchFieldModification` plus this warning when connected. Pending field BPs registered before class load promote synchronously on `ClassPrepareEvent`, so `<clinit>` writes are caught.
 - **Short-running tests can finish before a watchpoint suspends.** A field watchpoint (or any breakpoint armed late) on a test that completes in milliseconds can race `VM_DEATH`: the write happens, but the test tears the VM down before the suspend lands, so `jdwp_resume_until_event` returns `[VM_DEATH]` with no usable stop. **Set a line breakpoint at the failing assertion first, as a safety net,** then add the field watchpoint. The assertion BP guarantees at least one inspectable stop even if the watchpoint loses the race, and you can still read the write's effect from there. The deeper fix for a sub-second test: launch it with `suspend=y` (e.g. `-Dmaven.surefire.debug`) and attach with `jdwp_wait_for_attach` — the JVM blocks at VM_START until you've armed every breakpoint, so a fast test can't tear the VM down before your setup lands.
 - **`$newValue` is bound on both halves of a `mode="both"` field watchpoint.** On a modification event it is the value-to-be; on an access event it is bound as `null` (there is no incoming value). So an expression like `"$oldValue + \" -> \" + $newValue"` renders `… -> null` on reads instead of failing — you do **not** need two separate `access` / `modification` logpoints just to keep the expression compiling.
@@ -314,7 +339,7 @@ After any step, `jdwp_resume_until_event` blocks until the `STEP` event lands. T
 
 ## Inspecting and clearing debug state
 
-Use `jdwp_overview()` for a unified read of every kind of debug state (breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, marked instances) in one call. Filter by type (`types="breakpoint,watcher"`) or by substring (`filter="Cart"`).
+Use `jdwp_overview()` for a unified read of every kind of debug state (breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, watchers, marked instances) in one call. Filter by type (`types="breakpoint,watcher"`) or by substring (`filter="Cart"`).
 
 To bulk-clear: `jdwp_clear(types="...", filter="...")`. The `types` parameter is required so an empty call cannot wipe everything. To preview a clear safely, call `jdwp_overview` with the same `types`/`filter` first — the matching rows are exactly what `jdwp_clear` would remove. Per-id clears still go through `jdwp_clear_breakpoint(id)` / `jdwp_detach_watcher(id)`.
 

@@ -222,6 +222,32 @@ public class BreakpointTracker {
     }
 
     /**
+     * Mints a synthetic ID from the shared breakpoint ID space for a breakpoint kind this tracker
+     * does not store itself (fast logpoints), so {@code jdwp_clear_breakpoint(id)} can route every
+     * kind by one number.
+     */
+    public int allocateId() {
+        return idCounter.getAndIncrement();
+    }
+
+    /**
+     * Swaps the JDI request behind active breakpoint {@code id} — used after a class redefinition,
+     * which deletes every {@link BreakpointRequest} in the redefined class, so the re-created request
+     * keeps the user-facing ID, condition, logpoint expression and chain edges. A no-op returning
+     * {@code false} when {@code id} no longer maps to {@code expected} (cleared concurrently); the
+     * caller then deletes {@code replacement}.
+     */
+    public synchronized boolean replaceBreakpointRequest(int id, BreakpointRequest expected,
+                                                         BreakpointRequest replacement) {
+        if (!breakpointsById.replace(id, expected, replacement)) {
+            return false;
+        }
+        breakpointIdsByRequest.remove(expected);
+        breakpointIdsByRequest.put(replacement, id);
+        return true;
+    }
+
+    /**
      * Lookup a breakpoint by its synthetic ID.
      */
     @Nullable

@@ -28,7 +28,10 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * `EXCEPTION`, `EXCEPTION_SUPPRESSED`, `EXCEPTION_LOG`, `EXCEPTION_LOG_ERROR`, `LOGPOINT`,
  * `LOGPOINT_ERROR`, `CONDITION_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
  * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`,
- * `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`, `RECONNECT`, `VM_START`, `VM_DEATH`.
+ * `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`, `RECONNECT`, `VM_START`, `VM_DEATH`,
+ * `FAST_LOGPOINT`, `FAST_LOGPOINT_ERROR`, `FAST_LOGPOINT_DROPPED`, `FAST_LOGPOINT_ARMED`,
+ * `FAST_LOGPOINT_ARM_FAILED`, `FAST_LOGPOINT_DISARMED`, `FAST_LOGPOINT_WARNING`, `FAST_LOGPOINT_RECOVERED`,
+ * `FAST_LOGPOINT_RESTORED`.
  * These are the keys clients can grep on or filter by.
  */
 @Service
@@ -37,7 +40,7 @@ public class EventHistory {
     /**
      * Hard cap on retained events; not configurable by design (the buffer is for human-readable history, not telemetry).
      */
-    private static final int MAX_EVENTS = 500;
+    public static final int MAX_EVENTS = 500;
     private final Deque<DebugEvent> events = new ConcurrentLinkedDeque<>();
 
     /**

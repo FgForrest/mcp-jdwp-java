@@ -8,6 +8,8 @@ import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointRiskBriefing;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkInfo;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.Watcher;
@@ -120,6 +122,11 @@ public class JDWPTools {
      * instead of blocking.
      */
     private final LocalProjectClasspathProvider localClasspathProvider;
+    /**
+     * Owner of every fast logpoint ({@link #jdwp_set_fast_logpoint}); drained by
+     * {@link #jdwp_get_events}, disarmed by {@link #jdwp_clear_breakpoint} and {@link #jdwp_reset}.
+     */
+    private final FastLogpointService fastLogpoints;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
@@ -127,7 +134,8 @@ public class JDWPTools {
                      JvmDiscoveryService jvmDiscoveryService,
                      MarkedInstanceRegistry markedInstances,
                      JdiHealthMonitor healthMonitor,
-                     LocalProjectClasspathProvider localClasspathProvider) {
+                     LocalProjectClasspathProvider localClasspathProvider,
+                     FastLogpointService fastLogpoints) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -138,6 +146,7 @@ public class JDWPTools {
         this.markedInstances = markedInstances;
         this.healthMonitor = healthMonitor;
         this.localClasspathProvider = localClasspathProvider;
+        this.fastLogpoints = fastLogpoints;
     }
 
     /**
@@ -379,7 +388,8 @@ public class JDWPTools {
         final int port = JVM_JDWP_PORT;
 
         try {
-            return jdiService.connect(host, port) + " Next: set breakpoints, then jdwp_resume_until_event.";
+            return jdiService.connect(host, port) + " Next: set breakpoints, then jdwp_resume_until_event."
+                + jdiService.takeAttachNotice();
         } catch (Exception e) {
             return String.format("""
                     [ERROR] Connection failed to %s:%d
@@ -422,16 +432,19 @@ public class JDWPTools {
                         + "is already hit you can inspect/evaluate now; otherwise set breakpoints and call "
                         + "jdwp_resume_until_event. If you restarted the target on this port, run "
                         + "jdwp_diagnose to confirm identity (or jdwp_disconnect, then reconnect, for a clean attach).",
-                        result, attempts);
+                        result, attempts) + jdiService.takeAttachNotice();
                 }
                 // P3-4: tell the agent what to do next. At VM_START (the common suspend=y case),
                 // no thread is parked at a method-invocation event yet, so jdwp_evaluate_expression
                 // / jdwp_to_string would fail with IncompatibleThreadStateException — the agent
-                // needs to set BPs and resume first.
-                return String.format("%s (attached after %d attempt(s))%n"
-                    + "Next: set breakpoints, then call jdwp_resume_until_event. The VM is currently "
-                    + "suspended at VM_START — expression evaluation requires landing at a real BP first.",
-                    result, attempts);
+                // needs to set BPs and resume first. A JVM started with suspend=n is already running.
+                final String state = anyThreadSuspended()
+                    ? "The VM is currently suspended at VM_START — expression evaluation requires landing at a real "
+                    + "BP first."
+                    : "The VM is running (it was started with suspend=n) — expression evaluation requires landing "
+                    + "at a real BP first.";
+                return String.format("%s (attached after %d attempt(s))%nNext: set breakpoints, then call "
+                    + "jdwp_resume_until_event. %s", result, attempts, state) + jdiService.takeAttachNotice();
             } catch (IllegalConnectorArgumentsException e) {
                 // Configuration error — retrying will never make this succeed. Fail fast.
                 return String.format("[ERROR] Invalid connector arguments for %s:%d — %s",
@@ -528,7 +541,7 @@ public class JDWPTools {
     public String jdwp_reconnect() {
         try {
             final JDIConnectionService.ReconnectResult result = jdiService.reconnectPreservingSpecs();
-            return formatReconnectReport(result);
+            return formatReconnectReport(result) + jdiService.takeAttachNotice();
         } catch (IllegalStateException badPrecondition) {
             return "[ERROR] " + badPrecondition.getMessage();
         } catch (Exception e) {
@@ -2672,13 +2685,16 @@ public class JDWPTools {
             final Location boundLocation = locations.get(0);
             final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
             bpRequest.setSuspendPolicy(jdiPolicy);
-            bpRequest.enable();
 
             final int breakpointId = breakpointTracker.registerBreakpoint(bpRequest);
             breakpointTracker.setLogpointExpression(breakpointId, expression);
             if (condition != null && !condition.isBlank()) {
                 breakpointTracker.setCondition(breakpointId, condition);
             }
+            // Enable only now: JDI delivers events the instant a request is enabled, and a hit that
+            // lands before the expression is registered is handled as a plain breakpoint — on a hot
+            // line that parks the thread for good. Same disable-then-publish order as jdwp_set_breakpoint.
+            bpRequest.enable();
 
             // Diagnostic — see jdwp_set_breakpoint for the rationale.
             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
@@ -2691,6 +2707,150 @@ public class JDWPTools {
         } catch (Exception e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return errorReply(e);
+        }
+    }
+
+    @McpTool(description = "RARE, SITUATIONAL — needs the user's explicit consent. A logpoint evaluated INSIDE the "
+        + "target JVM: the class's bytecode is rewritten to call an injected probe that evaluates the condition and "
+        + "expression on the application thread and appends the result to an in-target ring buffer, so hits never "
+        + "suspend a thread. Use it only when suspending on every hit would distort what you are investigating — races, "
+        + "lock contention, latency-sensitive paths, hot loops with a rarely-true condition; jdwp_set_logpoint stays the "
+        + "default. CONSENT PROTOCOL: call it without userApproved first — nothing is armed and a risk briefing is "
+        + "returned. Relay the briefing to the user word for word and ask. Pass userApproved=true only after the user "
+        + "agreed in this conversation; never infer consent and never reuse consent given for a different class, line "
+        + "or VM. The class must already be loaded (or pass forceLoad=true). Arms on the next hit — that one hit pauses "
+        + "one thread briefly and is logged through the debugger. Read hits with jdwp_get_events (FAST_LOGPOINT entries; "
+        + "buffer overruns are reported as FAST_LOGPOINT_DROPPED). jdwp_clear_breakpoint(id), jdwp_reset, "
+        + "jdwp_disconnect and server shutdown restore the original bytecode. If the server dies without restoring it, "
+        + "the next attach lists the leftover (jdwp_overview) — see jdwp_restore_fast_logpoints.")
+    public String jdwp_set_fast_logpoint(
+        @McpToolParam(description = "Fully qualified class name") String className,
+        @McpToolParam(description = "Line number") int lineNumber,
+        @McpToolParam(description = "Java expression evaluated in the target on every hit (e.g. '\"x=\" + x') — supports `{ ...; return X; }` block syntax. Strings, boxed primitives and enums print their value; other objects print as type@hash unless you call toString() yourself.") String expression,
+        @McpToolParam(required = false, description = "Optional condition evaluated in the target — only log when it is true (e.g. 'i > 100'); supports `{ ...; return X; }` block syntax") @Nullable String condition,
+        @McpToolParam(required = false, description = "Set to true ONLY after the user explicitly approved this exact fast logpoint (class, line, target VM) in this conversation. Missing or false returns the risk briefing and arms nothing.") @Nullable Boolean userApproved,
+        @McpToolParam(required = false, description = "Ring-buffer capacity: a power of two between 16 and 65536 (default 4096). Entries overwritten before jdwp_get_events reads them are reported as dropped.") @Nullable Integer bufferSize,
+        @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`). Default false — the class must already be loaded.") @Nullable Boolean forceLoad) {
+        final String effectiveCondition = condition == null || condition.isBlank() ? null : condition;
+        // Consent gate FIRST — before any VM interaction. Missing and false are treated alike.
+        if (userApproved == null || !userApproved) {
+            return FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
+                describeAttachedTarget());
+        }
+        if (expression == null || expression.isBlank()) {
+            return "Error: expression is required";
+        }
+        final int effectiveBufferSize = bufferSize != null ? bufferSize : FastLogpointService.DEFAULT_BUFFER_SIZE;
+        if (effectiveBufferSize < FastLogpointService.MIN_BUFFER_SIZE
+            || effectiveBufferSize > FastLogpointService.MAX_BUFFER_SIZE
+            || Integer.bitCount(effectiveBufferSize) != 1) {
+            return String.format("Error: bufferSize must be a power of two between %d and %d, got %d",
+                FastLogpointService.MIN_BUFFER_SIZE, FastLogpointService.MAX_BUFFER_SIZE, effectiveBufferSize);
+        }
+        try {
+            final VirtualMachine vm = jdiService.getVM();
+            if (!vm.canRedefineClasses()) {
+                return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_logpoint.";
+            }
+            if (!vm.canGetBytecodes() || !vm.canGetConstantPool()) {
+                return "Error: the target VM does not report method bytecode or constant pools (canGetBytecodes() / "
+                    + "canGetConstantPool() is false), so the guard against stripping other agents' changes cannot run "
+                    + "— use jdwp_set_logpoint.";
+            }
+            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
+            final ReferenceType refType = effectiveForceLoad
+                ? jdiService.findOrForceLoadClass(className)
+                : jdiService.findLoadedClass(className);
+            if (refType == null) {
+                return String.format("Error: class %s is not loaded. A fast logpoint needs a loaded class — let the "
+                    + "application load it first (e.g. stop at a regular breakpoint once), or pass forceLoad=true.",
+                    className) + deferredClassSuggestion(vm, className);
+            }
+            final String rejection = FastLogpointService.rejectHost(refType);
+            if (rejection != null) {
+                return "Error: " + rejection + " — use jdwp_set_logpoint.";
+            }
+            final String leftovers = fastLogpoints.leftoversIn(refType);
+            if (leftovers != null) {
+                return "Error: " + leftovers;
+            }
+            final List<Location> locations = refType.locationsOfLine(lineNumber);
+            if (locations.isEmpty()) {
+                return String.format("Error: No executable code at line %d in class %s", lineNumber, className);
+            }
+            final Location boundLocation = locations.get(0);
+            if (boundLocation.method().isStaticInitializer()) {
+                return "Error: the line is in a static initializer (<clinit>), which runs once — use jdwp_set_logpoint.";
+            }
+            final int id = fastLogpoints.register(vm, boundLocation, expression, effectiveCondition, effectiveBufferSize);
+            final String methodName = boundLocation.method().name();
+            return String.format("Fast logpoint set at %s:%d (ID: %d, expression: %s%s, buffer: %d%s) — PENDING: it arms "
+                    + "on the next hit of the line. That hit pauses one thread while the probe is compiled and "
+                    + "installed, and is logged through the debugger; after that, hits are evaluated in the target "
+                    + "and never suspend. Threads already inside %s keep running the old code until they call it "
+                    + "again. Read hits with jdwp_get_events (FAST_LOGPOINT / FAST_LOGPOINT_ERROR / "
+                    + "FAST_LOGPOINT_DROPPED; FAST_LOGPOINT_ARM_FAILED explains a refused arm), check the state with "
+                    + "jdwp_overview, and restore the original bytecode with jdwp_clear_breakpoint(%d).",
+                className, lineNumber, id, expression,
+                effectiveCondition != null ? ", condition: " + effectiveCondition : "", effectiveBufferSize,
+                multiLocationDiagnostic(id, className, lineNumber, locations, boundLocation, "FLP"),
+                methodName, id);
+        } catch (AbsentInformationException e) {
+            return "Error: No line number information available. Compile with debug info (-g).";
+        } catch (Exception e) {
+            return errorReply(e);
+        }
+    }
+
+    @McpTool(description = "RARE — needs the user's explicit consent. Removes fast logpoints that an EARLIER debugging "
+        + "session left in the target JVM (listed by jdwp_overview as RECOVERED after that session's server died without "
+        + "restoring the class): redefines the class with the class file that session saved, which removes every such "
+        + "fast logpoint in that class. CONSENT PROTOCOL: call it without userApproved first — nothing changes and a "
+        + "briefing is returned (what is removed, what was and was not verified). Relay it to the user and ask; pass "
+        + "userApproved=true only after the user agreed in this conversation. jdwp_clear_breakpoint(id) is the "
+        + "no-consent alternative: it only switches the leftover off. Never restore leftovers on your own initiative.")
+    public String jdwp_restore_fast_logpoints(
+        @McpToolParam(description = "ID of a RECOVERED fast logpoint, as listed by jdwp_overview") int id,
+        @McpToolParam(required = false, description = "Set to true ONLY after the user explicitly approved restoring this class in this conversation. Missing or false returns the briefing and changes nothing.") @Nullable Boolean userApproved) {
+        try {
+            return fastLogpoints.restore(id, userApproved != null && userApproved);
+        } catch (Exception e) {
+            return errorReply(e);
+        }
+    }
+
+    /**
+     * Names the attached target for the fast-logpoint risk briefing, so consent visibly binds to one
+     * VM. Read-only — never connects. {@code null} when nothing is attached.
+     */
+    @Nullable
+    private String describeAttachedTarget() {
+        try {
+            final JDIConnectionService.ConnectionStatus status = jdiService.getConnectionStatus();
+            if (status.connected() && status.lastHost() != null) {
+                return String.format("the JVM attached at %s:%d", status.lastHost(), status.lastPort());
+            }
+        } catch (Exception ignored) {
+            // The briefing still renders without a target description.
+        }
+        return null;
+    }
+
+    /**
+     * Whether the freshly attached VM has a suspended thread — true at a {@code suspend=y}
+     * VM_START, false for a JVM started with {@code suspend=n}. Assumes suspended when the VM
+     * cannot be asked, the common case for {@code jdwp_wait_for_attach}.
+     */
+    private boolean anyThreadSuspended() {
+        try {
+            for (ThreadReference thread : jdiService.getVM().allThreads()) {
+                if (thread.isSuspended()) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception unknown) {
+            return true;
         }
     }
 
@@ -2725,7 +2885,11 @@ public class JDWPTools {
         if (locations.size() <= 1) {
             return "";
         }
-        final String kindLower = "LP".equals(kind) ? "logpoint" : "breakpoint";
+        final String kindLower = switch (kind) {
+            case "LP" -> "logpoint";
+            case "FLP" -> "fast logpoint";
+            default -> "breakpoint";
+        };
         final String boundDesc = JdiEventListener.describeLocation(boundLocation);
         log.warn("[JDI] {} {} bound at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this {})",
             kindLower, id, className, lineNumber, locations.size(), boundDesc, kind);
@@ -2742,9 +2906,13 @@ public class JDWPTools {
             locations.size(), boundDesc, kind);
     }
 
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space. After clearing mid-session, continue with jdwp_resume_until_event.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, field breakpoints and fast logpoints share one ID space (clearing a fast logpoint restores the class's original bytecode). After clearing mid-session, continue with jdwp_resume_until_event.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
+            final String fastLogpointReport = fastLogpoints.clear(breakpointId);
+            if (fastLogpointReport != null) {
+                return fastLogpointReport;
+            }
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
             // CHAIN_BROKEN events land in front of the removal confirmation.
             final boolean isLineBp = breakpointTracker.getBreakpoint(breakpointId) != null
@@ -2934,9 +3102,11 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Get recent JDWP events (breakpoints, steps, exceptions, logpoints, etc.)")
+    @McpTool(description = "Get recent JDWP events (breakpoints, steps, exceptions, logpoints, fast-logpoint hits, etc.)")
     public String jdwp_get_events(@McpToolParam(required = false, description = "Number of recent events to retrieve (default: 20, max: 100)") @Nullable Integer count) {
         try {
+            // Fast-logpoint hits live in the target's ring buffers until read; pull them in first.
+            fastLogpoints.drainAll();
             final int resolvedCount;
             if (count == null || count <= 0) {
                 resolvedCount = 20;
@@ -3439,7 +3609,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
+    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, fast logpoints — restoring the original bytecode —, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
     public String jdwp_reset() {
         final int activeBp = breakpointTracker.getAllBreakpoints().size();
         final int pendingBp = breakpointTracker.getAllPendingBreakpoints().size();
@@ -3448,18 +3618,34 @@ public class JDWPTools {
         final int activeFieldBp = breakpointTracker.getAllFieldBreakpoints().size();
         final int pendingFieldBp = breakpointTracker.getAllPendingFieldBreakpoints().size();
         final int watchers = watcherManager.getAllWatchers().size();
+        // Connect first: an auto-reconnect inside getVM() lists leftover fast logpoints under IDs from
+        // the shared counter, and must happen before the cleanup below, not after it.
+        VirtualMachine vm = null;
+        try {
+            vm = jdiService.getVM();
+        } catch (Exception e) {
+            log.debug("VM unreachable during jdwp_reset — falling back to in-memory reset", e);
+        }
+        // Leftovers of earlier sessions are switched off, never restored; this session's own fast
+        // logpoints get their original bytecode back. Both before the tracker wipe resets the shared
+        // ID counter. Bounded.
+        final int leftoversDisabled = fastLogpoints.disableLeftovers();
+        final int fastLogpointsCleared = fastLogpoints.disarmAll("jdwp_reset");
         final int events = eventHistory.size();
 
         // VM-dependent path first: try to delete the live JDI requests via the EventRequestManager.
         // If the VM is unreachable (external disconnect, crash) we fall back to a pure in-memory
         // reset so the server-local state still gets cleared.
         boolean vmCleared = false;
-        try {
-            final VirtualMachine vm = jdiService.getVM();
-            breakpointTracker.clearAll(vm.eventRequestManager());
-            vmCleared = true;
-        } catch (Exception e) {
-            log.debug("VM unreachable during jdwp_reset — falling back to in-memory reset", e);
+        if (vm != null) {
+            try {
+                breakpointTracker.clearAll(vm.eventRequestManager());
+                vmCleared = true;
+            } catch (Exception e) {
+                log.debug("VM unreachable during jdwp_reset — falling back to in-memory reset", e);
+            }
+        }
+        if (!vmCleared) {
             breakpointTracker.reset();
         }
 
@@ -3468,6 +3654,10 @@ public class JDWPTools {
         jdiService.clearObjectCache();
         eventHistory.clear();
 
+        // List the leftovers again under fresh IDs — unless a teardown worker is still stuck in the VM.
+        final String leftovers = vm != null && vmCleared && !fastLogpoints.isTeardownStuck()
+            ? fastLogpoints.discover(vm) : "";
+
         final String header = vmCleared
             ? "Reset complete (VM connection preserved)."
             : "Reset complete (VM unreachable — server-local state cleared).";
@@ -3475,21 +3665,24 @@ public class JDWPTools {
         // only useful when there was actually something to clear; for the common
         // "agent connects, runs jdwp_reset before starting" warm-up, repeating zeros adds noise.
         final int total = activeBp + pendingBp + activeExBp + pendingExBp
-            + activeFieldBp + pendingFieldBp + watchers + events;
+            + activeFieldBp + pendingFieldBp + fastLogpointsCleared + leftoversDisabled + watchers + events;
         if (total == 0) {
-            return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event.";
+            return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event." + leftovers;
         }
+        final String leftoverLine = leftoversDisabled == 0 ? "" : String.format(
+            "%n  Earlier sessions' fast logpoints: %d disabled (kill switch; bytecode unchanged)", leftoversDisabled);
         return String.format("""
                 %s
                   Breakpoints cleared:           %d active + %d pending
                   Exception breakpoints cleared: %d active + %d pending
                   Field breakpoints cleared:     %d active + %d pending
+                  Fast logpoints cleared:        %d (original bytecode restored)%s
                   Watchers cleared:              %d
                   Event history cleared:         %d entries
                   Object cache cleared.""",
             header, activeBp, pendingBp, activeExBp, pendingExBp,
-            activeFieldBp, pendingFieldBp, watchers, events)
-            + " Next: set breakpoints, then jdwp_resume_until_event.";
+            activeFieldBp, pendingFieldBp, fastLogpointsCleared, leftoverLine, watchers, events)
+            + " Next: set breakpoints, then jdwp_resume_until_event." + leftovers;
     }
 
     // ========================================
@@ -3507,7 +3700,7 @@ public class JDWPTools {
     private static final Set<String> OVERVIEW_TYPES = Collections.unmodifiableSet(
         new LinkedHashSet<>(List.of(
             "breakpoint", "exception_breakpoint", "field_breakpoint",
-            "logpoint", "watcher", "mark")));
+            "logpoint", "fast_logpoint", "watcher", "mark")));
 
     @McpTool(description = "Mark a cached object instance with an agent-chosen label so it can be referenced by name as $label inside conditional-breakpoint, logpoint, watcher, and exception-logpoint expressions. The object is pinned in the target heap (disableCollection) by default so the label remains usable across many events; pass pin=false to allow natural GC. Label must be a valid Java identifier and must not collide with a reserved binding ($exception, $oldValue, $newValue, $object, $fieldName, $mode, _this) or another live mark.")
     public String jdwp_mark_instance(
@@ -3576,9 +3769,9 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive). Empty sections are hidden by default; pass showEmpty=true to render every category header even when zero entries match.")
+    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive). Empty sections are hidden by default; pass showEmpty=true to render every category header even when zero entries match.")
     public String jdwp_overview(
-        @McpToolParam(required = false, description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark. Defaults to all.") @Nullable String types,
+        @McpToolParam(required = false, description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, watcher, mark. Defaults to all.") @Nullable String types,
         @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter,
         @McpToolParam(required = false, description = "If true, also render category headers for categories with zero entries (e.g. 'Watchers (0):'). Default false — saves ~5 lines per call for sessions that only use BPs.") @Nullable Boolean showEmpty) {
         try {
@@ -3605,6 +3798,9 @@ public class JDWPTools {
             if (wanted.contains("logpoint")) {
                 totalShown += appendBreakpointOverview(out, needle, true, renderEmpty);
             }
+            if (wanted.contains("fast_logpoint")) {
+                totalShown += appendFastLogpointOverview(out, needle, renderEmpty);
+            }
             if (wanted.contains("exception_breakpoint")) {
                 totalShown += appendExceptionBreakpointOverview(out, needle, renderEmpty);
             }
@@ -3628,7 +3824,7 @@ public class JDWPTools {
 
     @McpTool(description = "Delete debug state by type and/or substring filter. The 'types' arg is REQUIRED so an empty call cannot wipe everything by accident; pass 'all' to clear every supported type. To preview what would be cleared, call jdwp_overview with the same types/filter first.")
     public String jdwp_clear(
-        @McpToolParam(description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark. Use 'all' for every type. REQUIRED.") String types,
+        @McpToolParam(description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, watcher, mark. Use 'all' for every type. REQUIRED.") String types,
         @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter) {
         try {
             if (types == null || types.isBlank()) {
@@ -3666,6 +3862,9 @@ public class JDWPTools {
             if (wanted.contains("field_breakpoint")) {
                 totalCleared += clearFieldBreakpoints(out, needle);
             }
+            if (wanted.contains("fast_logpoint")) {
+                totalCleared += clearFastLogpoints(out, needle);
+            }
 
             if (totalCleared == 0) {
                 out.append("\n(nothing matched)\n");
@@ -3674,7 +3873,8 @@ public class JDWPTools {
                     totalCleared, totalCleared == 1 ? "y" : "ies"));
             }
             if (vm == null && (wanted.contains("breakpoint") || wanted.contains("exception_breakpoint")
-                || wanted.contains("field_breakpoint") || wanted.contains("logpoint"))) {
+                || wanted.contains("field_breakpoint") || wanted.contains("logpoint")
+                || wanted.contains("fast_logpoint"))) {
                 out.append("(note: VM not connected — BP removal is server-local only)\n");
             }
             return out.toString();
@@ -3817,6 +4017,59 @@ public class JDWPTools {
             ? String.format("\nLogpoints (%d):\n", rows.size())
             : String.format("\nBreakpoints (%d):\n", rows.size()));
         rows.forEach(r -> out.append(r).append('\n'));
+        return rows.size();
+    }
+
+    /**
+     * Renders the fast-logpoint section: state, and for armed ones the live write counter next to
+     * what has been read into the event history and what was dropped. Leftovers of an earlier
+     * session carry their provenance. Retries a leftover discovery that did not finish at attach.
+     */
+    private int appendFastLogpointOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
+        String retried = "";
+        try {
+            final VirtualMachine vm = jdiService.getRawVM();
+            if (vm != null) {
+                retried = fastLogpoints.discoverIfIncomplete(vm);
+            }
+        } catch (Exception ignored) {
+            // The overview renders what is known.
+        }
+        final List<String> rows = new ArrayList<>();
+        for (FastLogpointService.Info info : fastLogpoints.list()) {
+            if (!matchesFilter(needle, info.className(), info.expression(), info.condition())) {
+                continue;
+            }
+            final String counters = String.format("written=%s read=%d dropped=%d buffer=%d",
+                info.written() >= 0 ? String.valueOf(info.written()) : "?",
+                info.logged(), info.dropped(), info.bufferSize());
+            final String switchState = info.enabled() ? "evaluating" : "kill switch set";
+            final String state = switch (info.state()) {
+                case PENDING -> "PENDING — arms on the next hit";
+                case ARMED -> "ARMED — " + counters;
+                case DISABLED -> "DISABLED, still installed — " + info.failureReason();
+                case FAILED -> "FAILED: " + info.failureReason();
+                case DISARMED -> "DISARMED";
+                case RECOVERED -> "RECOVERED, " + switchState + " — " + counters
+                    + "; jdwp_clear_breakpoint disables, jdwp_restore_fast_logpoints restores (user approval)";
+                case STRANDED -> "STRANDED, " + switchState + " — " + info.failureReason();
+            };
+            final FastLogpointService.Provenance provenance = info.provenance();
+            final String origin = provenance == null ? "" : String.format(
+                "  [left by an earlier session: armed %s by %s, loader %s, up to %d entries written before this attach "
+                    + "(not replayed)]",
+                provenance.armedAt(), provenance.armedBy(), provenance.loader(), provenance.retained());
+            rows.add(String.format("  #%d  %s:%d  [%s]  expr=\"%s\"%s%s",
+                info.id(), info.className(), info.line(), state, info.expression(),
+                info.condition() != null ? "  cond=\"" + info.condition() + '"' : "", origin));
+        }
+        if (rows.isEmpty() && !showEmpty) {
+            out.append(retried);
+            return 0;
+        }
+        out.append(String.format("\nFast logpoints (%d) — bytecode-instrumented, read with jdwp_get_events:\n", rows.size()));
+        rows.forEach(r -> out.append(r).append('\n'));
+        out.append(retried);
         return rows.size();
     }
 
@@ -4113,6 +4366,26 @@ public class JDWPTools {
             appendBulkClearLine(out, "#" + id);
             breakpointTracker.removeFieldBreakpoint(id);
             watcherManager.deleteWatchersForBreakpoint(id);
+        }
+        return toClear.size();
+    }
+
+    /**
+     * Bulk-clear fast logpoints matching {@code needle}; each clear restores the class's bytecode.
+     */
+    private int clearFastLogpoints(StringBuilder out, @Nullable String needle) {
+        final List<Integer> toClear = new ArrayList<>();
+        for (FastLogpointService.Info info : fastLogpoints.list()) {
+            if (matchesFilter(needle, info.className(), info.expression(), info.condition())) {
+                toClear.add(info.id());
+            }
+        }
+        if (toClear.isEmpty()) {
+            return 0;
+        }
+        out.append(String.format("Fast logpoints: %d match%s\n", toClear.size(), toClear.size() == 1 ? "" : "es"));
+        for (int id : toClear) {
+            appendBulkClearLine(out, "#" + id + " — " + fastLogpoints.clear(id));
         }
         return toClear.size();
     }

@@ -4,6 +4,7 @@ import com.sun.jdi.*;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.*;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -11,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +49,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}); the safety-net
  * promoter is strictly passive (it never calls {@code invokeMethod} on the target VM), so it is
  * safe to invoke from any event-thread context.
+ * <p>
+ * Fast logpoints: a breakpoint event that belongs to a fast logpoint's one-shot arming request is
+ * handed to {@link FastLogpointService#handleArmingHit} instead of {@link #handleBreakpointEvent},
+ * after every other event of the same set has been handled — arming redefines the class, which
+ * replaces the JDI requests behind the other events' breakpoints in that class. The arming thread
+ * is resumed unless another event in the set asks to suspend.
  * <p>
  * Chain handling: after every BP, exception, or auto-resumed logpoint hit,
  * {@link #applyChainEffectsAfterHit} arms any dependent BPs waiting on the firing BP and
@@ -88,6 +96,12 @@ public class JdiEventListener {
      */
     @Nullable
     private volatile Runnable trafficObserver;
+    /**
+     * Receives fast-logpoint arming hits; registered by {@link FastLogpointService} itself, null in
+     * tests that drive the listener without it.
+     */
+    @Nullable
+    private volatile FastLogpointService fastLogpoints;
     /**
      * Idempotence gate so concurrent death observers (graceful in-loop event, disconnect exception,
      * external {@code stop()}) collapse into at most one {@link #vmDeathHook} invocation per session.
@@ -203,7 +217,7 @@ public class JdiEventListener {
      * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
      * history, so the simpler implementation is preferred.
      */
-    private static String formatLogpointResult(@Nullable Value value) {
+    public static String formatLogpointResult(@Nullable Value value) {
         if (value == null) {
             return "null";
         }
@@ -238,6 +252,13 @@ public class JdiEventListener {
      */
     public void setTrafficObserver(@Nullable Runnable observer) {
         this.trafficObserver = observer;
+    }
+
+    /**
+     * Registers the service that arms fast logpoints; see the class documentation.
+     */
+    public void setFastLogpointService(@Nullable FastLogpointService service) {
+        this.fastLogpoints = service;
     }
 
     /**
@@ -343,9 +364,17 @@ public class JdiEventListener {
                 // First thread parked for inspection in this set; used to pre-warm the compiler
                 // classpath once the loop has recorded the hit (see the prewarm call below).
                 ThreadReference warmThread = null;
+                final FastLogpointService fastLogpointService = fastLogpoints;
+                List<BreakpointEvent> armingHits = null;
 
                 for (Event event : eventSet) {
-                    if (event instanceof BreakpointEvent bpEvent) {
+                    if (event instanceof BreakpointEvent bpEvent
+                        && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
+                        if (armingHits == null) {
+                            armingHits = new ArrayList<>(1);
+                        }
+                        armingHits.add(bpEvent);
+                    } else if (event instanceof BreakpointEvent bpEvent) {
                         if (handleBreakpointEvent(bpEvent)) {
                             shouldSuspend = true;
                             if (warmThread == null) {
@@ -388,6 +417,14 @@ public class JdiEventListener {
                         breakpointTracker.fireNextEvent();
                         invokeVmDeathHook();
                         return;
+                    }
+                }
+
+                // Arm last: arming redefines the class, which replaces the JDI requests behind any
+                // other breakpoint event of this set located in the same class.
+                if (armingHits != null && fastLogpointService != null) {
+                    for (BreakpointEvent armingHit : armingHits) {
+                        fastLogpointService.handleArmingHit(armingHit);
                     }
                 }
 

@@ -8,7 +8,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 
 ## What you get (TL;DR)
 
-An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code as **47 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
+An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code as **48 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
 
 - **See runtime state, not stack traces** — read locals, fields, threads, the entire object graph
 - **Evaluate arbitrary Java in the suspended frame** — compiled to real bytecode, full classpath, including private/package-private members
@@ -367,6 +367,26 @@ jdwp_set_logpoint(
 
 A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never suspends the thread**. Combined with an optional condition, this gives the agent non-intrusive tracing without stopping execution. View results with `jdwp_get_events()`.
 
+### Fast logpoints (in-target, consent required)
+
+A regular logpoint does not stop the thread for long, but it does stop it: every hit — including one whose condition is false — pauses the hitting thread while the server evaluates the condition and expression over JDWP (milliseconds per hit, one hit at a time). In races, lock contention and hot loops that pause changes the very interleaving under investigation. `jdwp_set_fast_logpoint` moves the evaluation **into the target JVM**:
+
+```
+jdwp_set_fast_logpoint(
+  className="com.example.OrderService",
+  lineNumber=42,
+  expression="\"order \" + order.getId() + \" on \" + Thread.currentThread().getName()",
+  condition="order.getTotal() < 0",
+  userApproved=true          // only after the user explicitly agreed — see below
+)
+```
+
+On the next hit of the line the server compiles a small probe class, defines it in the class's own class loader, and redefines the class (`VirtualMachine.redefineClasses`) with a call to the probe at that line. From then on the probe evaluates the condition and expression on the application thread and appends the result to a lock-free ring buffer in the target; `jdwp_get_events` reads that buffer through plain field reads — no thread is ever suspended — and reports entries lost to a buffer overrun as `FAST_LOGPOINT_DROPPED`. Clearing the logpoint, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode.
+
+Because this **rewrites the running application's bytecode**, the tool requires explicit user consent: called without `userApproved=true` it arms nothing and returns a risk briefing (instrumentation that outlives a crashed server, user code on application threads, interaction with other bytecode agents, breakpoint re-creation, two stop-the-world pauses) for the agent to relay to the user word for word.
+
+If the server dies without restoring the class, the probe keeps running — but it describes itself, and the next attach finds it: the attach reply and `jdwp_overview` list it as `RECOVERED` (the class is exactly as that session left it) or `STRANDED` (it is not), with the expression and who armed it when. `jdwp_clear_breakpoint` switches a leftover off without touching the bytecode; `jdwp_restore_fast_logpoints(id, userApproved=true)` restores a `RECOVERED` class's original bytecode, again only after the user agreed to a briefing. Nothing an earlier session left is ever restored implicitly. Arming is refused when the live bytecode differs from the class file — e.g. JaCoCo or the Mockito inline mock maker instrumented the class — because redefining from the class file would silently strip their changes. Measured on the live test target (two threads calling the instrumented method in a loop, condition never true): throughput stayed at the no-logpoint level (about 25 million calls/s on the test machine), against a few hundred calls/s — 3–7 ms per hit — under `jdwp_set_logpoint`. `jdwp_set_logpoint` stays the default; reach for the fast variant only when suspending on every hit would distort what you are looking at.
+
 ### Deferred breakpoints
 
 By default, every line BP, logpoint, exception BP, and field BP is registered **passively**: if the target class isn't loaded when the breakpoint is set, the server registers a `ClassPrepareRequest` and promotes the breakpoint to active when the JVM loads the class on its own — same behaviour as IntelliJ / Eclipse / jdb.
@@ -602,7 +622,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 - **`step_out`** — an exception/early-abort left you deep in a frame you don't care about and finding the caller line for a breakpoint is awkward.
 - **`step_over`** — the *single* next line, when observing a state mutation is faster than predicting it. More than ~3 in a row → set a breakpoint instead.
 
-## Tool reference (47 tools)
+## Tool reference (48 tools)
 
 ### Connection (4)
 
@@ -639,13 +659,15 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`      |
 | `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event`  |
 
-### Breakpoints (7)
+### Breakpoints (8)
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
 | `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, trigger chaining; `forceLoad=true` binds immediately and runs `<clinit>`) |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`, `forceLoad?` | Non-stopping line breakpoint that logs expression result |
-| `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, and field BPs |
+| `jdwp_set_fast_logpoint`          | `className`, `lineNumber`, `expression`, `condition?`, `userApproved?`, `bufferSize?`, `forceLoad?` | **Rare, consent required.** Logpoint evaluated inside the target by injected bytecode — hits never suspend. Without `userApproved=true` it arms nothing and returns a risk briefing |
+| `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
+| `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs and fast logpoints (restoring the original bytecode; a leftover of an earlier session is only switched off) |
 | `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred and trigger chaining) |
 | `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
 | `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
@@ -704,7 +726,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool            | Parameters         | Description                                                                                                          |
 |-----------------|--------------------|----------------------------------------------------------------------------------------------------------------------|
-| `jdwp_overview` | `types?`, `filter?`, `showEmpty?` | Unified read-only listing of breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marks. Filter by type subset and/or case-insensitive substring (class/label/expression/type). |
+| `jdwp_overview` | `types?`, `filter?`, `showEmpty?` | Unified read-only listing of breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, watchers, and marks. Filter by type subset and/or case-insensitive substring (class/label/expression/type). |
 | `jdwp_clear`    | `types`, `filter?`  | Bulk-delete by type and/or substring filter. `types` is REQUIRED (use `'all'` to clear every supported kind). To preview, call `jdwp_overview` with the same args first. |
 
 ### Session (1)
