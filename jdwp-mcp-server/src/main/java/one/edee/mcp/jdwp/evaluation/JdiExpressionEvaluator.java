@@ -37,9 +37,10 @@ import java.util.stream.Collectors;
  * `LinkageError` when the MCP server reconnects to a freshly-restarted target VM and tries to
  * load bytecode that the previous session had already pinned to a class name.
  * <p>
- * Thread model: {@link #configureCompilerClasspath} MUST be called from the MCP worker thread
- * BEFORE {@link #evaluate}, never from inside the JDI event listener. The configuration step
- * issues `invokeMethod` calls that would deadlock the listener if it called itself.
+ * Thread model: {@link #configureCompilerClasspath} MUST be called BEFORE {@link #evaluate}, from an
+ * MCP worker thread or the JDI event dispatcher thread, never from the JDI event listener thread. The
+ * configuration step issues `invokeMethod` calls, and the listener thread has to keep draining the
+ * events those calls can raise.
  */
 @Service
 public class JdiExpressionEvaluator {
@@ -1274,9 +1275,9 @@ public class JdiExpressionEvaluator {
      * <p>{@code includeLocal} controls whether the local-project classpath fallback (env override +
      * filesystem scan + Maven {@code dependency:build-classpath}) is merged in. The real evaluation
      * paths pass {@code true}; the speculative {@link #prewarmClasspath} — which runs on the JDI
-     * event-listener thread the instant a breakpoint hits, before the user has asked for anything —
+     * event dispatcher thread the instant a breakpoint hits, before the user has asked for anything —
      * passes {@code false}. The local fallback can shell out to Maven with a multi-minute timeout, so
-     * paying it on the event-listener thread would block event processing (and every other breakpoint)
+     * paying it on the dispatcher thread would block event processing (and every other breakpoint)
      * for minutes even if the user never evaluates an expression. Prewarm therefore warms only the
      * remote classpath + JDK detection, and {@link #localClasspathMerged} stays {@code false} so the
      * first actual evaluation/logpoint/condition completes the local merge.
@@ -1348,7 +1349,7 @@ public class JdiExpressionEvaluator {
             // for the source/binary-drift risk.
             final long mergeStart = System.currentTimeMillis();
             // includeLocal=false (prewarm) skips the local provider entirely — it can shell out to
-            // Maven with a multi-minute timeout, which must never run on the JDI event-listener
+            // Maven with a multi-minute timeout, which must never run on the JDI event dispatcher
             // thread. The first real evaluation re-enters with includeLocal=true and completes the
             // merge below.
             final Set<String> localEntries = includeLocal ? localClasspathProvider.discover() : Set.of();
@@ -1399,13 +1400,13 @@ public class JdiExpressionEvaluator {
      * <p>
      * Warms ONLY the remote classpath + JDK detection (it passes {@code includeLocal=false}). The
      * local-project fallback is deliberately NOT run here: it can shell out to Maven with a
-     * multi-minute timeout, and this method runs on the JDI event-listener thread the moment a
+     * multi-minute timeout, and this method runs on the JDI event dispatcher thread the moment a
      * breakpoint hits — blocking that thread on Maven would stall event processing (and every other
      * breakpoint) for minutes even if the user never evaluates anything. The first real evaluation
      * completes the local merge via {@link #configureCompilerClasspath(ThreadReference)}.
      * <p>
      * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
-     * event listener while a thread is parked for inspection, and a warming failure must not disrupt
+     * event dispatcher while a thread is parked for inspection, and a warming failure must not disrupt
      * the breakpoint flow. Any failure is logged at debug and left for the real evaluation call to
      * re-attempt and surface with a precise error.
      *

@@ -14,6 +14,14 @@ JDI delivers every interesting target-VM event — breakpoint hits, steps, excep
 
 One thread, named `jdi-event-listener`, daemon, spawned by `JdiEventListener.start(vm)` (`JdiEventListener.java:200-212`). Exactly one runs at a time — `start()` calls `stop()` first (line 201) so reconnects never overlap two listeners.
 
+The listener only drains and routes. Processing an event set can call into the target — logpoint expressions, breakpoint conditions, fast-logpoint arming, the classpath pre-warm all use `invokeMethod` — and a method invoked that way can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. So the sets are processed on a second thread, `jdi-event-dispatcher` (a single-thread executor per connection, so they stay in arrival order and their evaluations stay serialized), while the listener keeps draining:
+
+- a set whose thread is inside an MCP-driven evaluation (`EvaluationGuard`) is processed on the listener thread at once — its handlers record `*_SUPPRESSED` and the set is resumed, which lets the waiting invocation finish;
+- a `VMDeath` / `VMDisconnect` set is processed on the listener thread after the dispatcher has finished the sets before it (bounded at 2 s), so `VM_DEATH` stays the last entry;
+- every other set goes to the dispatcher.
+
+Whoever processes a set decides its resume, after all of its events. Because a set can wait on the dispatcher, the handlers re-apply the rule JDI applies when a set leaves its queue to one case: an event whose request was **deleted** meanwhile (a cleared logpoint, a class redefined by a fast logpoint) is dropped and does not keep its set suspended — otherwise the stale hit would be untracked and park its thread for good. An event whose tracked request was merely **disabled** meanwhile still counts as a hit, as it would have when the set left the queue: resuming its set late could release a newer suspension of the same thread (after an intervening `jdwp_resume`, the thread may already be stopped at its next event).
+
 Lifetime:
 
 - Started by `JDIConnectionService.connect(...)` after the JDI attach succeeds (`JDIConnectionService.java:316`).
@@ -24,11 +32,15 @@ Lifetime:
 
 ## 2. The loop
 
-`listen(VirtualMachine vm)` (`JdiEventListener.java:278-349`) is the whole event loop. Skeleton:
+`listen(...)` drains and routes (see §1); `process(EventSet)` handles one set. Skeleton:
 
 ```java
 while (running) {
     EventSet eventSet = vm.eventQueue().remove();   // blocks
+    route(eventSet);   // process(eventSet) here, or on the dispatcher
+}
+
+void process(EventSet eventSet) {
     boolean shouldSuspend = false;
     for (Event e : eventSet) {
         shouldSuspend |= dispatchByType(e);
@@ -46,7 +58,7 @@ Two details matter:
 
 ### Dispatch by type
 
-The dispatcher inside the loop routes by `instanceof`:
+`process` routes each event by `instanceof`:
 
 | Event type | Handler | Lines |
 |---|---|---|

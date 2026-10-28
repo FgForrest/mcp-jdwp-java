@@ -64,8 +64,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * requests in the class first and re-creates them on the new bytecode, with the same ID, suspend
  * policy and enabled state.
  * <p>
- * <b>Threading.</b> Arming runs on the JDI listener thread; everything else runs on MCP worker
- * threads. Mutation of logpoint state and every redefinition happens under this service's monitor.
+ * <b>Threading.</b> Arming runs on the JDI event dispatcher thread while the listener thread keeps
+ * draining events, so a breakpoint hit inside a method arming invokes is suppressed and resumed (see
+ * {@link JdiEventListener}); everything else runs on MCP worker threads. Mutation of logpoint state
+ * and every redefinition happens under this service's monitor.
  * The slow part of arming (evaluation, compilation, method invocations) runs <em>outside</em> it so a
  * teardown never waits behind a compile; the locked install step re-checks that the logpoint was
  * not cleared meanwhile. Teardown ({@link #disarmAll}) and discovery are bounded by
@@ -247,8 +249,9 @@ public class FastLogpointService {
     }
 
     /**
-     * Arms the fast logpoint whose arming breakpoint {@code event} reports. Runs on the JDI listener
-     * thread with the event's thread suspended; the listener resumes it afterwards. Never throws —
+     * Arms the fast logpoint whose arming breakpoint {@code event} reports. Runs on the JDI event
+     * dispatcher thread with the event's thread suspended; the dispatcher resumes it afterwards.
+     * Never throws —
      * a failure marks the logpoint {@link State#FAILED} and records {@code FAST_LOGPOINT_ARM_FAILED}.
      */
     public void handleArmingHit(BreakpointEvent event) {
@@ -2031,7 +2034,7 @@ public class FastLogpointService {
         final String condition;
         final int bufferSize;
 
-        // Read by the listener thread and MCP workers; written under the service monitor.
+        // Read by the event threads and MCP workers; written under the service monitor.
         volatile State state = State.PENDING;
         @Nullable
         volatile String failureReason;

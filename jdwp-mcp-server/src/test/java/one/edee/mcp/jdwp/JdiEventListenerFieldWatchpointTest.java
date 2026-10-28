@@ -593,6 +593,7 @@ class JdiEventListenerFieldWatchpointTest {
 
 	private static void wireWatchpointEvent(WatchpointEvent event, ThreadReference thread,
 			WatchpointRequest req, String className, String fieldName, @Nullable Value valueCurrent) {
+		JdiEventListenerTestSupport.markLive(req);
 		when(event.request()).thenReturn(req);
 		when(event.thread()).thenReturn(thread);
 		when(event.valueCurrent()).thenReturn(valueCurrent);

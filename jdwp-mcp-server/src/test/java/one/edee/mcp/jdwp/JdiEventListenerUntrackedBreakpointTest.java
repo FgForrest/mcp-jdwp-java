@@ -119,4 +119,57 @@ class JdiEventListenerUntrackedBreakpointTest {
 			.extracting(EventHistory.DebugEvent::type)
 			.doesNotContain("BREAKPOINT", "BREAKPOINT_SUPPRESSED");
 	}
+
+	/**
+	 * A set can wait for the dispatcher thread while its request goes — a logpoint cleared, a class
+	 * redefined. JDI drops such an event when the set leaves its queue and resumes the set if nothing
+	 * is left; the listener must apply the same rule when it processes the set, not park the thread
+	 * as an untracked hit that nobody will ever resume.
+	 */
+	@Test
+	@DisplayName("An event whose request was deleted while its set waited is dropped and the set resumed")
+	void shouldDropEventOfDeletedRequest() throws Exception {
+		ThreadReference thread = mockThread("worker-cleared", 900L);
+		BreakpointRequest request = mock(BreakpointRequest.class);
+		int id = tracker.registerBreakpoint(request);
+		tracker.setLogpointExpression(id, "i");
+		BreakpointEvent event = mockBreakpointEvent(thread, request, "com.example.Cleared", 12);
+		EventSet eventSet = mockEventSet(event);
+		// The logpoint is cleared before the set is processed: forgotten, and its request deleted.
+		tracker.removeBreakpoint(id);
+		when(request.isEnabled()).thenReturn(false);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		assertThat(tracker.getLastBreakpointThread()).isNull();
+		assertThat(eventHistory.getRecent(10))
+			.extracting(EventHistory.DebugEvent::type)
+			.doesNotContain("BREAKPOINT", "LOGPOINT", "LOGPOINT_ERROR");
+	}
+
+	/**
+	 * The other half of the rule above: a breakpoint that is still tracked but was disabled while its
+	 * set waited is a hit, as it was when the set left JDI's queue. Resuming that set late could
+	 * release a newer suspension of the same thread — after an intervening {@code jdwp_resume} the
+	 * thread may already be stopped at its next event.
+	 */
+	@Test
+	@DisplayName("An event whose tracked request was disabled while its set waited is still a hit")
+	void shouldKeepHitOfDisabledTrackedRequest() throws Exception {
+		ThreadReference thread = mockThread("worker-disabled", 901L);
+		BreakpointRequest request = mock(BreakpointRequest.class);
+		int id = tracker.registerBreakpoint(request);
+		BreakpointEvent event = mockBreakpointEvent(thread, request, "com.example.Disabled", 13);
+		EventSet eventSet = mockEventSet(event);
+		when(request.isEnabled()).thenReturn(false);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet, never()).resume();
+		assertThat(tracker.getLastBreakpointId()).isEqualTo(id);
+		assertThat(eventHistory.getRecent(10))
+			.extracting(EventHistory.DebugEvent::type)
+			.contains("BREAKPOINT");
+	}
 }

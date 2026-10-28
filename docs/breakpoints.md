@@ -153,7 +153,7 @@ All three respect the same fail-safe rule: if the log expression fails to evalua
 
 ### 5a. Fast logpoints — evaluation moved into the target
 
-"Does not suspend" above is the agent's view; the thread *is* parked for the whole evaluation — several JDWP round trips per hit, one hit at a time on the single listener thread, and a method with a JVMTI breakpoint stays interpreted. `jdwp_set_fast_logpoint` (package `fastlogpoint`) removes the debugger from the per-hit path. It changes the running application's bytecode, so the tool refuses to arm without `userApproved=true` and returns a risk briefing instead (`FastLogpointRiskBriefing`).
+"Does not suspend" above is the agent's view; the thread *is* parked for the whole evaluation — several JDWP round trips per hit, one hit at a time on the single event dispatcher thread, and a method with a JVMTI breakpoint stays interpreted. `jdwp_set_fast_logpoint` (package `fastlogpoint`) removes the debugger from the per-hit path. It changes the running application's bytecode, so the tool refuses to arm without `userApproved=true` and returns a risk briefing instead (`FastLogpointRiskBriefing`).
 
 Lifecycle (`FastLogpointService`):
 

@@ -36,7 +36,7 @@ Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Targe
 - **JDWPTools** — Exposes ~30 MCP tools via `@McpTool` annotations. This is the main interface: connection, thread/stack/variable inspection, breakpoints, stepping, and watcher evaluation. All tool methods return formatted `String` responses.
 - **JDIConnectionService** — Singleton holding the persistent `VirtualMachine` (JDI) connection. Manages object caching (`ConcurrentHashMap<Long, ObjectReference>`) and smart collection rendering (ArrayList, HashMap, HashSet internals). Also drives classpath discovery for expression evaluation.
 - **BreakpointTracker** — Maintains a registry of breakpoints with synthetic integer IDs (since JDI `BreakpointRequest` has no user-facing ID). Tracks the last thread that hit a breakpoint.
-- **JdiEventListener** — Daemon thread consuming the JDI event queue. Updates `BreakpointTracker` on breakpoint/step events. Breakpoint events do NOT auto-resume — threads stay suspended for user inspection.
+- **JdiEventListener** — Daemon thread consuming the JDI event queue; the event sets are processed in order on a `jdi-event-dispatcher` thread, except a set raised inside an MCP-driven evaluation, which the listener handles (suppresses and resumes) at once. Updates `BreakpointTracker` on breakpoint/step events. Breakpoint events do NOT auto-resume — threads stay suspended for user inspection.
 
 ### Expression Evaluation Pipeline (`evaluation/` package)
 
@@ -76,4 +76,4 @@ When adding new code, do not introduce un-annotated nullable slots — if a valu
 - `JDIConnectionService.disconnect()` calls `vm.dispose()` for clean JDWP teardown.
 - Object references are cached globally so users can navigate object graphs across multiple tool calls.
 - Expression wrapper classes use UUID-based naming to avoid `LinkageError` across server restarts.
-- The JDI event listener thread must consume all events to prevent the target JVM from blocking.
+- The JDI event listener thread must consume all events to prevent the target JVM from blocking — so it never calls into the target itself: an invoked method can hit a breakpoint whose event only the listener can drain (see `docs/event-pipeline.md` § 1).

@@ -453,6 +453,32 @@ class FastLogpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	@Test
+	@Order(15)
+	@DisplayName("a breakpoint hit inside a method the debugger invokes is suppressed instead of hanging the debugger")
+	void breakpointInsideInvokedCodeDoesNotHang() throws Exception {
+		// A logpoint that never logs: from now on every call of other(i) raises a breakpoint event.
+		final int otherId = idOf(tools.jdwp_set_logpoint(TARGET, otherLine, "i", "i < 0", null));
+		try {
+			// Evaluating this logpoint calls other(i) on the very thread the debugger invokes it on.
+			final int callingId = idOf(tools.jdwp_set_logpoint(TARGET, probeLine, "this.other(i)", null, null));
+			await("a logpoint whose evaluation called other(i)", () -> history.getRecent(EventHistory.MAX_EVENTS)
+				.stream().anyMatch(e -> "LOGPOINT".equals(e.type()) && "this.other(i)".equals(e.details().get("expression"))));
+			tools.jdwp_clear_breakpoint(callingId);
+			assertThat(suppressedAtOtherLine()).isTrue();
+
+			// Arming evaluates its first hit through the debugger, which calls other(i) as well.
+			history.clear();
+			final int fastId = idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "this.other(i)", null, true, null, null));
+			awaitArmed(fastId);
+			assertThat(suppressedAtOtherLine()).isTrue();
+			assertThat(tools.jdwp_clear_breakpoint(fastId)).contains("original bytecode");
+		} finally {
+			tools.jdwp_clear_breakpoint(otherId);
+		}
+		assertBytecodeRestored();
+	}
+
 	// ── helpers ──
 
 	/**
@@ -603,6 +629,16 @@ class FastLogpointLiveTest {
 	private List<EventHistory.DebugEvent> drainedEvents(String type) {
 		tools.jdwp_get_events(1);
 		return history.getRecent(EventHistory.MAX_EVENTS).stream().filter(e -> type.equals(e.type())).toList();
+	}
+
+	/**
+	 * Whether the history holds a breakpoint event at the {@code other} line that was suppressed
+	 * because its thread was inside a method the debugger invoked.
+	 */
+	private boolean suppressedAtOtherLine() {
+		return history.getRecent(EventHistory.MAX_EVENTS).stream()
+			.anyMatch(e -> "BREAKPOINT_SUPPRESSED".equals(e.type())
+				&& String.valueOf(otherLine).equals(e.details().get("line")));
 	}
 
 	private Set<String> eventTypes() {
