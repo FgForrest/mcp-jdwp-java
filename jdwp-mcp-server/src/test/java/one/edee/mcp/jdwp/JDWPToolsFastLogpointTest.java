@@ -162,7 +162,7 @@ class JDWPToolsFastLogpointTest {
 		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(type);
 		when(type.name()).thenReturn("com.example.Cart");
 		when(type.classLoader()).thenReturn(mock(ClassLoaderReference.class));
-		when(fastLogpoints.leftoversIn(type)).thenReturn("refusing to arm: com.example.Cart still carries ...");
+		when(fastLogpoints.leftoversIn(type, FastLogpointService.Kind.LOGPOINT)).thenReturn("refusing to arm: com.example.Cart still carries ...");
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
 			.isEqualTo("Error: refusing to arm: com.example.Cart still carries ...");
 		verify(fastLogpoints, never()).register(any(), any(), anyString(), any(), anyInt());

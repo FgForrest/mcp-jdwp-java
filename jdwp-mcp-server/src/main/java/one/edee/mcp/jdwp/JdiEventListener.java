@@ -561,13 +561,20 @@ public class JdiEventListener {
 
         // Arm last: arming redefines the class, which replaces the JDI requests behind any
         // other breakpoint event of this set located in the same class.
+        boolean suspensionSpent = false;
         if (armingHits != null && fastLogpointService != null) {
             for (BreakpointEvent armingHit : armingHits) {
-                // A fast breakpoint's arming hit whose condition holds is published as its stop.
-                if (fastLogpointService.handleArmingHit(armingHit)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = armingHit.thread();
+                switch (fastLogpointService.handleArmingHit(armingHit)) {
+                    // A fast breakpoint's arming hit whose condition holds is published as its stop.
+                    case STOPPED -> {
+                        shouldSuspend = true;
+                        if (warmThread == null) {
+                            warmThread = armingHit.thread();
+                        }
+                    }
+                    // A resume of the VM (jdwp_resume) released the thread while it armed.
+                    case SPENT -> suspensionSpent = true;
+                    case RESUME -> {
                     }
                 }
             }
@@ -586,6 +593,11 @@ public class JdiEventListener {
             if (warmThread != null) {
                 expressionEvaluator.prewarmClasspath(warmThread);
             }
+            return false;
+        }
+        if (suspensionSpent) {
+            log.debug("[JDI] Not resuming an event set whose arming thread was resumed while it armed: its "
+                + "suspension is spent");
             return false;
         }
         return true;

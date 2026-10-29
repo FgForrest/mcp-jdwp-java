@@ -67,6 +67,7 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final ThreadReference thread = mockThread("worker", 11L);
 		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
+		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.RESUME);
 		final EventSet eventSet = mockEventSet(arming);
 
 		runListenerWith(listener, eventSet);
@@ -75,6 +76,21 @@ class JdiEventListenerFastLogpointRoutingTest {
 		verify(eventSet).resume();
 		assertThat(tracker.getLastBreakpointThread()).isNull();
 		assertThat(history.getRecent(10)).noneMatch(e -> "BREAKPOINT".equals(e.type()));
+	}
+
+	@Test
+	@DisplayName("an arming hit whose thread a resume of the VM released meanwhile is not resumed again")
+	void spentArmingHitIsNotResumedAgain() throws Exception {
+		final ThreadReference thread = mockThread("worker", 15L);
+		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
+		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
+		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.SPENT);
+		final EventSet eventSet = mockEventSet(arming);
+
+		runListenerWith(listener, eventSet);
+
+		verify(fastLogpoints).handleArmingHit(arming);
+		verify(eventSet, never()).resume();
 	}
 
 	@Test
@@ -91,7 +107,7 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final List<String> typesSeenWhenArming = new ArrayList<>();
 		doAnswer(invocation -> {
 			history.getRecent(10).forEach(e -> typesSeenWhenArming.add(e.type()));
-			return false;
+			return FastLogpointService.ArmingOutcome.RESUME;
 		}).when(fastLogpoints).handleArmingHit(any());
 		// Arming event first in the set: the listener must still defer it.
 		final EventSet eventSet = mockEventSet(arming, user);
@@ -109,7 +125,7 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final ThreadReference thread = mockThread("worker", 13L);
 		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
-		when(fastLogpoints.handleArmingHit(arming)).thenReturn(true);
+		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.STOPPED);
 		final EventSet eventSet = mockEventSet(arming);
 
 		runListenerWith(listener, eventSet);

@@ -129,7 +129,7 @@ class JdiEventListenerReentrantHitTest {
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
 		doAnswer(invocation -> {
 			blockInsideInvocation();
-			return null;
+			return FastLogpointService.ArmingOutcome.RESUME;
 		}).when(fastLogpoints).handleArmingHit(arming);
 		final EventSet armingSet = mockEventSet(arming);
 		final EventSet reentrantSet = reentrantBreakpointSet(thread);

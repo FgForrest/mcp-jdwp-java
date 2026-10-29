@@ -98,6 +98,10 @@ public class FastLogpointService {
      */
     public static final int MAX_BUFFER_SIZE = 65536;
     /**
+     * Capacity of a fast breakpoint probe's ring, which records condition failures only.
+     */
+    public static final int BREAKPOINT_ERROR_BUFFER_SIZE = 256;
+    /**
      * Upper bound for one teardown ({@link #disarmAll}) or discovery ({@link #discover}).
      */
     private static final long TEARDOWN_TIMEOUT_MS = 5_000L;
@@ -133,6 +137,14 @@ public class FastLogpointService {
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
+    /**
+     * Guards {@link #armingInFlight}; never the service monitor, which the arming itself takes.
+     */
+    private final Object armingIdle = new Object();
+    /**
+     * Arming hits being handled on the dispatcher; their threads are held by the event meanwhile.
+     */
+    private int armingInFlight;
     private final JdiExpressionEvaluator expressionEvaluator;
     /**
      * Written into every probe this server arms ({@code MCP_ARMED_BY}): the product and an opaque
@@ -196,21 +208,21 @@ public class FastLogpointService {
     }
 
     /**
-     * Whether a class may host a fast logpoint at all: not a platform class and not loaded by the
-     * bootstrap loader (the probe must be defined in the declaring class's own loader).
+     * Whether a class may host a probe of {@code kind} at all: not a platform class and not loaded by
+     * the bootstrap loader (the probe must be defined in the declaring class's own loader).
      *
      * @return {@code null} when allowed, otherwise the reason it is not
      */
     @Nullable
-    public static String rejectHost(ReferenceType refType) {
+    public static String rejectHost(ReferenceType refType, Kind kind) {
         final String name = refType.name();
         for (String prefix : PLATFORM_PACKAGE_PREFIXES) {
             if (name.startsWith(prefix)) {
-                return "platform classes (" + prefix + "*) cannot host a fast logpoint";
+                return "platform classes (" + prefix + "*) cannot host a " + kind.noun();
             }
         }
         if (refType.classLoader() == null) {
-            return "classes loaded by the bootstrap class loader cannot host a fast logpoint";
+            return "classes loaded by the bootstrap class loader cannot host a " + kind.noun();
         }
         return null;
     }
@@ -291,30 +303,93 @@ public class FastLogpointService {
      * on the JDI event dispatcher thread with the event's thread suspended. Never throws — a failure
      * marks the entry {@link State#FAILED} and records {@code FAST_LOGPOINT_ARM_FAILED}.
      *
-     * @return whether the hit was published as a fast-breakpoint stop and its set stays suspended;
-     * otherwise the dispatcher resumes it
+     * @return what the dispatcher does with the event's set
      */
-    public boolean handleArmingHit(BreakpointEvent event) {
+    public ArmingOutcome handleArmingHit(BreakpointEvent event) {
         final FastLogpoint flp = armingLogpoint(event);
         if (flp == null) {
-            return false;
+            return ArmingOutcome.RESUME;
         }
         final ThreadReference thread = event.thread();
         if (evaluationGuard.isEvaluating(thread)) {
             // The thread is inside an MCP-driven method invocation; invoking on it again from here
             // could deadlock. The one-shot request is spent, so put a fresh one in its place.
             rearm(flp);
-            return false;
+            return ArmingOutcome.RESUME;
         }
         final long threadId = thread.uniqueID();
+        synchronized (armingIdle) {
+            armingInFlight++;
+        }
         evaluationGuard.enter(threadId);
         try {
-            return arm(flp, thread);
+            return arm(flp, thread) ? ArmingOutcome.STOPPED : ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
+            if (flp.probeType == null && !isSuspended(thread)) {
+                // A resume of the whole VM took the thread away before anything was installed: the
+                // hit is lost, the entry is not — the next hit arms it. Decided here, not later: on a
+                // hot line the fresh request suspends the thread again at once.
+                log.info("[{}] #{} arming hit lost to a resume of its thread ({}) — waiting for the next hit",
+                    flp.kind.tag, flp.id, describe(e));
+                rearm(flp);
+                return ArmingOutcome.SPENT;
+            }
             markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
-            return false;
+            return ArmingOutcome.RESUME;
         } finally {
             evaluationGuard.exit(threadId);
+            synchronized (armingIdle) {
+                armingInFlight--;
+                armingIdle.notifyAll();
+            }
+        }
+    }
+
+    /**
+     * Waits until no arming hit is being handled, at most {@code timeoutMs}. An arming hit keeps its
+     * thread suspended by the event while the probe is compiled; resuming the VM meanwhile takes the
+     * thread away from the invocations on it, so the resume tools wait for this first.
+     *
+     * @return whether no arming was in flight when it returned
+     */
+    public boolean awaitArmingIdle(long timeoutMs) {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        synchronized (armingIdle) {
+            while (armingInFlight > 0) {
+                final long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (remainingMs <= 0) {
+                    return false;
+                }
+                try {
+                    armingIdle.wait(remainingMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    /**
+     * Rethrows an evaluation failure of the arming hit as the thread's resume when the thread is no
+     * longer suspended: it is not the condition's or the expression's failure.
+     */
+    private static void requireStillSuspended(ThreadReference thread, Exception failure) throws FastLogpointException {
+        if (!isSuspended(thread)) {
+            throw new FastLogpointException("the thread was resumed while its arming hit was evaluated: "
+                + describe(failure));
+        }
+    }
+
+    /**
+     * Whether {@code thread} is still suspended; {@code false} when it cannot be asked.
+     */
+    private static boolean isSuspended(ThreadReference thread) {
+        try {
+            return thread.isSuspended();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -675,16 +750,17 @@ public class FastLogpointService {
     }
 
     /**
-     * The refusal for arming in a class that still carries leftovers of an earlier session, or
-     * {@code null} when it carries none. Read-only; arming calls it again under the monitor.
+     * The refusal for arming a probe of {@code kind} in a class that still carries leftovers of an
+     * earlier session, or {@code null} when it carries none. Read-only; arming calls it again under
+     * the monitor.
      */
     @Nullable
-    public String leftoversIn(ReferenceType refType) {
+    public String leftoversIn(ReferenceType refType, Kind kind) {
         final List<String> names = new ArrayList<>();
         boolean restorable = false;
         for (FastLogpoint flp : logpoints.values()) {
             if (flp.isLeftover() && flp.refType.equals(refType)) {
-                names.add("#" + flp.id + " (line " + flp.line + ", " + flp.state + ")");
+                names.add("#" + flp.id + " (" + flp.kind.noun() + ", line " + flp.line + ", " + flp.state + ")");
                 restorable |= flp.state == State.RECOVERED;
             }
         }
@@ -692,13 +768,13 @@ public class FastLogpointService {
             return null;
         }
         Collections.sort(names);
-        return "refusing to arm: " + refType.name() + " still carries fast logpoints left by an earlier debugging "
+        return "refusing to arm: " + refType.name() + " still carries probes left by an earlier debugging "
             + "session: " + String.join(", ", names) + ". "
             + (restorable
             ? "jdwp_restore_fast_logpoints(id) restores the class's original bytecode, but only with the user's "
             + "approval; jdwp_clear_breakpoint(id) only disables them and leaves the class instrumented."
             : "They cannot be removed until the JVM restarts (the class changed after they were installed).")
-            + " Use jdwp_set_logpoint meanwhile.";
+            + " Use " + kind.fallbackTool + " meanwhile.";
     }
 
     /**
@@ -1091,7 +1167,7 @@ public class FastLogpointService {
         final ReferenceType refType = location.declaringType();
         if (method.isStaticInitializer()) {
             throw new FastLogpointException("the line is in a static initializer (<clinit>), which runs once — "
-                + "use jdwp_set_logpoint");
+                + "use " + flp.kind.fallbackTool);
         }
         // In a constructor `this` may still be uninitialized at the line; passing it would not verify.
         final boolean includeThis = !method.isStatic() && !method.isConstructor();
@@ -1118,7 +1194,8 @@ public class FastLogpointService {
         // 3. The probe: compiled for this frame, defined (disabled) in the declaring class's own loader.
         final ClassLoaderReference loader = refType.classLoader();
         if (loader == null) {
-            throw new FastLogpointException("classes loaded by the bootstrap class loader cannot host a fast logpoint");
+            throw new FastLogpointException("classes loaded by the bootstrap class loader cannot host a "
+                + flp.kind.noun());
         }
         final DefinedProbe probe = retryOnCollected(
             () -> compileAndDefineProbe(flp, vm, thread, refType, loader, includeThis));
@@ -1130,7 +1207,7 @@ public class FastLogpointService {
                 log.info("[{}] #{} was cleared while arming — not installing", flp.kind.tag, flp.id);
                 return false;
             }
-            final String leftovers = leftoversIn(refType);
+            final String leftovers = leftoversIn(refType, flp.kind);
             if (leftovers != null) {
                 throw new FastLogpointException(leftovers);
             }
@@ -1226,7 +1303,7 @@ public class FastLogpointService {
      * code, so without this the very hit that triggered arming — possibly the rare one the user is
      * waiting for — would be lost.
      */
-    private void logArmingHit(FastLogpoint flp, ThreadReference thread, Location location) {
+    private void logArmingHit(FastLogpoint flp, ThreadReference thread, Location location) throws FastLogpointException {
         final String context = String.format(" at %s:%d (thread %s, arming hit — evaluated through the debugger)",
             flp.className(), flp.line, thread.name());
         try {
@@ -1245,6 +1322,7 @@ public class FastLogpointService {
             final Value value = expressionEvaluator.evaluate(thread.frame(0), flp.expression);
             recordArmingHit(flp, "FAST_LOGPOINT", renderArmingValue(value), context, thread);
         } catch (Exception e) {
+            requireStillSuspended(thread, e);
             recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describe(e), context, thread);
         }
         log.debug("[FastLogpoint] #{} arming hit at {}", flp.id, location);
@@ -1780,7 +1858,9 @@ public class FastLogpointService {
                     }
                 }
             } catch (Exception e) {
-                eventHistory.record(new EventHistory.DebugEvent("FAST_LOGPOINT_WARNING",
+                final FastLogpoint armingOwner = bp.armingOwner();
+                eventHistory.record(new EventHistory.DebugEvent(
+                    (armingOwner != null ? armingOwner.kind : Kind.LOGPOINT).eventPrefix + "_WARNING",
                     String.format("Breakpoint #%d at %s:%d could not be re-created after redefining the class: %s",
                         bp.id(), refType.name(), bp.line(), describe(e)),
                     Map.of("breakpointId", String.valueOf(bp.id()), "class", refType.name(),
@@ -2150,6 +2230,89 @@ public class FastLogpointService {
     // ── Fast breakpoints ──
 
     /**
+     * Re-arms the fast breakpoint this session owns at {@code location} with exactly these
+     * parameters: both gates move to their next generation, so the next true hit (and the next
+     * failure) stops again. A breakpoint spent before its probe was ever installed waits for its
+     * first hit again.
+     *
+     * @return a one-line report, or {@code null} when this session owns no such fast breakpoint
+     */
+    @Nullable
+    public synchronized String rearmBreakpoint(Location location, String condition, boolean stopOnce,
+                                               int suspendPolicy) {
+        for (FastLogpoint flp : logpoints.values()) {
+            if (flp.kind != Kind.BREAKPOINT || flp.isLeftover() || !flp.refType.equals(location.declaringType())
+                || flp.line != location.lineNumber()) {
+                continue;
+            }
+            if (!condition.equals(flp.condition) || flp.stopOnce != stopOnce || flp.suspendPolicy != suspendPolicy) {
+                return String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
+                        + "(condition: %s, %s, suspendPolicy: %s) — clear it with jdwp_clear_breakpoint(%d) first, or call "
+                        + "again with exactly its parameters to re-arm it.", flp.id, flp.className(), flp.line,
+                    flp.condition, modeLabel(flp.stopOnce), policyLabel(flp.suspendPolicy), flp.id);
+            }
+            switch (flp.state) {
+                case PENDING -> {
+                    if (flp.armingRequest != null) {
+                        return String.format("Fast breakpoint %d at %s:%d is already waiting for its first hit (ID: %d) — "
+                            + "nothing to re-arm.", flp.id, flp.className(), flp.line, flp.id);
+                    }
+                    reopenGates(flp);
+                    rearm(flp);
+                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
+                        + "was installed, so it arms again on the next hit of the line.", flp.id, flp.className(),
+                        flp.line, flp.id);
+                }
+                case ARMED -> {
+                    reopenGates(flp);
+                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s", flp.id, flp.className(),
+                        flp.line, flp.id, stopOnce
+                            ? "the next true hit stops again, and so does the next failure of the condition."
+                            : "every true hit stops as before, and the next failure of the condition stops again.");
+                }
+                default -> {
+                    return String.format("Fast breakpoint %d at %s:%d is %s (ID: %d) — clear it with "
+                        + "jdwp_clear_breakpoint(%d) and set it again.", flp.id, flp.className(), flp.line, flp.state,
+                        flp.id, flp.id);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Moves both gates of {@code flp} to their next generation; caller holds the monitor.
+     */
+    private void reopenGates(FastLogpoint flp) {
+        advanceEpoch(flp, false);
+        advanceEpoch(flp, true);
+    }
+
+    /**
+     * How a fast breakpoint's mode reads in listings and replies.
+     */
+    public static String modeLabel(boolean stopOnce) {
+        return stopOnce ? "stops once" : "stops on every hit";
+    }
+
+    /**
+     * How a fast breakpoint's suspend policy reads in listings and replies: "all" or "thread".
+     */
+    public static String policyLabel(int suspendPolicy) {
+        return suspendPolicy == EventRequest.SUSPEND_ALL ? "all" : "thread";
+    }
+
+    /**
+     * Why the fast breakpoint {@code id} last stopped ("condition true" / "condition failed: ..."),
+     * or {@code null} when it is not a fast breakpoint or never stopped.
+     */
+    @Nullable
+    public String stopReason(int id) {
+        final FastLogpoint flp = logpoints.get(id);
+        return flp != null && flp.kind == Kind.BREAKPOINT ? flp.lastStopReason : null;
+    }
+
+    /**
      * Whether {@code simpleName} is the simple name of a probe class this server generates.
      */
     public static boolean isProbeClassName(String simpleName) {
@@ -2166,7 +2329,8 @@ public class FastLogpointService {
      *
      * @return whether the hit was published as a stop
      */
-    private boolean evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location) {
+    private boolean evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
+        throws FastLogpointException {
         String error = null;
         boolean passed = false;
         try {
@@ -2178,6 +2342,7 @@ public class FastLogpointService {
                 passed = result;
             }
         } catch (Exception e) {
+            requireStillSuspended(thread, e);
             error = describe(e);
         }
         synchronized (this) {
@@ -2227,6 +2392,7 @@ public class FastLogpointService {
         final int line = location.lineNumber();
         final String threadName = thread.name();
         final String reason = failed ? "condition failed: " + error : "condition true";
+        flp.lastStopReason = reason;
         breakpointTracker.setLastBreakpointThread(thread, flp.id);
         final Map<String, String> details = new LinkedHashMap<>();
         details.put("breakpointId", String.valueOf(flp.id));
@@ -2373,7 +2539,7 @@ public class FastLogpointService {
      * The location of the first frame that does not belong to a probe class: where the user's code
      * stopped. Falls back to {@code fallback}.
      */
-    private static Location userLocation(ThreadReference thread, Location fallback) {
+    public static Location userLocation(ThreadReference thread, Location fallback) {
         try {
             for (StackFrame frame : thread.frames()) {
                 final Location location = frame.location();
@@ -2499,11 +2665,30 @@ public class FastLogpointService {
     }
 
     /**
+     * What the dispatcher does with the event set of an arming hit.
+     */
+    public enum ArmingOutcome {
+        /**
+         * Resume it: the hit armed the probe, failed, or was skipped.
+         */
+        RESUME,
+        /**
+         * Keep it suspended: the hit was published as a fast breakpoint's stop.
+         */
+        STOPPED,
+        /**
+         * Neither: a resume of the VM released the thread while it armed, so the set's suspension is
+         * spent. Resuming it again would release the next arming hit before it is handled.
+         */
+        SPENT
+    }
+
+    /**
      * The two kinds of in-target probe this service owns.
      */
     public enum Kind {
-        LOGPOINT("Fast logpoint", "FastLogpoint", "FAST_LOGPOINT"),
-        BREAKPOINT("Fast breakpoint", "FastBreakpoint", "FAST_BREAKPOINT");
+        LOGPOINT("Fast logpoint", "FastLogpoint", "FAST_LOGPOINT", "jdwp_set_logpoint"),
+        BREAKPOINT("Fast breakpoint", "FastBreakpoint", "FAST_BREAKPOINT", "jdwp_set_breakpoint");
 
         /**
          * Name in sentences, e.g. "Fast logpoint 7 cleared".
@@ -2517,11 +2702,23 @@ public class FastLogpointService {
          * Prefix of the event-history types, e.g. {@code FAST_LOGPOINT_ARMED}.
          */
         final String eventPrefix;
+        /**
+         * The debugger-side tool to use where this kind cannot be armed.
+         */
+        public final String fallbackTool;
 
-        Kind(String label, String tag, String eventPrefix) {
+        Kind(String label, String tag, String eventPrefix, String fallbackTool) {
             this.label = label;
             this.tag = tag;
             this.eventPrefix = eventPrefix;
+            this.fallbackTool = fallbackTool;
+        }
+
+        /**
+         * Name in the middle of a sentence, e.g. "cannot host a fast logpoint".
+         */
+        public String noun() {
+            return label.toLowerCase(Locale.ROOT);
         }
     }
 
@@ -2570,6 +2767,11 @@ public class FastLogpointService {
         int errorClaimedEpoch;
         @Nullable
         BreakpointRequest stopRequest;
+        /**
+         * Why it last stopped ("condition true" / "condition failed: ..."), for the stop report.
+         */
+        @Nullable
+        volatile String lastStopReason;
 
         // Read by the event threads and MCP workers; written under the service monitor.
         volatile State state = State.PENDING;
