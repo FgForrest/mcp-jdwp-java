@@ -126,11 +126,11 @@ From there, just tell the agent what to do — *"attach to JDWP, set a breakpoin
 
 ## Find the Bug — test flights
 
-The `jdwp-sandbox` module ships 9 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
+The `jdwp-sandbox` module ships 10 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
 
 This doubles as a setup verification — if you can solve these, everything works.
 
-Each flight is built so that one tool group is the path of least resistance, and lists a **par** — the minimum tool calls that cleanly reveal the root cause. Hitting par is the elegant solve; the suite as a whole exercises the full tool surface (expression eval, exception breakpoints, field watchpoints, event history, marks, logpoints, runtime mutation, and multi-thread inspection).
+Each flight is built so that one tool group is the path of least resistance, and lists a **par** — the minimum tool calls that cleanly reveal the root cause. Hitting par is the elegant solve; the suite as a whole exercises the full tool surface (expression eval, exception breakpoints, field watchpoints, event history, marks, logpoints, runtime mutation, multi-thread inspection, and in-target probes).
 
 ### Just installed the plugin? Grab the sandbox zip
 
@@ -325,6 +325,29 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ---
 
+### #10 The Oversold House
+
+**Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 3 | **Exercises:** in-target probes (fast logpoint / fast breakpoint, with the user's consent)
+
+**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
+
+**Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`BoxOffice.trySell` checks that the seat is free, prices it (reading the pricing desk's volatile surcharge), and only then records the buyer: a check-then-act race. Two windows that check the same free seat within the pricing step both sell it, and `sold` counts both. About six seats per performance are sold twice.
+
+**Debug path:** On the sell line (`seatOwners[seat] = customer`), the condition `seatOwners[seat] != 0` is true exactly when another window sold the seat after this one checked it. Each of these tools needs the user's explicit consent, because it rewrites the class's bytecode: call it once without `userApproved`, relay the briefing, and ask.
+- `jdwp_set_fast_logpoint` with that condition and the expression `seat + " sold to " + seatOwners[seat] + ", resold to " + customer`, then `jdwp_get_events` after the run: every double sale is listed with both windows.
+- `jdwp_set_fast_breakpoint` with that condition, then `jdwp_resume_until_event`: the first double sale stops with every window parked, and `jdwp_get_breakpoint_context` shows the seat, its first buyer and the second.
+
+An ordinary conditional breakpoint or logpoint on that line goes through the debugger on each of about 60 million passes, at 3–30 ms each. The box office closes first, and the serialized windows stop colliding.
+
+</details>
+
+---
+
 ### Scorecard
 
 **Flights solved** — did you find the root cause?
@@ -333,10 +356,10 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 |--------|----------------------------------------------------------------------|
 | 0-2    | The JVM is winning. Check your setup.                                |
 | 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 6-8    | Impressive. You found bugs that would take hours with println.       |
-| 9      | Bug terminator. Nothing survives your debugger.                      |
+| 6-9    | Impressive. You found bugs that would take hours with println.       |
+| 10     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 27 stars across the nine flights.
+**Style** — how close to par? Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
 
 ## Features beyond standard JDWP
 

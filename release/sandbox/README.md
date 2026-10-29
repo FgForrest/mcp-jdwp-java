@@ -2,7 +2,7 @@
 
 Nine deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
 
-Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the nine, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, and multi-thread inspection.
+Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the ten, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
 
 This is the companion sandbox for the [jdwp-debugging Claude Code plugin](https://github.com/FgForrest/mcp-jdwp-java). Install the plugin first, then come back here.
 
@@ -153,6 +153,14 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for. (Don't try to evaluate expressions on the stuck threads — the debugger refuses, and that refusal is a clue.)
 
+### #10 The Oversold House
+
+**Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 3
+
+**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
+
+**Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
+
 ## Scorecard
 
 **Flights solved** — did you find the root cause?
@@ -161,10 +169,10 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 |--------|----------------------------------------------------------------------|
 | 0-2    | The JVM is winning. Check your setup.                                |
 | 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 6-8    | Impressive. You found bugs that would take hours with println.       |
-| 9      | Bug terminator. Nothing survives your debugger.                      |
+| 6-9    | Impressive. You found bugs that would take hours with println.       |
+| 10     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 27 stars across the nine flights.
+**Style** — how close to par? ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
 
 ## Where the spoilers live
 
@@ -181,4 +189,4 @@ The reveals are deliberately not in this zip so the agent that you ask to play c
 
 ## Have fun
 
-The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all nine and want more, the same techniques apply to real bugs in your own code.
+The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all ten and want more, the same techniques apply to real bugs in your own code.
