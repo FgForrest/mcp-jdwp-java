@@ -168,13 +168,14 @@ final class FakeSuspendModel {
 	}
 
 	/**
-	 * Starts a single-threaded invocation on {@code thread}: it must be invokable and suspended; it
-	 * borrows one count. The thread runs the invoked code only while its count is 0.
+	 * Starts a single-threaded invocation on {@code thread}: it must be invokable, suspended and not
+	 * invoking already (the agent runs one invocation per thread); it borrows one count. The thread
+	 * runs the invoked code only while its count is 0.
 	 *
 	 * @throws IncompatibleThreadStateException as JDI reports {@code INVALID_THREAD}
 	 */
 	void beginInvocation(FakeThread thread) throws IncompatibleThreadStateException {
-		if (!thread.invokable || thread.count == 0) {
+		if (!thread.invokable || thread.count == 0 || thread.loans > 0) {
 			throw new IncompatibleThreadStateException();
 		}
 		thread.loans++;
@@ -183,10 +184,16 @@ final class FakeSuspendModel {
 
 	/**
 	 * Completes an invocation on {@code thread}: the agent suspends it once more before the reply.
+	 * The invoked code must be able to run to get there — a test that completes an invocation whose
+	 * thread is still suspended would manufacture the very progress under test.
 	 */
 	void completeInvocation(FakeThread thread) {
 		if (thread.loans == 0) {
 			throw new IllegalStateException(thread.name + " has no invocation in flight");
+		}
+		if (thread.count > 0) {
+			throw new IllegalStateException(thread.name + " is suspended (count " + thread.count + ") — its invocation "
+				+ "cannot complete");
 		}
 		thread.loans--;
 		thread.count++;

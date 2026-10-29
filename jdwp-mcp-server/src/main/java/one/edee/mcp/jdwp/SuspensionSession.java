@@ -213,9 +213,17 @@ public final class SuspensionSession {
     }
 
     /**
-     * An invocation chain on {@code thread} and the contexts it took the thread out of.
+     * An invocation chain on {@code thread}: the contexts it took the thread out of, and whether it
+     * took the thread's manual hold out too.
      */
-    private record Lease(ThreadReference thread, List<Context> exemptFrom) {
+    private static final class Lease {
+        private final ThreadReference thread;
+        private final List<Context> exemptFrom = new ArrayList<>();
+        private boolean manualExempt;
+
+        private Lease(ThreadReference thread) {
+            this.thread = thread;
+        }
     }
 
     private final BreakpointTracker tracker;
@@ -223,6 +231,10 @@ public final class SuspensionSession {
     private final List<Context> contexts = new ArrayList<>();
     private final Set<ThreadReference> manual = new LinkedHashSet<>();
     private final Map<ThreadReference, Lease> leases = new LinkedHashMap<>();
+    /**
+     * How often a routed stop-all took a leased thread out of it, for diagnostics.
+     */
+    private long routeExemptions;
     private final Map<ThreadReference, StepRequest> pendingSteps = new LinkedHashMap<>();
     private long nextId = 1;
     private long generation = 1;
@@ -327,8 +339,9 @@ public final class SuspensionSession {
                 // The stop-all also suspended every thread in the middle of an invocation; take them
                 // out of it, or the invocation never completes and its caller never processes this set.
                 for (Lease lease : leases.values()) {
-                    if (!lease.thread().equals(thread)) {
+                    if (!lease.thread.equals(thread)) {
                         exempt(context, lease);
+                        routeExemptions++;
                     }
                 }
             }
@@ -520,7 +533,7 @@ public final class SuspensionSession {
         }
         final List<ThreadReference> manualReleased = new ArrayList<>(manual);
         for (ThreadReference thread : manualReleased) {
-            resumeQuietly(thread);
+            releaseManual(thread);
         }
         manual.clear();
         return new ReleaseResult(releasedStops, unseen, pending, manualReleased);
@@ -666,13 +679,30 @@ public final class SuspensionSession {
             return;
         }
         final Context anchor = leaseAnchor(thread);
-        final Lease lease = new Lease(thread, new ArrayList<>());
+        final List<Context> others = new ArrayList<>();
         for (Context context : contexts) {
-            // Only while the thread's count shows that context's suspension on top of the anchor's:
-            // a hold undone behind the session's back must not cost the anchor its own.
-            if (context != anchor && covers(context, thread) && suspendCountOf(thread) > 1) {
-                exempt(context, lease);
+            if (context != anchor && covers(context, thread)) {
+                others.add(context);
             }
+        }
+        final boolean manualHold = manual.contains(thread);
+        // The thread's count must carry every hold this session knows of: one fewer means a hold was
+        // undone behind the session's back, and taking the thread out of all of them would let it
+        // run. More is a set not routed yet — routing takes the thread out of it.
+        final int known = 1 + others.size() + (manualHold ? 1 : 0);
+        final int count = suspendCountOf(thread);
+        if (count < known) {
+            throw new EvaluationRefusedException("thread " + safeName(thread) + " is suspended " + count + " time(s), "
+                + "fewer than the " + known + " holds this debugging session knows of — something resumed it "
+                + "outside the session; jdwp_reset releases its stops");
+        }
+        final Lease lease = new Lease(thread);
+        for (Context other : others) {
+            exempt(other, lease);
+        }
+        if (manualHold) {
+            resumeQuietly(thread);
+            lease.manualExempt = true;
         }
         leases.put(thread, lease);
     }
@@ -686,10 +716,13 @@ public final class SuspensionSession {
         if (lease == null || closed) {
             return;
         }
-        for (Context context : lease.exemptFrom()) {
+        for (Context context : lease.exemptFrom) {
             if (context.state != State.RELEASED && context.exempt.remove(thread)) {
                 suspendQuietly(thread);
             }
+        }
+        if (lease.manualExempt && manual.contains(thread)) {
+            suspendQuietly(thread);
         }
     }
 
@@ -714,7 +747,7 @@ public final class SuspensionSession {
             }
         }
         for (ThreadReference thread : manual) {
-            resumeQuietly(thread);
+            releaseManual(thread);
         }
         manual.clear();
         for (StepRequest request : pendingSteps.values()) {
@@ -803,7 +836,7 @@ public final class SuspensionSession {
     private List<String> releaseHolders(ThreadReference thread) {
         final List<String> holders = new ArrayList<>();
         if (manual.remove(thread)) {
-            resumeQuietly(thread);
+            releaseManual(thread);
             holders.add("its jdwp_suspend_thread hold");
         }
         for (Context context : new ArrayList<>(contexts)) {
@@ -857,12 +890,25 @@ public final class SuspensionSession {
     }
 
     /**
+     * Resumes the manual hold of {@code thread} — unless a lease took the thread out of it already,
+     * whose resume stands for this one.
+     */
+    private void releaseManual(ThreadReference thread) {
+        final Lease lease = leases.get(thread);
+        if (lease != null && lease.manualExempt) {
+            lease.manualExempt = false;
+            return;
+        }
+        resumeQuietly(thread);
+    }
+
+    /**
      * Takes the leased thread out of {@code context}: one resume undoes the context's suspension of it.
      */
     private void exempt(Context context, Lease lease) {
-        resumeQuietly(lease.thread());
-        context.exempt.add(lease.thread());
-        lease.exemptFrom().add(context);
+        resumeQuietly(lease.thread);
+        context.exempt.add(lease.thread);
+        lease.exemptFrom.add(context);
     }
 
     /**
@@ -1012,7 +1058,8 @@ public final class SuspensionSession {
             leased.add(safeName(thread));
         }
         return "generation=" + generation + (closed ? ", closed" : "") + ", contexts=" + contexts + ", manual="
-            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", current=" + current;
+            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", routeExemptions="
+            + routeExemptions + ", current=" + current;
     }
 
     /**

@@ -411,21 +411,59 @@ class SuspensionSessionTest {
 	}
 
 	@Test
-	@DisplayName("a hold undone behind the session's back is not exempted: the lease keeps its own suspension")
-	void staleHoldIsNotExempted() throws Exception {
+	@DisplayName("a hold undone behind the session's back refuses the lease instead of letting the thread run")
+	void staleHoldRefusesTheLease() throws Exception {
 		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
 		t.ref.resume();
 		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 2));
 		assertThat(t.count).as("only the second stop really holds t").isEqualTo(1);
 
-		session.lease(t.ref);
+		assertThatThrownBy(() -> session.lease(t.ref)).isInstanceOf(EvaluationRefusedException.class)
+			.hasMessageContaining("fewer than the 2 holds");
 		assertThat(t.count).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("a manual hold that raced the stop is taken out for the lease and put back at its end")
+	void manualHoldIsExemptedForTheLease() throws Exception {
+		// jdwp_suspend_thread saw t running, then a breakpoint stopped t before the suspend landed.
+		assertThat(session.suspendThread(t.ref)).isNull();
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		assertThat(t.count).isEqualTo(2);
+
+		session.lease(t.ref);
 		model.beginInvocation(t);
 		assertThat(model.invocationRuns(t)).isTrue();
 		model.completeInvocation(t);
 		session.unlease(t.ref);
+		assertThat(t.count).isEqualTo(2);
 
+		session.releaseAll();
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	@DisplayName("a manual hold released during a lease is not resumed twice; the lease's own stop remains")
+	void manualHoldReleasedDuringTheLease() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD),
+			t.ref, false);
+		session.begin(own);
+		session.beginProcessing(own);
+		try {
+			session.lease(t.ref);
+			model.beginInvocation(t);
+			model.completeInvocation(t);
+			// jdwp_resume runs meanwhile, between two invocations of the dispatcher.
+			session.releaseAll();
+			assertThat(t.count).as("the set being processed still holds t").isEqualTo(1);
+			session.unlease(t.ref);
+		} finally {
+			SuspensionSession.endProcessing();
+		}
 		assertThat(t.count).isEqualTo(1);
+		session.finish(own);
+		assertThat(t.count).isZero();
 	}
 
 	@Test

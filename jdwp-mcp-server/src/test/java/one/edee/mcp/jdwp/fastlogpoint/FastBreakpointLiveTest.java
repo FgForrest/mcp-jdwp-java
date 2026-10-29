@@ -292,6 +292,8 @@ class FastBreakpointLiveTest {
 			stopAll.enable();
 
 			assertThat(waitForStop()).contains("Thread: worker-1");
+			assertThat(sessionState()).as("the stop-all landed during the evaluation and took worker-0 out of it")
+				.doesNotContain("routeExemptions=0");
 			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).as("the evaluation itself succeeded too")
 				.noneMatch(event -> event.type().equals("FIELD_LOGPOINT_ERROR"));
 		} finally {
