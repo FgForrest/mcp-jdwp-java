@@ -38,10 +38,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * and resumed while the invocation is still waiting, so a set whose thread is inside an MCP-driven
  * evaluation ({@link EvaluationGuard}) is {@link #suppress}ed on the listener thread at once and
  * resumed; that path never calls into the target. Whoever processes a set decides its resume, after
- * all of its events, except that a set is never resumed once a tool has spent its suspension
- * ({@link ResumeLedger}) or a later set of its thread is waiting (see {@link #dispatch}). An untracked
- * event whose request was deleted while its set waited (a cleared breakpoint) is dropped, as JDI drops
- * it when a set leaves its queue.
+ * all of its events, except that a set is not resumed once a later set of its thread is waiting (see
+ * {@link #dispatch}). An untracked event whose request was deleted while its set waited (a cleared
+ * breakpoint) is dropped, as JDI drops it when a set leaves its queue.
  * <p>
  * Per-event behaviour (every suspending handler follows the order
  * snapshot → history → latch so a concurrent reader observing the {@link EventHistory} tail
@@ -96,11 +95,6 @@ public class JdiEventListener {
     private final EvaluationGuard evaluationGuard;
     private final MarkedInstanceRegistry markedInstances;
     /**
-     * Counts the resumes the tools issue, so {@link #dispatch} never resumes a suspension a tool has
-     * already spent.
-     */
-    private final ResumeLedger resumeLedger;
-    /**
      * Late-bound handle to the connection service so {@link #handleClassPrepareEvent} can promote
      * pending field watchpoints synchronously on class load. {@code @Lazy} because
      * {@code JDIConnectionService} itself depends on this listener (it wires the VM-death hook)
@@ -149,15 +143,13 @@ public class JdiEventListener {
                             @Lazy JdiExpressionEvaluator expressionEvaluator,
                             EvaluationGuard evaluationGuard,
                             @Lazy @Nullable JDIConnectionService jdiConnectionService,
-                            MarkedInstanceRegistry markedInstances,
-                            ResumeLedger resumeLedger) {
+                            MarkedInstanceRegistry markedInstances) {
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.expressionEvaluator = expressionEvaluator;
         this.evaluationGuard = evaluationGuard;
         this.jdiConnectionService = jdiConnectionService;
         this.markedInstances = markedInstances;
-        this.resumeLedger = resumeLedger;
     }
 
     /**
@@ -387,9 +379,8 @@ public class JdiEventListener {
      * A death set is processed here once the sets before it are done (at most
      * {@link #DISPATCH_DRAIN_TIMEOUT_MS}; any still queued are discarded), so {@code VM_DEATH} stays
      * the last entry; a set from a thread inside an MCP-driven evaluation is {@link #suppress}ed here
-     * at once; every other set goes to the {@code dispatcher}, in order, with a
-     * {@link ResumeLedger.Claim} on its suspension, and counted in {@code waiting} per suspended target
-     * thread until it starts (see {@link #dispatch}).
+     * at once; every other set goes to the {@code dispatcher}, in order, counted in {@code waiting}
+     * per suspended target thread until it starts (see {@link #dispatch}).
      * <p>
      * On either death path (in-loop {@code VMDeath}/{@code VMDisconnect} event, or
      * {@code VMDisconnectedException}/{@code IllegalStateException} from the JDI queue, or
@@ -420,12 +411,11 @@ public class JdiEventListener {
                 } else if (fromEvaluatingThread(eventSet)) {
                     suppress(eventSet);
                 } else {
-                    final ThreadReference thread = suspendedThreadOf(eventSet);
-                    if (thread != null) {
-                        waiting.merge(thread.uniqueID(), 1, Integer::sum);
+                    final Long threadId = suspendedThreadIdOf(eventSet);
+                    if (threadId != null) {
+                        waiting.merge(threadId, 1, Integer::sum);
                     }
-                    final ResumeLedger.Claim claim = resumeLedger.claim(thread);
-                    dispatcher.execute(() -> dispatch(eventSet, claim, waiting));
+                    dispatcher.execute(() -> dispatch(eventSet, threadId, waiting));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -458,39 +448,27 @@ public class JdiEventListener {
     }
 
     /**
-     * Processes one event set on the dispatcher thread and resumes it if {@link #process} says so, but
-     * never a suspension that is already spent:
-     * <ul>
-     *   <li>a tool resumed the set's thread while the set waited ({@link ResumeLedger#spent});</li>
-     *   <li>a later set of the same thread is already {@code waiting}. A suspended thread raises no
-     *       events, so the thread was resumed meanwhile and has stopped again; resuming this set would
-     *       release the newer stop. A set that suspends nothing is not counted, since its thread may
-     *       have raised it inside an invocation that has ended by the time the set is routed.</li>
-     * </ul>
-     * The resume itself goes through {@link ResumeLedger#resume(EventSet, ResumeLedger.Claim)}, which
-     * accounts for a tool resume made while the set was processed.
+     * Processes one event set on the dispatcher thread and resumes it if {@link #process} says so —
+     * unless a later set of the same target thread is already {@code waiting}. A suspended thread
+     * raises no events, so the thread was resumed meanwhile (e.g. {@code jdwp_resume}) and has
+     * stopped again: this set's suspension is spent, and resuming it would release the newer one. A
+     * set that suspends nothing is not counted: its thread may have raised it inside an invocation
+     * that has ended by the time the set is routed, and holding the resume back would park that
+     * thread for good.
      * Never throws — an exception escaping the task would only reach the executor; a disconnected VM
      * is reported by the listener thread, whose next {@code queue.remove()} fails too.
      */
-    private void dispatch(EventSet eventSet, ResumeLedger.Claim claim, ConcurrentMap<Long, Integer> waiting) {
-        final ThreadReference thread = claim.thread();
-        final Long threadId = thread != null ? thread.uniqueID() : null;
+    private void dispatch(EventSet eventSet, @Nullable Long threadId, ConcurrentMap<Long, Integer> waiting) {
         if (threadId != null) {
             waiting.computeIfPresent(threadId, (id, count) -> count > 1 ? count - 1 : null);
         }
         try {
-            // Asked before processing: a tool resume during the set's own evaluation may not reach
-            // its thread, so only one made while the set waited proves the suspension spent.
-            final boolean spent = resumeLedger.spent(claim);
             if (process(eventSet)) {
-                if (spent) {
-                    log.debug("[JDI] Not resuming an event set of thread {}: a tool resumed it while it waited",
-                        threadId);
-                } else if (threadId != null && waiting.containsKey(threadId)) {
+                if (threadId != null && waiting.containsKey(threadId)) {
                     log.debug("[JDI] Not resuming an event set of thread {}: it was resumed and has stopped again since",
                         threadId);
                 } else {
-                    resumeLedger.resume(eventSet, claim);
+                    eventSet.resume();
                 }
             }
         } catch (Exception e) {
@@ -767,19 +745,19 @@ public class JdiEventListener {
     }
 
     /**
-     * The target thread {@code eventSet} suspended, or {@code null} for a set that suspends none of its
-     * own: one with suspend policy {@code none}, or one without a thread. JDI never puts events of
-     * different threads into one set.
+     * The target thread {@code eventSet} suspended ({@link ThreadReference#uniqueID}), or {@code null}
+     * for a set that suspends none of its own: one with suspend policy {@code none}, or one without a
+     * thread. JDI never puts events of different threads into one set.
      */
     @Nullable
-    private static ThreadReference suspendedThreadOf(EventSet eventSet) {
+    private static Long suspendedThreadIdOf(EventSet eventSet) {
         if (eventSet.suspendPolicy() == EventRequest.SUSPEND_NONE) {
             return null;
         }
         for (Event event : eventSet) {
             final ThreadReference thread = threadOf(event);
             if (thread != null) {
-                return thread;
+                return thread.uniqueID();
             }
         }
         return null;

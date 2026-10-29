@@ -44,8 +44,7 @@ class JdiEventListenerStepEventTest {
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null,
-			new MarkedInstanceRegistry(), new ResumeLedger());
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
 	}
 
 	@AfterEach

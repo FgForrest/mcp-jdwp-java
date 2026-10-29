@@ -127,11 +127,6 @@ public class JDWPTools {
      * {@link #jdwp_get_events}, disarmed by {@link #jdwp_clear_breakpoint} and {@link #jdwp_reset}.
      */
     private final FastLogpointService fastLogpoints;
-    /**
-     * Every resume a tool issues goes through it, so the event pipeline never resumes a suspension
-     * the tool has already spent.
-     */
-    private final ResumeLedger resumeLedger;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
@@ -140,8 +135,7 @@ public class JDWPTools {
                      MarkedInstanceRegistry markedInstances,
                      JdiHealthMonitor healthMonitor,
                      LocalProjectClasspathProvider localClasspathProvider,
-                     FastLogpointService fastLogpoints,
-                     ResumeLedger resumeLedger) {
+                     FastLogpointService fastLogpoints) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -153,7 +147,6 @@ public class JDWPTools {
         this.healthMonitor = healthMonitor;
         this.localClasspathProvider = localClasspathProvider;
         this.fastLogpoints = fastLogpoints;
-        this.resumeLedger = resumeLedger;
     }
 
     /**
@@ -1301,7 +1294,7 @@ public class JDWPTools {
     public String jdwp_resume() {
         try {
             final VirtualMachine vm = jdiService.getVM();
-            resumeLedger.resume(vm);
+            vm.resume();
             return "All threads resumed. To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
             return errorReply(e);
@@ -1330,7 +1323,7 @@ public class JDWPTools {
             } else {
                 // Arm BEFORE resume so we don't race with a near-instant event firing.
                 latch = breakpointTracker.armNextEventLatch();
-                resumeLedger.resume(vm);
+                vm.resume();
 
                 final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
                 if (!fired) {
@@ -2235,7 +2228,7 @@ public class JDWPTools {
                 return String.format("Thread %d (%s) is not suspended", threadId, thread.name());
             }
 
-            resumeLedger.resume(thread);
+            thread.resume();
             return String.format("Thread %d (%s) resumed. Use jdwp_resume_until_event to wait for the next event.", threadId, thread.name());
         } catch (Exception e) {
             return errorReply(e);
@@ -2397,7 +2390,7 @@ public class JDWPTools {
             // the signal is lost — see P0-2/P0-3. The arm-then-resume ordering matches what
             // jdwp_resume_until_event itself does for the same reason.
             breakpointTracker.armNextEventLatch();
-            resumeLedger.resume(thread);
+            thread.resume();
 
             return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
                 label, startLocation, thread.uniqueID(), thread.name());

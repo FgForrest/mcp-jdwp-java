@@ -68,7 +68,7 @@ class JdiEventListenerMergeMarkedBindingsTest {
 		final EventHistory history = new EventHistory();
 		evaluator = mock(JdiExpressionEvaluator.class);
 		listener = new JdiEventListener(tracker, history, evaluator,
-			new EvaluationGuard(), null, registry, new ResumeLedger());
+			new EvaluationGuard(), null, registry);
 	}
 
 	@AfterEach

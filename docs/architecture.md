@@ -98,10 +98,6 @@ The daemon thread that drains the JDI event queue (`JdiEventListener.java:200-21
 
 A counted, per-thread reentrancy guard (`EvaluationGuard.java`). Keys are target-VM `ThreadReference.uniqueID()` values. Its sole job is to tell the event listener "the MCP server is already running code on this thread — don't suspend it again". Without this guard, an expression evaluation that re-enters a breakpointed line would deadlock the entire server. See [threading-and-safety.md](threading-and-safety.md) for the full mechanism.
 
-### `ResumeLedger`
-
-Counts the resumes the tools issue (`ResumeLedger.java`). `jdwp_resume`, `jdwp_resume_until_event`, `jdwp_resume_thread` and the step tools all resume through it. The listener claims each event set it hands to the dispatcher. A set whose thread a tool resumed while the set waited has had its suspension spent, so the set is not resumed again: `EventSet.resume()` only decrements suspend counts, and it would release a newer stop. See [event-pipeline.md](event-pipeline.md) § 1.
-
 ### `EventHistory`
 
 A 500-entry FIFO ring buffer (`EventHistory.java`) of every JDWP event the listener has seen — including the ones it suppressed. Backed by a `ConcurrentLinkedDeque` so the producer (listener thread) and the consumers (MCP tool calls) never block each other.

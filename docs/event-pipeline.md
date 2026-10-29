@@ -20,12 +20,14 @@ The listener only drains and routes. Processing an event set can call into the t
 - a `VMDeath` / `VMDisconnect` set is processed on the listener thread after the dispatcher has finished the sets before it (bounded at 2 s); sets still queued after that are dropped unprocessed, so `VM_DEATH` stays the last entry (only a set already being processed — a long compile, say — can still finish after it);
 - every other set goes to the dispatcher.
 
-Whoever processes a set decides its resume, after all of its events. On the dispatcher, a set is never resumed once its suspension is spent: `EventSet.resume()` only decrements suspend counts, so resuming a spent set would release a newer stop of its thread. A set's suspension is spent in two cases:
+Whoever processes a set decides its resume, after all of its events — with one exception on the dispatcher: a set is not resumed when a later set of the same thread is already waiting. A suspended thread raises no events, so that thread was resumed meanwhile (`jdwp_resume`) and has stopped again; the older set's suspension is spent, and resuming it would release the newer stop. A set with suspend policy `none` is not counted: its thread may have raised it inside an invocation that has ended by the time the set is routed, and holding the older set's resume back would park that thread for good.
 
-- **A tool resumed its thread while the set waited.** Every resume a tool issues (`jdwp_resume`, `jdwp_resume_until_event`, `jdwp_resume_thread`, the step tools) goes through `ResumeLedger`, which counts it. The listener claims each set it routes, and the dispatcher checks the claim when it starts the set. While a set waits, its thread runs no invocation (nobody knows of the stop yet), so such a resume spent the suspension. A `SUSPEND_ALL` set is spent by a resume of the VM and by a resume of its own thread alike. It does not release a suspension it cannot prove is its own; the next `jdwp_resume` takes up what it leaves.
-- **A later set of the same thread is already waiting.** A suspended thread raises no events, so that thread was resumed meanwhile and has stopped again. This catches a tool resume that landed after the target raised the event but before the listener routed it, which the claim cannot see. A set with suspend policy `none` is not counted: its thread may have raised it inside an invocation that has ended by the time the set is routed.
+The rule infers from a later set; it does not track who owns a suspension. A tool resume (`jdwp_resume`, `jdwp_resume_thread`, a step) can still use up a waiting set's suspension, and the set's late resume can then release a newer stop in three cases:
+- the newer stop has not been routed yet;
+- the waiting set suspends all threads and the newer stop is on another thread;
+- the tool's resume lands between the check and `eventSet.resume()`.
 
-A tool resume made while the set is being processed is different. The thread may be inside `invokeMethod`, which resumes the thread for the call and suspends it again when the call returns. The tool's resume then does not reach the thread, and the set's suspension is still owed. So the set is resumed as usual. The one exception is a `SUSPEND_ALL` set after a VM resume: it resumes only its own thread, because the tool has already released the others. The tool resumes and the dispatcher's check-and-resume share the ledger's monitor, held only for those JDWP calls, so a tool resume never lands between a check and the resume it decides. Not covered: a `jdwp_resume_thread` of another thread while a `SUSPEND_ALL` set waits. Also, a breakpoint set spent while it waited is still reported as a stop, although its thread runs.
+The same happens on `main` through JDI's dequeue filter whenever the listener is busy. The fix, an ownership model in which the tools release only the stops they hold, is tracked in #45.
 
 Because a set can wait on the dispatcher, the handlers re-apply the rule JDI applies when a set leaves its queue to one case: an event whose request was **deleted** meanwhile (a cleared logpoint, a class redefined by a fast logpoint) is dropped and does not keep its set suspended — otherwise the stale hit would be untracked and park its thread for good. An event whose tracked request was merely **disabled** meanwhile still counts as a hit — it was one when it happened.
 
@@ -201,7 +203,7 @@ VM_START, VM_DEATH
 `jdwp_resume_until_event` is the blocking alternative to "resume + poll events + poll events". The mechanism:
 
 1. Tool method calls `breakpointTracker.armNextEventLatch()` (`BreakpointTracker.java:1518`) — creates a fresh `CountDownLatch(1)` in a `volatile` field.
-2. Tool method resumes the VM through `ResumeLedger.resume(vm)`, which counts the resume (§ 1).
+2. Tool method calls `vm.resume()`.
 3. Tool method calls `latch.await(timeoutMs, MILLISECONDS)` — releases the tracker's monitor and parks.
 4. When a suspending event fires, the listener's third step (after snapshot + history) is `breakpointTracker.fireNextEvent()` (`BreakpointTracker.java:1532`), which counts down the latch.
 5. Tool method wakes up, reads `lastBreakpoint`, returns the formatted context.
@@ -239,4 +241,4 @@ After promoting, the CPR is deleted if no pending entries reference the class an
 
 ## 13. Don't add state to the listener
 
-The listener owns only one piece of mutable state: the `vmDeathHookInvoked` atomic. Everything else lives in `BreakpointTracker`, `EventHistory`, `EvaluationGuard`, `ResumeLedger`, or `JDIConnectionService`. Keeping the listener thin is a deliberate choice — it is the busiest piece of code in the system and the easiest place to introduce a race. New event-handling logic almost always belongs in a service the listener delegates to, not in a new field on the listener itself.
+The listener owns only one piece of mutable state: the `vmDeathHookInvoked` atomic. Everything else lives in `BreakpointTracker`, `EventHistory`, `EvaluationGuard`, or `JDIConnectionService`. Keeping the listener thin is a deliberate choice — it is the busiest piece of code in the system and the easiest place to introduce a race. New event-handling logic almost always belongs in a service the listener delegates to, not in a new field on the listener itself.

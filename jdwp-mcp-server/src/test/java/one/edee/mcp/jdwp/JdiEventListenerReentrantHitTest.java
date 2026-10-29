@@ -10,6 +10,7 @@ import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.VMDisconnectEvent;
 import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -75,8 +76,7 @@ class JdiEventListenerReentrantHitTest {
 		guard = new EvaluationGuard();
 		evaluator = mock(JdiExpressionEvaluator.class);
 		fastLogpoints = mock(FastLogpointService.class);
-		listener = new JdiEventListener(tracker, history, evaluator, guard, null,
-			new MarkedInstanceRegistry(), new ResumeLedger());
+		listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
 		listener.setFastLogpointService(fastLogpoints);
 	}
 
@@ -178,8 +178,7 @@ class JdiEventListenerReentrantHitTest {
 		final EvaluationGuard closing = spy(new EvaluationGuard());
 		doReturn(true, false).when(closing).isEvaluating(thread);
 		listener.stop();
-		listener = new JdiEventListener(tracker, history, evaluator, closing, null,
-			new MarkedInstanceRegistry(), new ResumeLedger());
+		listener = new JdiEventListener(tracker, history, evaluator, closing, null, new MarkedInstanceRegistry());
 		final EventSet eventSet = mockEventSet(mockBreakpointEvent(thread, conditional, "com.example.Hot", 10));
 
 		start(eventSet);
@@ -189,6 +188,39 @@ class JdiEventListenerReentrantHitTest {
 		finish();
 		verify(evaluator, never()).evaluate(any(StackFrame.class), anyString(), any());
 		assertThat(types()).contains("BREAKPOINT_SUPPRESSED").doesNotContain("BREAKPOINT", "CONDITION_ERROR");
+	}
+
+	@Test
+	@DisplayName("a set suspending nothing, raised inside an evaluation that ended before it was routed, does not hold the evaluated set's resume")
+	void setSuspendingNothingIsNoStop() throws Exception {
+		final ThreadReference thread = threadWithFrame();
+		final BreakpointRequest logpointRequest = mock(BreakpointRequest.class);
+		tracker.setLogpointExpression(tracker.registerBreakpoint(logpointRequest), "helper()");
+		final CountDownLatch guardClosed = new CountDownLatch(1);
+		final CountDownLatch finishEvaluation = new CountDownLatch(1);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenAnswer(invocation -> {
+			blockInsideInvocation();
+			guardClosed.countDown();
+			assertThat(finishEvaluation.await(5, TimeUnit.SECONDS)).isTrue();
+			return null;
+		});
+		final EventSet logpointSet = mockEventSet(mockBreakpointEvent(thread, logpointRequest, "com.example.Hot", 10));
+		// The invoked code crossed a breakpoint with suspend policy "none": it did not hold the
+		// invocation up, which has ended by the time the listener routes the set.
+		final EventSet passedSet = reentrantBreakpointSet(thread);
+		when(passedSet.suspendPolicy()).thenReturn(EventRequest.SUSPEND_NONE);
+
+		start(logpointSet);
+		assertThat(invoking.await(2, TimeUnit.SECONDS)).isTrue();
+		release.countDown();
+		assertThat(guardClosed.await(2, TimeUnit.SECONDS)).isTrue();
+		queue.put(passedSet);
+		verify(passedSet, timeout(2000).atLeastOnce()).suspendPolicy();
+		finishEvaluation.countDown();
+		finish();
+
+		verify(logpointSet).resume();
+		assertThat(types()).containsSubsequence("LOGPOINT", "BREAKPOINT");
 	}
 
 	@Test

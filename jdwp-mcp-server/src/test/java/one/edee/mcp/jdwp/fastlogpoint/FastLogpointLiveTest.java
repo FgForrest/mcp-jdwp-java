@@ -740,15 +740,14 @@ class FastLogpointLiveTest {
 					throw e.getCause();
 				}
 			});
-			final ResumeLedger resumes = new ResumeLedger();
-			final JdiEventListener listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks, resumes);
+			final JdiEventListener listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks);
 			connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health);
 			final JdiExpressionEvaluator evaluator =
 				new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, noLocalClasspath);
 			evaluatorRef.set(evaluator);
 			fastLogpoints = new FastLogpointService(tracker, history, guard, evaluator, listener, connection);
 			tools = new JDWPTools(connection, tracker, watchers, evaluator, history, guard,
-				mock(JvmDiscoveryService.class), marks, health, noLocalClasspath, fastLogpoints, resumes);
+				mock(JvmDiscoveryService.class), marks, health, noLocalClasspath, fastLogpoints);
 		}
 
 		static LiveSession start(List<String> extraJvmArgs) throws Exception {

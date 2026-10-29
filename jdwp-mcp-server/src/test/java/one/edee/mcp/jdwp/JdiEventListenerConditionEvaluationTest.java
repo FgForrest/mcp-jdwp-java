@@ -64,8 +64,7 @@ class JdiEventListenerConditionEvaluationTest {
 		tracker = new BreakpointTracker();
 		eventHistory = new EventHistory();
 		evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null,
-			new MarkedInstanceRegistry(), new ResumeLedger());
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null, new MarkedInstanceRegistry());
 	}
 
 	@AfterEach
