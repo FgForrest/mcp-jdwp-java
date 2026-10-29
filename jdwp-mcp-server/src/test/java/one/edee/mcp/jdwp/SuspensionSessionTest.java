@@ -355,6 +355,32 @@ class SuspensionSessionTest {
 	}
 
 	@Test
+	@DisplayName("the holds known on a thread: its stops and a manual hold; a lease keeps them, a release ends them")
+	void holdsOnNamesWhatKeepsTheThreadAtItsStop() throws Exception {
+		final SuspensionSession.Context own = presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final SuspensionSession.Context all = presented(stopOn(u, EventRequest.SUSPEND_ALL, 2));
+		assertThat(session.holdsOn(t.ref)).containsExactly(own.id(), all.id());
+		assertThat(session.holdsOn(w.ref)).containsExactly(all.id());
+
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		assertThat(session.holdsOn(t.ref)).as("the invocation returns to the same frames")
+			.containsExactly(own.id(), all.id());
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+
+		assertThat(session.releaseThread(w.ref).released()).isTrue();
+		assertThat(session.holdsOn(w.ref)).isEmpty();
+		session.releaseAll();
+		assertThat(session.holdsOn(t.ref)).isEmpty();
+
+		assertThat(session.suspendThread(u.ref)).isNull();
+		assertThat(session.holdsOn(u.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
+		session.close();
+		assertThat(session.holdsOn(u.ref)).isEmpty();
+	}
+
+	@Test
 	@DisplayName("the dispatcher may invoke on the thread of the set it processes, though nobody has seen it")
 	void dispatcherLeaseIsAdmittedByConstruction() {
 		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_ALL),

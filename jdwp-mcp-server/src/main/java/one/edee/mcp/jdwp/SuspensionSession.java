@@ -38,6 +38,10 @@ public final class SuspensionSession {
      * Request property carrying the generation a request was created in; see {@link #stamp}.
      */
     public static final String GENERATION_PROPERTY = "mcp.generation";
+    /**
+     * The manual hold in {@link #holdsOn}; context ids start at 1.
+     */
+    public static final long MANUAL_HOLD = 0L;
 
     /**
      * Life cycle of a context.
@@ -624,6 +628,29 @@ public final class SuspensionSession {
     }
 
     /**
+     * The holds this session knows on {@code thread}: the ids of the contexts holding it, and
+     * {@link #MANUAL_HOLD} for a manual hold. A lease's exemption still counts — its invocation
+     * returns to the same frames. While one hold lasts, the thread cannot run past its stop, so a
+     * hold present in two snapshots proves its frames belong to the same activations in between
+     * (a frame tool's retry, issue #45 A12). Context ids are never reused.
+     */
+    public synchronized Set<Long> holdsOn(ThreadReference thread) {
+        if (closed) {
+            return Set.of();
+        }
+        final Set<Long> holds = new LinkedHashSet<>();
+        for (Context context : contexts) {
+            if (claims(context, thread)) {
+                holds.add(context.id);
+            }
+        }
+        if (manual.contains(thread)) {
+            holds.add(MANUAL_HOLD);
+        }
+        return holds;
+    }
+
+    /**
      * What the attach handshake found.
      */
     public enum StartState {
@@ -1012,7 +1039,14 @@ public final class SuspensionSession {
     }
 
     private static boolean covers(Context context, ThreadReference thread) {
-        if (context.state == State.RELEASED || context.released.contains(thread) || context.exempt.contains(thread)) {
+        return !context.exempt.contains(thread) && claims(context, thread);
+    }
+
+    /**
+     * Whether {@code context} holds {@code thread}, a lease's exemption from it aside.
+     */
+    private static boolean claims(Context context, ThreadReference thread) {
+        if (context.state == State.RELEASED || context.released.contains(thread)) {
             return false;
         }
         return switch (context.policy) {

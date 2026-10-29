@@ -33,6 +33,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -104,6 +105,11 @@ public class JDWPTools {
      */
     private static final DateTimeFormatter EVENT_TIME_FORMAT =
         DateTimeFormatter.ofPattern("HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
+    /**
+     * How often a frame tool reads its frames when a resume elsewhere invalidated them meanwhile.
+     */
+    private static final int FRAME_ATTEMPTS = 3;
+
     private final JDIConnectionService jdiService;
     private final BreakpointTracker breakpointTracker;
     private final WatcherManager watcherManager;
@@ -856,21 +862,23 @@ public class JDWPTools {
                 return "Error: Thread not found with ID " + threadId;
             }
 
-            if (!thread.isSuspended()) {
-                return notSuspendedForInspection(thread);
-            }
+            return withFreshFrames(thread, "call again.", () -> {
+                if (!thread.isSuspended()) {
+                    return notSuspendedForInspection(thread);
+                }
 
-            final FrameView view = FrameView.of(thread);
-            final List<StackFrame> frames = view.frames();
-            final StringBuilder result = new StringBuilder();
-            result.append(String.format("Stack trace for thread %d (%s) - %d frame(s) total:\n\n",
-                threadId, thread.name(), frames.size()));
-            result.append(view.hiddenNote());
+                final FrameView view = FrameView.of(thread);
+                final List<StackFrame> frames = view.frames();
+                final StringBuilder result = new StringBuilder();
+                result.append(String.format("Stack trace for thread %d (%s) - %d frame(s) total:\n\n",
+                    threadId, thread.name(), frames.size()));
+                result.append(view.hiddenNote());
 
-            appendUserFrames(result, frames, limit, includeNoiseFrames, "");
+                appendUserFrames(result, frames, limit, includeNoiseFrames, "");
 
-            result.append("\n→ jdwp_get_locals(threadId, frameIndex) for a frame's variables.");
-            return result.toString();
+                result.append("\n→ jdwp_get_locals(threadId, frameIndex) for a frame's variables.");
+                return result.toString();
+            });
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -887,52 +895,54 @@ public class JDWPTools {
                 return "Error: Thread not found with ID " + threadId;
             }
 
-            if (!thread.isSuspended()) {
-                return notSuspendedForInspection(thread);
-            }
-
-            final StackFrame frame = FrameView.of(thread).frame(frameIndex);
-            final StringBuilder result = new StringBuilder();
-            result.append(String.format("Local variables in frame %d:\n\n", frameIndex));
-
-            // Synthetic 'this' entry for instance methods. Cached so the user can immediately call
-            // jdwp_get_fields(<id>) without a separate eval round-trip.
-            final ObjectReference thisObj = frame.thisObject();
-            if (thisObj != null) {
-                result.append(String.format("this (%s) = %s\n",
-                    thisObj.referenceType().name(),
-                    formatValue(thisObj)));
-            }
-
-            try {
-                final Map<LocalVariable, Value> vars = frame.getValues(frame.visibleVariables());
-                for (Map.Entry<LocalVariable, Value> entry : vars.entrySet()) {
-                    final LocalVariable var = entry.getKey();
-                    final Value value = entry.getValue();
-                    result.append(String.format("%s (%s) = %s\n",
-                        var.name(),
-                        var.typeName(),
-                        formatValue(value)));
+            return withFreshFrames(thread, "call again.", () -> {
+                if (!thread.isSuspended()) {
+                    return notSuspendedForInspection(thread);
                 }
-            } catch (AbsentInformationException absent) {
-                // Method compiled without -g:vars, so there is no LocalVariableTable. Keep the
-                // 'this' line already appended (if any) and degrade with an actionable hint instead
-                // of letting the outer catch replace the whole response with "Error: null" — the same
-                // partial-output principle as appendMarkedInstancesFooter, and mirroring the graceful
-                // degrade jdwp_get_breakpoint_context already does for the same exception. The hint
-                // is tailored to the frame: an instance frame still has its receiver to inspect; a
-                // static frame has none, so we must not claim 'this' is available.
-                final String receiverHint = thisObj != null
-                    ? "'this' (above) and its fields still work — use jdwp_get_fields"
-                    : "this is a static frame with no receiver";
-                result.append(String.format(
-                    "(named local variables unavailable — %s has no LocalVariableTable; compiled "
-                    + "without -g:vars. %s; or recompile with -g.)%n",
-                    describeFrameMethod(frame), receiverHint));
-            }
 
-            appendMarkedInstancesFooter(result);
-            return result.toString();
+                final StackFrame frame = FrameView.of(thread).frame(frameIndex);
+                final StringBuilder result = new StringBuilder();
+                result.append(String.format("Local variables in frame %d:\n\n", frameIndex));
+
+                // Synthetic 'this' entry for instance methods. Cached so the user can immediately call
+                // jdwp_get_fields(<id>) without a separate eval round-trip.
+                final ObjectReference thisObj = frame.thisObject();
+                if (thisObj != null) {
+                    result.append(String.format("this (%s) = %s\n",
+                        thisObj.referenceType().name(),
+                        formatValue(thisObj)));
+                }
+
+                try {
+                    final Map<LocalVariable, Value> vars = frame.getValues(frame.visibleVariables());
+                    for (Map.Entry<LocalVariable, Value> entry : vars.entrySet()) {
+                        final LocalVariable var = entry.getKey();
+                        final Value value = entry.getValue();
+                        result.append(String.format("%s (%s) = %s\n",
+                            var.name(),
+                            var.typeName(),
+                            formatValue(value)));
+                    }
+                } catch (AbsentInformationException absent) {
+                    // Method compiled without -g:vars, so there is no LocalVariableTable. Keep the
+                    // 'this' line already appended (if any) and degrade with an actionable hint instead
+                    // of letting the outer catch replace the whole response with "Error: null" — the same
+                    // partial-output principle as appendMarkedInstancesFooter, and mirroring the graceful
+                    // degrade jdwp_get_breakpoint_context already does for the same exception. The hint
+                    // is tailored to the frame: an instance frame still has its receiver to inspect; a
+                    // static frame has none, so we must not claim 'this' is available.
+                    final String receiverHint = thisObj != null
+                        ? "'this' (above) and its fields still work — use jdwp_get_fields"
+                        : "this is a static frame with no receiver";
+                    result.append(String.format(
+                        "(named local variables unavailable — %s has no LocalVariableTable; compiled "
+                        + "without -g:vars. %s; or recompile with -g.)%n",
+                        describeFrameMethod(frame), receiverHint));
+                }
+
+                appendMarkedInstancesFooter(result);
+                return result.toString();
+            });
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -1164,6 +1174,53 @@ public class JDWPTools {
     @Nullable
     private ReferenceType forceLoad(String className) throws Exception {
         return invocations.run(null, "loading class " + className, () -> jdiService.findOrForceLoadClass(className));
+    }
+
+    /**
+     * Runs a frame tool's {@code work} on {@code thread}: refused while an evaluation runs on it, and
+     * run again, from fresh frames, when a resume elsewhere invalidated the frames it read — another
+     * stop's release, the arming's VM-wide suspend: JDI invalidates every frame of a resumed thread
+     * though it stays suspended (issue #45 A12). Each attempt rebuilds its whole reply.
+     * <p>
+     * It runs again only while a hold the session knows lasted across the attempt, so the fresh
+     * frames are the same activations; otherwise the thread may have run and stopped elsewhere, and
+     * the tool answers with {@code ifRunOn}. A write is retried only on this exception, which JDI
+     * raises before sending it or when the target rejects the frame — either way it did not land.
+     */
+    private String withFreshFrames(ThreadReference thread, String ifRunOn, Callable<String> work) throws Exception {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        Set<Long> holds = session != null ? session.holdsOn(thread) : Set.of();
+        for (int attempt = 1; ; attempt++) {
+            final String evaluating = evaluationRunningOn(thread);
+            if (evaluating != null) {
+                return evaluating;
+            }
+            try {
+                return work.call();
+            } catch (InvalidStackFrameException invalidated) {
+                if (session == null || attempt == FRAME_ATTEMPTS) {
+                    throw invalidated;
+                }
+                final Set<Long> now = session.holdsOn(thread);
+                if (Collections.disjoint(holds, now)) {
+                    return String.format("Error: thread %s was resumed while its frames were being read, and may have run "
+                        + "on since — %s", thread.name(), ifRunOn);
+                }
+                holds = now;
+            }
+        }
+    }
+
+    /**
+     * The refusal of a frame tool on a thread an evaluation is running on — its frames are then
+     * those of the invoked code, not of its stop — or {@code null}.
+     */
+    @Nullable
+    private String evaluationRunningOn(ThreadReference thread) {
+        return evaluationGuard.isEvaluating(thread)
+            ? "Error: an evaluation is running on thread " + thread.name() + " — its frames are the invoked code's "
+            + "now; try again when it has finished."
+            : null;
     }
 
     /**
@@ -2373,23 +2430,26 @@ public class JDWPTools {
             if (thread == null) {
                 return "Error: Thread not found with ID " + threadId;
             }
-            if (!thread.isSuspended()) {
-                return "Error: Thread is not suspended.";
-            }
+            final String nothingWritten = "nothing was written; read its frames again (jdwp_get_stack) before setting the variable.";
+            return withFreshFrames(thread, nothingWritten, () -> {
+                if (!thread.isSuspended()) {
+                    return "Error: Thread is not suspended.";
+                }
 
-            final StackFrame frame = FrameView.of(thread).frame(frameIndex);
-            final LocalVariable localVar = frame.visibleVariableByName(varName);
-            if (localVar == null) {
-                return String.format("Error: Variable '%s' not found in frame %d", varName, frameIndex);
-            }
+                final StackFrame frame = FrameView.of(thread).frame(frameIndex);
+                final LocalVariable localVar = frame.visibleVariableByName(varName);
+                if (localVar == null) {
+                    return String.format("Error: Variable '%s' not found in frame %d", varName, frameIndex);
+                }
 
-            final String parsedValue = "java.lang.String".equals(localVar.typeName())
-                ? stripJavaStringQuotes(value) : value;
+                final String parsedValue = "java.lang.String".equals(localVar.typeName())
+                    ? stripJavaStringQuotes(value) : value;
 
-            final Value newValue = createJdiValue(vm, parsedValue, localVar.type());
-            frame.setValue(localVar, newValue);
+                final Value newValue = createJdiValue(vm, parsedValue, localVar.type());
+                frame.setValue(localVar, newValue);
 
-            return String.format("Variable '%s' set to %s in frame %d of thread %d. Next: jdwp_step_over or jdwp_resume to continue.", varName, value, frameIndex, threadId);
+                return String.format("Variable '%s' set to %s in frame %d of thread %d. Next: jdwp_step_over or jdwp_resume to continue.", varName, value, frameIndex, threadId);
+            });
         } catch (ClassNotLoadedException notLoaded) {
             return String.format(
                 "Error setting variable: type '%s' is not yet loaded in the target VM, so JDI cannot validate the assignment. "
@@ -4841,83 +4901,85 @@ public class JDWPTools {
                 return "No current breakpoint detected. Set a breakpoint and trigger it first.";
             }
             final ThreadReference thread = snapshot.thread();
-            if (!thread.isSuspended()) {
-                return String.format("Thread %s (ID=%d) is no longer suspended.", thread.name(), thread.uniqueID());
-            }
-
-            final StringBuilder sb = new StringBuilder();
-            sb.append("=== Breakpoint Context ===\n");
-            sb.append(String.format("Thread: %s (ID=%d, %s)\n\n",
-                thread.name(), thread.uniqueID(), formatEventTag(snapshot)));
-
-            // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
-            final FrameView view = FrameView.of(thread);
-            final List<StackFrame> frames = view.frames();
-            sb.append(String.format("--- Top frames (showing up to %d, %d total) ---\n", frameLimit, frames.size()));
-            sb.append(view.hiddenNote());
-            appendUserFrames(sb, frames, frameLimit, "  ");
-
-            if (frames.isEmpty()) {
-                sb.append("\n(thread has no frames — possibly suspended at VM startup before any user code)\n");
-                return sb.toString();
-            }
-            sb.append('\n');
-
-            // Locals at frame 0 (with synthetic 'this' the same way jdwp_get_locals does it)
-            final StackFrame frame0 = frames.get(0);
-            sb.append("--- Locals at frame 0 ---\n");
-            final ObjectReference thisObj = frame0.thisObject();
-            if (thisObj != null) {
-                sb.append(String.format("  this (%s) = %s\n",
-                    thisObj.referenceType().name(), formatValue(thisObj)));
-            }
-            try {
-                final Map<LocalVariable, Value> vars = frame0.getValues(frame0.visibleVariables());
-                if (vars.isEmpty() && thisObj == null) {
-                    sb.append("  (none)\n");
+            return withFreshFrames(thread, "call again.", () -> {
+                if (!thread.isSuspended()) {
+                    return String.format("Thread %s (ID=%d) is no longer suspended.", thread.name(), thread.uniqueID());
                 }
-                for (Map.Entry<LocalVariable, Value> e : vars.entrySet()) {
-                    sb.append(String.format("  %s (%s) = %s\n",
-                        e.getKey().name(), e.getKey().typeName(), formatValue(e.getValue())));
-                }
-            } catch (AbsentInformationException e) {
-                sb.append("  (no debug info — compile with -g)\n");
-            }
-            sb.append('\n');
 
-            // 'this' field dump — instance fields only. Static fields are class-level state and
-            // would clutter the dump (e.g. constant tables like PRICE_CATALOG showing up under
-            // every instance) without telling the user anything about THIS object.
-            if (includeThis && thisObj != null) {
-                jdiService.cacheObject(thisObj);
-                sb.append(String.format("--- this fields (Object#%d, %s) ---\n",
-                    thisObj.uniqueID(), thisObj.referenceType().name()));
-                final List<Field> instanceFields = thisObj.referenceType().allFields().stream()
-                    .filter(f -> !f.isStatic())
-                    .toList();
-                if (instanceFields.isEmpty()) {
-                    sb.append("  (no instance fields)\n");
-                } else {
-                    for (Field field : instanceFields) {
-                        // Per-field guard: a single dead reference (e.g. ObjectCollectedException)
-                        // must not torpedo the whole context dump. The user still benefits from
-                        // seeing every other field, so we emit "<unavailable>" for the offender
-                        // and continue rendering.
-                        try {
-                            final Value v = thisObj.getValue(field);
-                            sb.append(String.format("  %s %s = %s\n", field.typeName(), field.name(), formatValue(v)));
-                        } catch (Exception fieldErr) {
-                            sb.append(String.format("  %s %s = <unavailable: %s>\n",
-                                field.typeName(), field.name(), fieldErr.getClass().getSimpleName()));
+                final StringBuilder sb = new StringBuilder();
+                sb.append("=== Breakpoint Context ===\n");
+                sb.append(String.format("Thread: %s (ID=%d, %s)\n\n",
+                    thread.name(), thread.uniqueID(), formatEventTag(snapshot)));
+
+                // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
+                final FrameView view = FrameView.of(thread);
+                final List<StackFrame> frames = view.frames();
+                sb.append(String.format("--- Top frames (showing up to %d, %d total) ---\n", frameLimit, frames.size()));
+                sb.append(view.hiddenNote());
+                appendUserFrames(sb, frames, frameLimit, "  ");
+
+                if (frames.isEmpty()) {
+                    sb.append("\n(thread has no frames — possibly suspended at VM startup before any user code)\n");
+                    return sb.toString();
+                }
+                sb.append('\n');
+
+                // Locals at frame 0 (with synthetic 'this' the same way jdwp_get_locals does it)
+                final StackFrame frame0 = frames.get(0);
+                sb.append("--- Locals at frame 0 ---\n");
+                final ObjectReference thisObj = frame0.thisObject();
+                if (thisObj != null) {
+                    sb.append(String.format("  this (%s) = %s\n",
+                        thisObj.referenceType().name(), formatValue(thisObj)));
+                }
+                try {
+                    final Map<LocalVariable, Value> vars = frame0.getValues(frame0.visibleVariables());
+                    if (vars.isEmpty() && thisObj == null) {
+                        sb.append("  (none)\n");
+                    }
+                    for (Map.Entry<LocalVariable, Value> e : vars.entrySet()) {
+                        sb.append(String.format("  %s (%s) = %s\n",
+                            e.getKey().name(), e.getKey().typeName(), formatValue(e.getValue())));
+                    }
+                } catch (AbsentInformationException e) {
+                    sb.append("  (no debug info — compile with -g)\n");
+                }
+                sb.append('\n');
+
+                // 'this' field dump — instance fields only. Static fields are class-level state and
+                // would clutter the dump (e.g. constant tables like PRICE_CATALOG showing up under
+                // every instance) without telling the user anything about THIS object.
+                if (includeThis && thisObj != null) {
+                    jdiService.cacheObject(thisObj);
+                    sb.append(String.format("--- this fields (Object#%d, %s) ---\n",
+                        thisObj.uniqueID(), thisObj.referenceType().name()));
+                    final List<Field> instanceFields = thisObj.referenceType().allFields().stream()
+                        .filter(f -> !f.isStatic())
+                        .toList();
+                    if (instanceFields.isEmpty()) {
+                        sb.append("  (no instance fields)\n");
+                    } else {
+                        for (Field field : instanceFields) {
+                            // Per-field guard: a single dead reference (e.g. ObjectCollectedException)
+                            // must not torpedo the whole context dump. The user still benefits from
+                            // seeing every other field, so we emit "<unavailable>" for the offender
+                            // and continue rendering.
+                            try {
+                                final Value v = thisObj.getValue(field);
+                                sb.append(String.format("  %s %s = %s\n", field.typeName(), field.name(), formatValue(v)));
+                            } catch (Exception fieldErr) {
+                                sb.append(String.format("  %s %s = <unavailable: %s>\n",
+                                    field.typeName(), field.name(), fieldErr.getClass().getSimpleName()));
+                            }
                         }
                     }
+                } else if (includeThis) {
+                    sb.append("--- this --- (static method, no this)\n");
                 }
-            } else if (includeThis) {
-                sb.append("--- this --- (static method, no this)\n");
-            }
 
-            appendMarkedInstancesFooter(sb);
-            return sb.toString();
+                appendMarkedInstancesFooter(sb);
+                return sb.toString();
+            });
         } catch (Exception e) {
             return errorReply(e);
         }
