@@ -1642,9 +1642,13 @@ public class JDIConnectionService {
             return null;
         }
         try {
-            // First preference: the thread that most recently hit a breakpoint — known to be
-            // suspended at a method-invocation event, which is what JDI requires for invokeMethod.
-            final ThreadReference lastBp = breakpointTracker.getLastBreakpointThread();
+            // First preference: the thread of the current stop — suspended at its own event, which
+            // is what JDI requires for invokeMethod (issue #45).
+            final SuspensionSession session = breakpointTracker.suspensionSession();
+            final BreakpointTracker.LastBreakpoint current = session != null ? session.currentStop() : null;
+            final ThreadReference lastBp = session != null
+                ? (current != null ? current.thread() : null)
+                : breakpointTracker.getLastBreakpointThread();
             if (lastBp != null && isUsableForInvoke(lastBp)) {
                 return lastBp;
             }

@@ -16,8 +16,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -113,6 +111,12 @@ public class JdiEventListener {
      */
     @Nullable
     private volatile ExecutorService dispatcher;
+    /**
+     * Suspension ownership of the current connection; opened by {@link #start}, closed on stop and
+     * death.
+     */
+    @Nullable
+    private volatile SuspensionSession session;
     private volatile boolean running;
     /**
      * Optional callback invoked exactly once when the listener observes VM death or disconnect.
@@ -310,8 +314,9 @@ public class JdiEventListener {
             return worker;
         });
         dispatcher = sessionDispatcher;
-        final ConcurrentMap<Long, Integer> waiting = new ConcurrentHashMap<>();
-        final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, waiting), "jdi-event-listener");
+        final SuspensionSession suspensions = breakpointTracker.openSuspensionSession(eventHistory);
+        session = suspensions;
+        final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, suspensions), "jdi-event-listener");
         thread.setDaemon(true);
         listenerThread = thread;
         thread.start();
@@ -349,6 +354,11 @@ public class JdiEventListener {
      */
     public void stop() {
         running = false;
+        final SuspensionSession suspensions = session;
+        session = null;
+        if (suspensions != null) {
+            suspensions.close();
+        }
         final ExecutorService sessionDispatcher = dispatcher;
         dispatcher = null;
         if (sessionDispatcher != null) {
@@ -389,7 +399,7 @@ public class JdiEventListener {
      * clears {@link #running}, fires the resume-until-event latch, and invokes the registered
      * {@link #vmDeathHook} before exiting.
      */
-    private void listen(VirtualMachine vm, ExecutorService dispatcher, ConcurrentMap<Long, Integer> waiting) {
+    private void listen(VirtualMachine vm, ExecutorService dispatcher, SuspensionSession suspensions) {
         final EventQueue queue = vm.eventQueue();
 
         while (running) {
@@ -408,21 +418,21 @@ public class JdiEventListener {
                 }
                 if (isDeath(eventSet)) {
                     awaitDispatched(dispatcher);
-                    process(eventSet);
+                    suspensions.close();
+                    process(eventSet, null, null);
                 } else if (fromEvaluatingThread(eventSet)) {
-                    suppress(eventSet);
+                    suppress(eventSet, suspensions);
                 } else {
-                    final Long threadId = suspendedThreadIdOf(eventSet);
-                    if (threadId != null) {
-                        waiting.merge(threadId, 1, Integer::sum);
-                    }
-                    dispatcher.execute(() -> dispatch(eventSet, threadId, waiting));
+                    final SuspensionSession.Context context =
+                        suspensions.route(eventSet, threadOf(eventSet), isVmStart(eventSet));
+                    dispatcher.execute(() -> dispatch(eventSet, suspensions, context));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 // User-initiated stop arrives via Thread.interrupt(). Treat it symmetrically to the
                 // other exit paths so a waiter blocked on jdwp_resume_until_event wakes and post-mortem
                 // cleanup runs; the CAS gate inside invokeVmDeathHook() handles the race with stop().
+                suspensions.close();
                 running = false;
                 breakpointTracker.fireNextEvent();
                 invokeVmDeathHook();
@@ -433,6 +443,7 @@ public class JdiEventListener {
                 // underneath us and a subsequent JDI call now rejects requests. Both are terminal.
                 log.info("[JDI] VM disconnected, stopping event listener: {}", e.getClass().getSimpleName());
                 awaitDispatched(dispatcher);
+                suspensions.close();
                 eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));
                 running = false;
                 breakpointTracker.fireNextEvent();
@@ -449,32 +460,41 @@ public class JdiEventListener {
     }
 
     /**
-     * Processes one event set on the dispatcher thread and resumes it if {@link #process} says so —
-     * unless a later set of the same target thread is already {@code waiting}. A suspended thread
-     * raises no events, so the thread was resumed meanwhile (e.g. {@code jdwp_resume}) and has
-     * stopped again: this set's suspension is spent, and resuming it would release the newer one. A
-     * set that suspends nothing is not counted: its thread may have raised it inside an invocation
-     * that has ended by the time the set is routed, and holding the resume back would park that
-     * thread for good.
-     * Never throws — an exception escaping the task would only reach the executor; a disconnected VM
-     * is reported by the listener thread, whose next {@code queue.remove()} fails too.
+     * Processes one event set on the dispatcher thread under its {@link SuspensionSession.Context}:
+     * the handlers' stops become candidates of the set, and {@link SuspensionSession#finish}
+     * publishes the first one once the whole set is processed, or releases the set. Only the
+     * context releases its suspension — no tool can spend it meanwhile, so no "later set" rule is
+     * needed. A set that should stay suspended but named no stop (an untracked breakpoint) is
+     * published as a plain breakpoint stop of its thread. Never throws — an exception escaping the
+     * task would only reach the executor; a disconnected VM is reported by the listener thread,
+     * whose next {@code queue.remove()} fails too.
      */
-    private void dispatch(EventSet eventSet, @Nullable Long threadId, ConcurrentMap<Long, Integer> waiting) {
-        if (threadId != null) {
-            waiting.computeIfPresent(threadId, (id, count) -> count > 1 ? count - 1 : null);
-        }
+    private void dispatch(EventSet eventSet, SuspensionSession suspensions, SuspensionSession.Context context) {
+        suspensions.begin(context);
+        boolean keep;
+        suspensions.beginProcessing(context);
         try {
-            if (process(eventSet)) {
-                if (threadId != null && waiting.containsKey(threadId)) {
-                    log.debug("[JDI] Not resuming an event set of thread {}: it was resumed and has stopped again since",
-                        threadId);
-                } else {
-                    eventSet.resume();
-                }
-            }
+            keep = !process(eventSet, suspensions, context);
         } catch (Exception e) {
             if (running) {
                 log.warn("[JDI] Error processing event: {}", e.getMessage());
+            }
+            // Fail-safe, as the handlers: an unexpected error keeps the set for inspection.
+            keep = true;
+        } finally {
+            SuspensionSession.endProcessing();
+        }
+        try {
+            final ThreadReference thread = context.thread();
+            if (!keep) {
+                suspensions.dropCandidatesAfter(context, 0);
+            } else if (suspensions.candidateCount(context) == 0 && thread != null) {
+                suspensions.candidate(context, new BreakpointTracker.LastBreakpoint(thread, null));
+            }
+            suspensions.finish(context);
+        } catch (Exception e) {
+            if (running) {
+                log.warn("[JDI] Error settling an event set: {}", e.getMessage());
             }
         }
     }
@@ -490,7 +510,8 @@ public class JdiEventListener {
      *
      * @return whether the caller should resume the set
      */
-    private boolean process(EventSet eventSet) {
+    private boolean process(EventSet eventSet, @Nullable SuspensionSession suspensions,
+                            SuspensionSession.@Nullable Context context) {
         boolean shouldSuspend = false;
         // First thread parked for inspection in this set; used to pre-warm the compiler
         // classpath once the set has been handled (see the prewarm call below).
@@ -505,49 +526,9 @@ public class JdiEventListener {
                     armingHits = new ArrayList<>(1);
                 }
                 armingHits.add(bpEvent);
-            } else if (event instanceof BreakpointEvent bpEvent
-                && fastLogpointService != null && fastLogpointService.claimsStopEvent(bpEvent)) {
-                if (fastLogpointService.handleStopHit(bpEvent)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = bpEvent.thread();
-                    }
-                }
-            } else if (event instanceof BreakpointEvent bpEvent) {
-                if (handleBreakpointEvent(bpEvent)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = bpEvent.thread();
-                    }
-                }
-            } else if (event instanceof StepEvent stepEvent) {
-                if (handleStepEvent(stepEvent)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = stepEvent.thread();
-                    }
-                }
-            } else if (event instanceof ExceptionEvent exEvent) {
-                if (handleExceptionEvent(exEvent)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = exEvent.thread();
-                    }
-                }
-            } else if (event instanceof WatchpointEvent wpEvent) {
-                if (handleWatchpointEvent(wpEvent)) {
-                    shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = wpEvent.thread();
-                    }
-                }
-            } else if (event instanceof ClassPrepareEvent cpEvent) {
-                handleClassPrepareEvent(cpEvent);
-            } else if (event instanceof VMStartEvent) {
-                log.info("[JDI] VM started — keeping suspended for breakpoint setup");
-                eventHistory.record(new EventHistory.DebugEvent("VM_START", "VM started"));
-                shouldSuspend = true;
-            } else if (event instanceof VMDisconnectEvent || event instanceof VMDeathEvent) {
+                continue;
+            }
+            if (event instanceof VMDisconnectEvent || event instanceof VMDeathEvent) {
                 log.info("[JDI] VM disconnected/died, stopping event listener");
                 eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected/died"));
                 // Clear running BEFORE waking the latch, otherwise a waiter that wakes can
@@ -557,50 +538,97 @@ public class JdiEventListener {
                 invokeVmDeathHook();
                 return false;
             }
+            // A handler that decides not to stop withdraws the stop candidates it added (a
+            // breakpoint records its snapshot before its condition is evaluated).
+            final int candidates = candidateMark(suspensions, context);
+            final boolean stop;
+            ThreadReference stopThread = null;
+            if (event instanceof BreakpointEvent bpEvent
+                && fastLogpointService != null && fastLogpointService.claimsStopEvent(bpEvent)) {
+                stop = fastLogpointService.handleStopHit(bpEvent);
+                stopThread = bpEvent.thread();
+            } else if (event instanceof BreakpointEvent bpEvent) {
+                stop = handleBreakpointEvent(bpEvent);
+                stopThread = bpEvent.thread();
+            } else if (event instanceof StepEvent stepEvent) {
+                stop = handleStepEvent(stepEvent);
+                stopThread = stepEvent.thread();
+            } else if (event instanceof ExceptionEvent exEvent) {
+                stop = handleExceptionEvent(exEvent);
+                stopThread = exEvent.thread();
+            } else if (event instanceof WatchpointEvent wpEvent) {
+                stop = handleWatchpointEvent(wpEvent);
+                stopThread = wpEvent.thread();
+            } else if (event instanceof ClassPrepareEvent cpEvent) {
+                handleClassPrepareEvent(cpEvent);
+                stop = false;
+            } else if (event instanceof VMStartEvent vmStart) {
+                log.info("[JDI] VM started — keeping suspended for breakpoint setup");
+                eventHistory.record(new EventHistory.DebugEvent("VM_START", "VM started"));
+                breakpointTracker.setLastSuspendingEvent(vmStart.thread(), BreakpointTracker.EventKind.VM_START);
+                // The JDWP agent does not enable method invocation at VM start: no pre-warm.
+                stop = true;
+            } else {
+                stop = false;
+            }
+            if (stop) {
+                shouldSuspend = true;
+                if (warmThread == null) {
+                    warmThread = stopThread;
+                }
+            } else {
+                withdrawCandidates(suspensions, context, candidates);
+            }
         }
 
         // Arm last: arming redefines the class, which replaces the JDI requests behind any
         // other breakpoint event of this set located in the same class.
-        boolean suspensionSpent = false;
         if (armingHits != null && fastLogpointService != null) {
             for (BreakpointEvent armingHit : armingHits) {
-                switch (fastLogpointService.handleArmingHit(armingHit)) {
-                    // A fast breakpoint's arming hit whose condition holds is published as its stop.
-                    case STOPPED -> {
-                        shouldSuspend = true;
-                        if (warmThread == null) {
-                            warmThread = armingHit.thread();
-                        }
+                final int candidates = candidateMark(suspensions, context);
+                // A fast breakpoint's arming hit whose condition holds is published as its stop.
+                if (fastLogpointService.handleArmingHit(armingHit) == FastLogpointService.ArmingOutcome.STOPPED) {
+                    shouldSuspend = true;
+                    if (warmThread == null) {
+                        warmThread = armingHit.thread();
                     }
-                    // A resume of the VM (jdwp_resume) released the thread while it armed.
-                    case SPENT -> suspensionSpent = true;
-                    case RESUME -> {
-                    }
+                } else {
+                    withdrawCandidates(suspensions, context, candidates);
                 }
             }
         }
 
         if (shouldSuspend) {
-            // The set stays parked for inspection. Pre-warm the compiler classpath now, on
-            // the first suspending thread, so the agent's first evaluate_expression (or the
-            // first logpoint/condition hit) does not pay the one-time ~1-3s discovery cost on
-            // its critical path. Runs only on the first stop per connection — thereafter the
-            // discovered JDK path short-circuits prewarmClasspath. Never throws (warming
-            // failures are logged and retried by the real evaluation call). It is safe to
-            // drive invokeMethod from here for the same reason logpoint evaluation is: the
-            // prohibition is on event-dispatch callbacks, not on invocations made while an
-            // event set is being processed.
-            if (warmThread != null) {
+            // The set stays parked for inspection. Pre-warm the compiler classpath now — still
+            // inside the set's processing, before its stop is published, so no tool can touch the
+            // thread meanwhile — on the first suspending thread, so the agent's first
+            // evaluate_expression does not pay the one-time ~1-3s discovery cost. Runs only on the
+            // first stop per connection and never for a set that suspends nothing (its thread runs).
+            // Never throws (warming failures are logged and retried by the real evaluation call).
+            if (warmThread != null && eventSet.suspendPolicy() != EventRequest.SUSPEND_NONE) {
                 expressionEvaluator.prewarmClasspath(warmThread);
             }
             return false;
         }
-        if (suspensionSpent) {
-            log.debug("[JDI] Not resuming an event set whose arming thread was resumed while it armed: its "
-                + "suspension is spent");
-            return false;
-        }
         return true;
+    }
+
+    /**
+     * How many stop candidates {@code context} has before a handler runs; {@code 0} without a context.
+     */
+    private static int candidateMark(@Nullable SuspensionSession suspensions,
+                                     SuspensionSession.@Nullable Context context) {
+        return suspensions != null && context != null ? suspensions.candidateCount(context) : 0;
+    }
+
+    /**
+     * Withdraws the candidates a handler added after {@code mark}: it decided not to stop.
+     */
+    private static void withdrawCandidates(@Nullable SuspensionSession suspensions,
+                                           SuspensionSession.@Nullable Context context, int mark) {
+        if (suspensions != null && context != null) {
+            suspensions.dropCandidatesAfter(context, mark);
+        }
     }
 
     /**
@@ -610,7 +638,9 @@ public class JdiEventListener {
      * says by now — the listener thread must never call into the target. A class prepare still
      * promotes the deferred breakpoints of its class, which touches debugger-side state only.
      */
-    private void suppress(EventSet eventSet) {
+    private void suppress(EventSet eventSet, SuspensionSession suspensions) {
+        // Released at once through its context, so no tool can spend its suspension first.
+        final SuspensionSession.Context context = suspensions.route(eventSet, threadOf(eventSet), false);
         final FastLogpointService fastLogpointService = fastLogpoints;
         for (Event event : eventSet) {
             try {
@@ -636,7 +666,7 @@ public class JdiEventListener {
                 log.debug("[JDI] Error suppressing an event raised inside an MCP evaluation: {}", e.getMessage());
             }
         }
-        eventSet.resume();
+        suspensions.finish(context);
     }
 
     /**
@@ -775,22 +805,30 @@ public class JdiEventListener {
     }
 
     /**
-     * The target thread {@code eventSet} suspended ({@link ThreadReference#uniqueID}), or {@code null}
-     * for a set that suspends none of its own: one with suspend policy {@code none}, or one without a
-     * thread. JDI never puts events of different threads into one set.
+     * The event thread of {@code eventSet}, or {@code null} for a set without one. JDI never puts
+     * events of different threads into one set.
      */
     @Nullable
-    private static Long suspendedThreadIdOf(EventSet eventSet) {
-        if (eventSet.suspendPolicy() == EventRequest.SUSPEND_NONE) {
-            return null;
-        }
+    private static ThreadReference threadOf(EventSet eventSet) {
         for (Event event : eventSet) {
-            final ThreadReference thread = threadOf(event);
+            final ThreadReference thread = event instanceof VMStartEvent vmStart ? vmStart.thread() : threadOf(event);
             if (thread != null) {
-                return thread.uniqueID();
+                return thread;
             }
         }
         return null;
+    }
+
+    /**
+     * Whether {@code eventSet} reports VM start.
+     */
+    private static boolean isVmStart(EventSet eventSet) {
+        for (Event event : eventSet) {
+            if (event instanceof VMStartEvent) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

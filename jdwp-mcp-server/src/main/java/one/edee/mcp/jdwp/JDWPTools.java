@@ -67,11 +67,10 @@ public class JDWPTools {
         System.getProperty("JVM_JDWP_PORT", "5005")
     );
     /**
-     * How long {@link #jdwp_resume} and {@link #jdwp_resume_until_event} wait for a fast logpoint or
-     * fast breakpoint arming in flight before they resume anyway. The first arming of a connection
-     * includes classpath discovery.
+     * How long attaching waits for the VMStart stop (the JDWP agent reports it only to its first
+     * connection, right after the handshake).
      */
-    private static final long ARMING_WAIT_MS = 30_000L;
+    private static final long START_HANDSHAKE_MS = 500L;
     /**
      * Allow-list of package prefixes treated as "noise" by `isNoiseFrame`. Stack frames whose
      * declaring class starts with any of these are collapsed in `jdwp_get_stack` and
@@ -395,8 +394,9 @@ public class JDWPTools {
         final int port = JVM_JDWP_PORT;
 
         try {
-            return jdiService.connect(host, port) + " Next: set breakpoints, then jdwp_resume_until_event."
-                + jdiService.takeAttachNotice();
+            final String result = jdiService.connect(host, port);
+            acknowledgeStart();
+            return result + " Next: set breakpoints, then jdwp_resume_until_event." + jdiService.takeAttachNotice();
         } catch (Exception e) {
             return String.format("""
                     [ERROR] Connection failed to %s:%d
@@ -445,11 +445,17 @@ public class JDWPTools {
                 // no thread is parked at a method-invocation event yet, so jdwp_evaluate_expression
                 // / jdwp_to_string would fail with IncompatibleThreadStateException — the agent
                 // needs to set BPs and resume first. A JVM started with suspend=n is already running.
-                final String state = anyThreadSuspended()
-                    ? "The VM is currently suspended at VM_START — expression evaluation requires landing at a real "
-                    + "BP first."
-                    : "The VM is running (it was started with suspend=n) — expression evaluation requires landing "
-                    + "at a real BP first.";
+                final String state = switch (acknowledgeStart()) {
+                    case SUSPENDED -> "The VM is currently suspended at VM_START — expression evaluation requires "
+                        + "landing at a real BP first.";
+                    case RUNNING -> "The VM is running (it was started with suspend=n) — expression evaluation "
+                        + "requires landing at a real BP first.";
+                    case NOT_SEEN -> anyThreadSuspended()
+                        ? "The VM appears suspended at VM_START, but its start event was not reported yet — if it "
+                        + "arrives, jdwp_resume_until_event shows it; expression evaluation requires landing at a "
+                        + "real BP first."
+                        : "The VM is running — expression evaluation requires landing at a real BP first.";
+                };
                 return String.format("%s (attached after %d attempt(s))%nNext: set breakpoints, then call "
                     + "jdwp_resume_until_event. %s", result, attempts, state) + jdiService.takeAttachNotice();
             } catch (IllegalConnectorArgumentsException e) {
@@ -1088,9 +1094,9 @@ public class JDWPTools {
                     return "Error: Thread not found with ID " + threadId;
                 }
             } else {
-                thread = breakpointTracker.getLastBreakpointThread();
+                thread = currentStopThread();
                 if (thread == null) {
-                    return "Error: No suspended thread available. Provide a threadId or hit a breakpoint first.";
+                    return noCurrentStop();
                 }
             }
 
@@ -1209,9 +1215,9 @@ public class JDWPTools {
                     return "Error: Thread not found with ID " + threadId;
                 }
             } else {
-                thread = breakpointTracker.getLastBreakpointThread();
+                thread = currentStopThread();
                 if (thread == null) {
-                    return "Error: No suspended thread available. Provide a threadId or hit a breakpoint first.";
+                    return noCurrentStop();
                 }
             }
             if (!thread.isSuspended()) {
@@ -1299,107 +1305,153 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Resume execution of all threads in the VM")
+    @McpTool(description = "Resume the stops you have seen: every stop a tool presented (jdwp_resume_until_event, "
+        + "jdwp_get_current_thread, jdwp_get_breakpoint_context) and every jdwp_suspend_thread hold is released. A stop "
+        + "not yet seen stays held (call jdwp_resume_until_event to see it); event sets still being processed keep "
+        + "their threads parked until then. Never resumes threads the debugger does not hold.")
     public String jdwp_resume() {
         try {
-            final VirtualMachine vm = jdiService.getVM();
-            fastLogpoints.awaitArmingIdle(ARMING_WAIT_MS);
-            vm.resume();
-            return "All threads resumed. To wait for the next event, use jdwp_resume_until_event.";
+            jdiService.getVM();
+            final SuspensionSession.ReleaseResult result = suspensions().releaseAll();
+            return renderRelease(result) + " To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
             return errorReply(e);
         }
     }
 
-    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, '[NO_EVENT] ...' when the wait was released without a stop — the message states whether the session is still armed (just call again) or was cleared (re-set breakpoints), or 'Wait interrupted' on thread interruption.")
+    /**
+     * The suspension-ownership session of the current connection.
+     *
+     * @throws IllegalStateException when no connection has a session
+     */
+    private SuspensionSession suspensions() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        if (session == null || session.isClosed()) {
+            throw new IllegalStateException("not connected — no debugging session");
+        }
+        return session;
+    }
+
+    /**
+     * Renders what a release did: released stops, stops still held because nobody saw them, sets
+     * still in processing, or that nothing was held.
+     */
+    private static String renderRelease(SuspensionSession.ReleaseResult result) {
+        final StringBuilder out = new StringBuilder();
+        if (!result.releasedAnything()) {
+            out.append("Nothing to release — no stop you have seen and no jdwp_suspend_thread hold is held.");
+        } else {
+            out.append("Resumed:");
+            for (BreakpointTracker.LastBreakpoint stop : result.released()) {
+                out.append(' ').append(describeStop(stop)).append(';');
+            }
+            for (ThreadReference thread : result.manual()) {
+                out.append(" the jdwp_suspend_thread hold of ").append(thread.name()).append(';');
+            }
+            out.setLength(out.length() - 1);
+            out.append('.');
+        }
+        if (!result.unseen().isEmpty()) {
+            out.append(" Still held, not yet seen:");
+            for (BreakpointTracker.LastBreakpoint stop : result.unseen()) {
+                out.append(' ').append(describeStop(stop)).append(';');
+            }
+            out.setLength(out.length() - 1);
+            out.append(" — jdwp_resume_until_event shows it.");
+        }
+        if (result.pending() > 0) {
+            out.append(String.format(" %d event set(s) are still being processed; their threads stay parked until "
+                + "then.", result.pending()));
+        }
+        return out.toString();
+    }
+
+    /**
+     * One stop in words: "breakpoint 3 on thread main".
+     */
+    private static String describeStop(BreakpointTracker.LastBreakpoint stop) {
+        final String thread = safeThreadName(stop.thread());
+        return switch (stop.kind()) {
+            case BREAKPOINT -> (stop.id() != null ? "breakpoint " + stop.id() : "untracked breakpoint") + " on thread "
+                + thread;
+            case STEP -> "step on thread " + thread;
+            case EXCEPTION -> "exception on thread " + thread;
+            case VM_START -> "VM start";
+        };
+    }
+
+    private static String safeThreadName(ThreadReference thread) {
+        try {
+            return thread.name();
+        } catch (Exception e) {
+            return "#" + thread.uniqueID();
+        }
+    }
+
+    /**
+     * The thread of the current stop — the stop a presenting tool last showed, while it is still
+     * held on its thread — for tools whose thread parameter is omitted. Without a session (no
+     * connection yet) the last published snapshot.
+     */
+    @Nullable
+    private ThreadReference currentStopThread() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        if (session == null) {
+            return breakpointTracker.getLastBreakpointThread();
+        }
+        final BreakpointTracker.LastBreakpoint stop = session.currentStop();
+        return stop != null ? stop.thread() : null;
+    }
+
+    /**
+     * The reply of a thread-defaulting tool when there is no current stop.
+     */
+    private String noCurrentStop() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        final int unseen = session != null ? session.unseenCount() : 0;
+        return "Error: No current stop. Provide a threadId, or hit a breakpoint first"
+            + (unseen > 0 ? String.format(" — %d stop(s) not yet seen: call jdwp_resume_until_event or "
+            + "jdwp_get_current_thread.", unseen) : ".");
+    }
+
+    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. Returns the same info as jdwp_get_current_thread on success. Returns one of: 'Event fired ...' on a stop, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
         try {
-            final VirtualMachine vm = jdiService.getVM();
-            // Before the short-circuit below: an arming hit that is being handled may still publish
-            // a fast breakpoint's stop, which must be reported, not resumed.
-            fastLogpoints.awaitArmingIdle(ARMING_WAIT_MS);
-
-            // State-checking short-circuit (P0-2/P0-3). If a BP / step / exception fired since the
-            // last call (e.g. the agent called jdwp_step_over and an intervening tool call meant
-            // we missed the signal-armed latch), don't re-resume — just return the snapshot.
-            // Without this guard, jdwp_resume_until_event would call vm.resume() while the thread
-            // is already suspended at the captured event, overshooting it.
-            final boolean alreadyFired = breakpointTracker.consumePendingFire();
-            final CountDownLatch latch;
-            if (alreadyFired) {
-                // Skip the resume + await — there's nothing to wait for, the snapshot already
-                // exists. We still fall through to the existing snapshot/VM_DEATH handling below
-                // so the caller sees a consistent response shape.
-                latch = null;
-            } else {
-                // Arm BEFORE resume so we don't race with a near-instant event firing.
-                latch = breakpointTracker.armNextEventLatch();
-                vm.resume();
-
-                final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
-                if (!fired) {
+            jdiService.getVM();
+            // A closed session still answers: it shows a stop published just before the VM died,
+            // or reports the death.
+            final SuspensionSession session = breakpointTracker.suspensionSession();
+            if (session == null) {
+                throw new IllegalStateException("not connected — no debugging session");
+            }
+            final SuspensionSession.NextStop next = session.nextStop(deadlineMs);
+            // What the call released before it waited, as a trailing line: replies keep starting with
+            // "Event fired" / "Status: still_waiting".
+            final String releasedSuffix = next.released() != null && next.released().releasedAnything()
+                ? "\n" + renderRelease(next.released()) : "";
+            switch (next.outcome()) {
+                case TIMEOUT -> {
                     return renderSoftWaitEnvelope("jdwp_resume_until_event", deadlineMs)
                         + "\n\n"
-                        + buildDiagnosticReport(true, deadlineMs);
+                        + buildDiagnosticReport(true, deadlineMs) + releasedSuffix;
                 }
-                // The waiter consumed the signal; clear the pending flag so the NEXT call doesn't
-                // immediately short-circuit on this same event.
-                breakpointTracker.consumePendingFire();
+                case CLOSED -> {
+                    return "[VM_DEATH] Target VM disconnected/died while waiting. No more events will fire on this "
+                        + "connection — run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach."
+                        + renderFailedPendingHint();
+                }
+                case RESET -> {
+                    return "[NO_EVENT] jdwp_reset ran while waiting: every stop was released and every breakpoint "
+                        + "cleared. Set breakpoints again, then call jdwp_resume_until_event.";
+                }
+                case STOPPED -> {
+                }
             }
-
-            // Snapshot the last breakpoint BEFORE inspecting the event tail. A breakpoint that
-            // fired moments before the VM died is real, suspended state the user cares about —
-            // discarding it in favour of the terminal VM_DEATH event would erase the only context
-            // that explains why the BP fired. If both a live BP snapshot AND a VM_DEATH tail are
-            // present, render the BP context with a suffix noting the subsequent disconnect.
-            final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
+            final BreakpointTracker.LastBreakpoint snapshot = java.util.Objects.requireNonNull(next.stop());
             final List<EventHistory.DebugEvent> tail = eventHistory.getRecent(1);
             final boolean vmDeathTail = !tail.isEmpty() && "VM_DEATH".equals(tail.get(0).type());
-            final boolean haveLiveBpSnapshot = snapshot != null && snapshot.thread().isSuspended();
-
-            if (vmDeathTail && !haveLiveBpSnapshot) {
-                return "[VM_DEATH] Target VM disconnected/died while waiting. No more events will fire on this connection — "
-                    + "run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach."
-                    + renderFailedPendingHint();
-            }
-
-            if (snapshot == null) {
-                // The wait was released but no suspending snapshot exists and the tail is not
-                // VM_DEATH. Two very different situations produce this, and a fixed message gets
-                // one of them wrong: (a) a concurrent jdwp_reset / jdwp_disconnect (both fire the
-                // latch to free waiters, then null the snapshot) or a listener teardown — the
-                // session is gone and re-waiting would burn the deadline; or (b) the latch was
-                // tripped by a NON-suspending wakeup (an early lifecycle event, a resumed
-                // non-breakpoint thread) while the VM is alive and every breakpoint is still
-                // armed — here re-setting breakpoints is wasted work and calling again just works.
-                // Probe liveness + the breakpoint registry and steer accordingly rather than
-                // always blaming a teardown.
-                boolean vmAlive;
-                try {
-                    vm.allThreads();           // cheap round-trip; throws if the connection is gone
-                    vmAlive = true;
-                } catch (Exception probe) {
-                    vmAlive = false;
-                }
-                final int armed = breakpointTracker.getAllBreakpoints().size()
-                    + breakpointTracker.getAllPendingBreakpoints().size()
-                    + breakpointTracker.getAllExceptionBreakpoints().size()
-                    + breakpointTracker.getAllFieldBreakpoints().size();
-                if (vmAlive && armed > 0) {
-                    return String.format("[NO_EVENT] The wait was released without a suspending event, but the VM "
-                        + "is still connected and %d breakpoint(s) are still armed — nothing was cleared. The latch "
-                        + "was tripped by a non-suspending wakeup (e.g. an early lifecycle event), not a stop. Just "
-                        + "call jdwp_resume_until_event again to keep waiting — do NOT re-set your breakpoints. If "
-                        + "this repeats, inspect jdwp_overview to confirm the breakpoint locations are reachable.",
-                        armed);
-                }
-                return "[NO_EVENT] The wait was released without a suspending event and no breakpoint context is "
-                    + "available. The debug session looks cleared — likely a concurrent jdwp_reset / jdwp_disconnect "
-                    + "or a listener teardown. Re-check state with jdwp_overview (or jdwp_diagnose if the connection "
-                    + "looks wrong), re-set your breakpoints, then call jdwp_resume_until_event again.";
-            }
             final ThreadReference thread = snapshot.thread();
             // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
             // line forced the agent to follow up with get_breakpoint_context just to learn which
@@ -1424,7 +1476,7 @@ public class JDWPTools {
                 locationSuffix,
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 frameCount,
-                formatEventTag(snapshot));
+                formatEventTag(snapshot)) + releasedSuffix;
             if (vmDeathTail) {
                 return base + " (VM has since disconnected — this is the last captured breakpoint)";
             }
@@ -1673,8 +1725,12 @@ public class JDWPTools {
         return switch (snapshot.kind()) {
             case STEP -> "via=step";
             case EXCEPTION -> "via=exception";
+            case VM_START -> "via=vm_start";
             case BREAKPOINT -> {
                 final Integer id = snapshot.id();
+                if (id == null) {
+                    yield "via=untracked_breakpoint";
+                }
                 final String fastStopReason = id != null ? fastLogpoints.stopReason(id) : null;
                 yield fastStopReason != null
                     ? "fast_breakpoint=" + id + ", " + fastStopReason
@@ -2218,7 +2274,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Suspend a specific thread by its ID")
+    @McpTool(description = "Suspend a specific thread by its ID (a manual hold, released by jdwp_resume or jdwp_resume_thread). Holds do not stack.")
     public String jdwp_suspend_thread(@McpToolParam(description = "Thread unique ID") long threadId) {
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -2227,18 +2283,19 @@ public class JDWPTools {
                 return "Error: Thread not found with ID " + threadId;
             }
 
-            if (thread.isSuspended()) {
-                return String.format("Thread %d (%s) is already suspended", threadId, thread.name());
+            final String refusal = suspensions().suspendThread(thread);
+            if (refusal != null) {
+                return String.format("Thread %d (%s) was not suspended: %s", threadId, thread.name(), refusal);
             }
-
-            thread.suspend();
-            return String.format("Thread %d (%s) suspended. Inspect with jdwp_get_stack.", threadId, thread.name());
+            return String.format("Thread %d (%s) suspended. Inspect with jdwp_get_stack; jdwp_resume or jdwp_resume_thread "
+                + "releases it. Evaluating expressions needs a stop at an event (a breakpoint or a step), not a "
+                + "manual suspend.", threadId, thread.name());
         } catch (Exception e) {
             return errorReply(e);
         }
     }
 
-    @McpTool(description = "Resume a specific thread by its ID")
+    @McpTool(description = "Resume a specific thread by its ID: releases what you hold on it — its jdwp_suspend_thread hold, its own stop, and its share of a stop-all stop (the other threads stay parked). Refuses while one of its events is still being processed or holds a stop you have not seen yet.")
     public String jdwp_resume_thread(@McpToolParam(description = "Thread unique ID") long threadId) {
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -2247,12 +2304,12 @@ public class JDWPTools {
                 return "Error: Thread not found with ID " + threadId;
             }
 
-            if (!thread.isSuspended()) {
-                return String.format("Thread %d (%s) is not suspended", threadId, thread.name());
+            final SuspensionSession.ThreadRelease release = suspensions().releaseThread(thread);
+            if (!release.released()) {
+                return String.format("Thread %d (%s) was not resumed: %s", threadId, thread.name(), release.refusal());
             }
-
-            thread.resume();
-            return String.format("Thread %d (%s) resumed. Use jdwp_resume_until_event to wait for the next event.", threadId, thread.name());
+            return String.format("Thread %d (%s) resumed (released: %s). Use jdwp_resume_until_event to wait for the next "
+                + "event.", threadId, thread.name(), String.join("; ", release.holders()));
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -2375,9 +2432,9 @@ public class JDWPTools {
                     return "Error: Thread not found with ID " + threadId;
                 }
             } else {
-                thread = breakpointTracker.getLastBreakpointThread();
+                thread = currentStopThread();
                 if (thread == null) {
-                    return "Error: No suspended thread available. Provide a threadId or hit a breakpoint first.";
+                    return noCurrentStop();
                 }
             }
 
@@ -2394,25 +2451,6 @@ public class JDWPTools {
             final ReferenceType stoppedInProbe = view.probeType();
             if (stoppedInProbe != null) {
                 probeClasses.add(stoppedInProbe.name());
-            }
-
-            // JDI permits only one StepRequest per thread; synchronising on the EventRequestManager
-            // keeps the delete-then-create pair atomic against concurrent step calls.
-            final StepRequest stepRequest;
-            synchronized (erm) {
-                erm.stepRequests().stream()
-                    .filter(sr -> sr.thread().equals(thread))
-                    .toList()
-                    .forEach(erm::deleteEventRequest);
-
-                stepRequest = erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth);
-                // Exclusions before the count filter: a step completed inside an excluded class is
-                // restarted by the JDWP agent and must not use up the count.
-                for (String probeClass : probeClasses) {
-                    stepRequest.addClassExclusionFilter(probeClass);
-                }
-                stepRequest.addCountFilter(1);
-                stepRequest.enable();
             }
 
             // P3-3: capture the starting location BEFORE resume so the response says where we
@@ -2432,14 +2470,37 @@ public class JDWPTools {
                 ? " From a fast breakpoint's stop every kind of step first lands on the stop line, before its code."
                 : "";
 
-            // Arm the next-event latch BEFORE resuming. Without this, the STEP event can fire
-            // before the caller's follow-up jdwp_resume_until_event has armed its own latch, and
-            // the signal is lost — see P0-2/P0-3. The arm-then-resume ordering matches what
-            // jdwp_resume_until_event itself does for the same reason.
-            breakpointTracker.armNextEventLatch();
-            thread.resume();
+            // Atomic under the session: admission, the request, then the release of the thread's
+            // holders. A refused step leaves no request behind; the landing publishes as a stop.
+            final String refusal = suspensions().step(thread, () -> {
+                // JDI permits only one StepRequest per thread; synchronising on the EventRequestManager
+                // keeps the delete-then-create pair atomic against concurrent step calls.
+                synchronized (erm) {
+                    erm.stepRequests().stream()
+                        .filter(sr -> sr.thread().equals(thread))
+                        .toList()
+                        .forEach(erm::deleteEventRequest);
 
-            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.%s",
+                    final StepRequest stepRequest = erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth);
+                    // Only the stepping thread stops on landing: from a stop-all stop the other
+                    // threads stay parked by that stop, from a thread stop the VM is not frozen.
+                    stepRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    // Exclusions before the count filter: a step completed inside an excluded class is
+                    // restarted by the JDWP agent and must not use up the count.
+                    for (String probeClass : probeClasses) {
+                        stepRequest.addClassExclusionFilter(probeClass);
+                    }
+                    stepRequest.addCountFilter(1);
+                    stepRequest.enable();
+                    return stepRequest;
+                }
+            });
+            if (refusal != null) {
+                return String.format("Error: cannot step thread %d (%s): %s", thread.uniqueID(), thread.name(), refusal);
+            }
+
+            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP "
+                    + "event; other threads stay parked until jdwp_resume.%s",
                 label, startLocation, thread.uniqueID(), thread.name(), fastStopNote);
         } catch (Exception e) {
             return errorReply(e);
@@ -2505,6 +2566,11 @@ public class JDWPTools {
                 default -> {
                     return String.format("Error: Invalid suspend policy '%s'. Use 'all', 'thread', or 'none'.", suspendPolicy);
                 }
+            }
+            if (jdiPolicy == EventRequest.SUSPEND_NONE && condition != null && !condition.isBlank()) {
+                // A condition is evaluated on the hitting thread, which a 'none' breakpoint does not stop.
+                return "Error: a condition needs a suspending policy — use suspendPolicy 'thread' or 'all'. A 'none' "
+                    + "breakpoint only records its hits in the event history.";
             }
 
             final String conditionInfo = condition != null && !condition.isBlank()
@@ -3038,6 +3104,24 @@ public class JDWPTools {
             // The briefing still renders without a target description.
         }
         return null;
+    }
+
+    /**
+     * The attach handshake (issue #45): outside the connection service's monitor, waits briefly for
+     * the VMStart stop and acknowledges it, so the first {@code jdwp_resume_until_event} releases it
+     * instead of showing it. Never throws.
+     */
+    private SuspensionSession.StartState acknowledgeStart() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        if (session == null) {
+            return SuspensionSession.StartState.NOT_SEEN;
+        }
+        try {
+            return session.acknowledgeStart(START_HANDSHAKE_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return SuspensionSession.StartState.NOT_SEEN;
+        }
     }
 
     /**
@@ -3838,6 +3922,7 @@ public class JDWPTools {
         final int fastLogpointsCleared = fastLogpoints.disarmAll("jdwp_reset");
         final int events = eventHistory.size();
 
+
         // VM-dependent path first: try to delete the live JDI requests via the EventRequestManager.
         // If the VM is unreachable (external disconnect, crash) we fall back to a pure in-memory
         // reset so the server-local state still gets cleared.
@@ -3853,6 +3938,19 @@ public class JDWPTools {
         if (!vmCleared) {
             breakpointTracker.reset();
         }
+        // Requests first, holds second: a thread the release below lets run can no longer hit a
+        // live request and leave a stop behind. A new generation — sets still in processing can no
+        // longer publish — then every held stop (seen or not) and every manual hold is released.
+        if (vm != null) {
+            try {
+                final EventRequestManager erm = vm.eventRequestManager();
+                erm.deleteEventRequests(new ArrayList<>(erm.stepRequests()));
+            } catch (Exception e) {
+                log.debug("Deleting step requests during jdwp_reset failed", e);
+            }
+        }
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        final int stopsReleased = session != null ? session.reset() : 0;
 
         // These clears are server-local and must happen regardless of VM liveness.
         watcherManager.clearAll();
@@ -3870,7 +3968,8 @@ public class JDWPTools {
         // only useful when there was actually something to clear; for the common
         // "agent connects, runs jdwp_reset before starting" warm-up, repeating zeros adds noise.
         final int total = activeBp + pendingBp + activeExBp + pendingExBp
-            + activeFieldBp + pendingFieldBp + fastLogpointsCleared + leftoversDisabled + watchers + events;
+            + activeFieldBp + pendingFieldBp + fastLogpointsCleared + leftoversDisabled + watchers + events
+            + stopsReleased;
         if (total == 0) {
             return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event." + leftovers;
         }
@@ -3883,10 +3982,11 @@ public class JDWPTools {
                   Field breakpoints cleared:     %d active + %d pending
                   In-target probes cleared:      %d (fast logpoints and breakpoints; original bytecode restored)%s
                   Watchers cleared:              %d
+                  Stops released:                %d
                   Event history cleared:         %d entries
                   Object cache cleared.""",
             header, activeBp, pendingBp, activeExBp, pendingExBp,
-            activeFieldBp, pendingFieldBp, fastLogpointsCleared, leftoverLine, watchers, events)
+            activeFieldBp, pendingFieldBp, fastLogpointsCleared, leftoverLine, watchers, stopsReleased, events)
             + " Next: set breakpoints, then jdwp_resume_until_event." + leftovers;
     }
 
@@ -4685,6 +4785,27 @@ public class JDWPTools {
         return jdiService.formatFieldValue(value);
     }
 
+    /**
+     * The stop the getters show: the current stop while it is held, else the oldest stop no tool has
+     * shown yet (it becomes current); without either, the last published stop, which the renderers
+     * mark as no longer suspended.
+     */
+    private BreakpointTracker.@Nullable LastBreakpoint presentedOrLastStop() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        final BreakpointTracker.LastBreakpoint presented = session != null ? session.presentCurrent() : null;
+        return presented != null ? presented : breakpointTracker.getLastBreakpoint();
+    }
+
+    /**
+     * " (N further stops not yet seen …)" or "".
+     */
+    private String unseenNote() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        final int unseen = session != null ? session.unseenCount() : 0;
+        return unseen == 0 ? "" : String.format(" (%d further stop(s) not yet seen — jdwp_resume_until_event shows "
+            + "the next one)", unseen);
+    }
+
     @McpTool(description = "One-shot debugging context at the current breakpoint: thread, top frames, locals at frame 0, and 'this' field dump. Use this instead of the four-call sequence (get_current_thread → get_stack → get_locals → get_fields(this)) at every BP hit.")
     public String jdwp_get_breakpoint_context(
         @McpToolParam(required = false, description = "Max stack frames to render (default: 5). Junit/maven/reflection frames are always collapsed.") @Nullable Integer maxFrames,
@@ -4693,7 +4814,7 @@ public class JDWPTools {
         final boolean includeThis = includeThisFields == null || includeThisFields;
 
         try {
-            final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
+            final BreakpointTracker.LastBreakpoint snapshot = presentedOrLastStop();
             if (snapshot == null) {
                 return "No current breakpoint detected. Set a breakpoint and trigger it first.";
             }
@@ -4783,7 +4904,7 @@ public class JDWPTools {
     @McpTool(description = "Get the thread ID of the current breakpoint. Prefer jdwp_get_breakpoint_context (thread+stack+locals+fields in one call).")
     public String jdwp_get_current_thread() {
         try {
-            final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
+            final BreakpointTracker.LastBreakpoint snapshot = presentedOrLastStop();
             if (snapshot == null) {
                 return "No current breakpoint detected. Set a breakpoint and trigger it first.";
             }
@@ -4793,10 +4914,10 @@ public class JDWPTools {
             // past. Annotate so the agent doesn't mistake "snapshot exists" for "thread is parked".
             final boolean suspended = thread.isSuspended();
             final String staleNote = suspended ? "" : " (stale — thread has resumed since the snapshot)";
-            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s",
+            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s%s",
                 thread.name(), thread.uniqueID(), suspended,
                 suspended ? String.valueOf(FrameView.of(thread).count()) : "N/A",
-                formatEventTag(snapshot), staleNote);
+                formatEventTag(snapshot), staleNote, unseenNote());
         } catch (Exception e) {
             return errorReply(e);
         }

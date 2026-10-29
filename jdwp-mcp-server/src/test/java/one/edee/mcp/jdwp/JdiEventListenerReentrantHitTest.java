@@ -231,8 +231,8 @@ class JdiEventListenerReentrantHitTest {
 	}
 
 	@Test
-	@DisplayName("a set whose thread was resumed and stopped again while it waited is not resumed")
-	void overtakenSetIsNotResumed() throws Exception {
+	@DisplayName("a queued set is released by its own processing, and a later stop of its thread stays held")
+	void queuedSetIsReleasedByItsOwnProcessing() throws Exception {
 		// The dispatcher is busy with one thread's evaluation while another thread's sets queue up.
 		final ThreadReference busy = threadWithFrame();
 		final BreakpointRequest busyRequest = mock(BreakpointRequest.class);
@@ -251,8 +251,8 @@ class JdiEventListenerReentrantHitTest {
 			return null;
 		});
 		final EventSet busySet = mockEventSet(mockBreakpointEvent(busy, busyRequest, "com.example.Busy", 5));
-		// The other thread hits a logpoint; while that set waits it is resumed (jdwp_resume) and stops
-		// at a breakpoint. The logpoint set's suspension is spent: resuming it would release the stop.
+		// The other thread hits a logpoint, then a breakpoint; no tool can release a queued set's
+		// suspension (issue #45), so each set is settled by its own processing.
 		final EventSet logpointSet = mockEventSet(mockBreakpointEvent(thread, logpointRequest, "com.example.Hot", 10));
 		final EventSet breakpointSet = mockEventSet(mockBreakpointEvent(thread, userRequest, "com.example.Hot", 20));
 
@@ -264,7 +264,7 @@ class JdiEventListenerReentrantHitTest {
 		finish();
 
 		verify(busySet).resume();
-		verify(logpointSet, never()).resume();
+		verify(logpointSet).resume();
 		verify(breakpointSet, never()).resume();
 		assertThat(types()).containsSubsequence("LOGPOINT", "LOGPOINT", "BREAKPOINT");
 		assertThat(tracker.getLastBreakpointId()).isEqualTo(userId);

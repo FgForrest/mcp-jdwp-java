@@ -9,6 +9,7 @@ import one.edee.mcp.jdwp.BreakpointTracker;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.JDWPTools;
+import one.edee.mcp.jdwp.SuspensionSession;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
@@ -75,11 +76,33 @@ class FastBreakpointLiveTest {
 
 	@AfterEach
 	void leaveNothingBehind() throws Exception {
-		tools.jdwp_resume();
+		// Release every hold, seen or not (an every-hit breakpoint can stop again before it is
+		// cleared), clear, let the dispatcher finish a set it already took, and release whatever
+		// stopped in between. An arming hit still evaluating on a worker would otherwise be frozen
+		// by the next test's suspend-all arming event, and the dispatcher with it.
+		releaseEverything();
 		for (FastLogpointService.Info info : fastLogpoints.list()) {
 			tools.jdwp_clear_breakpoint(info.id());
 		}
+		await("the dispatcher to finish its sets", this::dispatcherIdle);
+		releaseEverything();
 		history.clear();
+	}
+
+	private void releaseEverything() {
+		final SuspensionSession suspensions = session.tracker.suspensionSession();
+		if (suspensions != null) {
+			suspensions.reset();
+		}
+	}
+
+	private boolean dispatcherIdle() {
+		final SuspensionSession suspensions = session.tracker.suspensionSession();
+		if (suspensions == null) {
+			return true;
+		}
+		final String state = suspensions.describeState();
+		return !state.contains("QUEUED") && !state.contains("PROCESSING");
 	}
 
 	@Test
@@ -113,7 +136,7 @@ class FastBreakpointLiveTest {
 		assertThat(reply).contains("PENDING").contains("stops once").contains("suspendPolicy: all");
 		final int id = idOf(reply);
 
-		final String stop = tools.jdwp_resume_until_event((int) TIMEOUT.toMillis());
+		final String stop = waitForStop();
 		assertThat(stop)
 			.startsWith("Event fired at " + TARGET + ':' + probeLine)
 			.contains("fast_breakpoint=" + id + ", condition true");
@@ -135,7 +158,7 @@ class FastBreakpointLiveTest {
 
 		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null))
 			.contains("Fast breakpoint " + id).contains("re-armed");
-		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+		assertThat(waitForStop())
 			.contains("fast_breakpoint=" + id + ", condition true");
 		tools.jdwp_resume();
 		// stop() counts after its breakpoint, so the count follows the resume.
@@ -157,7 +180,7 @@ class FastBreakpointLiveTest {
 		final int id = idOf(reply);
 
 		for (int stop = 1; stop <= 2; stop++) {
-			assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+			assertThat(waitForStop())
 				.contains("Thread: worker-0")
 				.contains("fast_breakpoint=" + id + ", condition true");
 			final long before = calls();
@@ -178,7 +201,7 @@ class FastBreakpointLiveTest {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "10 / (i - i) == 0", true, null, null,
 			null));
 
-		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+		assertThat(waitForStop())
 			.startsWith("Event fired at " + TARGET + ':' + probeLine)
 			.contains("fast_breakpoint=" + id + ", condition failed:")
 			.contains("ArithmeticException");
@@ -197,7 +220,7 @@ class FastBreakpointLiveTest {
 	void trueFirstHitStopsWithoutInstalling() throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i >= 0", true, null, null, null));
 
-		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+		assertThat(waitForStop())
 			.startsWith("Event fired at " + TARGET + ':' + probeLine)
 			.contains("fast_breakpoint=" + id + ", condition true");
 		assertThat(stoppedThread().frame(0).location().method().name()).as("stopped in the user's frame").isEqualTo("compute");
@@ -220,7 +243,7 @@ class FastBreakpointLiveTest {
 		// threads one suspension behind (issue #45).
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
 			null, null));
-		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+		assertThat(waitForStop())
 			.contains("fast_breakpoint=" + id + ", condition true");
 		final long threadId = stoppedThread().uniqueID();
 
@@ -232,19 +255,62 @@ class FastBreakpointLiveTest {
 		assertThat(tools.jdwp_set_local(threadId, 0, "doubled", "-1")).contains("set to -1");
 
 		assertThat(tools.jdwp_step_over(threadId)).contains("first lands on the stop line");
-		// The step lands within microseconds. Until issue #45, the blind vm.resume() of a
-		// jdwp_resume_until_event issued while its event is still in flight would use up its suspension.
-		await("the step landed", () -> {
-			final BreakpointTracker.LastBreakpoint snapshot = session.tracker.getLastBreakpoint();
-			return snapshot != null && snapshot.kind() == BreakpointTracker.EventKind.STEP;
-		});
-		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+		// A step is in flight: the wait releases nothing and returns its landing.
+		assertThat(waitForStop())
 			.startsWith("Event fired at " + TARGET + ':' + probeLine)
 			.contains("via=step");
 		assertThat(tools.jdwp_get_locals(threadId, 0)).as("the step stayed in the user's frame").contains("doubled (int) = -1");
 	}
 
 	// ── helpers ──
+
+	/**
+	 * {@code jdwp_resume_until_event} that, when no stop arrives, fails with the state needed to
+	 * tell why: the target's threads and their suspend counts, the server's threads, the session.
+	 */
+	private String waitForStop() throws Exception {
+		final String reply = tools.jdwp_resume_until_event((int) TIMEOUT.toMillis());
+		if (reply.startsWith("Event fired")) {
+			return reply;
+		}
+		final StringBuilder state = new StringBuilder(reply).append("\n── session ──\n");
+		final SuspensionSession suspensions = session.tracker.suspensionSession();
+		state.append(suspensions != null ? suspensions.describeState() : "none").append("\n── workers ──\n");
+		for (ThreadReference worker : workers()) {
+			state.append(worker.name()).append(" suspendCount=").append(worker.suspendCount())
+				.append(" status=").append(worker.status()).append('\n');
+		}
+		state.append("── compute() progress ──\n");
+		final long before = calls();
+		Thread.sleep(500);
+		state.append("CALLS +").append(calls() - before).append(" in 500 ms\n");
+		state.append("── breakpoint requests ──\n");
+		final VirtualMachine vm = connection.getVM();
+		for (com.sun.jdi.request.BreakpointRequest request : vm.eventRequestManager().breakpointRequests()) {
+			state.append(request.location()).append(" enabled=").append(request.isEnabled())
+				.append(" policy=").append(request.suspendPolicy())
+				.append(" obsoleteMethod=").append(request.location().method().isObsolete()).append('\n');
+		}
+		state.append("── target jstack ──\n");
+		try {
+			final Process jstack = new ProcessBuilder(
+				java.nio.file.Path.of(System.getProperty("java.home"), "bin", "jstack").toString(),
+				String.valueOf(session.process.pid())).redirectErrorStream(true).start();
+			state.append(new String(jstack.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+		} catch (Exception e) {
+			state.append("jstack failed: ").append(e).append('\n');
+		}
+		state.append("── server threads ──\n");
+		Thread.getAllStackTraces().forEach((thread, stack) -> {
+			if (thread.getName().startsWith("jdi-") || thread.getName().equals("main")) {
+				state.append(thread.getName()).append(" (").append(thread.getState()).append(")\n");
+				for (StackTraceElement frame : stack) {
+					state.append("    at ").append(frame).append('\n');
+				}
+			}
+		});
+		throw new AssertionError(state.toString());
+	}
 
 	private FastLogpointService.Info info(int id) {
 		return fastLogpoints.list().stream().filter(i -> i.id() == id).findFirst()

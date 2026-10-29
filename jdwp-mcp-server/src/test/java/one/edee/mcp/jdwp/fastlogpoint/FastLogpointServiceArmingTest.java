@@ -92,23 +92,18 @@ class FastLogpointServiceArmingTest {
 	}
 
 	@Test
-	@DisplayName("a condition evaluation cut short by a resume of the thread re-arms instead of stopping or failing")
-	void resumedArmingHitReArms() throws Exception {
+	@DisplayName("a condition evaluation cut short by a resumed thread fails the arm with that reason, never a false stop")
+	void resumedArmingThreadFailsTheArm() throws Exception {
 		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("thread not suspended"));
 		when(thread.isSuspended()).thenReturn(false);
 
-		assertThat(service.handleArmingHit(armingHit())).as("the set's suspension is spent")
-			.isEqualTo(FastLogpointService.ArmingOutcome.SPENT);
+		assertThat(service.handleArmingHit(armingHit())).isEqualTo(FastLogpointService.ArmingOutcome.RESUME);
 
 		final FastLogpointService.Info info = service.list().get(0);
-		assertThat(info.state()).isEqualTo(FastLogpointService.State.PENDING);
-		assertThat(info.failureReason()).isNull();
+		assertThat(info.state()).isEqualTo(FastLogpointService.State.FAILED);
+		assertThat(info.failureReason()).contains("resumed while its arming hit was evaluated");
 		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).extracting(EventHistory.DebugEvent::type)
-			.doesNotContain("FAST_BREAKPOINT", "FAST_BREAKPOINT_ERROR", "FAST_BREAKPOINT_ARM_FAILED");
-		// The spent one-shot request is replaced by a fresh one.
-		assertThat(created).hasSize(2);
-		verify(created.get(1)).enable();
-		assertThat(service.claimsArmingEvent(armingHit())).as("the old request is retired").isFalse();
+			.doesNotContain("FAST_BREAKPOINT", "FAST_BREAKPOINT_ERROR");
 	}
 
 	@Test
@@ -122,30 +117,6 @@ class FastLogpointServiceArmingTest {
 		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
 			&& e.details().get("reason").startsWith("condition failed: "));
 		assertThat(service.stopReason(service.list().get(0).id())).startsWith("condition failed: ");
-	}
-
-	@Test
-	@DisplayName("awaitArmingIdle returns at once when nothing arms, and waits for an arming in flight")
-	void awaitArmingIdleWaitsForArmingInFlight() throws Exception {
-		assertThat(service.awaitArmingIdle(0)).isTrue();
-
-		final CountDownLatch evaluating = new CountDownLatch(1);
-		final CountDownLatch release = new CountDownLatch(1);
-		when(thread.isSuspended()).thenReturn(true);
-		doAnswer(invocation -> {
-			evaluating.countDown();
-			release.await(10, TimeUnit.SECONDS);
-			return null;
-		}).when(evaluator).configureCompilerClasspath(any());
-		when(evaluator.evaluate(any(StackFrame.class), anyString())).thenThrow(new JdiEvaluationException("boom"));
-
-		final CompletableFuture<FastLogpointService.ArmingOutcome> arming =
-			CompletableFuture.supplyAsync(() -> service.handleArmingHit(armingHit()));
-		assertThat(evaluating.await(10, TimeUnit.SECONDS)).isTrue();
-		assertThat(service.awaitArmingIdle(50)).as("an arming is in flight").isFalse();
-		release.countDown();
-		assertThat(service.awaitArmingIdle(10_000)).isTrue();
-		assertThat(arming.get(10, TimeUnit.SECONDS)).isEqualTo(FastLogpointService.ArmingOutcome.STOPPED);
 	}
 
 	private BreakpointEvent armingHit() {

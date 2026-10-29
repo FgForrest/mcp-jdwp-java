@@ -137,14 +137,6 @@ public class FastLogpointService {
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
-    /**
-     * Guards {@link #armingInFlight}; never the service monitor, which the arming itself takes.
-     */
-    private final Object armingIdle = new Object();
-    /**
-     * Arming hits being handled on the dispatcher; their threads are held by the event meanwhile.
-     */
-    private int armingInFlight;
     private final JdiExpressionEvaluator expressionEvaluator;
     /**
      * Written into every probe this server arms ({@code MCP_ARMED_BY}): the product and an opaque
@@ -265,7 +257,7 @@ public class FastLogpointService {
         flp.armingRequest = request;
         logpoints.put(id, flp);
         byArmingRequest.put(request, flp);
-        request.enable();
+        enableArmingRequest(vm, request);
         log.info("[{}] #{} registered at {}:{} — arms on first hit", kind.tag, id, flp.className(), flp.line);
         return id;
     }
@@ -318,62 +310,23 @@ public class FastLogpointService {
             return ArmingOutcome.RESUME;
         }
         final long threadId = thread.uniqueID();
-        synchronized (armingIdle) {
-            armingInFlight++;
-        }
         evaluationGuard.enter(threadId);
         try {
             return arm(flp, thread) ? ArmingOutcome.STOPPED : ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
-            if (flp.probeType == null && !isSuspended(thread)) {
-                // A resume of the whole VM took the thread away before anything was installed: the
-                // hit is lost, the entry is not — the next hit arms it. Decided here, not later: on a
-                // hot line the fresh request suspends the thread again at once.
-                log.info("[{}] #{} arming hit lost to a resume of its thread ({}) — waiting for the next hit",
-                    flp.kind.tag, flp.id, describe(e));
-                rearm(flp);
-                return ArmingOutcome.SPENT;
-            }
             markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
         } finally {
             evaluationGuard.exit(threadId);
-            synchronized (armingIdle) {
-                armingInFlight--;
-                armingIdle.notifyAll();
-            }
-        }
-    }
-
-    /**
-     * Waits until no arming hit is being handled, at most {@code timeoutMs}. An arming hit keeps its
-     * thread suspended by the event while the probe is compiled; resuming the VM meanwhile takes the
-     * thread away from the invocations on it, so the resume tools wait for this first.
-     *
-     * @return whether no arming was in flight when it returned
-     */
-    public boolean awaitArmingIdle(long timeoutMs) {
-        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        synchronized (armingIdle) {
-            while (armingInFlight > 0) {
-                final long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
-                if (remainingMs <= 0) {
-                    return false;
-                }
-                try {
-                    armingIdle.wait(remainingMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-            return true;
         }
     }
 
     /**
      * Rethrows an evaluation failure of the arming hit as the thread's resume when the thread is no
-     * longer suspended: it is not the condition's or the expression's failure.
+     * longer suspended: it is not the condition's or the expression's failure. A defensive check —
+     * the arming set's suspension belongs to its context while it is processed, so no tool can
+     * release the thread (issue #45) — and the arm fails with this reason instead of reporting a
+     * condition error for a running thread.
      */
     private static void requireStillSuspended(ThreadReference thread, Exception failure) throws FastLogpointException {
         if (!isSuspended(thread)) {
@@ -1846,7 +1799,7 @@ public class FastLogpointService {
                     final BreakpointRequest fresh = createArmingRequest(erm, location, bp.suspendPolicy());
                     armingOwner.armingRequest = fresh;
                     byArmingRequest.put(fresh, armingOwner);
-                    fresh.enable();
+                    enableArmingRequest(vm, fresh);
                 } else {
                     final BreakpointRequest fresh = erm.createBreakpointRequest(location);
                     fresh.setSuspendPolicy(bp.suspendPolicy());
@@ -2085,6 +2038,23 @@ public class FastLogpointService {
     }
 
     /**
+     * Enables a one-shot arming request while every thread is suspended. JDI learns a request's ID
+     * only from the reply to the enable command, and an event the target raises before that reply is
+     * read is dropped as unknown (jdk.jdi {@code EventSetImpl}: {@code UNKNOWN_EVENT}, resumed by JDI).
+     * On a hot line that was the request's only event — its count filter is spent — and the fast
+     * logpoint or breakpoint never armed. The resume undoes exactly the suspend's own count on each
+     * thread, so no held stop is released (issue #45); the cost is a pause of one JDWP round trip.
+     */
+    private static void enableArmingRequest(VirtualMachine vm, BreakpointRequest request) {
+        vm.suspend();
+        try {
+            request.enable();
+        } finally {
+            vm.resume();
+        }
+    }
+
+    /**
      * Replaces a spent arming request with a fresh one at the same location.
      */
     private synchronized void rearm(FastLogpoint flp) {
@@ -2098,7 +2068,7 @@ public class FastLogpointService {
                 flp.suspendPolicy);
             flp.armingRequest = fresh;
             byArmingRequest.put(fresh, flp);
-            fresh.enable();
+            enableArmingRequest(flp.vm, fresh);
         } catch (Exception e) {
             markFailed(flp, "could not re-arm after a hit inside an MCP evaluation: " + describe(e), true);
         }
@@ -2698,12 +2668,7 @@ public class FastLogpointService {
         /**
          * Keep it suspended: the hit was published as a fast breakpoint's stop.
          */
-        STOPPED,
-        /**
-         * Neither: a resume of the VM released the thread while it armed, so the set's suspension is
-         * spent. Resuming it again would release the next arming hit before it is handled.
-         */
-        SPENT
+        STOPPED
     }
 
     /**

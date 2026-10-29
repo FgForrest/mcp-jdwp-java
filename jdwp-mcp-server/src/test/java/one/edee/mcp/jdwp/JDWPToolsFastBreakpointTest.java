@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.StepRequest;
@@ -19,7 +20,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -175,6 +175,16 @@ class JDWPToolsFastBreakpointTest {
 		when(fastLogpoints.probeClassNames()).thenReturn(List.of("com.example.McpFastLogpoint_bb"));
 		final StepRequest step = mock(StepRequest.class);
 		when(erm.createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER)).thenReturn(step);
+		// The fast stop, published and shown, holds the thread (issue #45).
+		final SuspensionSession session = tracker.openSuspensionSession(new EventHistory());
+		final EventSet stopSet = mock(EventSet.class);
+		when(stopSet.suspendPolicy()).thenReturn(EventRequest.SUSPEND_ALL);
+		when(stopSet.iterator()).thenAnswer(invocation -> java.util.Collections.emptyIterator());
+		final SuspensionSession.Context context = session.route(stopSet, thread, false);
+		session.begin(context);
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread, 5));
+		session.finish(context);
+		session.nextStop(0);
 
 		assertThat(tools.jdwp_step_over(1L))
 			.contains("from com.example.BoxOffice:54")
@@ -203,18 +213,27 @@ class JDWPToolsFastBreakpointTest {
 	}
 
 	@Test
-	@DisplayName("jdwp_resume and jdwp_resume_until_event wait for an arming in flight before they resume")
-	void resumeWaitsForArming() throws Exception {
-		final VirtualMachine vm = mock(VirtualMachine.class);
-		when(jdiService.getVM()).thenReturn(vm);
+	@DisplayName("jdwp_resume releases only the stops a tool has shown, never a thread nobody holds")
+	void resumeReleasesOnlySeenStops() throws Exception {
+		when(jdiService.getVM()).thenReturn(mock(VirtualMachine.class));
+		final SuspensionSession session = tracker.openSuspensionSession(new EventHistory());
+		final FakeSuspendModel model = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread seen = model.thread("seen");
+		final FakeSuspendModel.FakeThread unseen = model.thread("unseen");
+		for (FakeSuspendModel.FakeThread thread : List.of(seen, unseen)) {
+			final SuspensionSession.Context context = session.route(
+				model.breakpointEvent(thread, EventRequest.SUSPEND_EVENT_THREAD), thread.ref, false);
+			session.begin(context);
+			session.candidate(context, new BreakpointTracker.LastBreakpoint(thread.ref, thread == seen ? 1 : 2));
+			session.finish(context);
+		}
+		assertThat(tools.jdwp_get_current_thread()).contains("breakpoint=1").contains("1 further stop(s) not yet seen");
 
-		tools.jdwp_resume();
-		tools.jdwp_resume_until_event(1);
-
-		final InOrder order = inOrder(fastLogpoints, vm);
-		order.verify(fastLogpoints).awaitArmingIdle(anyLong());
-		order.verify(vm).resume();
-		order.verify(fastLogpoints).awaitArmingIdle(anyLong());
-		order.verify(vm).resume();
+		assertThat(tools.jdwp_resume())
+			.contains("Resumed: breakpoint 1 on thread seen")
+			.contains("Still held, not yet seen: breakpoint 2 on thread unseen");
+		assertThat(seen.count).isZero();
+		assertThat(unseen.count).isEqualTo(1);
+		assertThat(tools.jdwp_resume()).startsWith("Nothing to release");
 	}
 }

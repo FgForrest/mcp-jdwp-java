@@ -79,21 +79,6 @@ class JdiEventListenerFastLogpointRoutingTest {
 	}
 
 	@Test
-	@DisplayName("an arming hit whose thread a resume of the VM released meanwhile is not resumed again")
-	void spentArmingHitIsNotResumedAgain() throws Exception {
-		final ThreadReference thread = mockThread("worker", 15L);
-		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
-		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
-		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.SPENT);
-		final EventSet eventSet = mockEventSet(arming);
-
-		runListenerWith(listener, eventSet);
-
-		verify(fastLogpoints).handleArmingHit(arming);
-		verify(eventSet, never()).resume();
-	}
-
-	@Test
 	@DisplayName("a regular breakpoint in the same event set is handled before arming and keeps the set suspended")
 	void regularBreakpointFirst() throws Exception {
 		final ThreadReference thread = mockThread("worker", 12L);
@@ -104,9 +89,11 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
 
-		final List<String> typesSeenWhenArming = new ArrayList<>();
+		// The regular breakpoint's stop is a candidate of the set by the time arming runs (its history
+		// is buffered until the set finishes, issue #45).
+		final List<Integer> candidatesWhenArming = new ArrayList<>();
 		doAnswer(invocation -> {
-			history.getRecent(10).forEach(e -> typesSeenWhenArming.add(e.type()));
+			candidatesWhenArming.add(SuspensionSession.processingCandidateCount());
 			return FastLogpointService.ArmingOutcome.RESUME;
 		}).when(fastLogpoints).handleArmingHit(any());
 		// Arming event first in the set: the listener must still defer it.
@@ -114,7 +101,8 @@ class JdiEventListenerFastLogpointRoutingTest {
 
 		runListenerWith(listener, eventSet);
 
-		assertThat(typesSeenWhenArming).contains("BREAKPOINT");
+		assertThat(candidatesWhenArming).containsExactly(1);
+		assertThat(history.getRecent(10)).extracting(EventHistory.DebugEvent::type).contains("BREAKPOINT");
 		assertThat(tracker.getLastBreakpointId()).isEqualTo(userId);
 		verify(eventSet, never()).resume();
 	}

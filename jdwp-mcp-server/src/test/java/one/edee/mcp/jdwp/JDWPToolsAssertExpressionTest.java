@@ -136,7 +136,7 @@ class JDWPToolsAssertExpressionTest {
 
 		final String out = tools.jdwp_assert_expression("x", "1", null, null);
 
-		assertThat(out).contains("No suspended thread available");
+		assertThat(out).contains("No current stop");
 	}
 
 	@Test

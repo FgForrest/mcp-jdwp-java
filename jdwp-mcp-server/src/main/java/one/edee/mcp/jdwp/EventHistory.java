@@ -64,6 +64,10 @@ public class EventHistory {
      * epoch — letting {@code jdwp_get_events} segment them.
      */
     public void record(DebugEvent event) {
+        if (SuspensionSession.buffer(event)) {
+            // Appended when the set the dispatcher processes finishes (dropped if it went stale).
+            return;
+        }
         final DebugEvent stamped = event.sessionEpoch() == DebugEvent.UNSTAMPED
             ? event.withEpoch(currentEpoch)
             : event;

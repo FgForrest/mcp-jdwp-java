@@ -2,6 +2,8 @@ package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
@@ -14,7 +16,10 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -56,6 +61,29 @@ class JDWPToolsStepTest {
 		erm = mock(EventRequestManager.class);
 		when(vm.eventRequestManager()).thenReturn(erm);
 		when(erm.stepRequests()).thenReturn(List.of());
+		session = breakpointTracker.openSuspensionSession(eventHistory);
+	}
+
+	private SuspensionSession session;
+	/**
+	 * The event set of each thread's held stop (see {@link #suspendedThread}).
+	 */
+	private final Map<ThreadReference, EventSet> stops = new HashMap<>();
+
+	/**
+	 * Holds a stop of {@code thread} that a tool has shown, as a breakpoint hit followed by
+	 * {@code jdwp_resume_until_event} leaves it: a step releases its thread through that stop.
+	 */
+	private void holdStop(ThreadReference thread, int breakpointId) throws Exception {
+		final EventSet set = mock(EventSet.class);
+		when(set.suspendPolicy()).thenReturn(EventRequest.SUSPEND_EVENT_THREAD);
+		when(set.iterator()).thenAnswer(invocation -> Collections.emptyIterator());
+		final SuspensionSession.Context context = session.route(set, thread, false);
+		session.begin(context);
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread, breakpointId));
+		session.finish(context);
+		session.nextStop(0);
+		stops.put(thread, set);
 	}
 
 	private ThreadReference suspendedThread(long id) {
@@ -63,6 +91,11 @@ class JDWPToolsStepTest {
 		when(thread.uniqueID()).thenReturn(id);
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.name()).thenReturn("thread-" + id);
+		try {
+			holdStop(thread, (int) id);
+		} catch (Exception e) {
+			throw new IllegalStateException(e);
+		}
 		return thread;
 	}
 
@@ -140,7 +173,7 @@ class JDWPToolsStepTest {
 			verify(erm).createStepRequest(threadCaptor.capture(), anyInt(), anyInt());
 			assertThat(threadCaptor.getValue()).isSameAs(thread);
 			assertThat(out).contains("42").contains("thread-42")
-				.contains("Call jdwp_resume_until_event to wait for the STEP event.");
+				.contains("Call jdwp_resume_until_event to wait for the STEP event");
 		}
 
 		@Test
@@ -171,14 +204,13 @@ class JDWPToolsStepTest {
 		}
 
 		@Test
-		@DisplayName("returns 'No suspended thread available' when threadId is null and tracker is empty")
+		@DisplayName("returns 'No current stop' when threadId is null and nothing is stopped")
 		void shouldReturnErrorWhenNullThreadIdAndNoLastBreakpointThread() throws Exception {
 			when(jdiService.getVM()).thenReturn(vm);
 
 			final String out = tools.jdwp_step_over(null);
 
-			assertThat(out).isEqualTo("Error: No suspended thread available. " +
-				"Provide a threadId or hit a breakpoint first.");
+			assertThat(out).isEqualTo("Error: No current stop. Provide a threadId, or hit a breakpoint first.");
 			verify(erm, never()).createStepRequest(any(), anyInt(), anyInt());
 		}
 	}
@@ -261,7 +293,7 @@ class JDWPToolsStepTest {
 
 			final String out = tools.jdwp_step_over(1L);
 
-			assertThat(out).contains("Call jdwp_resume_until_event to wait for the STEP event.");
+			assertThat(out).contains("Call jdwp_resume_until_event to wait for the STEP event");
 		}
 
 		@Test
@@ -287,7 +319,7 @@ class JDWPToolsStepTest {
 		 * would race with the thread's first line transition and the step could be lost.
 		 */
 		@Test
-		@DisplayName("creates → enables the StepRequest, then resumes the thread (in that order)")
+		@DisplayName("creates → enables the StepRequest, then releases the thread's stop (in that order)")
 		void shouldResumeThreadAfterCreatingStepRequest() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
 			when(jdiService.getVM()).thenReturn(vm);
@@ -296,10 +328,12 @@ class JDWPToolsStepTest {
 
 			tools.jdwp_step_over(1L);
 
-			final InOrder order = inOrder(erm, req, thread);
+			final EventSet stop = stops.get(thread);
+			final InOrder order = inOrder(erm, req, stop);
 			order.verify(erm).createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER);
+			order.verify(req).setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
 			order.verify(req).enable();
-			order.verify(thread).resume();
+			order.verify(stop).resume();
 		}
 	}
 
