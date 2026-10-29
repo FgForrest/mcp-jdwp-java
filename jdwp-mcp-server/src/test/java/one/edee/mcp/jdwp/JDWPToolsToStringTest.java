@@ -32,7 +32,7 @@ import static org.mockito.Mockito.when;
 /**
  * Tests for {@link JDWPTools#jdwp_to_string}: happy path, object-not-in-cache, explicit
  * thread vs. fallback, suspended-state guard, missing toString(), and the
- * {@link EvaluationGuard#enter}/{@link EvaluationGuard#exit} pairing around {@code invokeMethod}.
+ * {@link EvaluationGuard#lease} bracketing {@code invokeMethod}.
  */
 @DisplayName("jdwp_to_string")
 class JDWPToolsToStringTest {
@@ -186,12 +186,12 @@ class JDWPToolsToStringTest {
 	}
 
 	/**
-	 * The reentrancy guard must be entered BEFORE {@code invokeMethod} and exited AFTER — in
-	 * that exact order — so the listener can suppress recursive breakpoints fired during the
-	 * synthetic call. Verified via {@link InOrder} on the {@link EvaluationGuard}.
+	 * The thread must be leased BEFORE {@code invokeMethod} and the lease closed AFTER — in that
+	 * exact order — so the listener can suppress recursive breakpoints fired during the synthetic
+	 * call. Verified via {@link InOrder} on the {@link EvaluationGuard} and its lease.
 	 */
 	@Test
-	@DisplayName("brackets invokeMethod with EvaluationGuard.enter/exit in order")
+	@DisplayName("brackets invokeMethod with an EvaluationGuard lease, in order")
 	void shouldBracketInvokeMethodWithEvaluationGuard() throws Exception {
 		final ObjectReference obj = mock(ObjectReference.class);
 		final ReferenceType type = mock(ReferenceType.class);
@@ -209,14 +209,16 @@ class JDWPToolsToStringTest {
 		when(obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
 			ObjectReference.INVOKE_SINGLE_THREADED)).thenReturn(result);
 		when(result.value()).thenReturn("v");
+		final EvaluationGuard.Lease lease = mock(EvaluationGuard.Lease.class);
+		when(evaluationGuard.lease(thread)).thenReturn(lease);
 
 		tools.jdwp_to_string(42L, 5L);
 
-		final InOrder order = inOrder(evaluationGuard, obj);
-		order.verify(evaluationGuard).enter(5L);
+		final InOrder order = inOrder(evaluationGuard, obj, lease);
+		order.verify(evaluationGuard).lease(thread);
 		order.verify(obj).invokeMethod(thread, toStringMethod, Collections.emptyList(),
 			ObjectReference.INVOKE_SINGLE_THREADED);
-		order.verify(evaluationGuard).exit(5L);
+		order.verify(lease).close();
 	}
 
 	/**

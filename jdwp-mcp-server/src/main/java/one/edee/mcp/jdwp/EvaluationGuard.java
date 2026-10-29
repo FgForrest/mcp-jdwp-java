@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
+import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,13 +15,17 @@ import java.util.concurrent.ConcurrentMap;
  * {@code invokeMethod} is waiting on, producing a cross-thread deadlock (the MCP server freezes
  * until the evaluation times out).
  *
- * <p><b>Usage contract:</b> every MCP-driven {@code invokeMethod} path captures the
- * {@link ThreadReference#uniqueID()} of the invoking thread ONCE at the top of the call and
- * passes the resulting {@code long} to both {@link #enter(long)} and {@link #exit(long)} via a
- * try/finally. Capturing the id up front — rather than re-querying it from a {@code ThreadReference}
- * inside {@code exit} — is deliberate: if the target thread dies during the evaluation, its
- * {@code ThreadReference.uniqueID()} call throws {@code ObjectCollectedException}, which would
+ * <p><b>Usage contract:</b> every MCP-driven {@code invokeMethod} path runs inside
+ * {@code try (EvaluationGuard.Lease lease = guard.lease(thread))}. The lease captures the thread's
+ * {@link ThreadReference#uniqueID()} once, up front: if the target thread dies during the
+ * evaluation, a later {@code uniqueID()} call throws {@code ObjectCollectedException}, which would
  * propagate out of the cleanup and leave a dangling entry in the depth map.
+ *
+ * <p><b>Leases (issue #45):</b> the outermost lease of a thread is also taken in the bound
+ * {@link SuspensionSession}, which admits the invocation or refuses it with a reason
+ * ({@link EvaluationRefusedException}) and takes the thread out of every other stop suspending it,
+ * so the invocation can run. Without a bound session (unit tests) only the depth is counted.
+ * {@link #enter(long)} / {@link #exit(long)} count the depth alone.
  *
  * <p>The guard is counted (not a boolean) so layered call sites — e.g. {@code configureCompilerClasspath}
  * calling {@code discoverClasspath} which itself issues {@code invokeMethod} calls nested inside
@@ -43,12 +48,74 @@ import java.util.concurrent.ConcurrentMap;
 public class EvaluationGuard {
 
     /**
+     * The session of the current connection, bound by {@link JdiEventListener} when it starts.
+     */
+    @Nullable
+    private volatile SuspensionSession session;
+
+    /**
      * Depth counter per target-VM thread. An entry is present iff the thread is currently inside
      * at least one MCP-driven {@code invokeMethod} chain; the value is the current nesting depth.
      * Absent entries mean "not evaluating" — we remove entries on the last {@code exit} to keep
      * the map compact and {@link #isEvaluating} branch-free.
      */
     private final ConcurrentMap<Long, Integer> depthByThreadId = new ConcurrentHashMap<>();
+
+    /**
+     * Binds the session whose leases the outermost {@link #lease} of a thread takes.
+     */
+    public void bind(@Nullable SuspensionSession session) {
+        this.session = session;
+    }
+
+    /**
+     * Enters an MCP-driven invocation chain on {@code thread}; close the lease when the chain ends.
+     * The thread's outermost lease is admitted by the bound session (see the class Javadoc).
+     *
+     * @throws EvaluationRefusedException when the session refuses the invocation
+     */
+    public Lease lease(ThreadReference thread) {
+        final long threadUniqueId = thread.uniqueID();
+        final int depth = depthByThreadId.merge(threadUniqueId, 1, Integer::sum);
+        final SuspensionSession bound = depth == 1 ? this.session : null;
+        if (bound != null) {
+            try {
+                bound.lease(thread);
+            } catch (RuntimeException e) {
+                exit(threadUniqueId);
+                throw e;
+            }
+        }
+        return new Lease(threadUniqueId, thread, bound);
+    }
+
+    /**
+     * One level of an invocation chain; {@link #close} leaves it.
+     */
+    public final class Lease implements AutoCloseable {
+        private final long threadUniqueId;
+        private final ThreadReference thread;
+        /**
+         * The session this lease was taken in — only the thread's outermost lease has one.
+         */
+        @Nullable
+        private final SuspensionSession session;
+
+        private Lease(long threadUniqueId, ThreadReference thread, @Nullable SuspensionSession session) {
+            this.threadUniqueId = threadUniqueId;
+            this.thread = thread;
+            this.session = session;
+        }
+
+        @Override
+        public void close() {
+            // Unlease before the depth drops, so the thread's own events stay suppressed meanwhile.
+            if (this.session != null) {
+                this.session.unlease(this.thread);
+            }
+            exit(this.threadUniqueId);
+        }
+    }
 
     /**
      * Marks the thread with the given {@code threadUniqueId} as entering an MCP-driven

@@ -317,6 +317,7 @@ public class JdiEventListener {
         dispatcher = sessionDispatcher;
         final SuspensionSession suspensions = breakpointTracker.openSuspensionSession(eventHistory);
         session = suspensions;
+        evaluationGuard.bind(suspensions);
         final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, suspensions), "jdi-event-listener");
         thread.setDaemon(true);
         listenerThread = thread;

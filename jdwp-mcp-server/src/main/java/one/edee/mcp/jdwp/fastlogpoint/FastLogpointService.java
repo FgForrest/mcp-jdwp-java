@@ -309,15 +309,13 @@ public class FastLogpointService {
             rearm(flp);
             return ArmingOutcome.RESUME;
         }
-        final long threadId = thread.uniqueID();
-        evaluationGuard.enter(threadId);
+        // Each invocation of the arming takes its own lease, never one spanning the frame reads in
+        // between: a lease may resume the thread (issue #45), which invalidates its frames.
         try {
             return arm(flp, thread) ? ArmingOutcome.STOPPED : ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
             markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
-        } finally {
-            evaluationGuard.exit(threadId);
         }
     }
 
@@ -491,7 +489,6 @@ public class FastLogpointService {
         final boolean killed = setKillSwitch(flp);
         deleteStopRequest(flp);
         drain(flp);
-        releaseRing(flp);
         try {
             uninstall(flp);
         } catch (Exception | LinkageError e) {
@@ -507,6 +504,10 @@ public class FastLogpointService {
             return String.format("%s %d: restoring the original bytecode of %s FAILED: %s (kill switch %s). "
                 + "It stays listed as DISABLED — jdwp_clear_breakpoint(%d) retries.",
                 flp.kind.label, id, flp.className(), reason, killed ? "set" : "NOT set", id);
+        } finally {
+            // After the redefinition, not before it: a hit that passed the kill switch just before it
+            // was set still writes its entry.
+            releaseRing(flp);
         }
         logpoints.remove(id);
         flp.state = State.DISARMED;
@@ -795,13 +796,17 @@ public class FastLogpointService {
             }
             member.enabled = false;
             drain(member);
-            releaseRing(member);
         }
         try {
             redefine(flp.vm, flp.refType, record.original());
         } catch (Exception | LinkageError e) {
             return "Restoring the original bytecode of " + flp.className() + " FAILED: " + describe(e) + ". Its fast "
                 + "logpoints stay listed, disabled by their kill switches.";
+        } finally {
+            // After the redefinition: a hit that passed a kill switch just before it was set still writes.
+            for (FastLogpoint member : group) {
+                releaseRing(member);
+            }
         }
         final Map<String, byte[]> installed = readBack(flp.refType);
         final Set<String> wired = installed != null ? observeWiring(flp.refType, installed) : null;
@@ -1136,7 +1141,11 @@ public class FastLogpointService {
         final InstrumentedClass existing = instrumentedClasses.get(refType);
         final byte[] original = existing != null
             ? existing.originalBytes
-            : retryOnCollected(() -> readClassBytes(vm, thread, refType));
+            : retryTransient(() -> {
+                try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
+                    return readClassBytes(vm, thread, refType);
+                }
+            });
         checkLiveCode(refType, existing != null ? existing.installed : ClassFileMethods.codeByMethod(original),
             existing == null);
 
@@ -1150,7 +1159,7 @@ public class FastLogpointService {
             throw new FastLogpointException("classes loaded by the bootstrap class loader cannot host a "
                 + flp.kind.noun());
         }
-        final DefinedProbe probe = retryOnCollected(
+        final DefinedProbe probe = retryTransient(
             () -> compileAndDefineProbe(flp, vm, thread, refType, loader, includeThis));
         final ProbeInstrumenter.ProbeSite site = buildSite(flp, method, probe, point);
 
@@ -1292,27 +1301,33 @@ public class FastLogpointService {
     }
 
     /**
-     * Runs {@code action}, retrying up to twice when a target object it created was garbage-collected
-     * before use. Objects created through JDI (remote arrays, mirrored strings, returned streams)
-     * are unreferenced in the target until pinned, so a busy target can collect them in between.
+     * Runs {@code action}, retrying up to twice after a transient failure:
+     * <ul>
+     *   <li>a target object it created was garbage-collected before use — objects created through
+     *       JDI (remote arrays, mirrored strings, returned streams) are unreferenced in the target
+     *       until pinned, so a busy target can collect them in between;</li>
+     *   <li>a frame it read was invalidated — JDI invalidates every frame of a thread the debugger
+     *       resumes, also by a resume that leaves it suspended (another set's release, a VM-wide
+     *       suspend), and each attempt reads {@code thread.frame(0)} afresh.</li>
+     * </ul>
      * Every retried step is idempotent: a probe class already defined is reused by name.
      */
-    private static <T> T retryOnCollected(Callable<T> action) throws Exception {
+    private static <T> T retryTransient(Callable<T> action) throws Exception {
         for (int attempt = 1; ; attempt++) {
             try {
                 return action.call();
             } catch (Exception e) {
-                if (attempt >= 3 || !causedByCollection(e)) {
+                if (attempt >= 3 || !isTransient(e)) {
                     throw e;
                 }
-                log.debug("[FastLogpoint] target object collected mid-arming (attempt {}), retrying", attempt);
+                log.debug("[FastLogpoint] transient failure mid-arming (attempt {}), retrying: {}", attempt, e.toString());
             }
         }
     }
 
-    private static boolean causedByCollection(Throwable failure) {
+    private static boolean isTransient(Throwable failure) {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof ObjectCollectedException) {
+            if (cause instanceof ObjectCollectedException || cause instanceof InvalidStackFrameException) {
                 return true;
             }
         }
@@ -1615,7 +1630,7 @@ public class FastLogpointService {
         for (byte b : data) {
             mirrors.add(vm.mirrorOf(b));
         }
-        return retryOnCollected(() -> {
+        return retryTransient(() -> {
             final ArrayType byteArrayType = (ArrayType) vm.classesByName("byte[]").get(0);
             final ArrayReference array = byteArrayType.newInstance(data.length);
             array.disableCollection();
@@ -1679,8 +1694,10 @@ public class FastLogpointService {
             flp.condition, flp.bufferSize, metadata)
             : expressionEvaluator.compileFastBreakpointProbe(thread.frame(0), includeThis, probePackage,
             Objects.requireNonNull(flp.condition), flp.stopOnce, flp.bufferSize, metadata);
-        final ClassType type = RemoteCodeExecutor.defineAndInitialize(vm, thread, loader, compiled.className(),
-            compiled.bytecode());
+        final ClassType type;
+        try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
+            type = RemoteCodeExecutor.defineAndInitialize(vm, thread, loader, compiled.className(), compiled.bytecode());
+        }
         final Field ring = type.fieldByName(FastLogpointProbeSource.RING_FIELD);
         final Field seq = type.fieldByName(FastLogpointProbeSource.SEQ_FIELD);
         if (ring == null || seq == null || type.fieldByName(FastLogpointProbeSource.ENABLED_FIELD) == null

@@ -83,6 +83,11 @@ public final class SuspensionSession {
          * resume so the release nets zero on them.
          */
         private final Set<ThreadReference> released = new LinkedHashSet<>();
+        /**
+         * Leased threads taken out of this context so their invocation can run; each goes back at
+         * its lease's end, or is re-suspended before this context's own resume.
+         */
+        private final Set<ThreadReference> exempt = new LinkedHashSet<>();
 
         private Context(long id, long generation, EventSet eventSet, int policy, @Nullable ThreadReference thread,
                         boolean vmStart, boolean staleAtRouting) {
@@ -207,10 +212,17 @@ public final class SuspensionSession {
     private record Processing(SuspensionSession session, Context context) {
     }
 
+    /**
+     * An invocation chain on {@code thread} and the contexts it took the thread out of.
+     */
+    private record Lease(ThreadReference thread, List<Context> exemptFrom) {
+    }
+
     private final BreakpointTracker tracker;
     private final EventHistory history;
     private final List<Context> contexts = new ArrayList<>();
     private final Set<ThreadReference> manual = new LinkedHashSet<>();
+    private final Map<ThreadReference, Lease> leases = new LinkedHashMap<>();
     private final Map<ThreadReference, StepRequest> pendingSteps = new LinkedHashMap<>();
     private long nextId = 1;
     private long generation = 1;
@@ -311,6 +323,15 @@ public final class SuspensionSession {
             stale);
         if (!closed) {
             contexts.add(context);
+            if (context.policy == EventRequest.SUSPEND_ALL) {
+                // The stop-all also suspended every thread in the middle of an invocation; take them
+                // out of it, or the invocation never completes and its caller never processes this set.
+                for (Lease lease : leases.values()) {
+                    if (!lease.thread().equals(thread)) {
+                        exempt(context, lease);
+                    }
+                }
+            }
         }
         return context;
     }
@@ -627,6 +648,51 @@ public final class SuspensionSession {
         return StartState.NOT_SEEN;
     }
 
+    // ── Leases ──
+
+    /**
+     * Admits an invocation chain on {@code thread} and takes the thread out of every other context
+     * that suspends it, so the count the invocation borrows is the thread's only one (issue #45,
+     * proposal §§ 6–7). Pair with {@link #unlease}; {@link EvaluationGuard#lease} does both.
+     * <p>
+     * The dispatcher may invoke on the event thread of the set it processes. Any other caller needs
+     * the thread stopped at an event of its own that a tool has shown, and no set covering it still
+     * queued, processed or unseen.
+     *
+     * @throws EvaluationRefusedException when the invocation is not admitted
+     */
+    public synchronized void lease(ThreadReference thread) {
+        if (closed) {
+            return;
+        }
+        final Context anchor = leaseAnchor(thread);
+        final Lease lease = new Lease(thread, new ArrayList<>());
+        for (Context context : contexts) {
+            // Only while the thread's count shows that context's suspension on top of the anchor's:
+            // a hold undone behind the session's back must not cost the anchor its own.
+            if (context != anchor && covers(context, thread) && suspendCountOf(thread) > 1) {
+                exempt(context, lease);
+            }
+        }
+        leases.put(thread, lease);
+    }
+
+    /**
+     * Ends the invocation chain on {@code thread}: it goes back into each context it was taken out
+     * of that still holds. A context released meanwhile has re-suspended it already.
+     */
+    public synchronized void unlease(ThreadReference thread) {
+        final Lease lease = leases.remove(thread);
+        if (lease == null || closed) {
+            return;
+        }
+        for (Context context : lease.exemptFrom()) {
+            if (context.state != State.RELEASED && context.exempt.remove(thread)) {
+                suspendQuietly(thread);
+            }
+        }
+    }
+
     // ── Reset and close ──
 
     /**
@@ -776,17 +842,89 @@ public final class SuspensionSession {
                     suspendQuietly(thread);
                 }
             }
+            // Likewise the leased threads taken out of it; their leases find it released.
+            for (ThreadReference thread : context.exempt) {
+                suspendQuietly(thread);
+            }
             context.eventSet.resume();
         } catch (RuntimeException e) {
             // VM gone or dying: the session is about to close.
             log.debug("[Suspension] Releasing {} failed: {}", context, e.toString());
         }
         context.released.clear();
+        context.exempt.clear();
         contexts.remove(context);
     }
 
+    /**
+     * Takes the leased thread out of {@code context}: one resume undoes the context's suspension of it.
+     */
+    private void exempt(Context context, Lease lease) {
+        resumeQuietly(lease.thread());
+        context.exempt.add(lease.thread());
+        lease.exemptFrom().add(context);
+    }
+
+    /**
+     * The context whose suspension an invocation on {@code thread} borrows (see {@link #lease}).
+     *
+     * @throws EvaluationRefusedException when there is none
+     */
+    private Context leaseAnchor(ThreadReference thread) {
+        final Processing processing = PROCESSING.get();
+        if (processing != null && processing.session() == this && thread.equals(processing.context().thread)
+            && processing.context().policy != EventRequest.SUSPEND_NONE) {
+            // The dispatcher invokes on the thread of the set it processes.
+            return processing.context();
+        }
+        final String refusal = releaseRefusal(thread);
+        if (refusal != null) {
+            throw new EvaluationRefusedException(refusal);
+        }
+        Context anchor = null;
+        boolean bystander = false;
+        for (Context context : contexts) {
+            if (context.state != State.HELD || !covers(context, thread)) {
+                continue;
+            }
+            if (thread.equals(context.thread)) {
+                anchor = context;
+            } else {
+                bystander = true;
+            }
+        }
+        if (anchor != null) {
+            if (!anchor.invocable()) {
+                throw new EvaluationRefusedException("thread " + safeName(thread) + " is stopped at VM start, where "
+                    + "the JDWP agent allows no invocation — step or run to a breakpoint first");
+            }
+            return anchor;
+        }
+        final String needs = "; an evaluation needs it stopped at an event of its own (a breakpoint, an exception "
+            + "or a step)";
+        if (bystander) {
+            throw new EvaluationRefusedException("thread " + safeName(thread) + " is parked by another thread's "
+                + "stop" + needs);
+        }
+        if (manual.contains(thread)) {
+            throw new EvaluationRefusedException("thread " + safeName(thread) + " is held by jdwp_suspend_thread"
+                + needs);
+        }
+        throw new EvaluationRefusedException("thread " + safeName(thread) + " is not stopped by this debugging "
+            + "session" + needs);
+    }
+
+    private static int suspendCountOf(ThreadReference thread) {
+        try {
+            return thread.suspendCount();
+        } catch (RuntimeException e) {
+            // Thread gone or VM dying: nothing to take it out of.
+            return 0;
+        }
+    }
+
     private static boolean covers(Context context, ThreadReference thread) {
-        if (context.state == State.RELEASED || context.released.contains(thread)) {
+        if (context.state == State.RELEASED || context.released.contains(thread) || context.exempt.contains(thread)) {
             return false;
         }
         return switch (context.policy) {
@@ -869,8 +1007,12 @@ public final class SuspensionSession {
      * The contexts, manual holds and pending steps, for diagnostics.
      */
     public synchronized String describeState() {
+        final List<String> leased = new ArrayList<>();
+        for (ThreadReference thread : leases.keySet()) {
+            leased.add(safeName(thread));
+        }
         return "generation=" + generation + (closed ? ", closed" : "") + ", contexts=" + contexts + ", manual="
-            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", current=" + current;
+            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", current=" + current;
     }
 
     /**

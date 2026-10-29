@@ -1597,15 +1597,11 @@ public class JDIConnectionService {
                 className, thread.name(), thread.isSuspended(), tryFrameCount(thread));
             // Reentrancy guard: forcing Class.forName runs the target class's <clinit>, which
             // may hit a user breakpoint. Without the guard the listener would re-suspend the
-            // thread we are driving and the outer invokeMethod would hang. Capture the id up
-            // front so a thread death during <clinit> does not leak a guard entry.
-            final long guardedThreadId = thread.uniqueID();
-            evaluationGuard.enter(guardedThreadId);
-            try (PinnedMirrors pins = new PinnedMirrors()) {
+            // thread we are driving and the outer invokeMethod would hang.
+            try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread);
+                 PinnedMirrors pins = new PinnedMirrors()) {
                 classClass.invokeMethod(thread, forName, List.of(pins.string(vmRef, className)),
                     ClassType.INVOKE_SINGLE_THREADED);
-            } finally {
-                evaluationGuard.exit(guardedThreadId);
             }
             log.info("[JDI] Force-loaded class '{}' via Class.forName", className);
         } catch (Exception e) {

@@ -1116,18 +1116,13 @@ public class JDWPTools {
                 return String.format("Object #%d (%s): no toString() method found", objectId, obj.referenceType().name());
             }
 
-            // Reentrancy guard: the invoked toString() may hit a user breakpoint. Mark the
-            // thread as mid-evaluation so the listener suppresses the recursive hit rather
-            // than re-suspending the very thread this invokeMethod is waiting on. Capture the
-            // id up front so a thread death during toString() does not leak a guard entry.
-            Value result;
-            final long guardedThreadId = thread.uniqueID();
-            evaluationGuard.enter(guardedThreadId);
-            try {
+            // Reentrancy guard: the invoked toString() may hit a user breakpoint. Lease the
+            // thread so the listener suppresses the recursive hit rather than re-suspending the
+            // very thread this invokeMethod is waiting on.
+            final Value result;
+            try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
                 result = obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
                     ObjectReference.INVOKE_SINGLE_THREADED);
-            } finally {
-                evaluationGuard.exit(guardedThreadId);
             }
 
             if (result instanceof StringReference strRef) {

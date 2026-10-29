@@ -1,10 +1,13 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import com.sun.jdi.Location;
 import com.sun.jdi.LongValue;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.BreakpointTracker;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.JDIConnectionService;
@@ -28,7 +31,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End-to-end verification of {@code jdwp_set_fast_breakpoint} against a real forked JVM: the consent
  * gate, a stop-once breakpoint that parks every thread and is re-armed, an every-hit breakpoint that
  * parks only its thread, a failing condition that stops once and then installs, a first hit that
- * stops before anything is installed, and restoration of the original bytecode.
+ * stops before anything is installed, restoration of the original bytecode, and an evaluation that
+ * survives another thread's stop-all.
  * <p>
  * Opt-in like {@link FastLogpointLiveTest}:
  * {@code mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastBreakpointLiveTest}.
@@ -78,8 +82,7 @@ class FastBreakpointLiveTest {
 	void leaveNothingBehind() throws Exception {
 		// Release every hold, seen or not (an every-hit breakpoint can stop again before it is
 		// cleared), clear, let the dispatcher finish a set it already took, and release whatever
-		// stopped in between. An arming hit still evaluating on a worker would otherwise be frozen
-		// by the next test's suspend-all arming event, and the dispatcher with it.
+		// stopped in between, so the next test starts from a quiet session.
 		releaseEverything();
 		for (FastLogpointService.Info info : fastLogpoints.list()) {
 			tools.jdwp_clear_breakpoint(info.id());
@@ -262,6 +265,43 @@ class FastBreakpointLiveTest {
 		assertThat(tools.jdwp_get_locals(threadId, 0)).as("the step stayed in the user's frame").contains("doubled (int) = -1");
 	}
 
+	@Test
+	@Order(7)
+	@DisplayName("an evaluation in flight on one thread survives another thread's stop-all (issue #45)")
+	void evaluationSurvivesAnotherThreadsStopAll() throws Exception {
+		final ThreadReference slow = worker("worker-0");
+		final ThreadReference stopper = worker("worker-1");
+		// Every read of `base` on worker-0 runs an evaluation of 1.5 s on the dispatcher.
+		final int logpointId = idOf(tools.jdwp_set_field_logpoint(TARGET, "base", "access",
+			"{ java.util.concurrent.locks.LockSupport.parkNanos(1_500_000_000L); return \"slept\"; }", null,
+			slow.uniqueID(), null, null, null, null, null));
+		BreakpointRequest stopAll = null;
+		try {
+			// The first evaluation compiles; the next one spends its time parked in the target.
+			await("a first field logpoint entry", () -> history.getRecent(50).stream()
+				.anyMatch(event -> event.type().equals("FIELD_LOGPOINT")));
+			await("an evaluation in flight on worker-0", () -> sessionState().contains("leases=[worker-0]"));
+
+			// A stop-all on worker-1 suspends worker-0 too, in the middle of that evaluation. Without the
+			// lease's exemption the evaluation never completes and the dispatcher never gets to the stop.
+			final VirtualMachine vm = connection.getVM();
+			final Location location = vm.classesByName(TARGET).get(0).locationsOfLine(probeLine).get(0);
+			stopAll = vm.eventRequestManager().createBreakpointRequest(location);
+			stopAll.addThreadFilter(stopper);
+			stopAll.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+			stopAll.enable();
+
+			assertThat(waitForStop()).contains("Thread: worker-1");
+			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).as("the evaluation itself succeeded too")
+				.noneMatch(event -> event.type().equals("FIELD_LOGPOINT_ERROR"));
+		} finally {
+			if (stopAll != null) {
+				connection.getVM().eventRequestManager().deleteEventRequest(stopAll);
+			}
+			tools.jdwp_clear_breakpoint(logpointId);
+		}
+	}
+
 	// ── helpers ──
 
 	/**
@@ -333,6 +373,11 @@ class FastBreakpointLiveTest {
 
 	private List<ThreadReference> workers() throws Exception {
 		return connection.getVM().allThreads().stream().filter(t -> t.name().startsWith("worker-")).toList();
+	}
+
+	private String sessionState() {
+		final SuspensionSession suspensions = session.tracker.suspensionSession();
+		return suspensions == null ? "" : suspensions.describeState();
 	}
 
 	private ThreadReference worker(String name) throws Exception {

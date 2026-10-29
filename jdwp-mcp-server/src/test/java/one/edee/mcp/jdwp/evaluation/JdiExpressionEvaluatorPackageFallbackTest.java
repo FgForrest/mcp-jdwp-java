@@ -2,6 +2,8 @@ package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.ClassLoaderReference;
 import com.sun.jdi.ClassType;
+import com.sun.jdi.InvalidStackFrameException;
+import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
@@ -69,6 +71,10 @@ class JdiExpressionEvaluatorPackageFallbackTest {
 		when(frame.thread()).thenReturn(thread);
 		when(frame.virtualMachine()).thenReturn(mock(VirtualMachine.class));
 		when(frame.visibleVariables()).thenReturn(List.of());
+		// The rejected defineClass invocation invalidates the frame; the retry reads it afresh.
+		final Location location = mock(Location.class);
+		when(frame.location()).thenReturn(location);
+		when(thread.frames()).thenReturn(List.of(frame));
 
 		final ObjectReference thisRef = mock(ObjectReference.class);
 		final ClassType thisType = mock(ClassType.class);
@@ -102,6 +108,33 @@ class JdiExpressionEvaluatorPackageFallbackTest {
 			// Two binds: the rejected com.app attempt, then the successful default-package retry.
 			mocked.verify(() -> RemoteCodeExecutor.execute(any(), any(), any(), anyString(), any(), anyString(), anyList()),
 				times(2));
+		}
+	}
+
+	@Test
+	@DisplayName("a frame invalidated by a resume elsewhere before the invocation is read afresh")
+	void shouldReadAnInvalidatedFrameAfresh() throws Exception {
+		wireFrame(true);
+		final StackFrame stale = frame;
+		final ThreadReference thread = stale.thread();
+		final Location location = stale.location();
+		final ObjectReference thisRef = stale.thisObject();
+		final VirtualMachine vm = stale.virtualMachine();
+		final StackFrame fresh = mock(StackFrame.class);
+		when(fresh.thread()).thenReturn(thread);
+		when(fresh.location()).thenReturn(location);
+		when(fresh.virtualMachine()).thenReturn(vm);
+		when(fresh.visibleVariables()).thenReturn(List.of());
+		when(fresh.thisObject()).thenReturn(thisRef);
+		when(stale.thisObject()).thenThrow(new InvalidStackFrameException("Thread has been resumed"));
+		when(thread.frames()).thenReturn(List.of(fresh));
+		final Value expected = mock(Value.class);
+
+		try (MockedStatic<RemoteCodeExecutor> mocked = mockStatic(RemoteCodeExecutor.class)) {
+			mocked.when(() -> RemoteCodeExecutor.execute(any(), any(), any(), anyString(), any(), anyString(), anyList()))
+				.thenReturn(expected);
+
+			assertThat(evaluator.evaluate(stale, "1 + 1", Map.of())).isSameAs(expected);
 		}
 	}
 

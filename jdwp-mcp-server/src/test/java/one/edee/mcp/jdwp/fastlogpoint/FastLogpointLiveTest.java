@@ -287,7 +287,9 @@ class FastLogpointLiveTest {
 			assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
 		} finally {
 			tools.jdwp_clear_breakpoint(parkId);
-			parked.resume();
+			// Release the park through the session that holds it (a stop nobody has seen): a raw
+			// resume would leave the session holding a suspension that no longer exists.
+			Objects.requireNonNull(tracker.suspensionSession()).reset();
 		}
 		assertBytecodeRestored();
 	}

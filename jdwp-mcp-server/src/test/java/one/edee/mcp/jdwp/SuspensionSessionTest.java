@@ -15,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -270,6 +271,180 @@ class SuspensionSessionTest {
 	/**
 	 * Routes, processes and publishes a breakpoint stop of {@code thread} with {@code policy}.
 	 */
+	// ── Leases (proposal §§ 6–7): every ordering ends with the lease's own context holding ──
+
+	@Test
+	@DisplayName("§ 7 row 1: a dispatcher invocation survives another thread's stop-all, which takes it back at lease end")
+	void dispatcherInvocationSurvivesStopAll() throws Exception {
+		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD),
+			t.ref, false);
+		session.begin(own);
+		session.beginProcessing(own);
+		try {
+			session.lease(t.ref);
+			model.beginInvocation(t);
+
+			final SuspensionSession.Context other = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
+				u.ref, false);
+			assertThat(model.invocationRuns(t)).as("the stop-all no longer parks the invocation").isTrue();
+			assertThat(model.counts()).containsEntry("u", 1).containsEntry("w", 1);
+
+			model.completeInvocation(t);
+			session.unlease(t.ref);
+			assertThat(model.counts()).as("own set + the stop-all, which covers t again")
+				.containsEntry("t", 2).containsEntry("u", 1).containsEntry("w", 1);
+			assertThat(session.stateOf(other)).isEqualTo(SuspensionSession.State.QUEUED);
+		} finally {
+			SuspensionSession.endProcessing();
+		}
+		session.finish(own);
+		assertThat(model.counts()).as("the stop-all alone").containsEntry("t", 1).containsEntry("u", 1);
+	}
+
+	@Test
+	@DisplayName("§ 7 row 2: the stop-all is released mid-invocation; the lease's own stop alone remains")
+	void stopAllReleasedBeforeTheInvocationRestores() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		final SuspensionSession.Context other = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
+			u.ref, false);
+		session.begin(other);
+		session.finish(other);
+		assertThat(model.invocationRuns(t)).isTrue();
+
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	@DisplayName("§ 7 row 3: the invocation restores, then the stop-all is released; the lease's own stop alone remains")
+	void invocationRestoresBeforeTheStopAllIsReleased() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		final SuspensionSession.Context other = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
+			u.ref, false);
+
+		model.completeInvocation(t);
+		session.begin(other);
+		session.finish(other);
+		session.unlease(t.ref);
+
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	@DisplayName("a lease takes the thread out of a stop-all already held, and gives it back at its end")
+	void leaseExemptsFromAHeldStopAll() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		presented(stopOn(u, EventRequest.SUSPEND_ALL, 2));
+		assertThat(model.counts()).containsEntry("t", 2);
+
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		assertThat(model.invocationRuns(t)).isTrue();
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		assertThat(model.counts()).containsEntry("t", 2).containsEntry("u", 1).containsEntry("w", 1);
+
+		session.releaseAll();
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	@DisplayName("the dispatcher may invoke on the thread of the set it processes, though nobody has seen it")
+	void dispatcherLeaseIsAdmittedByConstruction() {
+		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_ALL),
+			t.ref, false);
+		session.begin(own);
+		session.beginProcessing(own);
+		try {
+			session.lease(t.ref);
+			session.unlease(t.ref);
+		} finally {
+			SuspensionSession.endProcessing();
+		}
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 1);
+	}
+
+	@Test
+	@DisplayName("an invocation is refused, with the reason, on a thread not stopped at a shown event of its own")
+	void leaseIsRefusedWithAReason() throws Exception {
+		assertThatThrownBy(() -> session.lease(w.ref)).isInstanceOf(EvaluationRefusedException.class)
+			.hasMessageContaining("not stopped by this debugging session");
+
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1);
+		assertThatThrownBy(() -> session.lease(t.ref)).hasMessageContaining("not seen yet");
+		session.nextStop(0);
+
+		session.suspendThread(w.ref);
+		assertThatThrownBy(() -> session.lease(w.ref)).hasMessageContaining("jdwp_suspend_thread");
+
+		presented(stopOn(u, EventRequest.SUSPEND_ALL, 2));
+		final FakeSuspendModel.FakeThread bystander = model.thread("bystander");
+		assertThat(bystander.count).as("born during the stop-all").isEqualTo(1);
+		assertThatThrownBy(() -> session.lease(bystander.ref)).hasMessageContaining("parked by another thread's stop");
+
+		final Map<String, Integer> before = model.counts();
+		session.route(model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false);
+		assertThatThrownBy(() -> session.lease(t.ref)).hasMessageContaining("waiting to be processed");
+		assertThat(model.counts()).as("a refusal suspends and resumes nothing")
+			.containsEntry("u", before.get("u")).containsEntry("w", before.get("w"));
+	}
+
+	@Test
+	@DisplayName("VM start cannot be invoked on, so a lease there is refused")
+	void leaseAtVmStartIsRefused() throws Exception {
+		final SuspensionSession.Context start = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_ALL),
+			t.ref, true);
+		session.begin(start);
+		session.candidate(start, new BreakpointTracker.LastBreakpoint(t.ref, null,
+			BreakpointTracker.EventKind.VM_START));
+		session.finish(start);
+		session.nextStop(0);
+
+		assertThatThrownBy(() -> session.lease(t.ref)).isInstanceOf(EvaluationRefusedException.class)
+			.hasMessageContaining("VM start");
+	}
+
+	@Test
+	@DisplayName("a hold undone behind the session's back is not exempted: the lease keeps its own suspension")
+	void staleHoldIsNotExempted() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		t.ref.resume();
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 2));
+		assertThat(t.count).as("only the second stop really holds t").isEqualTo(1);
+
+		session.lease(t.ref);
+		assertThat(t.count).isEqualTo(1);
+		model.beginInvocation(t);
+		assertThat(model.invocationRuns(t)).isTrue();
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+
+		assertThat(t.count).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("a closed session leases nothing and touches no count")
+	void closedSessionLeasesNothing() {
+		session.close();
+		session.lease(w.ref);
+		session.unlease(w.ref);
+		assertThat(model.counts()).containsEntry("w", 0);
+	}
+
+	/**
+	 * Presents {@code context}'s stop, as a tool showing it does.
+	 */
+	private SuspensionSession.Context presented(SuspensionSession.Context context) throws InterruptedException {
+		assertThat(session.nextStop(0).outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
+		return context;
+	}
+
 	private SuspensionSession.Context stopOn(FakeSuspendModel.FakeThread thread, int policy, int breakpointId) {
 		final SuspensionSession.Context context = session.route(model.breakpointEvent(thread, policy), thread.ref, false);
 		session.begin(context);
