@@ -466,6 +466,116 @@ class SuspensionSessionTest {
 		assertThat(t.count).isZero();
 	}
 
+	// ── Releasing the stop a running invocation borrows from: its share moves to the lease ──
+
+	@Test
+	@DisplayName("a thread-only stop released mid-invocation: the invocation runs on, and the thread runs once it ends")
+	void ownStopReleasedMidInvocation() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.invocationRuns(t)).isTrue();
+
+		model.completeInvocation(t);
+		assertThat(t.count).as("the restored count now belongs to the lease").isEqualTo(1);
+		session.unlease(t.ref);
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	@DisplayName("a thread-only stop released between two invocations: the next one still borrows a real count")
+	void ownStopReleasedBetweenInvocations() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+
+		session.releaseAll();
+		assertThat(t.count).as("still suspended for the next invocation").isEqualTo(1);
+		model.beginInvocation(t);
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	@DisplayName("a stop-all released mid-invocation frees the other threads; the borrower's share waits for the lease")
+	void stopAllReleasedMidInvocation() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_ALL, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		session.releaseAll();
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
+		assertThat(model.invocationRuns(t)).isTrue();
+
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	@DisplayName("a stop-all released between two invocations keeps the borrower suspended for the next one")
+	void stopAllReleasedBetweenInvocations() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_ALL, 1));
+		session.lease(t.ref);
+
+		session.releaseAll();
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 0).containsEntry("w", 0);
+		model.beginInvocation(t);
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+
+		assertThat(model.counts()).containsEntry("t", 0);
+	}
+
+	@Test
+	@DisplayName("jdwp_reset during an invocation hands the stop's share to the lease too")
+	void resetDuringInvocation() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		assertThat(session.reset()).isEqualTo(1);
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	@DisplayName("the borrowed stop released while a stop-all of another thread still holds: that stop-all alone remains")
+	void releasedAnchorWithAnotherStopStillHolding() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		final SuspensionSession.Context other = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
+			u.ref, false);
+
+		session.releaseAll();
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		assertThat(model.counts()).as("the queued stop-all holds everyone once")
+			.containsEntry("t", 1).containsEntry("u", 1).containsEntry("w", 1);
+
+		session.begin(other);
+		session.finish(other);
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	@DisplayName("resume_thread and a step are refused on a thread an evaluation is running on")
+	void releaseAndStepRefusedOnALeasedThread() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+
+		assertThat(session.releaseThread(t.ref).refusal()).contains("an evaluation is running");
+		assertThat(session.step(t.ref, this::stepRequest)).contains("an evaluation is running");
+		assertThat(t.count).isEqualTo(1);
+		session.unlease(t.ref);
+	}
+
 	@Test
 	@DisplayName("a closed session leases nothing and touches no count")
 	void closedSessionLeasesNothing() {

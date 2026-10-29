@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.TARGET;
@@ -301,6 +302,43 @@ class FastBreakpointLiveTest {
 				connection.getVM().eventRequestManager().deleteEventRequest(stopAll);
 			}
 			tools.jdwp_clear_breakpoint(logpointId);
+		}
+	}
+
+	@Test
+	@Order(8)
+	@DisplayName("an evaluation that outlives its wait runs on; releasing its stop meanwhile frees the thread once it ends")
+	void evaluationOutlivingItsWaitIsReportedLate() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final ThreadReference slow = worker("worker-0");
+		final Location location = vm.classesByName(TARGET).get(0).locationsOfLine(probeLine).get(0);
+		final BreakpointRequest park = vm.eventRequestManager().createBreakpointRequest(location);
+		park.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+		park.addThreadFilter(slow);
+		park.addCountFilter(1);
+		final int parkId = session.tracker.registerBreakpoint(park);
+		park.enable();
+		try {
+			assertThat(waitForStop()).contains("Thread: worker-0");
+
+			final long started = System.nanoTime();
+			final String reply = tools.jdwp_evaluate_expression(slow.uniqueID(),
+				"{ java.util.concurrent.locks.LockSupport.parkNanos(25_000_000_000L); return 42; }", 0);
+			final long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+			assertThat(reply).startsWith("[STILL_RUNNING]").contains("thread worker-0");
+			assertThat(waitedMs).as("the tool waited the bounded time, not the evaluation").isBetween(19_000L, 24_000L);
+
+			// The user releases the stop while the evaluation still runs: its share now belongs to the evaluation.
+			assertThat(tools.jdwp_resume()).contains("worker-0");
+			await("the late result", () -> history.getRecent(EventHistory.MAX_EVENTS).stream()
+				.anyMatch(event -> event.type().equals("EVALUATION_COMPLETED_LATE") && event.summary().contains("42")));
+			await("worker-0 running again", () -> slow.suspendCount() == 0);
+			final long before = calls();
+			Thread.sleep(200);
+			assertThat(calls()).isGreaterThan(before);
+			assertThat(workers()).allSatisfy(worker -> assertThat(worker.suspendCount()).as(worker.name()).isZero());
+		} finally {
+			tools.jdwp_clear_breakpoint(parkId);
 		}
 	}
 

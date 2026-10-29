@@ -133,6 +133,10 @@ public class JDWPTools {
      * {@link #jdwp_get_events}, disarmed by {@link #jdwp_clear_breakpoint} and {@link #jdwp_reset}.
      */
     private final FastLogpointService fastLogpoints;
+    /**
+     * Runs the tools' invocations in the target with a bounded wait (issue #45, § 19 A1).
+     */
+    private final InvocationRunner invocations;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
@@ -153,6 +157,8 @@ public class JDWPTools {
         this.healthMonitor = healthMonitor;
         this.localClasspathProvider = localClasspathProvider;
         this.fastLogpoints = fastLogpoints;
+        this.invocations = new InvocationRunner(InvocationRunner.newPool(), InvocationRunner.TIMEOUT_MS, eventHistory,
+            breakpointTracker::suspensionSession);
     }
 
     /**
@@ -1071,7 +1077,7 @@ public class JDWPTools {
             + " — re-attach via jdwp_connect / jdwp_wait_for_attach.";
     }
 
-    @McpTool(description = "Invoke toString() on a cached object to get its string representation. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
+    @McpTool(description = "Invoke toString() on a cached object to get its string representation. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_to_string(
         @McpToolParam(description = "Object unique ID (from jdwp_get_locals or jdwp_get_fields)") long objectId,
         @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the last breakpoint thread.") @Nullable Long threadId) {
@@ -1119,11 +1125,12 @@ public class JDWPTools {
             // Reentrancy guard: the invoked toString() may hit a user breakpoint. Lease the
             // thread so the listener suppresses the recursive hit rather than re-suspending the
             // very thread this invokeMethod is waiting on.
-            final Value result;
-            try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
-                result = obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
-                    ObjectReference.INVOKE_SINGLE_THREADED);
-            }
+            final Value result = invocations.run(thread, "toString() of object #" + objectId, () -> {
+                try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
+                    return obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
+                        ObjectReference.INVOKE_SINGLE_THREADED);
+                }
+            });
 
             if (result instanceof StringReference strRef) {
                 final String value = strRef.value();
@@ -1138,12 +1145,25 @@ public class JDWPTools {
             }
             return String.format("Object #%d (%s).toString() = %s",
                 objectId, obj.referenceType().name(), formatValue(result));
+        } catch (InvocationRunner.StillRunning e) {
+            return e.report();
         } catch (Exception e) {
             if (isVmGone(e)) {
                 return vmDisconnectedMessage("jdwp_to_string");
             }
             return "Error invoking toString(): " + e.getMessage();
         }
+    }
+
+    /**
+     * {@link JDIConnectionService#findOrForceLoadClass} with the bounded wait of {@link #invocations}:
+     * forcing a class load runs its {@code <clinit>} in the target, which can block on a parked thread.
+     *
+     * @throws InvocationRunner.StillRunning when the load did not finish in time
+     */
+    @Nullable
+    private ReferenceType forceLoad(String className) throws Exception {
+        return invocations.run(null, "loading class " + className, () -> jdiService.findOrForceLoadClass(className));
     }
 
     /**
@@ -1158,7 +1178,7 @@ public class JDWPTools {
     }
 
 
-    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
+    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_expression(
         @McpToolParam(description = "Thread unique ID") long threadId,
         @McpToolParam(description = "Java expression OR `{ ... }` block to evaluate. Examples: `order.getTotal()`, `x + y`, `{ try { return risky(); } catch (Exception e) { return e.getMessage(); } }`") String expression,
@@ -1177,14 +1197,17 @@ public class JDWPTools {
                 return invokeGuard;
             }
 
-            expressionEvaluator.configureCompilerClasspath(thread);
-
-            final StackFrame frame = FrameView.of(thread).frame(frameIndex != null ? frameIndex : 0);
-            final Value result = expressionEvaluator.evaluate(frame, expression, markedInstances.buildBindings());
+            final Value result = invocations.run(thread, "evaluating " + expression, () -> {
+                expressionEvaluator.configureCompilerClasspath(thread);
+                final StackFrame frame = FrameView.of(thread).frame(frameIndex != null ? frameIndex : 0);
+                return expressionEvaluator.evaluate(frame, expression, markedInstances.buildBindings());
+            });
 
             // P3-5: echo the expression so the agent can attribute results when several evals are
             // batched in one turn ("Result of foo.bar(): 42" instead of just "Result: 42").
             return String.format("Result of %s: %s", expression, formatValue(result));
+        } catch (InvocationRunner.StillRunning e) {
+            return e.report();
         } catch (Exception e) {
             if (isVmGone(e)) {
                 return vmDisconnectedMessage("jdwp_evaluate_expression");
@@ -1195,7 +1218,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure, or '[VM_DEATH] ...' if the target VM disconnects mid-call. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes). Supports `{ block }` syntax for multi-statement.")
+    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure, or '[VM_DEATH] ...' if the target VM disconnects mid-call. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes). Supports `{ block }` syntax for multi-statement. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_assert_expression(
         @McpToolParam(description = "Java expression (e.g., 'order.getTotal()', 'session.getRole()', 'list.size() == 5') — supports `{ ...; return X; }` block syntax") String expression,
         @McpToolParam(description = "Expected value (string-compared against the formatted expression result)") String expected,
@@ -1223,9 +1246,11 @@ public class JDWPTools {
                 return invokeGuard;
             }
 
-            expressionEvaluator.configureCompilerClasspath(thread);
-            final StackFrame stackFrame = FrameView.of(thread).frame(frame);
-            final Value result = expressionEvaluator.evaluate(stackFrame, expression, markedInstances.buildBindings());
+            final Value result = invocations.run(thread, "evaluating " + expression, () -> {
+                expressionEvaluator.configureCompilerClasspath(thread);
+                final StackFrame stackFrame = FrameView.of(thread).frame(frame);
+                return expressionEvaluator.evaluate(stackFrame, expression, markedInstances.buildBindings());
+            });
             final String actual = formatValue(result);
 
             // Strip wrapping quotes from formatted strings so users can pass `expected="hello"` or `expected=hello`.
@@ -1238,6 +1263,8 @@ public class JDWPTools {
                 return String.format("OK — %s = %s", expression, actual);
             }
             return String.format("MISMATCH — %s\n  expected: %s\n  actual:   %s", expression, expected, actual);
+        } catch (InvocationRunner.StillRunning e) {
+            return e.report();
         } catch (Exception e) {
             if (isVmGone(e)) {
                 return vmDisconnectedMessage("jdwp_assert_expression");
@@ -2576,7 +2603,7 @@ public class JDWPTools {
             // is opt-in for the rare cases that genuinely need eager binding (bootstrap classes,
             // tight integration tests). See GH issue #3.
             final ReferenceType eagerType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(className)
+                ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
             final List<ReferenceType> classes = eagerType != null ? List.of(eagerType) : List.of();
 
@@ -2723,7 +2750,7 @@ public class JDWPTools {
 
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType eagerType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(className)
+                ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
             final List<ReferenceType> classes = eagerType != null ? List.of(eagerType) : List.of();
 
@@ -2876,7 +2903,7 @@ public class JDWPTools {
             }
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType refType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(className)
+                ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
             if (refType == null) {
                 return String.format("Error: class %s is not loaded. A fast logpoint needs a loaded class — let the "
@@ -2988,7 +3015,7 @@ public class JDWPTools {
             }
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType refType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(className)
+                ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
             if (refType == null) {
                 return String.format("Error: class %s is not loaded. A fast breakpoint needs a loaded class — let the "
@@ -3542,7 +3569,7 @@ public class JDWPTools {
             // referenced by user code) is the primary forceLoad=true use case.
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType eagerType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(exceptionClass)
+                ? forceLoad(exceptionClass)
                 : jdiService.findLoadedClass(exceptionClass);
 
             if (eagerType == null) {
@@ -3728,7 +3755,7 @@ public class JDWPTools {
             final EventRequestManager erm = vm.eventRequestManager();
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType eagerType = effectiveForceLoad
-                ? jdiService.findOrForceLoadClass(className)
+                ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
 
             final String chainInfo = triggerBreakpointId != null
@@ -5017,7 +5044,7 @@ public class JDWPTools {
      * - 'full_stack': Scans every frame of the stack to find any location matching any breakpoint
      * with a watcher. Powerful but slower.
      */
-    @McpTool(description = "Evaluate watchers on a suspended thread's stack based on a scope. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
+    @McpTool(description = "Evaluate watchers on a suspended thread's stack based on a scope. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_watchers(
         @McpToolParam(description = "Thread unique ID") long threadId,
         @McpToolParam(description = "Evaluation scope: 'current_frame' (default) or 'full_stack'") String scope,
@@ -5044,33 +5071,36 @@ public class JDWPTools {
                 return invokeGuard;
             }
 
-            // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.
-            expressionEvaluator.configureCompilerClasspath(thread);
+            final String effectiveScope = scope.isBlank() ? "current_frame" : scope;
+            final Integer effectiveBreakpointId = breakpointId;
+            return invocations.run(thread, "evaluating the watchers", () -> {
+                // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.
+                expressionEvaluator.configureCompilerClasspath(thread);
 
-            if (scope.isBlank()) {
-                scope = "current_frame";
-            }
+                final StringBuilder result = new StringBuilder();
+                result.append(String.format("=== Watcher Evaluation for Thread %d (Scope: %s) ===\n\n", threadId,
+                    effectiveScope));
+                result.append(String.format("Thread: %s (frames: %d)\n\n", thread.name(), FrameView.of(thread).count()));
 
-            final StringBuilder result = new StringBuilder();
-            result.append(String.format("=== Watcher Evaluation for Thread %d (Scope: %s) ===\n\n", threadId, scope));
-            result.append(String.format("Thread: %s (frames: %d)\n\n", thread.name(), FrameView.of(thread).count()));
+                final int watchersEvaluated;
+                if ("full_stack".equalsIgnoreCase(effectiveScope)) {
+                    watchersEvaluated = evaluateWatchersFullStack(thread, result);
+                } else {
+                    watchersEvaluated = evaluateWatchersCurrentFrame(thread, effectiveBreakpointId, result);
+                }
 
-            final int watchersEvaluated;
-            if ("full_stack".equalsIgnoreCase(scope)) {
-                watchersEvaluated = evaluateWatchersFullStack(thread, result);
-            } else {
-                watchersEvaluated = evaluateWatchersCurrentFrame(thread, breakpointId, result);
-            }
+                if (watchersEvaluated == 0) {
+                    result.append("No watchers found or evaluated for the given scope.\n");
+                }
+                // Per-call tally (split into succeeded/errored on partial failure) is appended inside
+                // the evaluator helpers via appendWatcherTally — the outer "Evaluated N expression(s)"
+                // line was double-counting when both halves emitted their own totals.
 
-            if (watchersEvaluated == 0) {
-                result.append("No watchers found or evaluated for the given scope.\n");
-            }
-            // Per-call tally (split into succeeded/errored on partial failure) is appended inside
-            // the evaluator helpers via appendWatcherTally — the outer "Evaluated N expression(s)"
-            // line was double-counting when both halves emitted their own totals.
+                return result.toString();
+            });
 
-            return result.toString();
-
+        } catch (InvocationRunner.StillRunning e) {
+            return e.report();
         } catch (Exception e) {
             if (isVmGone(e)) {
                 return vmDisconnectedMessage("jdwp_evaluate_watchers");

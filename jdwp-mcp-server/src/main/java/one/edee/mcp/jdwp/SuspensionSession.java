@@ -213,16 +213,24 @@ public final class SuspensionSession {
     }
 
     /**
-     * An invocation chain on {@code thread}: the contexts it took the thread out of, and whether it
-     * took the thread's manual hold out too.
+     * An invocation chain on {@code thread}: the context whose suspension it borrows, the contexts it
+     * took the thread out of, whether it took the thread's manual hold out too, and the shares of
+     * released contexts it holds on to until it ends.
      */
     private static final class Lease {
         private final ThreadReference thread;
+        private final Context anchor;
         private final List<Context> exemptFrom = new ArrayList<>();
         private boolean manualExempt;
+        /**
+         * Suspensions of {@link #thread} that released contexts handed over to this lease (see
+         * {@link #release}); resumed when the lease ends.
+         */
+        private int debt;
 
-        private Lease(ThreadReference thread) {
+        private Lease(ThreadReference thread, Context anchor) {
             this.thread = thread;
+            this.anchor = anchor;
         }
     }
 
@@ -696,7 +704,7 @@ public final class SuspensionSession {
                 + "fewer than the " + known + " holds this debugging session knows of — something resumed it "
                 + "outside the session; jdwp_reset releases its stops");
         }
-        final Lease lease = new Lease(thread);
+        final Lease lease = new Lease(thread, anchor);
         for (Context other : others) {
             exempt(other, lease);
         }
@@ -723,6 +731,10 @@ public final class SuspensionSession {
         }
         if (lease.manualExempt && manual.contains(thread)) {
             suspendQuietly(thread);
+        }
+        // Last: the shares released contexts handed over (the invocation's restore put them back).
+        for (int i = 0; i < lease.debt; i++) {
+            resumeQuietly(thread);
         }
     }
 
@@ -797,6 +809,9 @@ public final class SuspensionSession {
 
     @Nullable
     private String releaseRefusal(ThreadReference thread) {
+        if (leases.containsKey(thread)) {
+            return "an evaluation is running on thread " + safeName(thread) + " — try again when it has finished";
+        }
         for (Context context : contexts) {
             if (!covers(context, thread)) {
                 continue;
@@ -867,26 +882,53 @@ public final class SuspensionSession {
         if (context == current) {
             current = null;
         }
+        // An invocation borrowing this context's suspension keeps its thread's share: resumed now, at
+        // count 0 mid-invocation, the resume would be lost and the invocation's restore would leave
+        // the thread suspended with no owner. The share moves to the lease, which resumes it at its end.
+        final Lease borrower = borrowerOf(context);
         try {
-            if (context.policy == EventRequest.SUSPEND_ALL) {
-                // Re-suspend the threads a user release took out, so the set's vm.resume() nets
-                // zero on them. Relative: a thread that has stopped again keeps its new stop.
-                for (ThreadReference thread : context.released) {
+            if (borrower != null && context.policy != EventRequest.SUSPEND_ALL) {
+                // The borrower's own stop of its thread alone: nothing else to release, and no thread
+                // is exempt from it (a lease never takes its thread out of its own anchor).
+                log.debug("[Suspension] {} released; its suspension of {} now belongs to the running "
+                    + "evaluation", context, safeName(borrower.thread));
+            } else {
+                if (context.policy == EventRequest.SUSPEND_ALL) {
+                    // Re-suspend the threads a user release took out, so the set's vm.resume() nets
+                    // zero on them. Relative: a thread that has stopped again keeps its new stop.
+                    for (ThreadReference thread : context.released) {
+                        suspendQuietly(thread);
+                    }
+                    if (borrower != null) {
+                        suspendQuietly(borrower.thread);
+                    }
+                }
+                // Likewise the leased threads taken out of it; their leases find it released.
+                for (ThreadReference thread : context.exempt) {
                     suspendQuietly(thread);
                 }
+                context.eventSet.resume();
             }
-            // Likewise the leased threads taken out of it; their leases find it released.
-            for (ThreadReference thread : context.exempt) {
-                suspendQuietly(thread);
-            }
-            context.eventSet.resume();
         } catch (RuntimeException e) {
             // VM gone or dying: the session is about to close.
             log.debug("[Suspension] Releasing {} failed: {}", context, e.toString());
         }
+        if (borrower != null) {
+            borrower.debt++;
+        }
         context.released.clear();
         context.exempt.clear();
         contexts.remove(context);
+    }
+
+    @Nullable
+    private Lease borrowerOf(Context context) {
+        for (Lease lease : leases.values()) {
+            if (lease.anchor == context) {
+                return lease;
+            }
+        }
+        return null;
     }
 
     /**
