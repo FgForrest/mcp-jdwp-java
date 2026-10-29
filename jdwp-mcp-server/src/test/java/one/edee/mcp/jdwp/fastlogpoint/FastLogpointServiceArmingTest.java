@@ -97,7 +97,7 @@ class FastLogpointServiceArmingTest {
 		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("thread not suspended"));
 		when(thread.isSuspended()).thenReturn(false);
 
-		assertThat(service.handleArmingHit(armingHit())).isEqualTo(FastLogpointService.ArmingOutcome.RESUME);
+		assertThat(service.handleArmingHit(armingHit(), false)).isEqualTo(FastLogpointService.ArmingOutcome.RESUME);
 
 		final FastLogpointService.Info info = service.list().get(0);
 		assertThat(info.state()).isEqualTo(FastLogpointService.State.FAILED);
@@ -112,7 +112,7 @@ class FastLogpointServiceArmingTest {
 		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("boom"));
 		when(thread.isSuspended()).thenReturn(true);
 
-		assertThat(service.handleArmingHit(armingHit())).as("the error stop is published")
+		assertThat(service.handleArmingHit(armingHit(), false)).as("the error stop is published")
 			.isEqualTo(FastLogpointService.ArmingOutcome.STOPPED);
 		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
 			&& e.details().get("reason").startsWith("condition failed: "));

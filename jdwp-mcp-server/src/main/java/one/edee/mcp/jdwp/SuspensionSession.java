@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -50,6 +51,15 @@ public final class SuspensionSession {
      * The manual hold in {@link #holdsOn}; context ids start at 1.
      */
     public static final long MANUAL_HOLD = 0L;
+    /**
+     * A step in flight in {@link #heldThreads}: the thread runs, but stops again where the user looks.
+     */
+    public static final long STEP_HOLD = -1L;
+    /**
+     * A suspension nothing in this session accounts for in {@link #heldThreads}: a set raised but
+     * not routed yet.
+     */
+    public static final long UNKNOWN_HOLD = -2L;
     /**
      * Request property marking a request whose events need their thread still stopped when the
      * dispatcher handles them even to skip them (a fast breakpoint's stop reads its arguments from
@@ -91,6 +101,11 @@ public final class SuspensionSession {
         private final ThreadReference thread;
         private final boolean vmStart;
         private final boolean staleAtRouting;
+        /**
+         * Whether a handler may publish a stop, as judged at routing: a set of logpoints, say, never
+         * does, so its threads are not held for the user (the redefinition rule, {@link #heldThreads}).
+         */
+        private final boolean mayStop;
         private State state = State.QUEUED;
         private boolean reported;
         private BreakpointTracker.@Nullable LastBreakpoint report;
@@ -118,7 +133,7 @@ public final class SuspensionSession {
         private boolean cancelled;
 
         private Context(long id, long generation, EventSet eventSet, int policy, @Nullable ThreadReference thread,
-                        boolean vmStart, boolean staleAtRouting) {
+                        boolean vmStart, boolean staleAtRouting, boolean mayStop) {
             this.id = id;
             this.generation = generation;
             this.eventSet = eventSet;
@@ -126,6 +141,7 @@ public final class SuspensionSession {
             this.thread = thread;
             this.vmStart = vmStart;
             this.staleAtRouting = staleAtRouting;
+            this.mayStop = mayStop;
         }
 
         public long id() {
@@ -380,12 +396,23 @@ public final class SuspensionSession {
      * @param vmStart whether the set reports VM start
      */
     public synchronized Context route(EventSet eventSet, @Nullable ThreadReference thread, boolean vmStart) {
+        return route(eventSet, thread, vmStart, true);
+    }
+
+    /**
+     * {@link #route(EventSet, ThreadReference, boolean)} for a set judged beforehand.
+     *
+     * @param mayStop whether a handler of the set may publish a stop; {@code false} for one that never
+     *                does (logpoints, say), whose threads the user never sees stopped
+     */
+    public synchronized Context route(EventSet eventSet, @Nullable ThreadReference thread, boolean vmStart,
+                                      boolean mayStop) {
         boolean stale = false;
         for (Event event : eventSet) {
             stale |= isStale(event.request());
         }
         final Context context = new Context(nextId++, generation, eventSet, eventSet.suspendPolicy(), thread, vmStart,
-            stale);
+            stale, mayStop);
         if (!closed) {
             contexts.add(context);
             if (context.policy == EventRequest.SUSPEND_ALL) {
@@ -697,6 +724,69 @@ public final class SuspensionSession {
             holds.add(MANUAL_HOLD);
         }
         return holds;
+    }
+
+    /**
+     * The threads the user may see stopped, with what holds each — for the redefinition rule (#42
+     * proposal § 6): a method a held thread has a frame in is never redefined, or the frame would
+     * turn obsolete and lose its locals. A hold is a context that is shown or may still be (HELD, or
+     * QUEUED or PROCESSING in the current generation, not cancelled, and able to stop), a manual hold
+     * ({@link #MANUAL_HOLD}), a step in flight ({@link #STEP_HOLD}), or a suspension nothing here
+     * accounts for ({@link #UNKNOWN_HOLD}: a set raised but not routed yet). As in {@link #holdsOn},
+     * a lease's exemption still counts. The set the calling thread processes counts only with
+     * {@code countProcessing} — an arming hit's own set, which resumes without being shown unless
+     * it has a stop.
+     *
+     * @param threads        the target's threads; every thread this session knows is added
+     * @param callerSuspends how often the caller itself suspended every thread ({@code vm.suspend()}),
+     *                       which the check for unknown suspensions discounts
+     */
+    public synchronized Map<ThreadReference, Set<Long>> heldThreads(Collection<ThreadReference> threads,
+                                                                     boolean countProcessing, int callerSuspends) {
+        if (closed) {
+            return Map.of();
+        }
+        final Processing processing = PROCESSING.get();
+        final Context own = processing != null && processing.session() == this && !countProcessing
+            ? processing.context() : null;
+        final Set<ThreadReference> candidates = new LinkedHashSet<>(threads);
+        for (Context context : contexts) {
+            if (context.thread != null) {
+                candidates.add(context.thread);
+            }
+        }
+        candidates.addAll(manual);
+        candidates.addAll(leases.keySet());
+        candidates.addAll(pendingSteps.keySet());
+        final Map<ThreadReference, Set<Long>> held = new LinkedHashMap<>();
+        for (ThreadReference thread : candidates) {
+            final Set<Long> holds = new LinkedHashSet<>();
+            // Every suspension still on the thread, shown or not: what its count should be.
+            int suspensions = callerSuspends;
+            for (Context context : contexts) {
+                if (covers(context, thread)) {
+                    suspensions++;
+                }
+                if (context != own && claims(context, thread) && mayBeShown(context)) {
+                    holds.add(context.id);
+                }
+            }
+            if (manual.contains(thread)) {
+                holds.add(MANUAL_HOLD);
+                suspensions++;
+            }
+            if (pendingSteps.containsKey(thread)) {
+                holds.add(STEP_HOLD);
+            }
+            // A leased thread's count is in flux (its invocation, the shares it keeps); its holds are known.
+            if (!leases.containsKey(thread) && suspendCountOf(thread) > suspensions) {
+                holds.add(UNKNOWN_HOLD);
+            }
+            if (!holds.isEmpty()) {
+                held.put(thread, holds);
+            }
+        }
+        return held;
     }
 
     /**
@@ -1305,6 +1395,19 @@ public final class SuspensionSession {
             case EventRequest.SUSPEND_ALL -> true;
             case EventRequest.SUSPEND_EVENT_THREAD -> thread.equals(context.thread);
             default -> false;
+        };
+    }
+
+    /**
+     * Whether {@code context} is a stop the user sees, or may still be: one that {@link #finish}
+     * can publish.
+     */
+    private boolean mayBeShown(Context context) {
+        return switch (context.state) {
+            case HELD -> true;
+            case QUEUED, PROCESSING -> context.mayStop && context.generation == generation && !context.staleAtRouting
+                && !context.cancelled && context.policy != EventRequest.SUSPEND_NONE;
+            case RELEASED -> false;
         };
     }
 

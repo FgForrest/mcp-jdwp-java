@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
 import com.sun.jdi.Method;
+import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
@@ -175,5 +177,20 @@ final class LiveSession implements AutoCloseable {
 			}
 		}
 		throw new IllegalStateException(marker + " not found in " + TARGET_SOURCE);
+	}
+
+	/**
+	 * Enables a one-shot request while every thread is suspended. JDI drops an event the target
+	 * raises before the enable reply is read, and on a hot line that spends the count filter: the
+	 * request would never report a hit (the service's arming requests do the same).
+	 */
+	static void enableSuspended(EventRequest request) {
+		final VirtualMachine vm = request.virtualMachine();
+		vm.suspend();
+		try {
+			request.enable();
+		} finally {
+			vm.resume();
+		}
 	}
 }

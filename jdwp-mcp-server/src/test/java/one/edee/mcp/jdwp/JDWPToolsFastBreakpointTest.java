@@ -46,7 +46,7 @@ class JDWPToolsFastBreakpointTest {
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
 		tracker = new BreakpointTracker();
-		fastLogpoints = mock(FastLogpointService.class);
+		fastLogpoints = JDWPToolsTestSupport.fastLogpointsMock();
 		tools = JDWPToolsTestSupport.newTools(jdiService, tracker, new EventHistory(), fastLogpoints);
 	}
 

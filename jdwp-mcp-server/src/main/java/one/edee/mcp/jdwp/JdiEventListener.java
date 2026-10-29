@@ -444,7 +444,7 @@ public class JdiEventListener {
                     suppress(eventSet, suspensions);
                 } else {
                     final SuspensionSession.Context context =
-                        suspensions.route(eventSet, threadOf(eventSet), isVmStart(eventSet));
+                        suspensions.route(eventSet, threadOf(eventSet), isVmStart(eventSet), mayStop(eventSet));
                     dispatcher.execute(() -> dispatch(eventSet, suspensions, context));
                 }
             } catch (InterruptedException e) {
@@ -614,8 +614,10 @@ public class JdiEventListener {
         if (armingHits != null && fastLogpointService != null) {
             for (BreakpointEvent armingHit : armingHits) {
                 final int candidates = candidateMark(suspensions, context);
-                // A fast breakpoint's arming hit whose condition holds is published as its stop.
-                if (fastLogpointService.handleArmingHit(armingHit) == FastLogpointService.ArmingOutcome.STOPPED) {
+                // A fast breakpoint's arming hit whose condition holds is published as its stop. A set
+                // that stops keeps its thread for the user, so arming must not obsolete its frame.
+                if (fastLogpointService.handleArmingHit(armingHit, shouldSuspend)
+                    == FastLogpointService.ArmingOutcome.STOPPED) {
                     shouldSuspend = true;
                     if (warmThread == null) {
                         warmThread = armingHit.thread();
@@ -657,6 +659,44 @@ public class JdiEventListener {
         if (suspensions != null && context != null) {
             suspensions.dropCandidatesAfter(context, mark);
         }
+    }
+
+    /**
+     * Whether a handler of {@code eventSet} may publish a stop, judged before it is processed: only a
+     * set the user may see holds its threads against a fast probe's redefinition (#42 proposal § 6).
+     * Logpoints of every kind, a fast logpoint's arming hit and a class prepare never stop; anything
+     * else may. Debugger-side lookups only — the listener thread never calls into the target.
+     * Package-private for tests.
+     */
+    boolean mayStop(EventSet eventSet) {
+        final FastLogpointService fastLogpointService = fastLogpoints;
+        for (Event event : eventSet) {
+            final boolean neverStops;
+            if (event instanceof ClassPrepareEvent) {
+                neverStops = true;
+            } else if (event instanceof BreakpointEvent bpEvent
+                && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
+                neverStops = fastLogpointService.armingNeverStops(bpEvent);
+            } else if (event instanceof BreakpointEvent bpEvent) {
+                final Integer id = bpEvent.request() instanceof BreakpointRequest request
+                    ? breakpointTracker.findIdByRequest(request) : null;
+                neverStops = id != null && breakpointTracker.isLogpoint(id);
+            } else if (event instanceof ExceptionEvent exEvent) {
+                final BreakpointTracker.ExceptionBreakpointInfo info = exEvent.request() instanceof ExceptionRequest
+                    request ? breakpointTracker.findExceptionInfoByRequest(request) : null;
+                neverStops = info != null && info.isLogOnly();
+            } else if (event instanceof WatchpointEvent wpEvent) {
+                final BreakpointTracker.FieldBreakpointInfo info = wpEvent.request() instanceof WatchpointRequest
+                    request ? breakpointTracker.findFieldInfoByRequest(request) : null;
+                neverStops = info != null && info.getSpec().logOnly();
+            } else {
+                neverStops = false;
+            }
+            if (!neverStops) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -814,10 +854,10 @@ public class JdiEventListener {
     }
 
     /**
-     * Whether the request of an untracked event is gone: deleted while the event's set waited for the
-     * dispatcher — a cleared breakpoint, a class redefined by a fast logpoint. JDI drops such an
-     * event when its set leaves the queue and resumes the set; the dispatcher does the same instead
-     * of parking the thread as an untracked hit nobody would resume. (A deleted request reports
+     * Whether the request of an untracked or just-cleared event is gone: deleted while the event's
+     * set waited for the dispatcher — a cleared breakpoint, a class redefined by a fast logpoint. JDI
+     * drops such an event when its set leaves the queue and resumes the set; the dispatcher does the
+     * same instead of parking the thread as a hit nobody would resume. (A deleted request reports
      * disabled; a tracked request that is merely disabled still counts as a hit, as it would have
      * when the set left the queue.)
      */
@@ -996,14 +1036,20 @@ public class JdiEventListener {
                 return true;
             }
 
+            final String logpointExpr = breakpointTracker.getLogpointExpression(bpId);
+            final String condition = breakpointTracker.getCondition(bpId);
+            // Cleared while its set waited: a clear deletes the request before it drops the logpoint
+            // expression and condition just read, so without this check a logpoint's hit could
+            // stop as a plain breakpoint nobody set.
+            if (breakpointTracker.getBreakpoint(bpId) != request && isDeleted(rawRequest)) {
+                return false;
+            }
+
             breakpointTracker.setLastBreakpointThread(event.thread(), bpId);
 
             final String className = event.location().declaringType().name();
             final int lineNumber = event.location().lineNumber();
             final String threadName = event.thread().name();
-
-            final String logpointExpr = breakpointTracker.getLogpointExpression(bpId);
-            final String condition = breakpointTracker.getCondition(bpId);
 
             final String conditionLocation = className + ':' + lineNumber;
 

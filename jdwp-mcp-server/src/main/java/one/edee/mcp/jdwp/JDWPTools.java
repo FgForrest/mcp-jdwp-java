@@ -1402,7 +1402,10 @@ public class JDWPTools {
         try {
             jdiService.getVM();
             final SuspensionSession.ReleaseResult result = suspensions().releaseAll();
-            return renderRelease(result) + " To wait for the next event, use jdwp_resume_until_event.";
+            // A thread released here may have kept a cleared fast probe's class from being restored.
+            final String restored = fastLogpoints.retryPendingRemovals();
+            return renderRelease(result) + (restored.isEmpty() ? "" : " " + restored)
+                + " To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -1516,10 +1519,12 @@ public class JDWPTools {
                 throw new IllegalStateException("not connected — no debugging session");
             }
             final SuspensionSession.NextStop next = session.nextStop(deadlineMs);
+            final String restored = next.outcome() == SuspensionSession.Outcome.CLOSED
+                ? "" : fastLogpoints.retryPendingRemovals();
             // What the call released before it waited, as a trailing line: replies keep starting with
             // "Event fired" / "Status: still_waiting".
-            final String releasedSuffix = next.released() != null && next.released().releasedAnything()
-                ? "\n" + renderRelease(next.released()) : "";
+            final String releasedSuffix = (next.released() != null && next.released().releasedAnything()
+                ? "\n" + renderRelease(next.released()) : "") + (restored.isEmpty() ? "" : "\n" + restored);
             switch (next.outcome()) {
                 case TIMEOUT -> {
                     return renderSoftWaitEnvelope("jdwp_resume_until_event", deadlineMs)
@@ -2397,8 +2402,10 @@ public class JDWPTools {
             if (!release.released()) {
                 return String.format("Thread %d (%s) was not resumed: %s", threadId, thread.name(), release.refusal());
             }
-            return String.format("Thread %d (%s) resumed (released: %s). Use jdwp_resume_until_event to wait for the next "
-                + "event.", threadId, thread.name(), String.join("; ", release.holders()));
+            final String restored = fastLogpoints.retryPendingRemovals();
+            return String.format("Thread %d (%s) resumed (released: %s).%s Use jdwp_resume_until_event to wait for the "
+                + "next event.", threadId, thread.name(), String.join("; ", release.holders()),
+                restored.isEmpty() ? "" : " " + restored);
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -4196,6 +4203,7 @@ public class JDWPTools {
                 totalShown += appendBreakpointOverview(out, needle, true, renderEmpty);
             }
             if (wanted.contains("fast_logpoint") || wanted.contains("fast_breakpoint")) {
+                fastLogpoints.retryPendingRemovals();
                 final String retried = retryLeftoverDiscovery();
                 if (wanted.contains("fast_logpoint")) {
                     totalShown += appendFastLogpointOverview(out, needle, renderEmpty);
@@ -4467,6 +4475,7 @@ public class JDWPTools {
                 case DISABLED -> "DISABLED, still installed — " + info.failureReason();
                 case FAILED -> "FAILED: " + info.failureReason();
                 case DISARMED -> "DISARMED";
+                case REMOVAL_PENDING -> "CLEARED, class restore pending";
                 case RECOVERED -> "RECOVERED, " + switchState + " — " + counters
                     + "; jdwp_clear_breakpoint disables, jdwp_restore_fast_logpoints restores (user approval)";
                 case STRANDED -> "STRANDED, " + switchState + " — " + info.failureReason();
@@ -4514,6 +4523,7 @@ public class JDWPTools {
                 case DISABLED -> "DISABLED, still installed — " + info.failureReason();
                 case FAILED -> "FAILED: " + info.failureReason();
                 case DISARMED -> "DISARMED";
+                case REMOVAL_PENDING -> "CLEARED, class restore pending";
                 case RECOVERED -> "RECOVERED, " + switchState + ", never stops — " + counted
                     + "; jdwp_clear_breakpoint disables, jdwp_restore_fast_logpoints restores (user approval)";
                 case STRANDED -> "STRANDED, " + switchState + ", never stops — " + info.failureReason();

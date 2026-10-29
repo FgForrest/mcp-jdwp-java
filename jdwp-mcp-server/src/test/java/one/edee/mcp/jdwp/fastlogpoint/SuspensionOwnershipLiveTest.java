@@ -18,6 +18,7 @@ import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.TARGET;
+import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.enableSuspended;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.idOf;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.lineOf;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -79,7 +80,7 @@ class SuspensionOwnershipLiveTest {
 			parkHolder.addThreadFilter(holder);
 			parkHolder.addCountFilter(1);
 			parkHolder.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-			parkHolder.enable();
+			enableSuspended(parkHolder);
 
 			await("the watchdog to release the holder", () -> eventTypes().contains("EVALUATION_UNBLOCKED"));
 			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).as("the holder's stop was cancelled, not shown")
@@ -123,7 +124,7 @@ class SuspensionOwnershipLiveTest {
 		heldStop.addThreadFilter(held);
 		heldStop.addCountFilter(1);
 		final int heldId = session.tracker.registerBreakpoint(heldStop);
-		heldStop.enable();
+		enableSuspended(heldStop);
 		int logpointId = -1;
 		BreakpointRequest queuedStop = null;
 		try {
@@ -139,7 +140,7 @@ class SuspensionOwnershipLiveTest {
 			queuedStop.addThreadFilter(holder);
 			queuedStop.addCountFilter(1);
 			queuedStop.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-			queuedStop.enable();
+			enableSuspended(queuedStop);
 			await("the holder's stop-all to queue", () -> sessionState().contains("QUEUED"));
 			assertThat(held.suspendCount()).as("its own stop and the queued stop-all").isEqualTo(2);
 

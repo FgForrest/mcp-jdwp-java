@@ -23,6 +23,7 @@ import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.enableSuspended;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.idOf;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.lineOf;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -148,10 +149,15 @@ class FastLogpointLiveTest {
 	@DisplayName("a breakpoint re-created on the instrumented bytecode still fires")
 	void recreatedBreakpointStillFires() throws Exception {
 		final int breakpointId = tracker.getAllBreakpoints().keySet().iterator().next();
+		// One worker only: a hit of the other one raised just before the disable would still stop
+		// (a disabled breakpoint's queued hit counts), and hold that worker in other() against the
+		// next test's redefinition.
+		Objects.requireNonNull(tracker.getBreakpoint(breakpointId)).addThreadFilter(connection.getVM().allThreads()
+			.stream().filter(t -> "worker-0".equals(t.name())).findFirst().orElseThrow());
 		tracker.setBreakpointEnabledById(breakpointId, true);
 		try {
 			final String reply = tools.jdwp_resume_until_event(20_000);
-			assertThat(reply).contains("Event fired").contains(TARGET);
+			assertThat(reply).contains("Event fired").contains(TARGET).contains("worker-0");
 		} finally {
 			tracker.setBreakpointEnabledById(breakpointId, false);
 			tools.jdwp_resume();
@@ -183,7 +189,7 @@ class FastLogpointLiveTest {
 		Thread.sleep(500);
 		await("a FAST_LOGPOINT_DROPPED event", () -> drainedEvents("FAST_LOGPOINT_DROPPED").stream()
 			.anyMatch(e -> e.summary().contains("[FastLogpoint " + id + "]") && e.summary().contains("buffer overrun")));
-		assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 	}
 
 	@Test
@@ -197,7 +203,7 @@ class FastLogpointLiveTest {
 			}
 		}
 		for (FastLogpointService.Info info : fastLogpoints.list()) {
-			assertThat(tools.jdwp_clear_breakpoint(info.id())).contains("original bytecode");
+			assertThat(tools.jdwp_clear_breakpoint(info.id())).contains("cleared — original bytecode");
 		}
 		assertBytecodeRestored();
 		// The probe classes stay loaded; their rings must not keep entries reachable.
@@ -268,8 +274,8 @@ class FastLogpointLiveTest {
 
 	@Test
 	@Order(9)
-	@DisplayName("arms through another thread while one thread is parked on the same line")
-	void armsWhileAnotherThreadIsParkedOnTheLine() throws Exception {
+	@DisplayName("arming waits while a thread is parked in the method, and arms once that thread is released")
+	void armingWaitsForAThreadParkedInTheMethod() throws Exception {
 		final VirtualMachine vm = connection.getVM();
 		final ThreadReference parked = vm.allThreads().stream()
 			.filter(t -> "worker-0".equals(t.name())).findFirst().orElseThrow();
@@ -279,12 +285,23 @@ class FastLogpointLiveTest {
 		park.addThreadFilter(parked);
 		park.addCountFilter(1);
 		final int parkId = tracker.registerBreakpoint(park);
-		park.enable();
+		enableSuspended(park);
 		try {
 			await("worker-0 parked on the probe line", parked::isSuspended);
 			final int id = idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null));
+			// Redefining compute() now would leave worker-0's frame there obsolete, without its locals.
+			await("arming deferred", () -> eventTypes().contains("FAST_LOGPOINT_ARMING_DEFERRED"));
+			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_LOGPOINT_ARMING_DEFERRED"
+				.equals(e.type()) && e.summary().contains("thread worker-0 is stopped in compute"));
+			assertThat(fastLogpoints.list()).filteredOn(info -> info.id() == id).singleElement()
+				.satisfies(info -> assertThat(info.state()).isEqualTo(FastLogpointService.State.PENDING));
+			assertBytecodeRestored();
+			assertThat(parked.frame(0).location().method().isObsolete()).isFalse();
+
+			tools.jdwp_clear_breakpoint(parkId);
+			Objects.requireNonNull(tracker.suspensionSession()).reset();
 			awaitArmed(id);
-			assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
+			assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 		} finally {
 			tools.jdwp_clear_breakpoint(parkId);
 			// Release the park through the session that holds it (a stop nobody has seen): a raw
@@ -459,7 +476,7 @@ class FastLogpointLiveTest {
 			final int fastId = idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "this.other(i)", null, true, null, null));
 			awaitArmed(fastId);
 			assertThat(suppressedAtOtherLine()).isTrue();
-			assertThat(tools.jdwp_clear_breakpoint(fastId)).contains("original bytecode");
+			assertThat(tools.jdwp_clear_breakpoint(fastId)).contains("cleared — original bytecode");
 		} finally {
 			tools.jdwp_clear_breakpoint(otherId);
 		}

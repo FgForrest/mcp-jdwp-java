@@ -273,12 +273,16 @@ public class BreakpointTracker {
         // Try active breakpoints first
         final BreakpointRequest bp = breakpointsById.remove(id);
         if (bp != null) {
-            breakpointIdsByRequest.remove(bp);
+            // Delete before forgetting the request: a hit still queued then finds either its ID or
+            // a disabled request, never an enabled one nobody knows — the listener would keep that
+            // thread stopped as an untracked breakpoint. The metadata goes last, after the request
+            // is deleted, which lets the listener tell a hit whose metadata vanished meanwhile.
             try {
                 bp.virtualMachine().eventRequestManager().deleteEventRequest(bp);
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            breakpointIdsByRequest.remove(bp);
             breakpointMetadata.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
@@ -799,13 +803,14 @@ public class BreakpointTracker {
     public synchronized boolean removeExceptionBreakpoint(int id) {
         final ExceptionBreakpointInfo info = exceptionBreakpointsById.remove(id);
         if (info != null) {
-            exceptionInfoByRequest.remove(info.request);
-            exceptionIdsByRequest.remove(info.request);
+            // Delete first, as removeBreakpoint does.
             try {
                 info.request.virtualMachine().eventRequestManager().deleteEventRequest(info.request);
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            exceptionInfoByRequest.remove(info.request);
+            exceptionIdsByRequest.remove(info.request);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -1397,19 +1402,20 @@ public class BreakpointTracker {
     }
 
     /**
-     * Removes the {@code req → info} and {@code req → id} reverse-index entries for the given field
-     * watchpoint, then best-effort deletes the underlying JDI request — exceptions are swallowed so
-     * a removal can still complete against a VM in mid-disconnect. Shared by the access and
-     * modification arms of {@link #removeFieldBreakpoint}; callers null-guard before invocation.
+     * Best-effort deletes the JDI request of the given field watchpoint — exceptions are swallowed
+     * so a removal can still complete against a VM in mid-disconnect — then removes its
+     * {@code req → info} and {@code req → id} reverse-index entries, in that order for the reason
+     * {@link #removeBreakpoint} gives. Shared by the access and modification arms of
+     * {@link #removeFieldBreakpoint}; callers null-guard before invocation.
      */
     private void tearDownFieldRequestQuietly(WatchpointRequest req) {
-        fieldInfoByRequest.remove(req);
-        fieldIdsByRequest.remove(req);
         try {
             req.virtualMachine().eventRequestManager().deleteEventRequest(req);
         } catch (Exception e) {
             // VM may already be disconnected
         }
+        fieldInfoByRequest.remove(req);
+        fieldIdsByRequest.remove(req);
     }
 
     // ── Chain (dependency) operations ──

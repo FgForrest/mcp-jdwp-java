@@ -24,6 +24,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.TARGET;
+import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.enableSuspended;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.idOf;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.lineOf;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -170,7 +171,7 @@ class FastBreakpointLiveTest {
 
 		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, null, null, null))
 			.startsWith("Error: fast breakpoint " + id + " is already set");
-		assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 		assertBytecodeRestored();
 	}
 
@@ -194,7 +195,7 @@ class FastBreakpointLiveTest {
 			tools.jdwp_resume();
 		}
 		await("both stops counted", () -> counters(id).stops() >= 2);
-		assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 		assertBytecodeRestored();
 	}
 
@@ -214,7 +215,7 @@ class FastBreakpointLiveTest {
 		assertThat(tools.jdwp_resume_until_event(QUIET_MS)).as("later failures do not stop").contains("still_waiting");
 		await("failures counted in the target", () -> counters(id).errors() > 0);
 		assertThat(eventTypes()).contains("FAST_BREAKPOINT_ERROR");
-		assertThat(tools.jdwp_clear_breakpoint(id)).contains("original bytecode");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 		assertBytecodeRestored();
 	}
 
@@ -317,7 +318,7 @@ class FastBreakpointLiveTest {
 		park.addThreadFilter(slow);
 		park.addCountFilter(1);
 		final int parkId = session.tracker.registerBreakpoint(park);
-		park.enable();
+		enableSuspended(park);
 		try {
 			assertThat(waitForStop()).contains("Thread: worker-0");
 
@@ -340,6 +341,53 @@ class FastBreakpointLiveTest {
 		} finally {
 			tools.jdwp_clear_breakpoint(parkId);
 		}
+	}
+
+	@Test
+	@Order(9)
+	@DisplayName("clear while a thread is stopped in the method: disabled at once, the class restored once the stop is released")
+	void clearWhileStoppedRestoresAfterTheRelease() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
+		final ThreadReference stopped = stoppedThread();
+
+		// Restoring compute() now would leave the stopped frame obsolete, without its locals.
+		assertThat(tools.jdwp_clear_breakpoint(id))
+			.contains("Fast breakpoint " + id + " disabled now")
+			.contains("thread " + stopped.name() + " is stopped in compute");
+		assertThat(fastLogpoints.list()).as("cleared: no longer listed").isEmpty();
+		assertThat(eventTypes()).contains("FAST_BREAKPOINT_REMOVAL_DEFERRED");
+		assertThat(bytecodeIsOriginal()).as("compute() still calls the disabled probe").isFalse();
+		assertThat(tools.jdwp_get_locals(stopped.uniqueID(), 0)).as("the stopped frame keeps its locals")
+			.contains("doubled (int) = ");
+
+		assertThat(tools.jdwp_resume()).contains("Cleared fast breakpoint " + id + ": the original bytecode of "
+			+ TARGET + " is restored.");
+		assertBytecodeRestored();
+		assertThat(eventTypes()).contains("FAST_BREAKPOINT_DISARMED");
+	}
+
+	@Test
+	@Order(10)
+	@DisplayName("jdwp_reset completes a removal still waiting for a stopped thread: it releases every stop as well")
+	void resetCompletesAPendingRemoval() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("disabled now");
+
+		tools.jdwp_reset();
+
+		assertBytecodeRestored();
+		assertThat(fastLogpoints.list()).isEmpty();
+		await("every worker running", () -> {
+			try {
+				return workers().stream().allMatch(worker -> worker.suspendCount() == 0);
+			} catch (Exception e) {
+				return false;
+			}
+		});
 	}
 
 	// ── helpers ──
@@ -433,6 +481,19 @@ class FastBreakpointLiveTest {
 		final ReferenceType type = vm.classesByName(TARGET).get(0);
 		final ObjectReference counter = (ObjectReference) type.getValue(type.fieldByName("CALLS"));
 		return ((LongValue) counter.getValue(counter.referenceType().fieldByName("value"))).value();
+	}
+
+	private boolean bytecodeIsOriginal() throws Exception {
+		final Map<String, byte[]> live = session.liveBytecode();
+		if (!live.keySet().equals(originalBytecode.keySet())) {
+			return false;
+		}
+		for (Map.Entry<String, byte[]> method : live.entrySet()) {
+			if (!java.util.Arrays.equals(method.getValue(), originalBytecode.get(method.getKey()))) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private void assertBytecodeRestored() throws Exception {

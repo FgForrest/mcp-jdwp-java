@@ -11,11 +11,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -250,6 +252,28 @@ class BreakpointTrackerTest {
 			assertThat(tracker.getBreakpoint(id)).isNull();
 			assertThat(tracker.getAllBreakpoints()).isEmpty();
 			verify(mockErm).deleteEventRequest(mockBp);
+		}
+
+		@Test
+		void shouldDeleteTheRequestBeforeForgettingIt() {
+			BreakpointRequest mockBp = mock(BreakpointRequest.class);
+			VirtualMachine mockVm = mock(VirtualMachine.class);
+			EventRequestManager mockErm = mock(EventRequestManager.class);
+			when(mockBp.virtualMachine()).thenReturn(mockVm);
+			when(mockVm.eventRequestManager()).thenReturn(mockErm);
+			int id = tracker.registerBreakpoint(mockBp);
+			// A hit still queued while the request is deleted must find its ID: an enabled request
+			// nobody knows is kept stopped as an untracked breakpoint.
+			List<Integer> idDuringDelete = new ArrayList<>();
+			doAnswer(invocation -> {
+				idDuringDelete.add(tracker.findIdByRequest(mockBp));
+				return null;
+			}).when(mockErm).deleteEventRequest(mockBp);
+
+			assertThat(tracker.removeBreakpoint(id)).isTrue();
+
+			assertThat(idDuringDelete).containsExactly(id);
+			assertThat(tracker.findIdByRequest(mockBp)).isNull();
 		}
 
 		@Test

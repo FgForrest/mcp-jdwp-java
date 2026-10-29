@@ -2,7 +2,9 @@ package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.StepEvent;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
@@ -22,6 +24,7 @@ import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -67,12 +70,12 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final ThreadReference thread = mockThread("worker", 11L);
 		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
-		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.RESUME);
+		when(fastLogpoints.handleArmingHit(arming, false)).thenReturn(FastLogpointService.ArmingOutcome.RESUME);
 		final EventSet eventSet = mockEventSet(arming);
 
 		runListenerWith(listener, eventSet);
 
-		verify(fastLogpoints).handleArmingHit(arming);
+		verify(fastLogpoints).handleArmingHit(arming, false);
 		verify(eventSet).resume();
 		assertThat(tracker.getLastBreakpointThread()).isNull();
 		assertThat(history.getRecent(10)).noneMatch(e -> "BREAKPOINT".equals(e.type()));
@@ -92,16 +95,20 @@ class JdiEventListenerFastLogpointRoutingTest {
 		// The regular breakpoint's stop is a candidate of the set by the time arming runs (its history
 		// is buffered until the set finishes, issue #45).
 		final List<Integer> candidatesWhenArming = new ArrayList<>();
+		final List<Boolean> setStops = new ArrayList<>();
 		doAnswer(invocation -> {
 			candidatesWhenArming.add(SuspensionSession.processingCandidateCount());
+			setStops.add(invocation.getArgument(1));
 			return FastLogpointService.ArmingOutcome.RESUME;
-		}).when(fastLogpoints).handleArmingHit(any());
+		}).when(fastLogpoints).handleArmingHit(any(), anyBoolean());
 		// Arming event first in the set: the listener must still defer it.
 		final EventSet eventSet = mockEventSet(arming, user);
 
 		runListenerWith(listener, eventSet);
 
 		assertThat(candidatesWhenArming).containsExactly(1);
+		assertThat(setStops).as("arming is told its set stops, so the redefinition rule counts its thread")
+			.containsExactly(true);
 		assertThat(history.getRecent(10)).extracting(EventHistory.DebugEvent::type).contains("BREAKPOINT");
 		assertThat(tracker.getLastBreakpointId()).isEqualTo(userId);
 		verify(eventSet, never()).resume();
@@ -113,7 +120,7 @@ class JdiEventListenerFastLogpointRoutingTest {
 		final ThreadReference thread = mockThread("worker", 13L);
 		final BreakpointEvent arming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
 		when(fastLogpoints.claimsArmingEvent(arming)).thenReturn(true);
-		when(fastLogpoints.handleArmingHit(arming)).thenReturn(FastLogpointService.ArmingOutcome.STOPPED);
+		when(fastLogpoints.handleArmingHit(arming, false)).thenReturn(FastLogpointService.ArmingOutcome.STOPPED);
 		final EventSet eventSet = mockEventSet(arming);
 
 		runListenerWith(listener, eventSet);
@@ -175,5 +182,27 @@ class JdiEventListenerFastLogpointRoutingTest {
 		verify(fastLogpoints).skipStopHit(stop);
 		verify(fastLogpoints, never()).handleStopHit(any());
 		verify(eventSet).resume();
+	}
+
+	@Test
+	@DisplayName("a set of logpoints, fast-logpoint arming hits and class prepares never stops; anything else may")
+	void judgesWhetherASetMayStop() {
+		final ThreadReference thread = mockThread("worker", 14L);
+		final BreakpointRequest logpointRequest = mock(BreakpointRequest.class);
+		tracker.setLogpointExpression(tracker.registerBreakpoint(logpointRequest), "i");
+		final BreakpointEvent logpoint = mockBreakpointEvent(thread, logpointRequest, "com.example.Hot", 10);
+		final BreakpointRequest breakpointRequest = mock(BreakpointRequest.class);
+		tracker.registerBreakpoint(breakpointRequest);
+		final BreakpointEvent breakpoint = mockBreakpointEvent(thread, breakpointRequest, "com.example.Hot", 11);
+		final BreakpointEvent logpointArming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 12);
+		final BreakpointEvent breakpointArming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 13);
+		when(fastLogpoints.claimsArmingEvent(logpointArming)).thenReturn(true);
+		when(fastLogpoints.armingNeverStops(logpointArming)).thenReturn(true);
+		when(fastLogpoints.claimsArmingEvent(breakpointArming)).thenReturn(true);
+
+		assertThat(listener.mayStop(mockEventSet(logpoint, logpointArming, mock(ClassPrepareEvent.class)))).isFalse();
+		assertThat(listener.mayStop(mockEventSet(logpoint, breakpoint))).isTrue();
+		assertThat(listener.mayStop(mockEventSet(breakpointArming))).as("a fast breakpoint's arming hit may stop").isTrue();
+		assertThat(listener.mayStop(mockEventSet(mock(StepEvent.class)))).isTrue();
 	}
 }
