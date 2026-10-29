@@ -110,6 +110,73 @@ class SuspensionOwnershipLiveTest {
 		});
 	}
 
+	@Test
+	@Order(2)
+	@DisplayName("jdwp_resume releases the stop it holds, not the stop-all queued behind an evaluation, which is shown later with its thread stopped")
+	void resumeReleasesOnlyHeldStops() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final ThreadReference held = thread("worker-1");
+		final ThreadReference holder = thread("lock-holder");
+		final Location probe = vm.classesByName(TARGET).get(0).locationsOfLine(lineOf("// MARK: probe")).get(0);
+		final BreakpointRequest heldStop = vm.eventRequestManager().createBreakpointRequest(probe);
+		heldStop.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+		heldStop.addThreadFilter(held);
+		heldStop.addCountFilter(1);
+		final int heldId = session.tracker.registerBreakpoint(heldStop);
+		heldStop.enable();
+		int logpointId = -1;
+		BreakpointRequest queuedStop = null;
+		try {
+			assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis())).contains("Thread: worker-1");
+
+			// The dispatcher is busy in a 3 s evaluation on worker-0 when a stop-all of the holder arrives.
+			logpointId = idOf(tools.jdwp_set_field_logpoint(TARGET, "base", "access",
+				"{ java.util.concurrent.locks.LockSupport.parkNanos(3_000_000_000L); return \"slept\"; }", null,
+				thread("worker-0").uniqueID(), null, null, null, null, null));
+			await("an evaluation in flight on worker-0", () -> sessionState().contains("leases=[worker-0]"));
+			queuedStop = vm.eventRequestManager().createBreakpointRequest(
+				vm.classesByName(TARGET).get(0).locationsOfLine(lineOf("// MARK: holding")).get(0));
+			queuedStop.addThreadFilter(holder);
+			queuedStop.addCountFilter(1);
+			queuedStop.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+			queuedStop.enable();
+			await("the holder's stop-all to queue", () -> sessionState().contains("QUEUED"));
+			assertThat(held.suspendCount()).as("its own stop and the queued stop-all").isEqualTo(2);
+
+			assertThat(tools.jdwp_resume()).contains("worker-1");
+			assertThat(held.suspendCount()).as("only the held stop was released").isEqualTo(1);
+			assertThat(holder.suspendCount()).as("the queued set still holds its thread").isEqualTo(1);
+
+			tools.jdwp_clear_breakpoint(logpointId);
+			logpointId = -1;
+			final String shown = tools.jdwp_resume_until_event((int) TIMEOUT.toMillis());
+			assertThat(shown).contains("Thread: lock-holder").contains("suspended=true");
+			assertThat(holder.isSuspended()).as("a stop is never shown for a running thread").isTrue();
+		} finally {
+			if (logpointId >= 0) {
+				tools.jdwp_clear_breakpoint(logpointId);
+			}
+			if (queuedStop != null) {
+				vm.eventRequestManager().deleteEventRequest(queuedStop);
+			}
+			tools.jdwp_clear_breakpoint(heldId);
+			await("the dispatcher to finish its sets", this::dispatcherIdle);
+			Objects.requireNonNull(session.tracker.suspensionSession()).reset();
+		}
+		await("every thread running again", () -> {
+			try {
+				for (ThreadReference thread : vm.allThreads()) {
+					if ((thread.name().startsWith("worker-") || thread == holder) && thread.suspendCount() != 0) {
+						return false;
+					}
+				}
+				return true;
+			} catch (Exception e) {
+				return false;
+			}
+		});
+	}
+
 	// ── helpers ──
 
 	private ThreadReference thread(String name) throws Exception {

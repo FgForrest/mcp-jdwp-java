@@ -637,7 +637,7 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 ### Stepping: when it's worth it
 
-`jdwp_step_over` / `jdwp_step_into` / `jdwp_step_out` are wired through the same event-and-latch pipeline as breakpoints — the step resumes the thread, the next `STEP` event suspends it again, and `jdwp_resume_until_event` blocks on it. `threadId` is optional; omitted, the step targets the thread of the last breakpoint hit.
+`jdwp_step_over` / `jdwp_step_into` / `jdwp_step_out` go through the same stop pipeline as breakpoints — the step releases the stepping thread, the next `STEP` event stops that thread alone again, and `jdwp_resume_until_event` waits for it without resuming anything else; other threads parked by the original stop stay parked until `jdwp_resume`. `threadId` is optional; omitted, the step targets the thread of the current stop.
 
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
@@ -674,7 +674,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool                      | Parameters   | Description                                                  |
 |---------------------------|--------------|--------------------------------------------------------------|
-| `jdwp_resume`             | —            | Resume all threads                                           |
+| `jdwp_resume`             | —            | Release the stops you have seen and `jdwp_suspend_thread` holds; event sets still being processed keep their threads until processed |
 | `jdwp_resume_thread`      | `threadId`   | Resume a specific thread                                     |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
 | `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until next breakpoint/step/exception (soft-wait envelope at the ceiling) |

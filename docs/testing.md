@@ -9,7 +9,7 @@ There are four logical tiers of tests, all running under JUnit 5:
 | Tier | Examples | Approach |
 |---|---|---|
 | **Pure unit** | `BreakpointTrackerTest.PendingBreakpoints` (`BreakpointTrackerTest.java:32-143`), `EvaluationGuardTest`, `EventHistoryTest`, `ThreadFormattingTest`, `JDWPToolsParseCharInputTest`, `JdwpAgentArgParserTest`, `DiagnoseReportRendererTest` | No JDI types involved. Plain JUnit assertions against pojo behaviour. |
-| **Mocked-JDI unit** (the bulk) | every `JdiEventListener*Test`, `JDIConnectionService*Test`, `JDWPTools*Test` | `BreakpointRequest`, `ThreadReference`, `EventSet`, `Location`, etc. mocked via Mockito. |
+| **Mocked-JDI unit** (the bulk) | every `JdiEventListener*Test`, `JDIConnectionService*Test`, `JDWPTools*Test`, `SuspensionSession*Test`, `SuspensionWatchdogTest`, `InvocationRunnerTest` | `BreakpointRequest`, `ThreadReference`, `EventSet`, `Location`, etc. mocked via Mockito; `SuspensionSession*Test` and `SuspensionWatchdogTest` put the `FakeSuspendModel` count model behind the mocks (§ 2). |
 | **In-process integration** | `InMemoryJavaCompilerPackageIntegrationTest` (`evaluation/InMemoryJavaCompilerPackageIntegrationTest.java:36`), `JdwpHandshakeProbeTest`, `JvmDiscoveryServiceConfirmAllTest` | Runs real Eclipse JDT against a tiny in-process classpath, or talks to a `FakeJdwpServer` over a loopback socket. |
 | **Sandbox** | The `jdwp-sandbox/` module | Deliberately broken classes designed to fail under JDWP. Skipped by default. |
 
@@ -17,7 +17,9 @@ There are four logical tiers of tests, all running under JUnit 5:
 
 Live-JVM verification is done **manually** via the sandbox module, not automatically in CI. See § 4.
 
-**One opt-in exception:** `fastlogpoint/FastLogpointLiveTest` forks a JVM with a JDWP agent and attaches, because bytecode redefinition, breakpoint re-creation and the live-bytecode guard cannot be faked with mocks. It is skipped unless `-Djdwp.live=true` is set, so CI never runs it. Run it with `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastLogpointLiveTest`; add `-Djdwp.live.jacocoAgent=<path to org.jacoco.agent-<version>-runtime.jar>` to also check that arming is refused for a JaCoCo-instrumented class. It prints the per-hit cost of a fast logpoint against `jdwp_set_logpoint`.
+**Two opt-in exceptions.** `fastlogpoint/FastLogpointLiveTest` forks a JVM with a JDWP agent and attaches, because bytecode redefinition, breakpoint re-creation and the live-bytecode guard cannot be faked with mocks. It is skipped unless `-Djdwp.live=true` is set, so CI never runs it. Run it with `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastLogpointLiveTest`; add `-Djdwp.live.jacocoAgent=<path to org.jacoco.agent-<version>-runtime.jar>` to also check that arming is refused for a JaCoCo-instrumented class. It prints the per-hit cost of a fast logpoint against `jdwp_set_logpoint`.
+
+`fastlogpoint/SuspensionOwnershipLiveTest` drives suspension ownership (issue #45) against the same forked target (`LiveSession`, fixture `FastLogpointTarget`): its `lock-holder` thread holds `FastLogpointTarget.LOCK`, so an evaluation can be made to wait on a monitor whose owner a stop-all parks. It checks that the watchdog frees a dispatcher evaluation stuck behind a queued stop-all, and that `jdwp_resume` releases only the stop it holds. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=SuspensionOwnershipLiveTest`.
 
 ## 2. Mocking JDI
 
@@ -29,7 +31,7 @@ Live-JVM verification is done **manually** via the sandbox module, not automatic
 >
 > This codebase commits hard to option (b). The support classes below exist purely to keep the mock-chain setup compact.
 
-Every JDI type is mocked with Mockito. Three test-support classes centralise the patterns so individual tests stay short:
+Every JDI type is mocked with Mockito. A few test-support classes centralise the patterns so individual tests stay short:
 
 ### `JdiEventListenerTestSupport`
 
@@ -55,6 +57,22 @@ Each factory wires the JDI `Location → ReferenceType → name()` chain that th
 ### `JDWPToolsTestSupport`
 
 `JDWPToolsTestSupport.java:28`. Factory for the seven-argument `JDWPTools` constructor — it has a lot of collaborators, and the support class assembles them with mocks for unit tests.
+
+### `FakeSuspendModel`
+
+A model of the JDWP agent's suspend bookkeeping (jdk21u `threadControl.c`, `invoker.c`, `eventHelper.c`) behind Mockito-built JDI mocks: per-thread suspend counts, where a resume at count 0 is a no-op; `vm.suspend()` / `resume()` with a global count that a thread started meanwhile inherits; event sets that suspend by policy and make their thread invokable, and `EventSet.resume()` that undoes exactly that; a single-threaded invocation that borrows one count and restores it on completion; thread status for the watchdog. Tests of suspension ownership assert the counts the target would really have (`counts()`), not which calls were made. `FakeSuspendModelTest` pins the model itself to that agent behaviour.
+
+Built on it:
+
+- `SuspensionSessionTest` — publication, presentation, releases with compensation, steps, `jdwp_reset`, leases and admission, ownership transfer; every scenario ends on the suspend counts.
+- `SuspensionSessionUnblockTest` — what `SuspensionSession.unblock` may release for the watchdog, how a cancelled set is settled, and what it never touches.
+- `SuspensionWatchdogTest` — sampling driven by hand (`tick()`, an injected clock): the minimum age, two consecutive monitor samples, samples that belong to one invocation, a closed session stopping the watchdog.
+
+Mockito only, around the same feature:
+
+- `EvaluationGuardTest` — the depth marker, plus leases: a nested lease, a competing chain refused, a reconnect (`bind`) dropping the earlier connection's holds.
+- `InvocationRunnerTest` — the bounded wait: the result or the rethrown failure, `[STILL_RUNNING]` then exactly one late record, a busy thread refused, no late record in a later connection, a job given up before it started never run, a monitor's owner named with a balanced suspension.
+- `JDWPToolsFrameToolsFreshFramesTest` — the frame tools re-read invalidated frames only while a hold the session knows lasted, and refuse a thread an evaluation runs on.
 
 ### `TestReflectionUtils`
 
@@ -100,11 +118,11 @@ The property-not-surefire-config distinction matters: it survives surefire upgra
 ## 5. Test-naming conventions
 
 - **`XxxTest`** — standard unit / mock test. The default.
-- **`XxxLiveTest`** — exercises a real production code path with a hand-built mock object graph (e.g. `JDIConnectionServiceCollectionViewLiveTest.java:47-233` builds a fake HashMap from `mock(ObjectReference.class)`). Despite the name, **there is no real JVM**. "Live" means "exercising the live production code path against realistic mock state". A misleading name, but the convention is what it is.
+- **`XxxLiveTest`** — exercises a real production code path with a hand-built mock object graph (e.g. `JDIConnectionServiceCollectionViewLiveTest.java:47-233` builds a fake HashMap from `mock(ObjectReference.class)`). Despite the name, **there is no real JVM** — except in the opt-in `fastlogpoint/FastLogpointLiveTest` and `SuspensionOwnershipLiveTest` (§ 1). "Live" means "exercising the live production code path against realistic mock state". A misleading name, but the convention is what it is.
 - **`XxxChainTest`** — tests for the breakpoint-chaining feature (`BreakpointTrackerChainTest`, `JdiEventListenerChainTest`).
 - **`XxxIntegrationTest`** — single example, `InMemoryJavaCompilerPackageIntegrationTest`. Actually invokes ECJ for end-to-end compilation. New tests that genuinely cross a real boundary should follow this name.
 - **`XxxTestSupport`** — shared scaffolding / factories. Package-private, `final` with private constructor.
-- **`Fake*`** — in-process fakes (currently only `FakeJdwpServer`).
+- **`Fake*`** — in-process fakes: `FakeJdwpServer`, and `FakeSuspendModel`, the suspend-count model behind JDI mocks.
 
 Many tests use nested `@Nested` classes named after behavioural areas (`PendingBreakpoints`, `ActiveBreakpoints`, `SuspendPolicy` in `BreakpointTrackerTest.java:34, 147, 176, 274, 349`). The pattern lets one file own a coherent slice of behaviour without becoming a 3,000-line linear scroll.
 

@@ -36,30 +36,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * invokes methods in the target (logpoint and condition evaluation, fast-logpoint arming, classpath
  * pre-warm), and an invoked method can hit a breakpoint of its own. That event's set must be drained
  * and resumed while the invocation is still waiting, so a set whose thread is inside an MCP-driven
- * evaluation ({@link EvaluationGuard}) is {@link #suppress}ed on the listener thread at once and
- * resumed; that path never calls into the target. Whoever processes a set decides its resume, after
- * all of its events, except that a set is not resumed once a later set of its thread is waiting (see
- * {@link #dispatch}). An untracked event whose request was deleted while its set waited (a cleared
- * breakpoint) is dropped, as JDI drops it when a set leaves its queue.
+ * evaluation ({@link EvaluationGuard}) is {@link #suppress}ed on the listener thread at once: routed
+ * as a context and released; that path never calls into the target. Every other set becomes a QUEUED
+ * {@link SuspensionSession.Context} and only that context releases its suspension (issue #45): the
+ * dispatcher's {@link SuspensionSession#finish} publishes the set's first stop candidate as a held
+ * stop, which only a tool releases after one has presented it, or releases the set. No tool can
+ * spend the suspension of a set still queued or processed. An untracked event whose request was
+ * deleted while its set waited (a cleared breakpoint) is dropped, as JDI drops it when a set leaves
+ * its queue.
  * <p>
- * Per-event behaviour (every suspending handler follows the order
- * snapshot → history → latch so a concurrent reader observing the {@link EventHistory} tail
- * never sees it ahead of {@link BreakpointTracker#getLastBreakpoint()}):
- * - `BreakpointEvent` → publish snapshot via {@link BreakpointTracker#setLastBreakpointThread},
- * record to {@link EventHistory}, fire the resume-until-event latch, and KEEP the thread suspended
- * (auto-resume only for logpoints and false conditional breakpoints).
+ * Per-event behaviour. Handlers still write the snapshot, record history and fire the latch, in that
+ * order; while the dispatcher processes a set, the snapshot becomes a stop candidate of its context,
+ * the history entry is buffered in it (appended when the set finishes, dropped if it went stale) and
+ * the latch call does nothing — {@link SuspensionSession#finish} publishes and notifies waiters:
+ * - `BreakpointEvent` → snapshot via {@link BreakpointTracker#setLastBreakpointThread}, record to
+ * {@link EventHistory}, and stop (no stop for logpoints and false conditional breakpoints, whose
+ * candidates are withdrawn).
  * - `StepEvent` → delete the one-shot StepRequest (JDI requirement), tag the snapshot via
  * {@link BreakpointTracker#setLastSuspendingEvent} with {@link BreakpointTracker.EventKind#STEP}
- * (the STEP snapshot inherits the prior BP id so watcher fallbacks still resolve), record, fire.
+ * (the STEP snapshot inherits the prior BP id so watcher fallbacks still resolve), record, stop.
  * - `ExceptionEvent` → tag the snapshot via {@link BreakpointTracker#setLastSuspendingEvent} with
- * {@link BreakpointTracker.EventKind#EXCEPTION} (id null), record throw/catch metadata, fire.
+ * {@link BreakpointTracker.EventKind#EXCEPTION} (id null), record throw/catch metadata, stop.
  * - `ClassPrepareEvent` → promote pending line and exception breakpoints for the loaded class.
- * - `VMStartEvent` → keep the VM suspended so the user can finish wiring up breakpoints.
- * - `VMDisconnectEvent` / `VMDeathEvent` → record `VM_DEATH`, fire the resume-until-event latch so
- * any parked `jdwp_resume_until_event` caller detects the dead VM promptly, then invoke the optional
- * {@link #vmDeathHook} before exiting the loop. A {@code VMDisconnectedException} raised by the JDI
- * event queue follows the same contract — abrupt target exit is handled symmetrically to a graceful
- * death event.
+ * - `VMStartEvent` → a {@link BreakpointTracker.EventKind#VM_START} stop: the VM stays suspended so
+ * the user can finish wiring up breakpoints.
+ * - `VMDisconnectEvent` / `VMDeathEvent` → processed on the listener thread, without a context, after
+ * the session is closed (which wakes a parked `jdwp_resume_until_event` caller): record `VM_DEATH`,
+ * then invoke the optional {@link #vmDeathHook} before exiting the loop. A
+ * {@code VMDisconnectedException} raised by the JDI event queue follows the same contract — abrupt
+ * target exit is handled symmetrically to a graceful death event.
  * <p>
  * Promotion contract: the main listener loop does not call
  * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} directly — promotion happens
@@ -72,8 +77,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Fast logpoints: a breakpoint event that belongs to a fast logpoint's one-shot arming request is
  * handed to {@link FastLogpointService#handleArmingHit} instead of {@link #handleBreakpointEvent},
  * after every other event of the same set has been handled — arming redefines the class, which
- * replaces the JDI requests behind the other events' breakpoints in that class. The arming thread
- * is resumed unless another event in the set asks to suspend.
+ * replaces the JDI requests behind the other events' breakpoints in that class. The set is released
+ * unless one of its events stops.
  * <p>
  * Chain handling: after every BP, exception, or auto-resumed logpoint hit,
  * {@link #applyChainEffectsAfterHit} arms any dependent BPs waiting on the firing BP and
@@ -403,14 +408,16 @@ public class JdiEventListener {
      * A death set is processed here once the sets before it are done (at most
      * {@link #DISPATCH_DRAIN_TIMEOUT_MS}; any still queued are discarded), so {@code VM_DEATH} stays
      * the last entry; a set from a thread inside an MCP-driven evaluation is {@link #suppress}ed here
-     * at once; every other set goes to the {@code dispatcher}, in order, counted in {@code waiting}
-     * per suspended target thread until it starts (see {@link #dispatch}).
+     * at once; every other set is routed as a QUEUED context of {@code suspensions}
+     * ({@link SuspensionSession#route}) and handed to the {@code dispatcher}, in order (see
+     * {@link #dispatch}).
      * <p>
      * On either death path (in-loop {@code VMDeath}/{@code VMDisconnect} event, or
-     * {@code VMDisconnectedException}/{@code IllegalStateException} from the JDI queue, or
-     * {@code InterruptedException} from an external {@link #stop}), the loop records {@code VM_DEATH},
-     * clears {@link #running}, fires the resume-until-event latch, and invokes the registered
-     * {@link #vmDeathHook} before exiting.
+     * {@code VMDisconnectedException}/{@code IllegalStateException} from the JDI queue), the loop
+     * waits for the dispatcher, closes the session (which wakes a {@code jdwp_resume_until_event}
+     * waiter), records {@code VM_DEATH}, clears {@link #running}, and invokes the registered
+     * {@link #vmDeathHook} before exiting. An {@code InterruptedException} from an external
+     * {@link #stop} closes the session, clears {@link #running} and invokes the hook.
      */
     private void listen(VirtualMachine vm, ExecutorService dispatcher, SuspensionSession suspensions) {
         final EventQueue queue = vm.eventQueue();
