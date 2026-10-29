@@ -140,7 +140,7 @@ A typical "set a breakpoint and inspect" cycle:
    returns it through MCP → Claude.
 ```
 
-Everything in step 3 happens on the listener thread; everything in step 4 happens on the MCP dispatch thread. The hand-off is the latch. The full sequence is covered in [event-pipeline.md](event-pipeline.md).
+Everything in step 3 happens on the event dispatcher thread the listener hands the event set to; everything in step 4 happens on the MCP dispatch thread. The hand-off is the latch. The full sequence is covered in [event-pipeline.md](event-pipeline.md).
 
 ## Project layout
 

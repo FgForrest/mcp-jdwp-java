@@ -17,6 +17,8 @@ There are four logical tiers of tests, all running under JUnit 5:
 
 Live-JVM verification is done **manually** via the sandbox module, not automatically in CI. See § 4.
 
+**One opt-in exception:** `fastlogpoint/FastLogpointLiveTest` forks a JVM with a JDWP agent and attaches, because bytecode redefinition, breakpoint re-creation and the live-bytecode guard cannot be faked with mocks. It is skipped unless `-Djdwp.live=true` is set, so CI never runs it. Run it with `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastLogpointLiveTest`; add `-Djdwp.live.jacocoAgent=<path to org.jacoco.agent-<version>-runtime.jar>` to also check that arming is refused for a JaCoCo-instrumented class. It prints the per-hit cost of a fast logpoint against `jdwp_set_logpoint`.
+
 ## 2. Mocking JDI
 
 > **Background — why testing JDI is hard**

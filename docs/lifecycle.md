@@ -93,7 +93,7 @@ On success, the tool returns a one-line hint that the VM is at `VM_START` — se
 
 ## 3. The event listener — started here, stopped on disconnect
 
-`JdiEventListener.start(vm)` (`JdiEventListener.java:200-212`) spawns the daemon thread that drains the JDI event queue. The thread is named `jdi-event-listener` and is created fresh on every `connect()` — `start()` calls `stop()` first so two listeners never overlap (line 201).
+`JdiEventListener.start(vm)` (`JdiEventListener.java:200-212`) spawns the daemon thread that drains the JDI event queue, plus the `jdi-event-dispatcher` thread that processes the drained event sets. The listener thread is named `jdi-event-listener` and is created fresh on every `connect()` — `start()` calls `stop()` first so two listeners never overlap (line 201).
 
 `stop()` (`JdiEventListener.java:243-263`):
 

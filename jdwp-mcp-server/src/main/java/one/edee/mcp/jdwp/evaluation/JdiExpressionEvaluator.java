@@ -37,9 +37,10 @@ import java.util.stream.Collectors;
  * `LinkageError` when the MCP server reconnects to a freshly-restarted target VM and tries to
  * load bytecode that the previous session had already pinned to a class name.
  * <p>
- * Thread model: {@link #configureCompilerClasspath} MUST be called from the MCP worker thread
- * BEFORE {@link #evaluate}, never from inside the JDI event listener. The configuration step
- * issues `invokeMethod` calls that would deadlock the listener if it called itself.
+ * Thread model: {@link #configureCompilerClasspath} MUST be called BEFORE {@link #evaluate}, from an
+ * MCP worker thread or the JDI event dispatcher thread, never from the JDI event listener thread. The
+ * configuration step issues `invokeMethod` calls, and the listener thread has to keep draining the
+ * events those calls can raise.
  */
 @Service
 public class JdiExpressionEvaluator {
@@ -51,7 +52,7 @@ public class JdiExpressionEvaluator {
      * wrapper into {@code this}'s own package so package-private fields and the type itself become
      * reachable — see {@link #resolveWrapperPackage}.
      */
-    private static final String DEFAULT_EVALUATION_PACKAGE = "mcp.jdi.evaluation";
+    public static final String DEFAULT_EVALUATION_PACKAGE = "mcp.jdi.evaluation";
     /**
      * Class name prefix; the actual name is `<prefix><UUID>` for collision-free reloads.
      */
@@ -443,6 +444,24 @@ public class JdiExpressionEvaluator {
             .map(v -> v.type + ' ' + v.name)
             .collect(Collectors.joining(", "));
 
+        final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
+        return packageDecl +
+            "// Automatically generated class for JDI expression evaluation\n" +
+            "public class " + simpleClassName + " {\n" +
+            "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
+            generateMethodBody(expression) +
+            "    }\n" +
+            "}\n";
+    }
+
+    /**
+     * Generates the body of a static {@code Object}-returning method that yields the value of the
+     * user input — in expression mode a single {@code return (Object) (...)}, in block mode the
+     * user's statements behind a fallthrough guard (see {@link #generateSourceCode} for both
+     * modes). The bare {@code this} keyword is rewritten to {@code _this} first. Shared by the
+     * expression-evaluation wrapper and the fast-logpoint probe ({@link FastLogpointProbeSource}).
+     */
+    static String generateMethodBody(String expression) {
         // Replace bare `this` keyword with `_this` to match the wrapper's static-method parameter name.
         // Tokenizer-aware so identifiers like `myThis`/`thisFoo` and `this` tokens inside string/char
         // literals are NOT rewritten — see {@link #rewriteThisKeyword(String)}.
@@ -476,15 +495,7 @@ public class JdiExpressionEvaluator {
                 "        // User expression:\n" +
                 "        return (Object) (" + safeExpression + ");\n";
         }
-
-        final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
-        return packageDecl +
-            "// Automatically generated class for JDI expression evaluation\n" +
-            "public class " + simpleClassName + " {\n" +
-            "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
-            methodBody +
-            "    }\n" +
-            "}\n";
+        return methodBody;
     }
 
     /**
@@ -1053,20 +1064,11 @@ public class JdiExpressionEvaluator {
         //    package — so we'd produce a misleading "not visible" error if we rewrote it.
         //  - Private fields are never rewritten.
         final ObjectReference thisObject = frame.thisObject();
-        if (!isBlockMode(expression)
-            && thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
-            final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
-                && wrapperPackage.equals(packageOf(thisClass.name()));
-            if (thisClass.isPublic() || sharingPackage) {
-                final Set<String> shadowingLocals = context.getVariables().stream()
-                    .map(v -> v.name)
-                    .collect(Collectors.toSet());
-                final Set<String> rewritableFieldNames = thisClass.allFields().stream()
-                    .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
-                    .map(Field::name)
-                    .collect(Collectors.toSet());
-                expression = rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
-            }
+        if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
+            final Set<String> shadowingLocals = context.getVariables().stream()
+                .map(v -> v.name)
+                .collect(Collectors.toSet());
+            expression = rewriteBareThisFields(expression, thisClass, wrapperPackage, shadowingLocals);
         }
 
         // 2. Cache key includes the wrapper package: the same (signature, expression) may be
@@ -1085,7 +1087,7 @@ public class JdiExpressionEvaluator {
         final CachedCompilation cached = compilationCache.get(cacheKey);
 
         final String className;
-        byte[] bytecode;
+        final byte[] bytecode;
 
         if (cached != null) {
             // Cache hit — reuse previously compiled class name and bytecode
@@ -1099,27 +1101,7 @@ public class JdiExpressionEvaluator {
             final String sourceCode = generateSourceCode(className, context, expression);
 
             final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
-
-            bytecode = compiledCode.get(className);
-            if (bytecode == null) {
-                // Some compilers key by binary name with slashes, simple name, or with leading slashes —
-                // fall back to a suffix match on the simple class name.
-                final String simpleName = className.substring(className.lastIndexOf('.') + 1);
-                for (Map.Entry<String, byte[]> entry : compiledCode.entrySet()) {
-                    final String key = entry.getKey();
-                    String keyTail = key.substring(key.lastIndexOf('/') + 1).replace(".class", "");
-                    keyTail = keyTail.substring(keyTail.lastIndexOf('.') + 1);
-                    if (keyTail.equals(simpleName)) {
-                        bytecode = entry.getValue();
-                        log.debug("[Evaluator] Bytecode found via fallback key '{}' for class '{}'", key, className);
-                        break;
-                    }
-                }
-            }
-            if (bytecode == null) {
-                throw new JdiEvaluationException("Could not find compiled bytecode for class " + className
-                    + " (available keys: " + compiledCode.keySet() + ')');
-            }
+            bytecode = findCompiledBytecode(compiledCode, className);
 
             compilationCache.put(cacheKey, new CachedCompilation(className, bytecode));
         }
@@ -1141,6 +1123,129 @@ public class JdiExpressionEvaluator {
         log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
             System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
         return value;
+    }
+
+    /**
+     * Applies the bare-field auto-rewrite ({@code field} → {@code _this.field}) for the fields of
+     * {@code thisClass} that the wrapper in {@code wrapperPackage} can reach — see the comment in
+     * {@link #evaluateInPackage} for the accessibility rules. Returns {@code expression} unchanged in
+     * block mode, and when {@code thisClass} is neither public nor in the wrapper's package.
+     */
+    private static String rewriteBareThisFields(String expression, ClassType thisClass, String wrapperPackage,
+                                                Set<String> shadowingLocals) {
+        if (isBlockMode(expression)) {
+            return expression;
+        }
+        final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
+            && wrapperPackage.equals(packageOf(thisClass.name()));
+        if (!thisClass.isPublic() && !sharingPackage) {
+            return expression;
+        }
+        final Set<String> rewritableFieldNames = thisClass.allFields().stream()
+            .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
+            .map(Field::name)
+            .collect(Collectors.toSet());
+        return rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
+    }
+
+    /**
+     * Compiles the in-target probe class of a fast logpoint ({@code jdwp_set_fast_logpoint}) for
+     * the location {@code frame} is stopped at. The probe's static {@code hit} method takes the
+     * receiver ({@code _this}, when {@code includeThis}) and the locals visible at the frame's
+     * location as parameters — the same context an evaluation wrapper gets — and evaluates the
+     * optional condition and the expression inside the target VM (see
+     * {@link FastLogpointProbeSource}).
+     * <p>
+     * Unlike an evaluation wrapper, {@code _this} is typed from the method's <em>declaring</em>
+     * class, not the receiver's runtime class: the instrumented call site passes {@code this} with
+     * the declaring class as its static type, and the verifier rejects passing it where a subclass
+     * is expected. Nothing is cached — every probe gets a fresh UUID-suffixed class name.
+     * <p>
+     * Must be called on a thread suspended by an event, after {@link #configureCompilerClasspath}.
+     *
+     * @param frame          the frame stopped at the logpoint's location
+     * @param includeThis    whether {@code this} is passed to the probe (false in static methods
+     *                       and constructors, where {@code this} may still be uninitialized)
+     * @param wrapperPackage package the probe class is generated into
+     * @param bufferSize     ring-buffer capacity; must be a power of two
+     * @param metadata       what the probe records about itself (target, user text, arming session)
+     * @return the probe's class name, bytecode, and {@code hit} parameter names in declaration order
+     * @throws JdiEvaluationException when the probe does not compile (including the compiler's
+     *                                diagnostics) or the frame's context cannot be read
+     */
+    public FastLogpointProbe compileFastLogpointProbe(StackFrame frame, boolean includeThis, String wrapperPackage,
+                                                      String expression, @Nullable String condition, int bufferSize,
+                                                      FastLogpointProbeSource.Metadata metadata)
+        throws JdiEvaluationException {
+        final List<FastLogpointProbeSource.Parameter> parameters = new ArrayList<>();
+        final ReferenceType declaringType = frame.location().declaringType();
+        if (includeThis) {
+            parameters.add(new FastLogpointProbeSource.Parameter("_this", getDeclaredType(declaringType, wrapperPackage)));
+        }
+        try {
+            for (LocalVariable var : frame.visibleVariables()) {
+                // Same `this$N` filter as buildContext — the outer-instance reference is unaddressable.
+                if (var.isArgument() || !var.name().startsWith("this$")) {
+                    parameters.add(new FastLogpointProbeSource.Parameter(var.name(), resolveLocalVarType(var, wrapperPackage)));
+                }
+            }
+        } catch (AbsentInformationException noLocals) {
+            log.debug("[Evaluator] No local-variable table at the fast-logpoint location — probe receives `this` only.");
+        }
+
+        String effectiveExpression = expression;
+        String effectiveCondition = condition;
+        if (includeThis && declaringType instanceof ClassType thisClass) {
+            final Set<String> localNames = parameters.stream()
+                .map(FastLogpointProbeSource.Parameter::name)
+                .collect(Collectors.toSet());
+            effectiveExpression = rewriteBareThisFields(expression, thisClass, wrapperPackage, localNames);
+            if (condition != null) {
+                effectiveCondition = rewriteBareThisFields(condition, thisClass, wrapperPackage, localNames);
+            }
+        }
+
+        final String uniqueId = UUID.randomUUID().toString().replace("-", "");
+        final String className = wrapperPackage.isEmpty()
+            ? FastLogpointProbeSource.CLASS_PREFIX + uniqueId
+            : wrapperPackage + '.' + FastLogpointProbeSource.CLASS_PREFIX + uniqueId;
+        final String sourceCode = FastLogpointProbeSource.generate(
+            className, parameters, effectiveExpression, effectiveCondition, bufferSize, metadata);
+        final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
+        if (compiledCode.size() > 1) {
+            // The probe is defined as a single class; a nested/anonymous class in the user code
+            // would compile to a second class file that is never defined in the target.
+            throw new JdiEvaluationException("Fast logpoint expressions and conditions cannot declare "
+                + "anonymous or nested classes (compiled to " + compiledCode.size() + " classes)");
+        }
+        final byte[] bytecode = findCompiledBytecode(compiledCode, className);
+        return new FastLogpointProbe(className, bytecode,
+            parameters.stream().map(FastLogpointProbeSource.Parameter::name).toList());
+    }
+
+    /**
+     * Picks {@code className}'s bytecode out of the compiler's output map. Some compilers key by
+     * binary name with slashes, simple name, or with leading slashes — falls back to a suffix
+     * match on the simple class name.
+     */
+    private static byte[] findCompiledBytecode(Map<String, byte[]> compiledCode, String className)
+        throws JdiEvaluationException {
+        final byte[] direct = compiledCode.get(className);
+        if (direct != null) {
+            return direct;
+        }
+        final String simpleName = className.substring(className.lastIndexOf('.') + 1);
+        for (Map.Entry<String, byte[]> entry : compiledCode.entrySet()) {
+            final String key = entry.getKey();
+            String keyTail = key.substring(key.lastIndexOf('/') + 1).replace(".class", "");
+            keyTail = keyTail.substring(keyTail.lastIndexOf('.') + 1);
+            if (keyTail.equals(simpleName)) {
+                log.debug("[Evaluator] Bytecode found via fallback key '{}' for class '{}'", key, className);
+                return entry.getValue();
+            }
+        }
+        throw new JdiEvaluationException("Could not find compiled bytecode for class " + className
+            + " (available keys: " + compiledCode.keySet() + ')');
     }
 
     /**
@@ -1170,9 +1275,9 @@ public class JdiExpressionEvaluator {
      * <p>{@code includeLocal} controls whether the local-project classpath fallback (env override +
      * filesystem scan + Maven {@code dependency:build-classpath}) is merged in. The real evaluation
      * paths pass {@code true}; the speculative {@link #prewarmClasspath} — which runs on the JDI
-     * event-listener thread the instant a breakpoint hits, before the user has asked for anything —
+     * event dispatcher thread the instant a breakpoint hits, before the user has asked for anything —
      * passes {@code false}. The local fallback can shell out to Maven with a multi-minute timeout, so
-     * paying it on the event-listener thread would block event processing (and every other breakpoint)
+     * paying it on the dispatcher thread would block event processing (and every other breakpoint)
      * for minutes even if the user never evaluates an expression. Prewarm therefore warms only the
      * remote classpath + JDK detection, and {@link #localClasspathMerged} stays {@code false} so the
      * first actual evaluation/logpoint/condition completes the local merge.
@@ -1244,7 +1349,7 @@ public class JdiExpressionEvaluator {
             // for the source/binary-drift risk.
             final long mergeStart = System.currentTimeMillis();
             // includeLocal=false (prewarm) skips the local provider entirely — it can shell out to
-            // Maven with a multi-minute timeout, which must never run on the JDI event-listener
+            // Maven with a multi-minute timeout, which must never run on the JDI event dispatcher
             // thread. The first real evaluation re-enters with includeLocal=true and completes the
             // merge below.
             final Set<String> localEntries = includeLocal ? localClasspathProvider.discover() : Set.of();
@@ -1295,13 +1400,13 @@ public class JdiExpressionEvaluator {
      * <p>
      * Warms ONLY the remote classpath + JDK detection (it passes {@code includeLocal=false}). The
      * local-project fallback is deliberately NOT run here: it can shell out to Maven with a
-     * multi-minute timeout, and this method runs on the JDI event-listener thread the moment a
+     * multi-minute timeout, and this method runs on the JDI event dispatcher thread the moment a
      * breakpoint hits — blocking that thread on Maven would stall event processing (and every other
      * breakpoint) for minutes even if the user never evaluates anything. The first real evaluation
      * completes the local merge via {@link #configureCompilerClasspath(ThreadReference)}.
      * <p>
      * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
-     * event listener while a thread is parked for inspection, and a warming failure must not disrupt
+     * event dispatcher while a thread is parked for inspection, and a warming failure must not disrupt
      * the breakpoint flow. Any failure is logged at debug and left for the real evaluation call to
      * re-attempt and surface with a precise error.
      *

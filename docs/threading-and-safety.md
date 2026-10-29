@@ -4,17 +4,18 @@ The MCP server runs alongside a live target JVM and pokes at its internals throu
 
 ## 1. Threads in the server JVM
 
-There are exactly three logical actors. Every concurrency decision in the code orbits these three.
+There are exactly four logical actors. Every concurrency decision in the code orbits these four.
 
 | Thread | Source | Role |
 |---|---|---|
 | **Spring `main`** | `JDWPMcpServerApplication.main` | Boots the context, then idles. No HTTP listener (`spring.main.web-application-type=none`). |
 | **MCP STDIO dispatcher** | `MultiVersionStdioServerTransportProvider` (Spring AI MCP) | Reads JSON-RPC frames from `System.in`, dispatches to `@McpTool` methods one at a time, writes responses to `System.out`. |
-| **`jdi-event-listener`** | Spawned by `JdiEventListener.start(vm)` on every `connect()` | Daemon. Drains `vm.eventQueue().remove()` and routes events. Exactly one at a time — `start()` calls `stop()` first (`JdiEventListener.java:201`). |
+| **`jdi-event-listener`** | Spawned by `JdiEventListener.start(vm)` on every `connect()` | Daemon. Drains `vm.eventQueue().remove()` and routes event sets. Exactly one at a time — `start()` calls `stop()` first (`JdiEventListener.java:201`). Never calls into the target itself. |
+| **`jdi-event-dispatcher`** | Single-thread executor created by `JdiEventListener.start(vm)`, shut down by `stop()` | Daemon. Processes the routed event sets in arrival order — handlers, logpoint and condition evaluation, fast-logpoint arming, classpath pre-warm — and decides each set's resume. |
 
 Daemons that Spring spins up for logging and scheduling exist, but the application owns no others. JDI's own socket-I/O threads run inside the `jdk.jdi` module and are invisible to us.
 
-The point is: tool calls do not run concurrently. Breakpoint events do not run concurrently with each other (they share one listener thread). The only true concurrency is **between** the dispatcher and the listener — one tool method reading state that the listener is writing. That hand-off is engineered explicitly.
+The point is: tool calls do not run concurrently. Breakpoint events do not run concurrently with each other (they are processed in order on the one `jdi-event-dispatcher` thread; only a set raised inside an MCP-driven evaluation is handled on the listener thread at once — see the walkthrough in §5). The only true concurrency is **between** the MCP dispatcher and the event threads — one tool method reading state that an event handler is writing. That hand-off is engineered explicitly.
 
 ## 2. SYNC MCP dispatch
 
@@ -182,6 +183,8 @@ So we capture the `long` once, at the top of the call, when the thread is provab
 ```
 
 No lock is held across `invokeMethod` (the guard is lock-free; the `JDIConnectionService` monitor is released long before this point). T is never re-suspended by the listener while the server is waiting on it. The same mechanism covers nested `Class.forName`, `toString`, `getSystemClassLoader`, and step events fired during evaluation.
+
+The event pipeline drives evaluations of its own — logpoint expressions, breakpoint conditions, fast-logpoint arming, the classpath pre-warm. Those run on the `jdi-event-dispatcher` thread, so step 3 blocks the dispatcher, not the listener. Step 5 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and processes that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. (When these evaluations ran on the listener thread, step 5 never happened and the debugger hung.)
 
 ### Why does `exit` survive a missing entry?
 

@@ -13,6 +13,7 @@ import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.ExceptionEvent;
 import com.sun.jdi.event.StepEvent;
 import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.ExceptionRequest;
 import com.sun.jdi.request.StepRequest;
 import org.jspecify.annotations.Nullable;
@@ -52,10 +53,11 @@ final class JdiEventListenerTestSupport {
 	/**
 	 * Drives the listener with exactly one caller-supplied {@link EventSet} followed by a
 	 * {@link VMDisconnectedException} sentinel so the listener's main loop exits cleanly. A
-	 * {@link CountDownLatch} fires once the second {@code queue.remove()} call has returned,
-	 * meaning the event set has been fully processed (including the trailing
-	 * {@code eventSet.resume()} call on the auto-resume path). A short post-await sleep lets
-	 * the disconnect catch block settle before assertions.
+	 * {@link CountDownLatch} fires once the second {@code queue.remove()} call has returned, meaning
+	 * the listener has routed the event set; {@link JdiEventListener#awaitIdle} then waits until it
+	 * has been fully processed (including the trailing {@code eventSet.resume()} call on the
+	 * auto-resume path). A short post-await sleep lets the disconnect catch block settle before
+	 * assertions.
 	 */
 	static void runListenerWith(JdiEventListener listener, EventSet eventSet) throws InterruptedException {
 		VirtualMachine vm = mock(VirtualMachine.class);
@@ -79,6 +81,8 @@ final class JdiEventListenerTestSupport {
 		listener.start(vm);
 
 		assertThat(drained.await(2, TimeUnit.SECONDS)).isTrue();
+		// The listener hands the set to its dispatcher thread; wait until that has processed it.
+		assertThat(listener.awaitIdle(2000)).isTrue();
 		// Give the listener's catch block a moment to run after the disconnect throw so the
 		// loop exits cleanly before the test asserts mock-interaction state.
 		Thread.sleep(30);
@@ -125,6 +129,7 @@ final class JdiEventListenerTestSupport {
 		listener.start(vm);
 
 		assertThat(drained.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(listener.awaitIdle(2000)).isTrue();
 		// Give the listener thread a moment to complete its post-event-set bookkeeping (hook
 		// invocation, history record, latch firing) before the test reads observable state.
 		Thread.sleep(30);
@@ -142,12 +147,24 @@ final class JdiEventListenerTestSupport {
 
 	/**
 	 * Creates an {@link EventSet} mock that iterates the given events exactly once and
-	 * records calls to {@link EventSet#resume()} so the test can verify auto-resume.
+	 * records calls to {@link EventSet#resume()} so the test can verify auto-resume. It suspends the
+	 * event thread, as most sets do; a bare mock would report {@code SUSPEND_NONE} (0), a set that
+	 * suspends nothing, which the listener does not count as a stop of its thread.
 	 */
 	static EventSet mockEventSet(Event... events) {
 		EventSet set = mock(EventSet.class);
 		when(set.iterator()).thenAnswer(inv -> List.of(events).iterator());
+		when(set.suspendPolicy()).thenReturn(EventRequest.SUSPEND_EVENT_THREAD);
 		return set;
+	}
+
+	/**
+	 * Stubs {@code request} as enabled, as a request whose event is being delivered is. A request
+	 * mock otherwise reports {@code isEnabled() == false}, and the listener drops the event of a
+	 * request that is no longer enabled (JDI's own rule for events whose request went meanwhile).
+	 */
+	static void markLive(EventRequest request) {
+		when(request.isEnabled()).thenReturn(true);
 	}
 
 	static ThreadReference mockThread(String name, long uniqueId) {
@@ -165,6 +182,7 @@ final class JdiEventListenerTestSupport {
 	 */
 	static BreakpointEvent mockBreakpointEvent(ThreadReference thread, BreakpointRequest request,
 			String className, int line) {
+		markLive(request);
 		BreakpointEvent event = mock(BreakpointEvent.class);
 		when(event.request()).thenReturn(request);
 		when(event.thread()).thenReturn(thread);
@@ -182,6 +200,7 @@ final class JdiEventListenerTestSupport {
 	 * Mirrors {@link #mockBreakpointEvent} but for the step path.
 	 */
 	static StepEvent mockStepEvent(ThreadReference thread, StepRequest request, String className, int line) {
+		markLive(request);
 		StepEvent event = mock(StepEvent.class);
 		when(event.request()).thenReturn(request);
 		when(event.thread()).thenReturn(thread);
@@ -213,6 +232,9 @@ final class JdiEventListenerTestSupport {
 	static ExceptionEvent mockExceptionEvent(@Nullable ExceptionRequest request, ThreadReference thread,
 			ObjectReference exception, String declaringClassName, int throwLine,
 			@Nullable String catchClassName, int catchLine) {
+		if (request != null) {
+			markLive(request);
+		}
 		ExceptionEvent event = mock(ExceptionEvent.class);
 		when(event.request()).thenReturn(request);
 		when(event.thread()).thenReturn(thread);

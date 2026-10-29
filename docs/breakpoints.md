@@ -151,6 +151,47 @@ Same pattern in:
 
 All three respect the same fail-safe rule: if the log expression fails to evaluate, record a `*_ERROR` entry (e.g. `LOGPOINT_ERROR`) with the failure reason and continue. The thread still auto-resumes.
 
+### 5a. Fast logpoints — evaluation moved into the target
+
+"Does not suspend" above is the agent's view; the thread *is* parked for the whole evaluation — several JDWP round trips per hit, one hit at a time on the single event dispatcher thread, and a method with a JVMTI breakpoint stays interpreted. `jdwp_set_fast_logpoint` (package `fastlogpoint`) removes the debugger from the per-hit path. It changes the running application's bytecode, so the tool refuses to arm without `userApproved=true` and returns a risk briefing instead (`FastLogpointRiskBriefing`).
+
+Lifecycle (`FastLogpointService`):
+
+1. **Register** — a one-shot arming breakpoint (`SUSPEND_EVENT_THREAD`, `addCountFilter(1)`, so concurrent hits on other threads are filtered in the target) at the line's first location. ID drawn from the shared space (`BreakpointTracker.allocateId`). The class must be loaded.
+2. **Arm on the first hit** — the listener hands the event to `handleArmingHit` *after* every other event of the set (arming redefines the class, replacing the requests behind those events). While the one thread is parked, under the `EvaluationGuard`:
+   - the hit itself is evaluated through the normal debugger path (it runs the old code) and recorded with `armingHit=true`;
+   - the class file is fetched through `Class.getResourceAsStream` in the target and compared, method by method, with `Method.bytecodes()` of the live class (`ClassFileMethods`). Any difference — JaCoCo, the Mockito inline mock maker, an enhancer, a different class file — refuses the arm: redefining from the class file would silently strip those changes;
+   - the probe is compiled (`JdiExpressionEvaluator.compileFastLogpointProbe` → `FastLogpointProbeSource`), defined in the **declaring class's own loader** and package, and initialized — **disabled** (`ENABLED=false`); `RemoteCodeExecutor.defineAndInitialize` checks that the loader resolves the probe's name to that class, so the injected call cannot fail to link at the application's call site;
+   - `ProbeInstrumenter` (ASM tree API) inserts `xLOAD`s of `this` and the visible locals plus `invokestatic Probe.hit(...)` after the label / line number / stack-map frame of the line's first instruction, and `redefineClasses` installs it;
+   - the server reads back what HotSpot installed — `Method.bytecodes()` of every method (the **installed snapshot**) and, through the live constant pool, which probes the code calls (`ProbeCallScanner`) — writes an install record into the target (§ 5b) and only then sets `ENABLED=true`. A failure after the redefinition leaves the logpoint listed as `DISABLED` (installed, not evaluating), never as "not modified".
+3. **Hits** — the probe checks its `ENABLED` kill switch, evaluates the condition and expression, catches every `Throwable` (recorded as an `E`/`C` entry), and appends one immutable string `seq␀millis␀nanos␀kind␀thread␀value` to a power-of-two `String[]` ring claimed with `AtomicLong.getAndIncrement`.
+4. **Read** — `jdwp_get_events` first calls `drainAll`: one static-field read of `SEQ`, one `ArrayReference.getValues` of the new slice, one `StringReference.value()` per entry. No thread is suspended, nothing is invoked. The per-entry sequence number tells ready / overwritten / still-being-written slots apart (`ProbeRing`); losses surface as `FAST_LOGPOINT_DROPPED`.
+5. **Disarm** — `jdwp_clear_breakpoint`, `jdwp_reset`, `jdwp_disconnect`, `jdwp_reconnect` and server shutdown (`@PreDestroy`) set `ENABLED=false`, drain one last time, check that the live code still equals the installed snapshot (otherwise someone else redefined the class, and restoring would undo that — refused), and redefine the class from the original bytes plus any remaining probes. A failed restore keeps the logpoint listed as `DISABLED`; clearing it again retries. Teardown is bounded (5 s) because `redefineClasses` on a wedged VM blocks forever; past the deadline the instrumentation is abandoned with a `FAST_LOGPOINT_WARNING` — the next attach lists it (§ 5b). The teardown worker only ever clears the entries it captured, so a late one cannot clear a later session's logpoint that reuses an ID. VM death only forgets the state — the classes died with the VM.
+
+**Breakpoints survive redefinition.** JDI's `redefineClasses` deletes every `BreakpointRequest` located in the redefined class. Before each redefinition the service snapshots the tracked line breakpoints in the class (and other pending arming requests), then re-creates them on the new bytecode at the same line and method with the same suspend policy and enabled state, swapping them in with `BreakpointTracker.replaceBreakpointRequest` so the ID, condition, logpoint expression and chain edges stay attached.
+
+Every instrumentation is computed from the class's original bytes plus the full set of probe sites in it, so arming and disarming never compound. The guard for the next change compares live code with the *installed snapshot*, not with the bytes sent: HotSpot renumbers constant-pool entries during a redefinition when the new pool is not an extension of the old one, and rewrites the operands in the installed code.
+
+Known limits: within one session the checks use JDI's cached view, which JDI refreshes only after its own `redefineClasses` — a redefinition by an agent inside the target during the session goes unnoticed until the next attach (an IDE HotSwap cannot happen meanwhile: JDWP admits one debugger). JDWP exposes method code and the constant pool, never exception tables, annotations or other attributes, so only method code is compared.
+
+### 5b. Fast logpoints left behind by a dead server
+
+When the server dies without restoring (SIGKILL, crash) or a teardown times out, the probe keeps running in the target. Each probe therefore describes itself and the class it instruments:
+
+- compile-time constants: `MCP_FORMAT`, the target class / method / descriptor / line, the expression and condition as entered (each capped at 2,048 chars), `MCP_ARMED_AT`, `MCP_ARMED_BY` (`mcp-jdwp-java, session <8 hex>` — no host, no PID), `MCP_ABOUT` (for whoever finds the class in a heap dump);
+- `MCP_IMAGE`: the class's **install record** (`GenerationRecord`), a `byte[]` shared by every probe the class calls: the original class file, the probe names the installed code calls, and the installed snapshot. It is rewritten after every redefinition and dropped from a probe once the probe is off and no longer called.
+
+`FastLogpointService.discover` runs after every attach (`jdwp_connect`, `jdwp_wait_for_attach`, the auto-reconnect, `jdwp_reconnect`), after `jdwp_reset`, and from `jdwp_overview` when the previous run did not finish. It is read-only and bounded by 5 s; the reads hold no lock. For every probe class (`McpFastLogpoint_*`) it reads the constants, resolves the target in the probe's own class loader, decodes which probes the target's live code calls, and classifies (`LeftoverClassifier`):
+
+| found | listed as | offered |
+|---|---|---|
+| called by a class whose code equals the install record, which names exactly the probes the code calls | `RECOVERED` | disable; restore with the user's approval |
+| called, but the record is missing, unreadable, ambiguous or does not match the live code | `STRANDED` | disable only |
+| not called, still enabled (a thread running the pre-redefinition method can still call it) | `STRANDED` | disable, which retires it |
+| not called and disabled | not listed — inert | — |
+
+Leftovers get IDs from the shared space and are drained from their write position at discovery (entries written before are not replayed; the overview shows an upper bound of how many the ring may still hold). They are never owned by the session: disconnect, reconnect, target switch and shutdown leave them alone. `jdwp_clear_breakpoint` / `jdwp_clear` / `jdwp_reset` only set their kill switch. `jdwp_restore_fast_logpoints(id, userApproved)` redefines the class with the recorded original — removing every leftover in it — and follows the arming consent protocol: without approval it returns a briefing of what is removed and what was and was not verified (the recorded original is the class file the loader served at arming time, whose method code then matched the live class). A class with leftovers refuses new fast logpoints until they are restored.
+
 ## 6. Breakpoint chains
 
 The chain mechanism lets one breakpoint stay disabled until another fires. The data model:
@@ -286,5 +327,7 @@ If you find yourself adding a new variant, the shape to follow:
 7. **Chain participation** — opt in by calling `applyChainEffectsAfterHit` from your handler and by accepting `triggerBreakpointId` / `oneShot` parameters in the registration path. Existing chain machinery handles the rest.
 8. **`jdwp_overview` rendering** — add the new kind to the rendering switch so the agent can see it.
 9. **`jdwp_clear_breakpoint` routing** — add the new registry to the lookup chain.
+
+Fast logpoints (§ 5a) are the exception to this shape: they live in `FastLogpointService`, not in `BreakpointTracker`, borrow an ID with `allocateId`, and are routed first by `jdwp_clear_breakpoint`.
 
 The whole machine is shaped so that new kinds slot in via parallel structure, not by adding special cases to existing kinds.

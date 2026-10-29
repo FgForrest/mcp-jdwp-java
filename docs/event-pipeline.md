@@ -14,6 +14,23 @@ JDI delivers every interesting target-VM event — breakpoint hits, steps, excep
 
 One thread, named `jdi-event-listener`, daemon, spawned by `JdiEventListener.start(vm)` (`JdiEventListener.java:200-212`). Exactly one runs at a time — `start()` calls `stop()` first (line 201) so reconnects never overlap two listeners.
 
+The listener only drains and routes. Processing an event set can call into the target — logpoint expressions, breakpoint conditions, fast-logpoint arming, the classpath pre-warm all use `invokeMethod` — and a method invoked that way can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. So the sets are processed on a second thread, `jdi-event-dispatcher` (a single-thread executor per connection, so they stay in arrival order and their evaluations stay serialized), while the listener keeps draining:
+
+- a set whose thread is inside an MCP-driven evaluation (`EvaluationGuard`) is **suppressed** on the listener thread at once (`suppress`): each event is recorded as `*_SUPPRESSED` (a fast-logpoint arming hit is re-armed instead, a class prepare still promotes its deferred breakpoints) and the set is resumed, which lets the waiting invocation finish. This path never evaluates, arms or pre-warms — not even if the evaluation has ended by the time the set is handled (possible for a suspend-policy-`none` breakpoint, which does not hold the invocation up) — so the listener thread never calls into the target;
+- a `VMDeath` / `VMDisconnect` set is processed on the listener thread after the dispatcher has finished the sets before it (bounded at 2 s); sets still queued after that are dropped unprocessed, so `VM_DEATH` stays the last entry (only a set already being processed — a long compile, say — can still finish after it);
+- every other set goes to the dispatcher.
+
+Whoever processes a set decides its resume, after all of its events — with one exception on the dispatcher: a set is not resumed when a later set of the same thread is already waiting. A suspended thread raises no events, so that thread was resumed meanwhile (`jdwp_resume`) and has stopped again; the older set's suspension is spent, and resuming it would release the newer stop. A set with suspend policy `none` is not counted: its thread may have raised it inside an invocation that has ended by the time the set is routed, and holding the older set's resume back would park that thread for good.
+
+The rule infers from a later set; it does not track who owns a suspension. A tool resume (`jdwp_resume`, `jdwp_resume_thread`, a step) can still use up a waiting set's suspension, and the set's late resume can then release a newer stop in three cases:
+- the newer stop has not been routed yet;
+- the waiting set suspends all threads and the newer stop is on another thread;
+- the tool's resume lands between the check and `eventSet.resume()`.
+
+The same happens on `main` through JDI's dequeue filter whenever the listener is busy. The fix, an ownership model in which the tools release only the stops they hold, is tracked in #45.
+
+Because a set can wait on the dispatcher, the handlers re-apply the rule JDI applies when a set leaves its queue to one case: an event whose request was **deleted** meanwhile (a cleared logpoint, a class redefined by a fast logpoint) is dropped and does not keep its set suspended — otherwise the stale hit would be untracked and park its thread for good. An event whose tracked request was merely **disabled** meanwhile still counts as a hit — it was one when it happened.
+
 Lifetime:
 
 - Started by `JDIConnectionService.connect(...)` after the JDI attach succeeds (`JDIConnectionService.java:316`).
@@ -24,11 +41,15 @@ Lifetime:
 
 ## 2. The loop
 
-`listen(VirtualMachine vm)` (`JdiEventListener.java:278-349`) is the whole event loop. Skeleton:
+`listen(...)` drains and routes (see §1); `process(EventSet)` handles one set. Skeleton:
 
 ```java
 while (running) {
     EventSet eventSet = vm.eventQueue().remove();   // blocks
+    route(eventSet);   // process(eventSet) here, or on the dispatcher
+}
+
+void process(EventSet eventSet) {
     boolean shouldSuspend = false;
     for (Event e : eventSet) {
         shouldSuspend |= dispatchByType(e);
@@ -46,7 +67,7 @@ Two details matter:
 
 ### Dispatch by type
 
-The dispatcher inside the loop routes by `instanceof`:
+`process` routes each event by `instanceof`:
 
 | Event type | Handler | Lines |
 |---|---|---|

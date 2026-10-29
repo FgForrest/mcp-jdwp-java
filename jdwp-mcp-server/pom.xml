@@ -44,6 +44,18 @@
             <version>${ecj.version}</version>
         </dependency>
 
+        <!-- ASM: rewrites target-class bytecode for jdwp_set_fast_logpoint (java.lang.classfile needs JDK 24+) -->
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm</artifactId>
+            <version>${asm.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm-tree</artifactId>
+            <version>${asm.version}</version>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

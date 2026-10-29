@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 
@@ -50,7 +51,8 @@ final class JDWPToolsTestSupport {
 			mock(JvmDiscoveryService.class),
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
-			defaultEmptyClasspathProvider()
+			defaultEmptyClasspathProvider(),
+			mock(FastLogpointService.class)
 		);
 	}
 
@@ -95,7 +97,8 @@ final class JDWPToolsTestSupport {
 			jvmDiscoveryService,
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
-			defaultEmptyClasspathProvider()
+			defaultEmptyClasspathProvider(),
+			mock(FastLogpointService.class)
 		);
 	}
 
@@ -124,7 +127,8 @@ final class JDWPToolsTestSupport {
 			jvmDiscoveryService,
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
-			localClasspathProvider
+			localClasspathProvider,
+			mock(FastLogpointService.class)
 		);
 	}
 
@@ -152,7 +156,8 @@ final class JDWPToolsTestSupport {
 			jvmDiscoveryService,
 			markedInstances,
 			new JdiHealthMonitor(),
-			defaultEmptyClasspathProvider()
+			defaultEmptyClasspathProvider(),
+			mock(FastLogpointService.class)
 		);
 	}
 
@@ -181,7 +186,33 @@ final class JDWPToolsTestSupport {
 			jvmDiscoveryService,
 			markedInstances,
 			healthMonitor,
-			defaultEmptyClasspathProvider()
+			defaultEmptyClasspathProvider(),
+			mock(FastLogpointService.class)
+		);
+	}
+
+	/**
+	 * Overload that accepts a caller-supplied {@link FastLogpointService} — needed by tests of the
+	 * fast-logpoint tool surface (consent gate, routing of clear / get_events / reset).
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		EventHistory eventHistory,
+		FastLogpointService fastLogpoints
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			mock(WatcherManager.class),
+			mock(JdiExpressionEvaluator.class),
+			eventHistory,
+			new EvaluationGuard(),
+			mock(JvmDiscoveryService.class),
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider(),
+			fastLogpoints
 		);
 	}
 }
