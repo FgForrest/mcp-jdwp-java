@@ -505,6 +505,14 @@ public class JdiEventListener {
                     armingHits = new ArrayList<>(1);
                 }
                 armingHits.add(bpEvent);
+            } else if (event instanceof BreakpointEvent bpEvent
+                && fastLogpointService != null && fastLogpointService.claimsStopEvent(bpEvent)) {
+                if (fastLogpointService.handleStopHit(bpEvent)) {
+                    shouldSuspend = true;
+                    if (warmThread == null) {
+                        warmThread = bpEvent.thread();
+                    }
+                }
             } else if (event instanceof BreakpointEvent bpEvent) {
                 if (handleBreakpointEvent(bpEvent)) {
                     shouldSuspend = true;
@@ -555,7 +563,13 @@ public class JdiEventListener {
         // other breakpoint event of this set located in the same class.
         if (armingHits != null && fastLogpointService != null) {
             for (BreakpointEvent armingHit : armingHits) {
-                fastLogpointService.handleArmingHit(armingHit);
+                // A fast breakpoint's arming hit whose condition holds is published as its stop.
+                if (fastLogpointService.handleArmingHit(armingHit)) {
+                    shouldSuspend = true;
+                    if (warmThread == null) {
+                        warmThread = armingHit.thread();
+                    }
+                }
             }
         }
 
@@ -591,6 +605,9 @@ public class JdiEventListener {
                 if (event instanceof BreakpointEvent bpEvent
                     && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
                     fastLogpointService.skipArmingHit(bpEvent);
+                } else if (event instanceof BreakpointEvent bpEvent
+                    && fastLogpointService != null && fastLogpointService.claimsStopEvent(bpEvent)) {
+                    fastLogpointService.skipStopHit(bpEvent);
                 } else if (event instanceof BreakpointEvent bpEvent) {
                     recordSuppressedBreakpoint(bpEvent);
                 } else if (event instanceof StepEvent stepEvent) {
