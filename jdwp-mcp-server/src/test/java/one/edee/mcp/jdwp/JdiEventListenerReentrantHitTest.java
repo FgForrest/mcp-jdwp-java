@@ -24,6 +24,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockBreakpointEvent;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
@@ -60,6 +61,11 @@ class JdiEventListenerReentrantHitTest {
 	private FastLogpointService fastLogpoints;
 	private JdiEventListener listener;
 	private final BlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+	/**
+	 * How many times the listener has asked for its next event set; it asks again only once it has
+	 * routed the previous one.
+	 */
+	private final AtomicInteger removals = new AtomicInteger();
 	/**
 	 * Counted down when the blocked invocation has started (the thread is inside it).
 	 */
@@ -215,7 +221,8 @@ class JdiEventListenerReentrantHitTest {
 		release.countDown();
 		assertThat(guardClosed.await(2, TimeUnit.SECONDS)).isTrue();
 		queue.put(passedSet);
-		verify(passedSet, timeout(2000).atLeastOnce()).suspendPolicy();
+		// The third removal starts once the listener has routed passedSet to the dispatcher.
+		awaitRemovals(3);
 		finishEvaluation.countDown();
 		finish();
 
@@ -331,6 +338,7 @@ class JdiEventListenerReentrantHitTest {
 		final EventQueue eventQueue = mock(EventQueue.class);
 		when(vm.eventQueue()).thenReturn(eventQueue);
 		when(eventQueue.remove()).thenAnswer(invocation -> {
+			removals.incrementAndGet();
 			final Object next = queue.take();
 			if (next instanceof EventSet eventSet) {
 				return eventSet;
@@ -339,6 +347,17 @@ class JdiEventListenerReentrantHitTest {
 		});
 		queue.put(first);
 		listener.start(vm);
+	}
+
+	/**
+	 * Waits until the listener has asked for its {@code count}-th event set.
+	 */
+	private void awaitRemovals(int count) throws InterruptedException {
+		final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+		while (removals.get() < count && System.nanoTime() < deadline) {
+			Thread.sleep(5);
+		}
+		assertThat(removals.get()).as("listener asked for event set #%d", count).isGreaterThanOrEqualTo(count);
 	}
 
 	/**
