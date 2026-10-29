@@ -16,6 +16,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,9 +36,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * invokes methods in the target (logpoint and condition evaluation, fast-logpoint arming, classpath
  * pre-warm), and an invoked method can hit a breakpoint of its own. That event's set must be drained
  * and resumed while the invocation is still waiting, so a set whose thread is inside an MCP-driven
- * evaluation ({@link EvaluationGuard}) is processed on the listener thread at once: its handlers
- * suppress the event and the set is resumed. Whoever processes a set decides its resume, after all
- * of its events. An untracked event whose request was deleted while its set waited (a cleared
+ * evaluation ({@link EvaluationGuard}) is {@link #suppress}ed on the listener thread at once and
+ * resumed; that path never calls into the target. Whoever processes a set decides its resume, after
+ * all of its events, except that a set is not resumed once a later set of its thread is waiting (see
+ * {@link #dispatch}). An untracked event whose request was deleted while its set waited (a cleared
  * breakpoint) is dropped, as JDI drops it when a set leaves its queue.
  * <p>
  * Per-event behaviour (every suspending handler follows the order
@@ -306,7 +309,8 @@ public class JdiEventListener {
             return worker;
         });
         dispatcher = sessionDispatcher;
-        final Thread thread = new Thread(() -> listen(vm, sessionDispatcher), "jdi-event-listener");
+        final ConcurrentMap<Long, Integer> waiting = new ConcurrentHashMap<>();
+        final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, waiting), "jdi-event-listener");
         thread.setDaemon(true);
         listenerThread = thread;
         thread.start();
@@ -372,9 +376,11 @@ public class JdiEventListener {
 
     /**
      * Main event loop: drains the queue and routes every event set (see the class documentation).
-     * A death set is processed here once the sets before it are done, so {@code VM_DEATH} stays the
-     * last entry; a set from a thread inside an MCP-driven evaluation is processed here at once;
-     * every other set goes to the {@code dispatcher}, in order.
+     * A death set is processed here once the sets before it are done (at most
+     * {@link #DISPATCH_DRAIN_TIMEOUT_MS}; any still queued are discarded), so {@code VM_DEATH} stays
+     * the last entry; a set from a thread inside an MCP-driven evaluation is {@link #suppress}ed here
+     * at once; every other set goes to the {@code dispatcher}, in order, counted in {@code waiting}
+     * per target thread until it starts (see {@link #dispatch}).
      * <p>
      * On either death path (in-loop {@code VMDeath}/{@code VMDisconnect} event, or
      * {@code VMDisconnectedException}/{@code IllegalStateException} from the JDI queue, or
@@ -382,7 +388,7 @@ public class JdiEventListener {
      * clears {@link #running}, fires the resume-until-event latch, and invokes the registered
      * {@link #vmDeathHook} before exiting.
      */
-    private void listen(VirtualMachine vm, ExecutorService dispatcher) {
+    private void listen(VirtualMachine vm, ExecutorService dispatcher, ConcurrentMap<Long, Integer> waiting) {
         final EventQueue queue = vm.eventQueue();
 
         while (running) {
@@ -403,9 +409,13 @@ public class JdiEventListener {
                     awaitDispatched(dispatcher);
                     process(eventSet);
                 } else if (fromEvaluatingThread(eventSet)) {
-                    process(eventSet);
+                    suppress(eventSet);
                 } else {
-                    dispatcher.execute(() -> dispatch(eventSet));
+                    final Long threadId = threadIdOf(eventSet);
+                    if (threadId != null) {
+                        waiting.merge(threadId, 1, Integer::sum);
+                    }
+                    dispatcher.execute(() -> dispatch(eventSet, threadId, waiting));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -433,18 +443,31 @@ public class JdiEventListener {
                 }
             }
         }
-        // Sets already handed over still run; the thread exits once they are done.
-        dispatcher.shutdown();
+        // The loop ends on VM death or stop(): sets still queued are dropped unprocessed.
+        dispatcher.shutdownNow();
     }
 
     /**
-     * Processes one event set on the dispatcher thread. Never throws — an exception escaping the
-     * task would only reach the executor; a disconnected VM is reported by the listener thread,
-     * whose next {@code queue.remove()} fails too.
+     * Processes one event set on the dispatcher thread and resumes it if {@link #process} says so —
+     * unless a later set of the same target thread is already {@code waiting}. A suspended thread
+     * raises no events, so the thread was resumed meanwhile (e.g. {@code jdwp_resume}) and has
+     * stopped again: this set's suspension is spent, and resuming it would release the newer one.
+     * Never throws — an exception escaping the task would only reach the executor; a disconnected VM
+     * is reported by the listener thread, whose next {@code queue.remove()} fails too.
      */
-    private void dispatch(EventSet eventSet) {
+    private void dispatch(EventSet eventSet, @Nullable Long threadId, ConcurrentMap<Long, Integer> waiting) {
+        if (threadId != null) {
+            waiting.computeIfPresent(threadId, (id, count) -> count > 1 ? count - 1 : null);
+        }
         try {
-            process(eventSet);
+            if (process(eventSet)) {
+                if (threadId != null && waiting.containsKey(threadId)) {
+                    log.debug("[JDI] Not resuming an event set of thread {}: it was resumed and has stopped again since",
+                        threadId);
+                } else {
+                    eventSet.resume();
+                }
+            }
         } catch (Exception e) {
             if (running) {
                 log.warn("[JDI] Error processing event: {}", e.getMessage());
@@ -455,13 +478,15 @@ public class JdiEventListener {
     /**
      * Handles every event of one set and decides its resume. Events that require user inspection
      * (breakpoints, steps, exceptions) cause the entire `EventSet` to stay suspended; logpoints and
-     * false conditional breakpoints reach the bottom with `shouldSuspend == false` and the set is
-     * `eventSet.resume()`d. Note that `resume()` is only called when NO event in the set demanded
-     * suspension — even one suspending event keeps every thread in the set parked for user inspection.
-     * A death event records {@code VM_DEATH}, clears {@link #running}, fires the resume-until-event
-     * latch and invokes the {@link #vmDeathHook}; the rest of its set is not processed.
+     * false conditional breakpoints reach the bottom with `shouldSuspend == false` and the set is to
+     * be resumed. Note that the set is resumed only when NO event in it demanded suspension — even one
+     * suspending event keeps every thread in the set parked for user inspection. A death event records
+     * {@code VM_DEATH}, clears {@link #running}, fires the resume-until-event latch and invokes the
+     * {@link #vmDeathHook}; the rest of its set is not processed.
+     *
+     * @return whether the caller should resume the set
      */
-    private void process(EventSet eventSet) {
+    private boolean process(EventSet eventSet) {
         boolean shouldSuspend = false;
         // First thread parked for inspection in this set; used to pre-warm the compiler
         // classpath once the set has been handled (see the prewarm call below).
@@ -518,7 +543,7 @@ public class JdiEventListener {
                 running = false;
                 breakpointTracker.fireNextEvent();
                 invokeVmDeathHook();
-                return;
+                return false;
             }
         }
 
@@ -543,8 +568,132 @@ public class JdiEventListener {
             if (warmThread != null) {
                 expressionEvaluator.prewarmClasspath(warmThread);
             }
-        } else {
-            eventSet.resume();
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Handles, on the listener thread, a set raised inside an MCP-driven evaluation (see
+     * {@link #fromEvaluatingThread}) and resumes it, so the invocation waiting for its thread can
+     * finish. Only suppresses: it never evaluates, arms or pre-warms, whatever the evaluation guard
+     * says by now — the listener thread must never call into the target. A class prepare still
+     * promotes the deferred breakpoints of its class, which touches debugger-side state only.
+     */
+    private void suppress(EventSet eventSet) {
+        final FastLogpointService fastLogpointService = fastLogpoints;
+        for (Event event : eventSet) {
+            try {
+                if (event instanceof BreakpointEvent bpEvent
+                    && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
+                    fastLogpointService.skipArmingHit(bpEvent);
+                } else if (event instanceof BreakpointEvent bpEvent) {
+                    recordSuppressedBreakpoint(bpEvent);
+                } else if (event instanceof StepEvent stepEvent) {
+                    deleteStepRequest(stepEvent);
+                    recordSuppressedStep(stepEvent);
+                } else if (event instanceof ExceptionEvent exEvent) {
+                    recordSuppressedException(exEvent);
+                } else if (event instanceof WatchpointEvent wpEvent) {
+                    recordSuppressedWatchpoint(wpEvent);
+                } else if (event instanceof ClassPrepareEvent cpEvent) {
+                    handleClassPrepareEvent(cpEvent);
+                }
+            } catch (Exception e) {
+                log.debug("[JDI] Error suppressing an event raised inside an MCP evaluation: {}", e.getMessage());
+            }
+        }
+        eventSet.resume();
+    }
+
+    /**
+     * Records a breakpoint hit inside an MCP-driven evaluation as {@code BREAKPOINT_SUPPRESSED}. It
+     * must not set the last-breakpoint snapshot or fire the resume-until-event latch: it would
+     * clobber the user's current context and wake a waiter. Never throws.
+     */
+    private void recordSuppressedBreakpoint(BreakpointEvent event) {
+        try {
+            final String className = event.location().declaringType().name();
+            final int lineNumber = event.location().lineNumber();
+            eventHistory.record(new EventHistory.DebugEvent("BREAKPOINT_SUPPRESSED",
+                String.format("Recursive BP at %s:%d suppressed (thread '%s' inside MCP evaluation)",
+                    className, lineNumber, event.thread().name()),
+                Map.of("class", className, "line", String.valueOf(lineNumber),
+                    "thread", event.thread().name())));
+            log.info("[JDI] Suppressing recursive BP at {}:{} on thread {} (inside MCP evaluation)",
+                className, lineNumber, event.thread().name());
+        } catch (Exception e) {
+            log.debug("[JDI] Error recording suppressed breakpoint event: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Deletes the one-shot {@link StepRequest} behind {@code event} (JDI convention — step requests
+     * are consumed after firing).
+     */
+    private static void deleteStepRequest(StepEvent event) {
+        // Some legacy JDI providers deliver step events with a null request reference (already
+        // auto-removed by the provider) — guard before calling deleteEventRequest.
+        if (event.request() != null) {
+            event.request().virtualMachine().eventRequestManager().deleteEventRequest(event.request());
+        }
+    }
+
+    /**
+     * Records a step event inside an MCP-driven evaluation as {@code STEP_SUPPRESSED}. Never throws.
+     */
+    private void recordSuppressedStep(StepEvent event) {
+        try {
+            final String className = event.location().declaringType().name();
+            final int lineNumber = event.location().lineNumber();
+            eventHistory.record(new EventHistory.DebugEvent("STEP_SUPPRESSED",
+                String.format("Step at %s:%d suppressed (thread '%s' inside MCP evaluation)",
+                    className, lineNumber, event.thread().name()),
+                Map.of("class", className, "line", String.valueOf(lineNumber),
+                    "thread", event.thread().name())));
+            log.info("[JDI] Suppressing step event at {}:{} on thread {} (inside MCP evaluation)",
+                className, lineNumber, event.thread().name());
+        } catch (Exception e) {
+            log.debug("[JDI] Error recording suppressed step event: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Records an exception thrown inside an MCP-driven evaluation as {@code EXCEPTION_SUPPRESSED}; it
+     * still reaches the invoking code through JDI's {@link InvocationException}. Never throws.
+     */
+    private void recordSuppressedException(ExceptionEvent event) {
+        try {
+            final String exceptionType = event.exception().referenceType().name();
+            final String threadName = event.thread().name();
+            eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_SUPPRESSED",
+                String.format("Exception %s on thread '%s' suppressed (inside MCP evaluation)",
+                    exceptionType, threadName),
+                Map.of("exceptionType", exceptionType, "thread", threadName)));
+            log.info("[JDI] Suppressing exception {} on thread {} (inside MCP evaluation)",
+                exceptionType, threadName);
+        } catch (Exception e) {
+            log.debug("[JDI] Error recording suppressed exception event: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Records a field event inside an MCP-driven evaluation as {@code FIELD_BREAKPOINT_SUPPRESSED}.
+     * Never throws.
+     */
+    private void recordSuppressedWatchpoint(WatchpointEvent event) {
+        try {
+            final String className = event.field().declaringType().name();
+            final String fieldName = event.field().name();
+            final String threadName = event.thread().name();
+            eventHistory.record(new EventHistory.DebugEvent("FIELD_BREAKPOINT_SUPPRESSED",
+                String.format("Recursive field event on %s.%s suppressed (thread '%s' inside MCP evaluation)",
+                    className, fieldName, threadName),
+                Map.of("class", className, "field", fieldName, "thread", threadName)));
+            log.info("[JDI] Suppressing recursive field watchpoint on {}.{} (thread {})",
+                className, fieldName, threadName);
+        } catch (Exception e) {
+            log.debug("[JDI] Error recording suppressed field event: {}", e.getMessage());
         }
     }
 
@@ -577,34 +726,56 @@ public class JdiEventListener {
     }
 
     /**
-     * Whether every thread {@code eventSet} reports is inside an MCP-driven evaluation, i.e. the set
-     * was generated by a method the debugger invoked. Its handlers suppress the events (or, for a
-     * class prepare, only touch debugger-side state), so it can be processed on the listener thread
-     * — and must be: the invocation that produced it may be the one the dispatcher is waiting on.
+     * Whether every event of {@code eventSet} comes from a thread inside an MCP-driven evaluation,
+     * i.e. the set was raised by a method the debugger invoked. It is {@link #suppress}ed on the
+     * listener thread — and must be: the invocation that raised it may be the one the dispatcher is
+     * waiting on.
      */
     private boolean fromEvaluatingThread(EventSet eventSet) {
-        boolean threaded = false;
         for (Event event : eventSet) {
-            final ThreadReference thread;
-            if (event instanceof LocatableEvent located) {
-                thread = located.thread();
-            } else if (event instanceof ClassPrepareEvent prepared) {
-                thread = prepared.thread();
-            } else {
-                continue;
-            }
-            // A class prepare raised by a debugger system thread in the target has no thread.
+            final ThreadReference thread = threadOf(event);
             if (thread == null || !evaluationGuard.isEvaluating(thread)) {
                 return false;
             }
-            threaded = true;
         }
-        return threaded;
+        return !eventSet.isEmpty();
     }
 
     /**
-     * Waits until the dispatcher has processed every set handed to it so far, at most
-     * {@link #DISPATCH_DRAIN_TIMEOUT_MS}; on a dying VM its target calls fail fast.
+     * The target thread {@code eventSet} reports ({@link ThreadReference#uniqueID}), or {@code null}
+     * for a set without one. JDI never puts events of different threads into one set.
+     */
+    @Nullable
+    private static Long threadIdOf(EventSet eventSet) {
+        for (Event event : eventSet) {
+            final ThreadReference thread = threadOf(event);
+            if (thread != null) {
+                return thread.uniqueID();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The target thread {@code event} occurred in, or {@code null} for an event without one — a
+     * class prepare raised by a debugger system thread in the target has none either.
+     */
+    @Nullable
+    private static ThreadReference threadOf(Event event) {
+        if (event instanceof LocatableEvent located) {
+            return located.thread();
+        }
+        if (event instanceof ClassPrepareEvent prepared) {
+            return prepared.thread();
+        }
+        return null;
+    }
+
+    /**
+     * At VM death: waits until the dispatcher has processed every set handed to it so far, at most
+     * {@link #DISPATCH_DRAIN_TIMEOUT_MS} (on a dying VM its target calls fail fast), then shuts it
+     * down — sets still queued are for a dead VM and must not record anything after
+     * {@code VM_DEATH}. Only a set already being processed can still finish afterwards.
      */
     private static void awaitDispatched(ExecutorService dispatcher) {
         try {
@@ -614,6 +785,7 @@ public class JdiEventListener {
         } catch (ExecutionException | TimeoutException | RejectedExecutionException e) {
             log.debug("[JDI] Event sets still in progress at VM death: {}", e.toString());
         }
+        dispatcher.shutdownNow();
     }
 
     /**
@@ -664,15 +836,7 @@ public class JdiEventListener {
             // the suppressed event does not clobber the user's current context or wake a
             // waiter on jdwp_resume_until_event.
             if (evaluationGuard.isEvaluating(event.thread())) {
-                final String className = event.location().declaringType().name();
-                final int lineNumber = event.location().lineNumber();
-                eventHistory.record(new EventHistory.DebugEvent("BREAKPOINT_SUPPRESSED",
-                    String.format("Recursive BP at %s:%d suppressed (thread '%s' inside MCP evaluation)",
-                        className, lineNumber, event.thread().name()),
-                    Map.of("class", className, "line", String.valueOf(lineNumber),
-                        "thread", event.thread().name())));
-                log.info("[JDI] Suppressing recursive BP at {}:{} on thread {} (inside MCP evaluation)",
-                    className, lineNumber, event.thread().name());
+                recordSuppressedBreakpoint(event);
                 return false;
             }
 
@@ -753,27 +917,13 @@ public class JdiEventListener {
     private boolean handleStepEvent(StepEvent event) {
         // Some legacy JDI providers deliver step events with a null request reference (already
         // auto-removed by the provider) — guard before calling deleteEventRequest.
-        if (event.request() != null) {
-            event.request().virtualMachine().eventRequestManager().deleteEventRequest(event.request());
-        }
+        deleteStepRequest(event);
 
         // Reentrancy guard — see handleBreakpointEvent for the rationale. JDI is not supposed to
         // deliver step events during invokeMethod but we suppress defensively so a future JDI
         // implementation change can never turn this path into a deadlock.
         if (evaluationGuard.isEvaluating(event.thread())) {
-            try {
-                final String className = event.location().declaringType().name();
-                final int lineNumber = event.location().lineNumber();
-                eventHistory.record(new EventHistory.DebugEvent("STEP_SUPPRESSED",
-                    String.format("Step at %s:%d suppressed (thread '%s' inside MCP evaluation)",
-                        className, lineNumber, event.thread().name()),
-                    Map.of("class", className, "line", String.valueOf(lineNumber),
-                        "thread", event.thread().name())));
-                log.info("[JDI] Suppressing step event at {}:{} on thread {} (inside MCP evaluation)",
-                    className, lineNumber, event.thread().name());
-            } catch (Exception e) {
-                log.debug("[JDI] Error recording suppressed step event: {}", e.getMessage());
-            }
+            recordSuppressedStep(event);
             return false;
         }
 
@@ -822,18 +972,7 @@ public class JdiEventListener {
     private boolean handleExceptionEvent(ExceptionEvent event) {
         // Reentrancy guard — see contract above.
         if (evaluationGuard.isEvaluating(event.thread())) {
-            try {
-                final String exceptionType = event.exception().referenceType().name();
-                final String threadName = event.thread().name();
-                eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_SUPPRESSED",
-                    String.format("Exception %s on thread '%s' suppressed (inside MCP evaluation)",
-                        exceptionType, threadName),
-                    Map.of("exceptionType", exceptionType, "thread", threadName)));
-                log.info("[JDI] Suppressing exception {} on thread {} (inside MCP evaluation)",
-                    exceptionType, threadName);
-            } catch (Exception e) {
-                log.debug("[JDI] Error recording suppressed exception event: {}", e.getMessage());
-            }
+            recordSuppressedException(event);
             return false;
         }
 
@@ -980,19 +1119,7 @@ public class JdiEventListener {
     private boolean handleWatchpointEvent(WatchpointEvent event) {
         // Reentrancy guard — see handleBreakpointEvent for the rationale.
         if (evaluationGuard.isEvaluating(event.thread())) {
-            try {
-                final String className = event.field().declaringType().name();
-                final String fieldName = event.field().name();
-                final String threadName = event.thread().name();
-                eventHistory.record(new EventHistory.DebugEvent("FIELD_BREAKPOINT_SUPPRESSED",
-                    String.format("Recursive field event on %s.%s suppressed (thread '%s' inside MCP evaluation)",
-                        className, fieldName, threadName),
-                    Map.of("class", className, "field", fieldName, "thread", threadName)));
-                log.info("[JDI] Suppressing recursive field watchpoint on {}.{} (thread {})",
-                    className, fieldName, threadName);
-            } catch (Exception e) {
-                log.debug("[JDI] Error recording suppressed field event: {}", e.getMessage());
-            }
+            recordSuppressedWatchpoint(event);
             return false;
         }
 

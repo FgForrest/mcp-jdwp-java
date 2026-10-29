@@ -255,8 +255,7 @@ public class FastLogpointService {
      * a failure marks the logpoint {@link State#FAILED} and records {@code FAST_LOGPOINT_ARM_FAILED}.
      */
     public void handleArmingHit(BreakpointEvent event) {
-        final EventRequest request = event.request();
-        final FastLogpoint flp = request != null ? byArmingRequest.get(request) : null;
+        final FastLogpoint flp = armingLogpoint(event);
         if (flp == null) {
             return;
         }
@@ -276,6 +275,27 @@ public class FastLogpointService {
         } finally {
             evaluationGuard.exit(threadId);
         }
+    }
+
+    /**
+     * Puts a fresh one-shot arming request in place of the one {@code event} spent, without arming:
+     * the hit came from a thread inside an MCP-driven method invocation, whose events the listener
+     * thread only suppresses (invoking on that thread again could deadlock). Never throws.
+     */
+    public void skipArmingHit(BreakpointEvent event) {
+        final FastLogpoint flp = armingLogpoint(event);
+        if (flp != null) {
+            rearm(flp);
+        }
+    }
+
+    /**
+     * The fast logpoint whose arming request reported {@code event}, or {@code null}.
+     */
+    @Nullable
+    private FastLogpoint armingLogpoint(BreakpointEvent event) {
+        final EventRequest request = event.request();
+        return request != null ? byArmingRequest.get(request) : null;
     }
 
     /**

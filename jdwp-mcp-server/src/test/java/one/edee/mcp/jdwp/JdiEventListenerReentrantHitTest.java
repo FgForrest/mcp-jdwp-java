@@ -8,6 +8,7 @@ import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.VMDisconnectEvent;
 import com.sun.jdi.request.BreakpointRequest;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
@@ -30,8 +31,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -161,6 +164,100 @@ class JdiEventListenerReentrantHitTest {
 		assertThat(types()).containsSubsequence("LOGPOINT", "BREAKPOINT");
 		assertThat(tracker.getLastBreakpointId()).isEqualTo(userId);
 		verify(otherSet, never()).resume();
+	}
+
+	@Test
+	@DisplayName("a set raised inside an evaluation is only suppressed, even if the evaluation ended meanwhile")
+	void reentrantSetNeverEvaluates() throws Exception {
+		final ThreadReference thread = threadWithFrame();
+		final BreakpointRequest conditional = mock(BreakpointRequest.class);
+		tracker.setCondition(tracker.registerBreakpoint(conditional), "helper() > 0");
+		// Inside the evaluation when the listener routes the set, out of it when the set is handled —
+		// possible for a breakpoint with suspend policy "none", which does not hold the invocation up.
+		final EvaluationGuard closing = spy(new EvaluationGuard());
+		doReturn(true, false).when(closing).isEvaluating(thread);
+		listener.stop();
+		listener = new JdiEventListener(tracker, history, evaluator, closing, null, new MarkedInstanceRegistry());
+		final EventSet eventSet = mockEventSet(mockBreakpointEvent(thread, conditional, "com.example.Hot", 10));
+
+		start(eventSet);
+
+		// Suppressed on the listener thread, not on the dispatcher that finish() waits for.
+		verify(eventSet, timeout(2000)).resume();
+		finish();
+		verify(evaluator, never()).evaluate(any(StackFrame.class), anyString(), any());
+		assertThat(types()).contains("BREAKPOINT_SUPPRESSED").doesNotContain("BREAKPOINT", "CONDITION_ERROR");
+	}
+
+	@Test
+	@DisplayName("a set whose thread was resumed and stopped again while it waited is not resumed")
+	void overtakenSetIsNotResumed() throws Exception {
+		// The dispatcher is busy with one thread's evaluation while another thread's sets queue up.
+		final ThreadReference busy = threadWithFrame();
+		final BreakpointRequest busyRequest = mock(BreakpointRequest.class);
+		tracker.setLogpointExpression(tracker.registerBreakpoint(busyRequest), "helper()");
+		final ThreadReference thread = mockThread("other", 22L);
+		final StackFrame frame = mock(StackFrame.class);
+		when(thread.frame(0)).thenReturn(frame);
+		final BreakpointRequest logpointRequest = mock(BreakpointRequest.class);
+		tracker.setLogpointExpression(tracker.registerBreakpoint(logpointRequest), "i");
+		final BreakpointRequest userRequest = mock(BreakpointRequest.class);
+		final int userId = tracker.registerBreakpoint(userRequest);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenAnswer(invocation -> {
+			if (invocation.getArgument(0) != frame) {
+				blockInsideInvocation();
+			}
+			return null;
+		});
+		final EventSet busySet = mockEventSet(mockBreakpointEvent(busy, busyRequest, "com.example.Busy", 5));
+		// The other thread hits a logpoint; while that set waits it is resumed (jdwp_resume) and stops
+		// at a breakpoint. The logpoint set's suspension is spent: resuming it would release the stop.
+		final EventSet logpointSet = mockEventSet(mockBreakpointEvent(thread, logpointRequest, "com.example.Hot", 10));
+		final EventSet breakpointSet = mockEventSet(mockBreakpointEvent(thread, userRequest, "com.example.Hot", 20));
+
+		start(busySet);
+		assertThat(invoking.await(2, TimeUnit.SECONDS)).isTrue();
+		queue.put(logpointSet);
+		queue.put(breakpointSet);
+		Thread.sleep(100);
+		finish();
+
+		verify(busySet).resume();
+		verify(logpointSet, never()).resume();
+		verify(breakpointSet, never()).resume();
+		assertThat(types()).containsSubsequence("LOGPOINT", "LOGPOINT", "BREAKPOINT");
+		assertThat(tracker.getLastBreakpointId()).isEqualTo(userId);
+	}
+
+	@Test
+	@DisplayName("at VM death, sets queued behind a stuck evaluation are dropped instead of processed after VM_DEATH")
+	void deathDropsQueuedSets() throws Exception {
+		final ThreadReference busy = threadWithFrame();
+		final BreakpointRequest busyRequest = mock(BreakpointRequest.class);
+		tracker.setLogpointExpression(tracker.registerBreakpoint(busyRequest), "helper()");
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenAnswer(invocation -> {
+			blockInsideInvocation();
+			return null;
+		});
+		final BreakpointRequest userRequest = mock(BreakpointRequest.class);
+		tracker.registerBreakpoint(userRequest);
+		final EventSet queuedSet = mockEventSet(
+			mockBreakpointEvent(mockThread("other", 22L), userRequest, "com.example.Hot", 20));
+
+		start(mockEventSet(mockBreakpointEvent(busy, busyRequest, "com.example.Busy", 5)));
+		assertThat(invoking.await(2, TimeUnit.SECONDS)).isTrue();
+		queue.put(queuedSet);
+		queue.put(mockEventSet(mock(VMDisconnectEvent.class)));
+
+		// The listener gives the stuck evaluation DISPATCH_DRAIN_TIMEOUT_MS, then records the death.
+		final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (!types().contains("VM_DEATH") && System.nanoTime() < deadline) {
+			Thread.sleep(20);
+		}
+		assertThat(types()).contains("VM_DEATH");
+		assertThat(listener.awaitIdle(5000)).as("the stuck evaluation is interrupted").isTrue();
+		assertThat(types()).doesNotContain("BREAKPOINT");
+		verify(queuedSet, never()).resume();
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────
