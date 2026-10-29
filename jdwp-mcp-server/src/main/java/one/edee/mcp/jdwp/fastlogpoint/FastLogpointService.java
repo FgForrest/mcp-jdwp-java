@@ -2321,6 +2321,29 @@ public class FastLogpointService {
     }
 
     /**
+     * Whether {@code type} is a probe class this server generates (this session's, an earlier one's,
+     * or any class named like one).
+     */
+    public static boolean isProbeType(ReferenceType type) {
+        return isProbeClassName(simpleName(type.name()));
+    }
+
+    /**
+     * Binary names of the probe classes of every listed fast logpoint and fast breakpoint, own and
+     * leftover, that has one: what a step must not stop in.
+     */
+    public List<String> probeClassNames() {
+        final List<String> names = new ArrayList<>();
+        for (FastLogpoint flp : logpoints.values()) {
+            final ClassType probeType = flp.probeType;
+            if (probeType != null) {
+                names.add(probeType.name());
+            }
+        }
+        return names;
+    }
+
+    /**
      * The fast breakpoint's arming hit, evaluated through the debugger: this execution runs the old
      * code, so the probe never sees it. A hit that stops (the condition holds or fails, and its gate
      * is open) is published at once and installs nothing — redefining the method now would leave this
@@ -2539,11 +2562,11 @@ public class FastLogpointService {
      * The location of the first frame that does not belong to a probe class: where the user's code
      * stopped. Falls back to {@code fallback}.
      */
-    public static Location userLocation(ThreadReference thread, Location fallback) {
+    private static Location userLocation(ThreadReference thread, Location fallback) {
         try {
             for (StackFrame frame : thread.frames()) {
                 final Location location = frame.location();
-                if (!isProbeClassName(simpleName(location.declaringType().name()))) {
+                if (!isProbeType(location.declaringType())) {
                     return location;
                 }
             }

@@ -1,8 +1,11 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -148,6 +151,55 @@ class JDWPToolsFastBreakpointTest {
 
 		tracker.setLastBreakpointThread(thread, 8);
 		assertThat(tools.jdwp_get_current_thread()).contains("breakpoint=8").doesNotContain("fast_breakpoint");
+	}
+
+	@Test
+	@DisplayName("a step from a fast breakpoint's stop excludes every probe class before its count filter")
+	void stepFromFastStopExcludesProbes() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final EventRequestManager erm = mock(EventRequestManager.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.eventRequestManager()).thenReturn(erm);
+		when(erm.stepRequests()).thenReturn(List.of());
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.name()).thenReturn("box-office-3");
+		when(thread.isSuspended()).thenReturn(true);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		final StackFrame stop = frame("com.example.McpFastBreakpoint_aa", "stop", 1);
+		final StackFrame hit = frame("com.example.McpFastBreakpoint_aa", "hit", 1);
+		final StackFrame user = frame("com.example.BoxOffice", "trySell", 54);
+		when(thread.frameCount()).thenReturn(3);
+		when(thread.frames(0, 3)).thenReturn(List.of(stop, hit, user));
+		when(thread.frame(2)).thenReturn(user);
+		when(fastLogpoints.probeClassNames()).thenReturn(List.of("com.example.McpFastLogpoint_bb"));
+		final StepRequest step = mock(StepRequest.class);
+		when(erm.createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER)).thenReturn(step);
+
+		assertThat(tools.jdwp_step_over(1L))
+			.contains("from com.example.BoxOffice:54")
+			.contains("first lands on the stop line");
+
+		final InOrder order = inOrder(step, thread);
+		order.verify(step).addClassExclusionFilter("com.example.McpFastBreakpoint_aa");
+		order.verify(step).addCountFilter(1);
+		order.verify(step).enable();
+		order.verify(thread).resume();
+		verify(step).addClassExclusionFilter("com.example.McpFastLogpoint_bb");
+	}
+
+	private static StackFrame frame(String className, String methodName, int line) {
+		final com.sun.jdi.ReferenceType type = mock(com.sun.jdi.ReferenceType.class);
+		when(type.name()).thenReturn(className);
+		final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+		when(method.name()).thenReturn(methodName);
+		final com.sun.jdi.Location location = mock(com.sun.jdi.Location.class);
+		when(location.declaringType()).thenReturn(type);
+		when(location.method()).thenReturn(method);
+		when(location.lineNumber()).thenReturn(line);
+		final StackFrame frame = mock(StackFrame.class);
+		when(frame.location()).thenReturn(location);
+		return frame;
 	}
 
 	@Test

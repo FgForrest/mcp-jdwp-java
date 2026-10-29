@@ -219,7 +219,7 @@ class FastLogpointLiveTest {
 	@DisplayName("jdwp_reset, jdwp_disconnect and jdwp_reconnect restore the original bytecode")
 	void resetAndDisconnectRestoreBytecode() throws Exception {
 		awaitArmed(idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null)));
-		assertThat(tools.jdwp_reset()).contains("Fast logpoints cleared:        1");
+		assertThat(tools.jdwp_reset()).contains("In-target probes cleared:      1");
 		assertBytecodeRestored();
 
 		awaitArmed(idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null)));

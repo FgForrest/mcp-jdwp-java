@@ -212,6 +212,38 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	@Test
+	@Order(6)
+	@DisplayName("a fast stop is inspected at the user's frame: stack, locals, evaluation, set_local, and a step")
+	void fastStopIsInspectedAtTheUsersFrame() throws Exception {
+		// suspendPolicy=thread: after a step from a stop-all stop, today's blind jdwp_resume leaves the other
+		// threads one suspension behind (issue #45).
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+			.contains("fast_breakpoint=" + id + ", condition true");
+		final long threadId = stoppedThread().uniqueID();
+
+		assertThat(tools.jdwp_get_stack(threadId, null, null))
+			.contains("frame(s) of fast-breakpoint probe")
+			.contains("compute");
+		assertThat(tools.jdwp_get_locals(threadId, 0)).contains("i (int) = ").contains("doubled (int) = ");
+		assertThat(tools.jdwp_evaluate_expression(threadId, "i % 2000000", 0)).isEqualTo("Result of i % 2000000: 1999999");
+		assertThat(tools.jdwp_set_local(threadId, 0, "doubled", "-1")).contains("set to -1");
+
+		assertThat(tools.jdwp_step_over(threadId)).contains("first lands on the stop line");
+		// The step lands within microseconds. Until issue #45, the blind vm.resume() of a
+		// jdwp_resume_until_event issued while its event is still in flight would use up its suspension.
+		await("the step landed", () -> {
+			final BreakpointTracker.LastBreakpoint snapshot = session.tracker.getLastBreakpoint();
+			return snapshot != null && snapshot.kind() == BreakpointTracker.EventKind.STEP;
+		});
+		assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis()))
+			.startsWith("Event fired at " + TARGET + ':' + probeLine)
+			.contains("via=step");
+		assertThat(tools.jdwp_get_locals(threadId, 0)).as("the step stayed in the user's frame").contains("doubled (int) = -1");
+	}
+
 	// ── helpers ──
 
 	private FastLogpointService.Info info(int id) {

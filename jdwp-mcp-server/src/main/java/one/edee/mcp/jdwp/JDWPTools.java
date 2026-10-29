@@ -848,10 +848,12 @@ public class JDWPTools {
                 return notSuspendedForInspection(thread);
             }
 
-            final List<StackFrame> frames = thread.frames();
+            final FrameView view = FrameView.of(thread);
+            final List<StackFrame> frames = view.frames();
             final StringBuilder result = new StringBuilder();
             result.append(String.format("Stack trace for thread %d (%s) - %d frame(s) total:\n\n",
                 threadId, thread.name(), frames.size()));
+            result.append(view.hiddenNote());
 
             appendUserFrames(result, frames, limit, includeNoiseFrames, "");
 
@@ -877,7 +879,7 @@ public class JDWPTools {
                 return notSuspendedForInspection(thread);
             }
 
-            final StackFrame frame = thread.frame(frameIndex);
+            final StackFrame frame = FrameView.of(thread).frame(frameIndex);
             final StringBuilder result = new StringBuilder();
             result.append(String.format("Local variables in frame %d:\n\n", frameIndex));
 
@@ -1176,7 +1178,7 @@ public class JDWPTools {
 
             expressionEvaluator.configureCompilerClasspath(thread);
 
-            final StackFrame frame = thread.frame(frameIndex != null ? frameIndex : 0);
+            final StackFrame frame = FrameView.of(thread).frame(frameIndex != null ? frameIndex : 0);
             final Value result = expressionEvaluator.evaluate(frame, expression, markedInstances.buildBindings());
 
             // P3-5: echo the expression so the agent can attribute results when several evals are
@@ -1221,7 +1223,7 @@ public class JDWPTools {
             }
 
             expressionEvaluator.configureCompilerClasspath(thread);
-            final StackFrame stackFrame = thread.frame(frame);
+            final StackFrame stackFrame = FrameView.of(thread).frame(frame);
             final Value result = expressionEvaluator.evaluate(stackFrame, expression, markedInstances.buildBindings());
             final String actual = formatValue(result);
 
@@ -1260,7 +1262,7 @@ public class JDWPTools {
             if (thread == null || !thread.isSuspended()) {
                 return originalMessage;
             }
-            final StackFrame frame = thread.frame(frameIndex != null ? frameIndex : 0);
+            final StackFrame frame = FrameView.of(thread).frame(frameIndex != null ? frameIndex : 0);
             final ObjectReference thisObj = frame.thisObject();
             if (thisObj == null) {
                 return originalMessage;
@@ -1403,13 +1405,14 @@ public class JDWPTools {
             // line forced the agent to follow up with get_breakpoint_context just to learn which
             // line they landed on. Capturing it here saves one round-trip per BP hit.
             String locationSuffix = "";
+            int frameCount = -1;
             if (thread.isSuspended()) {
                 try {
-                    if (thread.frameCount() > 0) {
-                        final com.sun.jdi.Location top = thread.frame(0).location();
-                        // A fast breakpoint stops inside its probe; report the line in the user's code.
-                        final com.sun.jdi.Location loc = fastStopReason(snapshot) != null
-                            ? FastLogpointService.userLocation(thread, top) : top;
+                    // Logical frames: a fast breakpoint stops inside its probe, the line is the user's.
+                    final FrameView view = FrameView.of(thread);
+                    frameCount = view.count();
+                    if (frameCount > 0) {
+                        final com.sun.jdi.Location loc = view.frame(0).location();
                         locationSuffix = String.format(" at %s:%d",
                             loc.declaringType().name(), loc.lineNumber());
                     }
@@ -1420,7 +1423,7 @@ public class JDWPTools {
             final String base = String.format("Event fired%s. Thread: %s (ID=%d, suspended=%s, frames=%d, %s)",
                 locationSuffix,
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
-                thread.isSuspended() ? thread.frameCount() : -1,
+                frameCount,
                 formatEventTag(snapshot));
             if (vmDeathTail) {
                 return base + " (VM has since disconnected — this is the last captured breakpoint)";
@@ -1671,23 +1674,13 @@ public class JDWPTools {
             case STEP -> "via=step";
             case EXCEPTION -> "via=exception";
             case BREAKPOINT -> {
-                final String reason = fastStopReason(snapshot);
-                yield reason != null
-                    ? "fast_breakpoint=" + snapshot.id() + ", " + reason
-                    : "breakpoint=" + snapshot.id();
+                final Integer id = snapshot.id();
+                final String fastStopReason = id != null ? fastLogpoints.stopReason(id) : null;
+                yield fastStopReason != null
+                    ? "fast_breakpoint=" + id + ", " + fastStopReason
+                    : "breakpoint=" + id;
             }
         };
-    }
-
-    /**
-     * Why the fast breakpoint {@code snapshot} reports last stopped, or {@code null} when the
-     * snapshot is not a fast breakpoint's stop.
-     */
-    @Nullable
-    private String fastStopReason(BreakpointTracker.LastBreakpoint snapshot) {
-        final Integer id = snapshot.id();
-        return snapshot.kind() == BreakpointTracker.EventKind.BREAKPOINT && id != null
-            ? fastLogpoints.stopReason(id) : null;
     }
 
     @McpTool(description = "Read-only snapshot of the WHOLE world: (1) this MCP server's status, (2) the JDWP connection (or last-attempt error if disconnected), (3) local JVMs visible to the user with their JDWP ports — answering 'did my target JVM come up, and on which port?' without ps/lsof/jps. When connected, the existing breakpoint+events report continues to appear inside block #2. Run this first when something isn't working.")
@@ -2305,7 +2298,7 @@ public class JDWPTools {
                 return "Error: Thread is not suspended.";
             }
 
-            final StackFrame frame = thread.frame(frameIndex);
+            final StackFrame frame = FrameView.of(thread).frame(frameIndex);
             final LocalVariable localVar = frame.visibleVariableByName(varName);
             if (localVar == null) {
                 return String.format("Error: Variable '%s' not found in frame %d", varName, frameIndex);
@@ -2324,6 +2317,13 @@ public class JDWPTools {
                     + "Wait for the application to reference the type, or call jdwp_force_load_class(\"%s\") to load it now.",
                 notLoaded.className(), notLoaded.className());
         } catch (Exception e) {
+            // com.sun.jdi.OpaqueFrameException (JDK 21+; this module compiles for 17): a virtual
+            // thread's locals can only be changed in its top frame.
+            if ("com.sun.jdi.OpaqueFrameException".equals(e.getClass().getName())) {
+                return String.format("Error setting variable: frame %d of virtual thread %d cannot be changed — a virtual "
+                    + "thread's locals can only be set in its top frame. Where a fast breakpoint stopped, the probe's "
+                    + "frames sit above frame 0: step once (jdwp_step_over), then set the variable.", frameIndex, threadId);
+            }
             return "Error setting variable: " + e.getMessage();
         }
     }
@@ -2386,6 +2386,15 @@ public class JDWPTools {
             }
 
             final EventRequestManager erm = vm.eventRequestManager();
+            final FrameView view = FrameView.of(thread);
+            // A step never stops inside an in-target probe: from a fast breakpoint's stop it runs
+            // out of the probe and lands on the stop line, before its code. Exact names — a class
+            // filter pattern may only start or end with '*'.
+            final Set<String> probeClasses = new TreeSet<>(fastLogpoints.probeClassNames());
+            final ReferenceType stoppedInProbe = view.probeType();
+            if (stoppedInProbe != null) {
+                probeClasses.add(stoppedInProbe.name());
+            }
 
             // JDI permits only one StepRequest per thread; synchronising on the EventRequestManager
             // keeps the delete-then-create pair atomic against concurrent step calls.
@@ -2397,6 +2406,11 @@ public class JDWPTools {
                     .forEach(erm::deleteEventRequest);
 
                 stepRequest = erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth);
+                // Exclusions before the count filter: a step completed inside an excluded class is
+                // restarted by the JDWP agent and must not use up the count.
+                for (String probeClass : probeClasses) {
+                    stepRequest.addClassExclusionFilter(probeClass);
+                }
                 stepRequest.addCountFilter(1);
                 stepRequest.enable();
             }
@@ -2406,14 +2420,17 @@ public class JDWPTools {
             // extra get_breakpoint_context call.
             String startLocation = "";
             try {
-                if (thread.frameCount() > 0) {
-                    final com.sun.jdi.Location loc = thread.frame(0).location();
+                if (view.count() > 0) {
+                    final com.sun.jdi.Location loc = view.frame(0).location();
                     startLocation = String.format(" from %s:%d",
                         loc.declaringType().name(), loc.lineNumber());
                 }
             } catch (Exception ignore) {
                 // Best-effort — fall back to unannotated message.
             }
+            final String fastStopNote = view.isFastStop()
+                ? " From a fast breakpoint's stop every kind of step first lands on the stop line, before its code."
+                : "";
 
             // Arm the next-event latch BEFORE resuming. Without this, the STEP event can fire
             // before the caller's follow-up jdwp_resume_until_event has armed its own latch, and
@@ -2422,8 +2439,8 @@ public class JDWPTools {
             breakpointTracker.armNextEventLatch();
             thread.resume();
 
-            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
-                label, startLocation, thread.uniqueID(), thread.name());
+            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.%s",
+                label, startLocation, thread.uniqueID(), thread.name(), fastStopNote);
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -3858,13 +3875,13 @@ public class JDWPTools {
             return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event." + leftovers;
         }
         final String leftoverLine = leftoversDisabled == 0 ? "" : String.format(
-            "%n  Earlier sessions' fast logpoints: %d disabled (kill switch; bytecode unchanged)", leftoversDisabled);
+            "%n  Earlier sessions' probes:      %d disabled (kill switch; bytecode unchanged)", leftoversDisabled);
         return String.format("""
                 %s
                   Breakpoints cleared:           %d active + %d pending
                   Exception breakpoints cleared: %d active + %d pending
                   Field breakpoints cleared:     %d active + %d pending
-                  Fast logpoints cleared:        %d (original bytecode restored)%s
+                  In-target probes cleared:      %d (fast logpoints and breakpoints; original bytecode restored)%s
                   Watchers cleared:              %d
                   Event history cleared:         %d entries
                   Object cache cleared.""",
@@ -4691,8 +4708,10 @@ public class JDWPTools {
                 thread.name(), thread.uniqueID(), formatEventTag(snapshot)));
 
             // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
-            final List<StackFrame> frames = thread.frames();
+            final FrameView view = FrameView.of(thread);
+            final List<StackFrame> frames = view.frames();
             sb.append(String.format("--- Top frames (showing up to %d, %d total) ---\n", frameLimit, frames.size()));
+            sb.append(view.hiddenNote());
             appendUserFrames(sb, frames, frameLimit, "  ");
 
             if (frames.isEmpty()) {
@@ -4776,7 +4795,7 @@ public class JDWPTools {
             final String staleNote = suspended ? "" : " (stale — thread has resumed since the snapshot)";
             return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s",
                 thread.name(), thread.uniqueID(), suspended,
-                suspended ? String.valueOf(thread.frameCount()) : "N/A",
+                suspended ? String.valueOf(FrameView.of(thread).count()) : "N/A",
                 formatEventTag(snapshot), staleNote);
         } catch (Exception e) {
             return errorReply(e);
@@ -4918,7 +4937,7 @@ public class JDWPTools {
 
             final StringBuilder result = new StringBuilder();
             result.append(String.format("=== Watcher Evaluation for Thread %d (Scope: %s) ===\n\n", threadId, scope));
-            result.append(String.format("Thread: %s (frames: %d)\n\n", thread.name(), thread.frameCount()));
+            result.append(String.format("Thread: %s (frames: %d)\n\n", thread.name(), FrameView.of(thread).count()));
 
             final int watchersEvaluated;
             if ("full_stack".equalsIgnoreCase(scope)) {
@@ -4955,7 +4974,8 @@ public class JDWPTools {
      */
     private int evaluateWatchersCurrentFrame(
         ThreadReference thread, @Nullable Integer breakpointId, StringBuilder result) throws Exception {
-        if (thread.frameCount() == 0) {
+        final FrameView view = FrameView.of(thread);
+        if (view.count() == 0) {
             return 0;
         }
 
@@ -4963,7 +4983,7 @@ public class JDWPTools {
         // this reference inside the per-watcher loop. JDI invalidates every StackFrame on the
         // thread the moment invokeMethod returns, so a reused frame would throw
         // InvalidStackFrameException("Thread has been resumed") on every watcher after the first.
-        final Location location = thread.frame(0).location();
+        final Location location = view.frame(0).location();
         int succeeded = 0;
         int errored = 0;
 
@@ -4985,7 +5005,7 @@ public class JDWPTools {
             result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
             try {
                 // Re-fetch the frame on every iteration — see comment at top of method.
-                final StackFrame freshFrame = thread.frame(0);
+                final StackFrame freshFrame = view.frame(0);
                 final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
                 result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
                 succeeded++;
@@ -5019,13 +5039,14 @@ public class JDWPTools {
         // frame fresh from the thread inside the loop. Capturing StackFrame references in advance
         // and re-using them after an invokeMethod would throw InvalidStackFrameException
         // ("Thread has been resumed") — same root cause as the current-frame variant above.
-        final int frameCount = thread.frameCount();
+        final FrameView view = FrameView.of(thread);
+        final int frameCount = view.count();
         final Map<String, Value> markBindings = markedInstances.buildBindings();
 
         for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
             // Probe the location once per outer iteration; SAFE because no invokeMethod has run
             // since the previous probe in this iteration.
-            final Location location = thread.frame(frameIndex).location();
+            final Location location = view.frame(frameIndex).location();
             final String locationKey = location.declaringType().name() + ':' + location.lineNumber();
 
             final Integer breakpointId = locationToBreakpointId.get(locationKey);
@@ -5045,7 +5066,7 @@ public class JDWPTools {
                 result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
                 try {
                     // Fresh frame per watcher — see comment above.
-                    final StackFrame freshFrame = thread.frame(frameIndex);
+                    final StackFrame freshFrame = view.frame(frameIndex);
                     final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
                     result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
                     succeeded++;

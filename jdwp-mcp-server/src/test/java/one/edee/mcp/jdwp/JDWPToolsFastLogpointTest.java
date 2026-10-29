@@ -198,7 +198,8 @@ class JDWPToolsFastLogpointTest {
 	@DisplayName("jdwp_reset disarms every fast logpoint and reports it")
 	void resetDisarms() {
 		when(fastLogpoints.disarmAll("jdwp_reset")).thenReturn(2);
-		assertThat(tools.jdwp_reset()).contains("Fast logpoints cleared:        2 (original bytecode restored)");
+		assertThat(tools.jdwp_reset())
+			.contains("In-target probes cleared:      2 (fast logpoints and breakpoints; original bytecode restored)");
 		verify(fastLogpoints).disarmAll("jdwp_reset");
 	}
 
@@ -213,7 +214,7 @@ class JDWPToolsFastLogpointTest {
 		when(fastLogpoints.discover(vm)).thenReturn("\n\nFAST LOGPOINTS LEFT BY AN EARLIER SESSION — 1 found");
 
 		assertThat(tools.jdwp_reset())
-			.contains("Earlier sessions' fast logpoints: 1 disabled (kill switch; bytecode unchanged)")
+			.contains("Earlier sessions' probes:      1 disabled (kill switch; bytecode unchanged)")
 			.endsWith("FAST LOGPOINTS LEFT BY AN EARLIER SESSION — 1 found");
 		final InOrder order = inOrder(jdiService, fastLogpoints);
 		order.verify(jdiService).getVM();
