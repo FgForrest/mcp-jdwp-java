@@ -36,7 +36,7 @@ Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Targe
 - **JDWPTools** — Exposes ~30 MCP tools via `@McpTool` annotations. This is the main interface: connection, thread/stack/variable inspection, breakpoints, stepping, and watcher evaluation. All tool methods return formatted `String` responses.
 - **JDIConnectionService** — Singleton holding the persistent `VirtualMachine` (JDI) connection. Manages object caching (`ConcurrentHashMap<Long, ObjectReference>`) and smart collection rendering (ArrayList, HashMap, HashSet internals). Also drives classpath discovery for expression evaluation.
 - **BreakpointTracker** — Maintains a registry of breakpoints with synthetic integer IDs (since JDI `BreakpointRequest` has no user-facing ID). Tracks the last thread that hit a breakpoint.
-- **JdiEventListener** — Daemon thread consuming the JDI event queue; the event sets are processed in order on a `jdi-event-dispatcher` thread, except a set raised inside an MCP-driven evaluation, which the listener handles (suppresses and resumes) at once. Updates `BreakpointTracker` on breakpoint/step events. Breakpoint events do NOT auto-resume — threads stay suspended for user inspection.
+- **JdiEventListener** — Daemon thread consuming the JDI event queue; the event sets are processed in order on a `jdi-event-dispatcher` thread, except a set raised inside an MCP-driven evaluation, which the listener handles (suppresses and resumes) at once. Updates `BreakpointTracker` on breakpoint/step events. Breakpoint events do NOT auto-resume — threads stay suspended for user inspection. Tool resumes go through **ResumeLedger**, so a set processed late never resumes a suspension a tool has already spent.
 
 ### Expression Evaluation Pipeline (`evaluation/` package)
 

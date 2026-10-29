@@ -61,7 +61,8 @@ class JdiEventListenerExceptionLogTest {
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null,
+			new MarkedInstanceRegistry(), new ResumeLedger());
 	}
 
 	@AfterEach

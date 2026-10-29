@@ -42,7 +42,8 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		// Real listener — the wiring of vmDeathHook → notifyVmDied happens in the JDIConnectionService
 		// constructor; using a real listener exercises the full path. The listener's start() is not
 		// invoked because we never reach a successful attach.
-		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, marks);
+		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null,
+			marks, new ResumeLedger());
 		final JDIConnectionService service = new JDIConnectionService(
 			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
 
@@ -81,7 +82,8 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		final EvaluationGuard guard = new EvaluationGuard();
 		final MarkedInstanceRegistry marks = new MarkedInstanceRegistry();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, marks);
+		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null,
+			marks, new ResumeLedger());
 		final JDIConnectionService service = new JDIConnectionService(
 			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
 

@@ -41,6 +41,7 @@ Beyond that, the codebase uses targeted lock-free primitives where the hot path 
 - **`volatile`** — `JDIConnectionService.vm`, `cachedClasspath`, `discoveredJdkPath`, `targetMajorVersion`, `lastConnectAttempt`, `lastConnectError`; `BreakpointTracker.lastBreakpoint`, `nextEventLatch`, `pendingFire`; `JdiEventListener.listenerThread`, `running`, `vmDeathHook`. Each marks a single reference that one thread writes and others read without locking.
 - **`AtomicInteger`** for synthetic breakpoint IDs (`BreakpointTracker.idCounter:45`). **`AtomicBoolean`** for the one-shot VM-death-hook gate (`JdiEventListener.vmDeathHookInvoked:87`).
 - **`CountDownLatch`** for `jdwp_resume_until_event` (`BreakpointTracker.nextEventLatch:139`). The tool method `await`s; the listener `countDown`s when an event fires.
+- **`synchronized` on `ResumeLedger`** — a tool's resume and the dispatcher's decision to resume a late event set must not interleave, or the tool's resume could land between the check and the resume it decides ([event-pipeline.md](event-pipeline.md) § 1). The monitor is held only for those JDWP calls, never across event processing: `jdwp_resume` must not wait behind a stalled evaluation.
 
 One ad-hoc lock worth calling out: `synchronized(erm)` in `JDWPTools.java:1771` — used to make the delete-then-create `StepRequest` pair atomic, because JDI allows only one `StepRequest` per thread at a time.
 

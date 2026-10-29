@@ -53,7 +53,7 @@ final class JDWPToolsTestSupport {
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
 			mock(FastLogpointService.class)
-		);
+		, new ResumeLedger());
 	}
 
 	/**
@@ -99,7 +99,7 @@ final class JDWPToolsTestSupport {
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
 			mock(FastLogpointService.class)
-		);
+		, new ResumeLedger());
 	}
 
 	/**
@@ -129,7 +129,7 @@ final class JDWPToolsTestSupport {
 			new JdiHealthMonitor(),
 			localClasspathProvider,
 			mock(FastLogpointService.class)
-		);
+		, new ResumeLedger());
 	}
 
 	/**
@@ -158,7 +158,7 @@ final class JDWPToolsTestSupport {
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
 			mock(FastLogpointService.class)
-		);
+		, new ResumeLedger());
 	}
 
 	/**
@@ -188,7 +188,7 @@ final class JDWPToolsTestSupport {
 			healthMonitor,
 			defaultEmptyClasspathProvider(),
 			mock(FastLogpointService.class)
-		);
+		, new ResumeLedger());
 	}
 
 	/**
@@ -213,6 +213,6 @@ final class JDWPToolsTestSupport {
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
 			fastLogpoints
-		);
+		, new ResumeLedger());
 	}
 }

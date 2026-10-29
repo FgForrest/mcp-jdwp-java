@@ -49,7 +49,7 @@ class JdiEventListenerFastLogpointRoutingTest {
 		history = new EventHistory();
 		fastLogpoints = mock(FastLogpointService.class);
 		listener = new JdiEventListener(tracker, history, mock(JdiExpressionEvaluator.class), new EvaluationGuard(),
-			null, new MarkedInstanceRegistry());
+			null, new MarkedInstanceRegistry(), new ResumeLedger());
 		listener.setFastLogpointService(fastLogpoints);
 	}
 

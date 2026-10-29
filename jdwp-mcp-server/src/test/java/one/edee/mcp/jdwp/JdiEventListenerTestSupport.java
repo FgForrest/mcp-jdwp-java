@@ -147,11 +147,14 @@ final class JdiEventListenerTestSupport {
 
 	/**
 	 * Creates an {@link EventSet} mock that iterates the given events exactly once and
-	 * records calls to {@link EventSet#resume()} so the test can verify auto-resume.
+	 * records calls to {@link EventSet#resume()} so the test can verify auto-resume. It suspends the
+	 * event thread, as most sets do; a bare mock would report {@code SUSPEND_NONE} (0), a set that
+	 * suspends nothing, which the listener does not count as a stop of its thread.
 	 */
 	static EventSet mockEventSet(Event... events) {
 		EventSet set = mock(EventSet.class);
 		when(set.iterator()).thenAnswer(inv -> List.of(events).iterator());
+		when(set.suspendPolicy()).thenReturn(EventRequest.SUSPEND_EVENT_THREAD);
 		return set;
 	}
 

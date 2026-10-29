@@ -90,7 +90,8 @@ class JDIConnectionServiceMarkLifecycleTest {
 		final one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator evaluator =
 			mock(one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator.class);
 		final JdiEventListener listener =
-			new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
+			new JdiEventListener(tracker, history, evaluator, guard, null,
+				new MarkedInstanceRegistry(), new ResumeLedger());
 		final JDIConnectionService service = JDIConnectionServiceTestSupport.newServiceWithCollaborators(
 			listener, tracker, history, watchers, guard, registry);
 
@@ -138,7 +139,8 @@ class JDIConnectionServiceMarkLifecycleTest {
 		final one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator evaluator =
 			mock(one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator.class);
 		final JdiEventListener listener =
-			new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
+			new JdiEventListener(tracker, history, evaluator, guard, null,
+				new MarkedInstanceRegistry(), new ResumeLedger());
 		final JDIConnectionService service = JDIConnectionServiceTestSupport.newServiceWithCollaborators(
 			listener, tracker, history, watchers, guard, registry);
 

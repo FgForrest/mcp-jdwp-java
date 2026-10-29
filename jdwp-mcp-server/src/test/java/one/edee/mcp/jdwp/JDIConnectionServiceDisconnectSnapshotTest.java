@@ -62,7 +62,8 @@ class JDIConnectionServiceDisconnectSnapshotTest {
 		final EvaluationGuard guard = new EvaluationGuard();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		final JdiEventListener listener =
-			new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
+			new JdiEventListener(tracker, history, evaluator, guard, null,
+				new MarkedInstanceRegistry(), new ResumeLedger());
 		final JDIConnectionService service = JDIConnectionServiceTestSupport.newServiceWithCollaborators(
 			listener, tracker, history, watchers, guard, registry);
 
