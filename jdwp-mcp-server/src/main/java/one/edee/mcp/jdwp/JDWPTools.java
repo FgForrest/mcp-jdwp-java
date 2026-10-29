@@ -1186,28 +1186,38 @@ public class JDWPTools {
      * frames are the same activations; otherwise the thread may have run and stopped elsewhere, and
      * the tool answers with {@code ifRunOn}. A write is retried only on this exception, which JDI
      * raises before sending it or when the target rejects the frame — either way it did not land.
+     * Meanwhile the thread is reserved: the watchdog does not release it (A2).
      */
     private String withFreshFrames(ThreadReference thread, String ifRunOn, Callable<String> work) throws Exception {
         final SuspensionSession session = breakpointTracker.suspensionSession();
-        Set<Long> holds = session != null ? session.holdsOn(thread) : Set.of();
-        for (int attempt = 1; ; attempt++) {
+        if (session == null) {
             final String evaluating = evaluationRunningOn(thread);
-            if (evaluating != null) {
-                return evaluating;
-            }
-            try {
-                return work.call();
-            } catch (InvalidStackFrameException invalidated) {
-                if (session == null || attempt == FRAME_ATTEMPTS) {
-                    throw invalidated;
+            return evaluating != null ? evaluating : work.call();
+        }
+        session.reserve(thread);
+        try {
+            Set<Long> holds = session.holdsOn(thread);
+            for (int attempt = 1; ; attempt++) {
+                final String evaluating = evaluationRunningOn(thread);
+                if (evaluating != null) {
+                    return evaluating;
                 }
-                final Set<Long> now = session.holdsOn(thread);
-                if (Collections.disjoint(holds, now)) {
-                    return String.format("Error: thread %s was resumed while its frames were being read, and may have run "
-                        + "on since — %s", thread.name(), ifRunOn);
+                try {
+                    return work.call();
+                } catch (InvalidStackFrameException invalidated) {
+                    if (attempt == FRAME_ATTEMPTS) {
+                        throw invalidated;
+                    }
+                    final Set<Long> now = session.holdsOn(thread);
+                    if (Collections.disjoint(holds, now)) {
+                        return String.format("Error: thread %s was resumed while its frames were being read, and may "
+                            + "have run on since — %s", thread.name(), ifRunOn);
+                    }
+                    holds = now;
                 }
-                holds = now;
             }
+        } finally {
+            session.unreserve(thread);
         }
     }
 
@@ -1555,7 +1565,7 @@ public class JDWPTools {
                 locationSuffix,
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 frameCount,
-                formatEventTag(snapshot)) + releasedSuffix;
+                formatEventTag(snapshot)) + unblockedNote() + releasedSuffix;
             if (vmDeathTail) {
                 return base + " (VM has since disconnected — this is the last captured breakpoint)";
             }
@@ -4888,6 +4898,14 @@ public class JDWPTools {
             + "the next one)", unseen);
     }
 
+    /**
+     * " — partial stop: …" when the watchdog released threads from the presented stop, or "".
+     */
+    private String unblockedNote() {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        return session != null ? session.unblockedNote() : "";
+    }
+
     @McpTool(description = "One-shot debugging context at the current breakpoint: thread, top frames, locals at frame 0, and 'this' field dump. Use this instead of the four-call sequence (get_current_thread → get_stack → get_locals → get_fields(this)) at every BP hit.")
     public String jdwp_get_breakpoint_context(
         @McpToolParam(required = false, description = "Max stack frames to render (default: 5). Junit/maven/reflection frames are always collapsed.") @Nullable Integer maxFrames,
@@ -4908,8 +4926,8 @@ public class JDWPTools {
 
                 final StringBuilder sb = new StringBuilder();
                 sb.append("=== Breakpoint Context ===\n");
-                sb.append(String.format("Thread: %s (ID=%d, %s)\n\n",
-                    thread.name(), thread.uniqueID(), formatEventTag(snapshot)));
+                sb.append(String.format("Thread: %s (ID=%d, %s)%s\n\n",
+                    thread.name(), thread.uniqueID(), formatEventTag(snapshot), unblockedNote()));
 
                 // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
                 final FrameView view = FrameView.of(thread);
@@ -4998,10 +5016,10 @@ public class JDWPTools {
             // past. Annotate so the agent doesn't mistake "snapshot exists" for "thread is parked".
             final boolean suspended = thread.isSuspended();
             final String staleNote = suspended ? "" : " (stale — thread has resumed since the snapshot)";
-            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s%s",
+            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s%s%s",
                 thread.name(), thread.uniqueID(), suspended,
                 suspended ? String.valueOf(FrameView.of(thread).count()) : "N/A",
-                formatEventTag(snapshot), staleNote, unseenNote());
+                formatEventTag(snapshot), staleNote, unblockedNote(), unseenNote());
         } catch (Exception e) {
             return errorReply(e);
         }

@@ -118,6 +118,11 @@ public class JdiEventListener {
      */
     @Nullable
     private volatile SuspensionSession session;
+    /**
+     * Watches the dispatcher's invocations of the current {@link #session}; see {@link SuspensionWatchdog}.
+     */
+    @Nullable
+    private volatile SuspensionWatchdog watchdog;
     private volatile boolean running;
     /**
      * Optional callback invoked exactly once when the listener observes VM death or disconnect.
@@ -318,6 +323,7 @@ public class JdiEventListener {
         final SuspensionSession suspensions = breakpointTracker.openSuspensionSession(eventHistory);
         session = suspensions;
         evaluationGuard.bind(suspensions);
+        watchdog = SuspensionWatchdog.start(suspensions);
         final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, suspensions), "jdi-event-listener");
         thread.setDaemon(true);
         listenerThread = thread;
@@ -360,6 +366,11 @@ public class JdiEventListener {
         session = null;
         if (suspensions != null) {
             suspensions.close();
+        }
+        final SuspensionWatchdog sessionWatchdog = watchdog;
+        watchdog = null;
+        if (sessionWatchdog != null) {
+            sessionWatchdog.stop();
         }
         final ExecutorService sessionDispatcher = dispatcher;
         dispatcher = null;
@@ -472,7 +483,15 @@ public class JdiEventListener {
      * whose next {@code queue.remove()} fails too.
      */
     private void dispatch(EventSet eventSet, SuspensionSession suspensions, SuspensionSession.Context context) {
-        suspensions.begin(context);
+        if (!suspensions.begin(context)) {
+            settleCancelled(eventSet);
+            try {
+                suspensions.finish(context);
+            } catch (Exception e) {
+                log.debug("[JDI] Error settling a cancelled event set: {}", e.getMessage());
+            }
+            return;
+        }
         boolean keep;
         suspensions.beginProcessing(context);
         try {
@@ -669,6 +688,31 @@ public class JdiEventListener {
             }
         }
         suspensions.finish(context);
+    }
+
+    /**
+     * Handles the events of a set the watchdog cancelled — its thread was released before the set
+     * was processed, so it runs (proposal § 19 A1): only what needs no stopped thread. An arming hit
+     * re-arms, a step's request is deleted, a class prepare still activates its deferred breakpoints;
+     * conditions, logpoints and stops are dropped ({@code EVENT_CANCELLED} records them). A set with
+     * a fast breakpoint's stop is never cancelled. Never throws.
+     */
+    private void settleCancelled(EventSet eventSet) {
+        final FastLogpointService fastLogpointService = fastLogpoints;
+        for (Event event : eventSet) {
+            try {
+                if (event instanceof BreakpointEvent bpEvent
+                    && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
+                    fastLogpointService.skipArmingHit(bpEvent);
+                } else if (event instanceof StepEvent stepEvent) {
+                    deleteStepRequest(stepEvent);
+                } else if (event instanceof ClassPrepareEvent cpEvent) {
+                    handleClassPrepareEvent(cpEvent);
+                }
+            } catch (Exception e) {
+                log.debug("[JDI] Error settling a cancelled event: {}", e.getMessage());
+            }
+        }
     }
 
     /**

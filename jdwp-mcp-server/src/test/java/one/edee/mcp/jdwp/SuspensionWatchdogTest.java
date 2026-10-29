@@ -1,0 +1,132 @@
+package one.edee.mcp.jdwp;
+
+import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ThreadReference;
+import com.sun.jdi.request.EventRequest;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * {@link SuspensionWatchdog}: when it asks for a stuck dispatcher invocation's monitor owner and
+ * hands it to {@link SuspensionSession#unblock} — after {@link SuspensionWatchdog#MIN_AGE_NANOS},
+ * blocked on a monitor in {@link SuspensionWatchdog#MONITOR_SAMPLES} consecutive samples of the same
+ * invocation (issue #45, proposal § 19 A1).
+ */
+@DisplayName("SuspensionWatchdog — sampling stuck dispatcher invocations (#45 A1)")
+class SuspensionWatchdogTest {
+
+	private FakeSuspendModel model;
+	private FakeSuspendModel.FakeThread t;
+	private FakeSuspendModel.FakeThread u;
+	private SuspensionSession session;
+	private final AtomicLong now = new AtomicLong();
+	private SuspensionWatchdog watchdog;
+
+	@BeforeEach
+	void setUp() throws Exception {
+		model = new FakeSuspendModel();
+		t = model.thread("t");
+		u = model.thread("u");
+		session = new BreakpointTracker().openSuspensionSession(new EventHistory());
+		watchdog = new SuspensionWatchdog(session, now::get);
+		// The dispatcher processes a stop-all of t and invokes on t; u, parked by it, owns the monitor
+		// the invoked code waits for.
+		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_ALL),
+			t.ref, false);
+		session.begin(own);
+		session.beginProcessing(own);
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		final ObjectReference monitor = mock(ObjectReference.class);
+		when(monitor.owningThread()).thenReturn(u.ref);
+		when(t.ref.currentContendedMonitor()).thenReturn(monitor);
+	}
+
+	@AfterEach
+	void tearDown() {
+		SuspensionSession.endProcessing();
+	}
+
+	@Test
+	@DisplayName("blocked on a monitor past the minimum age, twice in a row: the owner is released, the query is balanced")
+	void releasesTheOwnerOfAStuckInvocation() throws Exception {
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		watchdog.tick();
+		assertThat(u.count).as("one sample is not enough").isEqualTo(1);
+
+		advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		watchdog.tick();
+
+		assertThat(u.count).isZero();
+		assertThat(model.invocationRuns(t)).as("the brief suspension around the query is undone").isTrue();
+	}
+
+	@Test
+	@DisplayName("a young invocation is not sampled, however blocked")
+	void youngInvocationIsLeftAlone() throws Exception {
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		for (int i = 0; i < 5; i++) {
+			watchdog.tick();
+			advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		}
+
+		assertThat(u.count).isEqualTo(1);
+		verify(t.ref, never()).currentContendedMonitor();
+	}
+
+	@Test
+	@DisplayName("a sample that is not blocked on a monitor starts the count again")
+	void unblockedSampleResetsTheStreak() throws Exception {
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+		t.status = ThreadReference.THREAD_STATUS_RUNNING;
+		watchdog.tick();
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+
+		assertThat(u.count).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("samples belong to one invocation: the next invocation on the thread starts young")
+	void nextInvocationStartsAfresh() throws Exception {
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		watchdog.tick();
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		watchdog.tick();
+		assertThat(u.count).as("the new invocation was only just seen").isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("a closed session stops the watchdog")
+	void closedSessionStopsIt() {
+		session.close();
+		watchdog.tick();
+		assertThat(session.dispatcherInvocations()).isEmpty();
+	}
+
+	private void advance(long nanos) {
+		now.addAndGet(nanos);
+	}
+}

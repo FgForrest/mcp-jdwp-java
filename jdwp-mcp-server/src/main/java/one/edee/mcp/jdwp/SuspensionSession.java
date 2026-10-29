@@ -1,7 +1,15 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.Location;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.ClassPrepareEvent;
+import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.ExceptionEvent;
+import com.sun.jdi.event.LocatableEvent;
+import com.sun.jdi.event.StepEvent;
+import com.sun.jdi.event.WatchpointEvent;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.StepRequest;
 import org.jspecify.annotations.Nullable;
@@ -42,6 +50,12 @@ public final class SuspensionSession {
      * The manual hold in {@link #holdsOn}; context ids start at 1.
      */
     public static final long MANUAL_HOLD = 0L;
+    /**
+     * Request property marking a request whose events need their thread still stopped when the
+     * dispatcher handles them even to skip them (a fast breakpoint's stop reads its arguments from
+     * the frame): the watchdog never cancels a set with such an event.
+     */
+    public static final String KEEPS_THREAD_PROPERTY = "mcp.keepsThread";
 
     /**
      * Life cycle of a context.
@@ -92,6 +106,16 @@ public final class SuspensionSession {
          * its lease's end, or is re-suspended before this context's own resume.
          */
         private final Set<ThreadReference> exempt = new LinkedHashSet<>();
+        /**
+         * Threads the watchdog released from this stop-all so an evaluation could finish (A1); they
+         * are in {@link #released} too. A stop published with any is partial.
+         */
+        private final Set<ThreadReference> unblocked = new LinkedHashSet<>();
+        /**
+         * The watchdog released the event thread before the set was processed: no handler may use
+         * the thread or publish a stop; {@link SuspensionSession#finish} settles it.
+         */
+        private boolean cancelled;
 
         private Context(long id, long generation, EventSet eventSet, int policy, @Nullable ThreadReference thread,
                         boolean vmStart, boolean staleAtRouting) {
@@ -231,11 +255,24 @@ public final class SuspensionSession {
          * {@link #release}); resumed when the lease ends.
          */
         private int debt;
+        /**
+         * Taken by the dispatcher for the set it processes: only such an invocation can be stuck
+         * where no tool reaches it, so only it is watched (A1).
+         */
+        private final boolean dispatcher;
 
-        private Lease(ThreadReference thread, Context anchor) {
+        private Lease(ThreadReference thread, Context anchor, boolean dispatcher) {
             this.thread = thread;
             this.anchor = anchor;
+            this.dispatcher = dispatcher;
         }
+    }
+
+    /**
+     * A dispatcher invocation in flight, for {@link SuspensionWatchdog}: its {@code token} names this
+     * very invocation chain — a later one on the same thread has another.
+     */
+    public record Invocation(Object token, ThreadReference thread) {
     }
 
     private final BreakpointTracker tracker;
@@ -243,6 +280,10 @@ public final class SuspensionSession {
     private final List<Context> contexts = new ArrayList<>();
     private final Set<ThreadReference> manual = new LinkedHashSet<>();
     private final Map<ThreadReference, Lease> leases = new LinkedHashMap<>();
+    /**
+     * Threads a frame tool works on, with how many tools: the watchdog never releases them (A2).
+     */
+    private final Map<ThreadReference, Integer> reserved = new LinkedHashMap<>();
     /**
      * How often a routed stop-all took a leased thread out of it, for diagnostics.
      */
@@ -340,7 +381,7 @@ public final class SuspensionSession {
      */
     public synchronized Context route(EventSet eventSet, @Nullable ThreadReference thread, boolean vmStart) {
         boolean stale = false;
-        for (com.sun.jdi.event.Event event : eventSet) {
+        for (Event event : eventSet) {
             stale |= isStale(event.request());
         }
         final Context context = new Context(nextId++, generation, eventSet, eventSet.suspendPolicy(), thread, vmStart,
@@ -363,11 +404,18 @@ public final class SuspensionSession {
 
     /**
      * The dispatcher starts processing {@code context}.
+     *
+     * @return {@code false} for a set the watchdog cancelled: its thread runs, so no handler may use
+     *     it; skip the handlers that need it and {@link #finish} the set
      */
-    public synchronized void begin(Context context) {
+    public synchronized boolean begin(Context context) {
+        if (context.cancelled) {
+            return false;
+        }
         if (!closed && context.state == State.QUEUED) {
             context.state = State.PROCESSING;
         }
+        return true;
     }
 
     /**
@@ -405,7 +453,8 @@ public final class SuspensionSession {
             }
         }
         context.history.clear();
-        if (current && !context.candidates.isEmpty() && context.policy != EventRequest.SUSPEND_NONE) {
+        if (current && !context.cancelled && !context.candidates.isEmpty()
+            && context.policy != EventRequest.SUSPEND_NONE) {
             publish(context);
             return true;
         }
@@ -731,7 +780,8 @@ public final class SuspensionSession {
                 + "fewer than the " + known + " holds this debugging session knows of — something resumed it "
                 + "outside the session; jdwp_reset releases its stops");
         }
-        final Lease lease = new Lease(thread, anchor);
+        final Processing processing = PROCESSING.get();
+        final Lease lease = new Lease(thread, anchor, processing != null && processing.context() == anchor);
         for (Context other : others) {
             exempt(other, lease);
         }
@@ -763,6 +813,208 @@ public final class SuspensionSession {
         for (int i = 0; i < lease.debt; i++) {
             resumeQuietly(thread);
         }
+    }
+
+    // ── Watchdog (A1) and reservations (A2) ──
+
+    /**
+     * A frame tool starts working on {@code thread}: the watchdog leaves it alone until
+     * {@link #unreserve}.
+     */
+    public synchronized void reserve(ThreadReference thread) {
+        reserved.merge(thread, 1, Integer::sum);
+    }
+
+    /**
+     * Ends a {@link #reserve}.
+     */
+    public synchronized void unreserve(ThreadReference thread) {
+        reserved.computeIfPresent(thread, (key, tools) -> tools == 1 ? null : tools - 1);
+    }
+
+    /**
+     * The dispatcher invocations in flight, for the watchdog.
+     */
+    public synchronized List<Invocation> dispatcherInvocations() {
+        final List<Invocation> invocations = new ArrayList<>();
+        if (!closed) {
+            for (Lease lease : leases.values()) {
+                if (lease.dispatcher) {
+                    invocations.add(new Invocation(lease, lease.thread));
+                }
+            }
+        }
+        return invocations;
+    }
+
+    /**
+     * Releases {@code owner} — the owner of the monitor the dispatcher invocation {@code token} is
+     * stuck on — from the sets holding it, when all of them are still queued or being processed:
+     * nobody else can release those while the dispatcher is stuck (A1). Everything is re-checked
+     * under the monitor: the invocation is still {@code token}'s; the owner is not leased, reserved,
+     * manually held, or held by a published stop; and its count is exactly those sets' holds, so
+     * they are all it waits for — a hold the session does not know (a set not routed yet, a VM-wide
+     * suspend in progress) is never released. A bystander of a stop-all joins its {@code released}
+     * and makes the stop partial; the event thread of a queued set cancels it ({@link #cancel}).
+     *
+     * @return what was released, or {@code null} when nothing was
+     */
+    @Nullable
+    public synchronized String unblock(Object token, ThreadReference owner) {
+        if (closed || !(token instanceof Lease lease) || leases.get(lease.thread) != lease || !lease.dispatcher
+            || leases.containsKey(owner) || reserved.containsKey(owner) || manual.contains(owner)) {
+            return null;
+        }
+        final List<Context> holding = new ArrayList<>();
+        for (Context context : contexts) {
+            if (!covers(context, owner)) {
+                continue;
+            }
+            if (context.state == State.HELD || (owner.equals(context.thread) && !cancellable(context))) {
+                return null;
+            }
+            holding.add(context);
+        }
+        if (holding.isEmpty() || suspendCountOf(owner) != holding.size()) {
+            return null;
+        }
+        final List<String> from = new ArrayList<>();
+        for (Context context : holding) {
+            if (owner.equals(context.thread)) {
+                from.add(cancel(context, lease.thread));
+            } else {
+                resumeQuietly(owner);
+                context.released.add(owner);
+                context.unblocked.add(owner);
+                from.add(describeSet(context) + " (its other threads stay parked)");
+            }
+        }
+        final String summary = String.format("thread %s, which holds the monitor the evaluation on thread %s waits "
+            + "for, from %s", safeName(owner), safeName(lease.thread), String.join("; ", from));
+        history.record(new EventHistory.DebugEvent("EVALUATION_UNBLOCKED", "The watchdog released " + summary,
+            Map.of("thread", safeName(owner), "evaluatingThread", safeName(lease.thread))));
+        return summary;
+    }
+
+    /**
+     * Whether the watchdog may cancel {@code context} to release its event thread: a set still
+     * queued, not VM start, with no event whose handling needs the thread stopped.
+     */
+    private static boolean cancellable(Context context) {
+        if (context.state != State.QUEUED || context.vmStart) {
+            return false;
+        }
+        for (Event event : context.eventSet) {
+            final EventRequest request = event.request();
+            if (request != null && request.getProperty(KEEPS_THREAD_PROPERTY) != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Cancels the queued {@code context} and releases its event thread: the set will neither use
+     * the thread nor publish a stop. A thread-only set is settled now — the thread's resume is the
+     * set's own release — so its later processing has nothing left to release and cannot spend the
+     * count of a stop the thread reaches meanwhile (§ 19 review, finding 5). A stop-all keeps
+     * holding its other threads until it is processed; the thread joins its {@code released}.
+     *
+     * @return what was cancelled
+     */
+    private String cancel(Context context, ThreadReference evaluating) {
+        final ThreadReference thread = Objects.requireNonNull(context.thread);
+        context.cancelled = true;
+        final String what = describeSet(context);
+        final StepRequest step = pendingSteps.get(thread);
+        if (step != null && reports(context, step)) {
+            // The step's landing: it never lands now.
+            pendingSteps.remove(thread);
+            deleteQuietly(step);
+        }
+        if (context.policy == EventRequest.SUSPEND_ALL) {
+            resumeQuietly(thread);
+            context.released.add(thread);
+        } else {
+            context.state = State.RELEASED;
+            try {
+                context.eventSet.resume();
+            } catch (RuntimeException e) {
+                log.debug("[Suspension] Releasing cancelled {} failed: {}", context, e.toString());
+            }
+            contexts.remove(context);
+        }
+        history.record(new EventHistory.DebugEvent("EVENT_CANCELLED", String.format("%s was cancelled before it was "
+                + "processed — no condition, logpoint or stop for it: its thread held the monitor the evaluation on "
+                + "thread %s waits for", what, safeName(evaluating)),
+            Map.of("thread", safeName(thread))));
+        return what + " (cancelled)";
+    }
+
+    private static boolean reports(Context context, EventRequest request) {
+        for (Event event : context.eventSet) {
+            if (event.request() == request) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * What {@code context}'s set reports, for the records: "breakpoint at a.B:42 on thread t".
+     */
+    private static String describeSet(Context context) {
+        final List<String> events = new ArrayList<>();
+        for (Event event : context.eventSet) {
+            events.add(kindOf(event) + locationOf(event));
+        }
+        final ThreadReference thread = context.thread;
+        return (events.isEmpty() ? "a set" : String.join(", ", events))
+            + (thread != null ? " on thread " + safeName(thread) : "");
+    }
+
+    private static String kindOf(Event event) {
+        if (event instanceof BreakpointEvent) {
+            return "breakpoint";
+        }
+        if (event instanceof StepEvent) {
+            return "step";
+        }
+        if (event instanceof ExceptionEvent) {
+            return "exception";
+        }
+        if (event instanceof WatchpointEvent) {
+            return "field watchpoint";
+        }
+        if (event instanceof ClassPrepareEvent) {
+            return "class prepare";
+        }
+        return "event";
+    }
+
+    private static String locationOf(Event event) {
+        try {
+            final Location location = event instanceof LocatableEvent located ? located.location() : null;
+            return location != null ? " at " + location.declaringType().name() + ':' + location.lineNumber() : "";
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    /**
+     * " — partial stop: …" when the watchdog released threads from the presented stop, else "".
+     */
+    public synchronized String unblockedNote() {
+        final Context presented = current;
+        if (presented == null || presented.unblocked.isEmpty()) {
+            return "";
+        }
+        final List<String> names = new ArrayList<>();
+        for (ThreadReference thread : presented.unblocked) {
+            names.add(safeName(thread));
+        }
+        return " — partial stop: the watchdog released thread(s) " + String.join(", ", names) + " from it so an "
+            + "evaluation could finish (EVALUATION_UNBLOCKED in jdwp_get_events)";
     }
 
     // ── Reset and close ──
@@ -1134,8 +1386,8 @@ public final class SuspensionSession {
             leased.add(safeName(thread));
         }
         return "generation=" + generation + (closed ? ", closed" : "") + ", contexts=" + contexts + ", manual="
-            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", routeExemptions="
-            + routeExemptions + ", current=" + current;
+            + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", reserved="
+            + reserved.size() + ", routeExemptions=" + routeExemptions + ", current=" + current;
     }
 
     /**

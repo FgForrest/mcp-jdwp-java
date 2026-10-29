@@ -11,6 +11,7 @@ import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.JdiEventListener;
+import one.edee.mcp.jdwp.SuspensionSession;
 import one.edee.mcp.jdwp.evaluation.FastBreakpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.FastLogpointProbe;
 import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
@@ -2503,6 +2504,8 @@ public class FastLogpointService {
         }
         final BreakpointRequest request = flp.vm.eventRequestManager().createBreakpointRequest(stops.get(0).location());
         request.setSuspendPolicy(flp.suspendPolicy);
+        // Skipping a stop reads its arguments from the frame, so the watchdog must not release its thread first.
+        request.putProperty(SuspensionSession.KEEPS_THREAD_PROPERTY, Boolean.TRUE);
         flp.stopRequest = request;
         byStopRequest.put(request, flp);
         request.enable();
