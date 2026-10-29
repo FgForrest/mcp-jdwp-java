@@ -1177,10 +1177,57 @@ public class JdiExpressionEvaluator {
                                                       String expression, @Nullable String condition, int bufferSize,
                                                       FastLogpointProbeSource.Metadata metadata)
         throws JdiEvaluationException {
+        final List<FastLogpointProbeSource.Parameter> parameters = probeParameters(frame, includeThis, wrapperPackage);
+        final String effectiveExpression = rewriteForProbe(expression, frame, includeThis, wrapperPackage, parameters);
+        final String effectiveCondition = condition != null
+            ? rewriteForProbe(condition, frame, includeThis, wrapperPackage, parameters)
+            : null;
+        final String className = probeClassName(wrapperPackage, FastLogpointProbeSource.CLASS_PREFIX);
+        return compileProbe(className, parameters, FastLogpointProbeSource.generate(
+            className, parameters, effectiveExpression, effectiveCondition, bufferSize, metadata));
+    }
+
+    /**
+     * Compiles the in-target probe class of a fast breakpoint ({@code jdwp_set_fast_breakpoint}) for
+     * the location {@code frame} is stopped at: the same {@code hit} parameters, {@code _this}
+     * typing and naming as {@link #compileFastLogpointProbe}, with the condition evaluated inside
+     * the target VM and a {@code stop} method for the server's breakpoint (see
+     * {@link FastBreakpointProbeSource}).
+     * <p>
+     * Must be called on a thread suspended by an event, after {@link #configureCompilerClasspath}.
+     *
+     * @param frame          the frame stopped at the breakpoint's location
+     * @param includeThis    whether {@code this} is passed to the probe
+     * @param wrapperPackage package the probe class is generated into
+     * @param condition      the condition, as the user entered it
+     * @param stopOnce       whether only the first true hit of an epoch stops
+     * @param bufferSize     capacity of the condition-failure ring; must be a power of two
+     * @param metadata       what the probe records about itself (target, user text, arming session)
+     * @return the probe's class name, bytecode, and {@code hit} parameter names in declaration order
+     * @throws JdiEvaluationException when the probe does not compile or the frame's context cannot be read
+     */
+    public FastLogpointProbe compileFastBreakpointProbe(StackFrame frame, boolean includeThis, String wrapperPackage,
+                                                        String condition, boolean stopOnce, int bufferSize,
+                                                        FastLogpointProbeSource.Metadata metadata)
+        throws JdiEvaluationException {
+        final List<FastLogpointProbeSource.Parameter> parameters = probeParameters(frame, includeThis, wrapperPackage);
+        final String effectiveCondition = rewriteForProbe(condition, frame, includeThis, wrapperPackage, parameters);
+        final String className = probeClassName(wrapperPackage, FastBreakpointProbeSource.CLASS_PREFIX);
+        return compileProbe(className, parameters, FastBreakpointProbeSource.generate(
+            className, parameters, effectiveCondition, stopOnce, bufferSize, metadata));
+    }
+
+    /**
+     * The {@code hit} parameters of a probe at {@code frame}'s location: {@code _this} (typed from the
+     * declaring class) when {@code includeThis}, then every visible local except the outer-instance
+     * {@code this$N}.
+     */
+    private List<FastLogpointProbeSource.Parameter> probeParameters(StackFrame frame, boolean includeThis,
+                                                                    String wrapperPackage) {
         final List<FastLogpointProbeSource.Parameter> parameters = new ArrayList<>();
-        final ReferenceType declaringType = frame.location().declaringType();
         if (includeThis) {
-            parameters.add(new FastLogpointProbeSource.Parameter("_this", getDeclaredType(declaringType, wrapperPackage)));
+            parameters.add(new FastLogpointProbeSource.Parameter("_this",
+                getDeclaredType(frame.location().declaringType(), wrapperPackage)));
         }
         try {
             for (LocalVariable var : frame.visibleVariables()) {
@@ -1190,33 +1237,42 @@ public class JdiExpressionEvaluator {
                 }
             }
         } catch (AbsentInformationException noLocals) {
-            log.debug("[Evaluator] No local-variable table at the fast-logpoint location — probe receives `this` only.");
+            log.debug("[Evaluator] No local-variable table at the probe location — probe receives `this` only.");
         }
+        return parameters;
+    }
 
-        String effectiveExpression = expression;
-        String effectiveCondition = condition;
-        if (includeThis && declaringType instanceof ClassType thisClass) {
-            final Set<String> localNames = parameters.stream()
-                .map(FastLogpointProbeSource.Parameter::name)
-                .collect(Collectors.toSet());
-            effectiveExpression = rewriteBareThisFields(expression, thisClass, wrapperPackage, localNames);
-            if (condition != null) {
-                effectiveCondition = rewriteBareThisFields(condition, thisClass, wrapperPackage, localNames);
-            }
+    /**
+     * Rewrites the bare {@code this} fields in a probe's user text to {@code _this.field}, as an
+     * evaluation wrapper does; unchanged when {@code this} is not passed.
+     */
+    private String rewriteForProbe(String text, StackFrame frame, boolean includeThis, String wrapperPackage,
+                                   List<FastLogpointProbeSource.Parameter> parameters) {
+        if (!includeThis || !(frame.location().declaringType() instanceof ClassType thisClass)) {
+            return text;
         }
+        final Set<String> localNames = parameters.stream()
+            .map(FastLogpointProbeSource.Parameter::name)
+            .collect(Collectors.toSet());
+        return rewriteBareThisFields(text, thisClass, wrapperPackage, localNames);
+    }
 
+    private static String probeClassName(String wrapperPackage, String classPrefix) {
         final String uniqueId = UUID.randomUUID().toString().replace("-", "");
-        final String className = wrapperPackage.isEmpty()
-            ? FastLogpointProbeSource.CLASS_PREFIX + uniqueId
-            : wrapperPackage + '.' + FastLogpointProbeSource.CLASS_PREFIX + uniqueId;
-        final String sourceCode = FastLogpointProbeSource.generate(
-            className, parameters, effectiveExpression, effectiveCondition, bufferSize, metadata);
+        return wrapperPackage.isEmpty() ? classPrefix + uniqueId : wrapperPackage + '.' + classPrefix + uniqueId;
+    }
+
+    /**
+     * Compiles a probe's source; the probe must compile to exactly one class.
+     */
+    private FastLogpointProbe compileProbe(String className, List<FastLogpointProbeSource.Parameter> parameters,
+                                           String sourceCode) throws JdiEvaluationException {
         final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
         if (compiledCode.size() > 1) {
             // The probe is defined as a single class; a nested/anonymous class in the user code
             // would compile to a second class file that is never defined in the target.
-            throw new JdiEvaluationException("Fast logpoint expressions and conditions cannot declare "
-                + "anonymous or nested classes (compiled to " + compiledCode.size() + " classes)");
+            throw new JdiEvaluationException("Fast logpoint and fast breakpoint expressions and conditions cannot "
+                + "declare anonymous or nested classes (compiled to " + compiledCode.size() + " classes)");
         }
         final byte[] bytecode = findCompiledBytecode(compiledCode, className);
         return new FastLogpointProbe(className, bytecode,
