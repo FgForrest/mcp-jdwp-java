@@ -4,6 +4,7 @@ import com.sun.jdi.*;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.*;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.PinnedMirrors;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import org.jspecify.annotations.Nullable;
@@ -1211,7 +1212,7 @@ public class JdiEventListener {
             return false;
         }
 
-        try {
+        try (PinnedMirrors pins = new PinnedMirrors()) {
             final WatchpointRequest request = event.request() instanceof WatchpointRequest wr ? wr : null;
             final Integer bpId = request != null ? breakpointTracker.findFieldIdByRequest(request) : null;
             final BreakpointTracker.FieldBreakpointInfo info = request != null
@@ -1247,16 +1248,23 @@ public class JdiEventListener {
 
             breakpointTracker.setLastBreakpointThread(event.thread(), bpId);
 
+            final String condition = breakpointTracker.getCondition(bpId);
+            final BreakpointTracker.FieldBreakpointSpec spec = info.getSpec();
+            // The bindings cost JDWP round trips — two strings created and pinned in the target —
+            // so they are built only when a condition or a logpoint expression can use them.
             final Map<String, Value> bindings;
-            try {
-                bindings = buildFieldEventBindings(event, isModification, fieldName, modeStr);
-            } catch (Exception bindEx) {
-                log.warn("[JDI] Could not build bindings for field event on {}.{}: {}",
-                    className, fieldName, bindEx.getMessage());
-                return true;
+            if (condition == null && (!spec.logOnly() || spec.expression() == null)) {
+                bindings = Map.of();
+            } else {
+                try {
+                    bindings = buildFieldEventBindings(event, isModification, fieldName, modeStr, pins);
+                } catch (Exception bindEx) {
+                    log.warn("[JDI] Could not build bindings for field event on {}.{}: {}",
+                        className, fieldName, bindEx.getMessage());
+                    return true;
+                }
             }
 
-            final String condition = breakpointTracker.getCondition(bpId);
             if (condition != null && !evaluateConditionWithBindings(event.thread(), condition, bindings,
                     bpId, className + '.' + fieldName)) {
                 log.debug("[JDI] Field BP {} condition false, skipping", bpId);
@@ -1264,7 +1272,6 @@ public class JdiEventListener {
                 return false;
             }
 
-            final BreakpointTracker.FieldBreakpointSpec spec = info.getSpec();
             if (spec.logOnly()) {
                 evaluateFieldLogpoint(event, bpId, spec, modeStr, className, fieldName, threadName, bindings);
                 applyChainEffectsAfterHit(bpId, request);
@@ -1298,6 +1305,8 @@ public class JdiEventListener {
      * as the typed-null literal by {@code JdiExpressionEvaluator#inferDeclaredType} ({@code
      * java.lang.Object}), so string-concatenation expressions like {@code "$oldValue + \" -> \" +
      * $newValue"} render the literal {@code "null"} instead of failing at compile time.
+     * {@code $fieldName} and {@code $mode} are strings created in the target, pinned by {@code pins}
+     * until the caller's evaluations are done.
      * <p>
      * {@link HashMap} (not {@link java.util.LinkedHashMap}) is intentional — null values are
      * supported by HashMap and the binding order is fixed by {@link JdiExpressionEvaluator}'s
@@ -1306,7 +1315,8 @@ public class JdiEventListener {
      */
     private static Map<String, Value> buildFieldEventBindings(WatchpointEvent event,
                                                               boolean isModification,
-                                                              String fieldName, String modeStr) {
+                                                              String fieldName, String modeStr,
+                                                              PinnedMirrors pins) {
         final VirtualMachine vm = event.virtualMachine();
         final Map<String, Value> bindings = new HashMap<>();
         bindings.put("$oldValue", event.valueCurrent());
@@ -1322,8 +1332,8 @@ public class JdiEventListener {
             bindings.put("$newValue", null);
         }
         bindings.put("$object", event.object());
-        bindings.put("$fieldName", vm.mirrorOf(fieldName));
-        bindings.put("$mode", vm.mirrorOf(modeStr));
+        bindings.put("$fieldName", pins.string(vm, fieldName));
+        bindings.put("$mode", pins.string(vm, modeStr));
         // Map is method-scoped and the downstream consumers (condition + logpoint evaluators) read
         // it without mutation — skipping Map.copyOf saves an allocation per field hit on a hot path.
         return bindings;

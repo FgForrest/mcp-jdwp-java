@@ -11,6 +11,7 @@ import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService.JdkNotFoundException;
+import one.edee.mcp.jdwp.evaluation.PinnedMirrors;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -1545,7 +1546,6 @@ public class JDIConnectionService {
         final ThreadReference thread;
         final ClassType classClass;
         final Method forName;
-        final StringReference nameRef;
         synchronized (this) {
             if (vm == null) {
                 return null;
@@ -1589,7 +1589,6 @@ public class JDIConnectionService {
                 log.warn("[JDI] Class.forName(String) method not found");
                 return null;
             }
-            nameRef = vmRef.mirrorOf(className);
         }
 
         // Phase 2: invokeMethod OUTSIDE the monitor.
@@ -1602,8 +1601,9 @@ public class JDIConnectionService {
             // front so a thread death during <clinit> does not leak a guard entry.
             final long guardedThreadId = thread.uniqueID();
             evaluationGuard.enter(guardedThreadId);
-            try {
-                classClass.invokeMethod(thread, forName, List.of(nameRef), ClassType.INVOKE_SINGLE_THREADED);
+            try (PinnedMirrors pins = new PinnedMirrors()) {
+                classClass.invokeMethod(thread, forName, List.of(pins.string(vmRef, className)),
+                    ClassType.INVOKE_SINGLE_THREADED);
             } finally {
                 evaluationGuard.exit(guardedThreadId);
             }

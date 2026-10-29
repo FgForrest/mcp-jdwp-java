@@ -122,13 +122,16 @@ public class ClasspathDiscoverer {
         try {
             final ClassType systemClass = (ClassType) vm.classesByName("java.lang.System").get(0);
             final Method getPropertyMethod = systemClass.methodsByName("getProperty", "(Ljava/lang/String;)Ljava/lang/String;").get(0);
-            final StringReference pathArg = vm.mirrorOf("java.class.path");
-            final Value result = systemClass.invokeMethod(
-                suspendedThread,
-                getPropertyMethod,
-                Collections.singletonList(pathArg),
-                ClassType.INVOKE_SINGLE_THREADED
-            );
+            final Value result;
+            try (PinnedMirrors pins = new PinnedMirrors()) {
+                final StringReference pathArg = pins.string(vm, "java.class.path");
+                result = systemClass.invokeMethod(
+                    suspendedThread,
+                    getPropertyMethod,
+                    Collections.singletonList(pathArg),
+                    ClassType.INVOKE_SINGLE_THREADED
+                );
+            }
 
             if (result instanceof StringReference stringRef) {
                 final String initialClasspath = stringRef.value();

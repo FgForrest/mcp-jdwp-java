@@ -9,7 +9,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Supplier;
 
 /**
  * Injects compiled bytecode into a target JVM and invokes a static method on the resulting class.
@@ -36,10 +35,6 @@ public final class RemoteCodeExecutor {
      * JNI signature for the four-argument `defineClass(String, byte[], int, int)` overload.
      */
     private static final String CLASSLOADER_DEFINE_CLASS_SIGNATURE = "(Ljava/lang/String;[BII)Ljava/lang/Class;";
-    /**
-     * How often {@link #createPinned} creates an object a GC collected before it could be pinned.
-     */
-    private static final int PIN_ATTEMPTS = 3;
 
     private RemoteCodeExecutor() {
     }
@@ -177,32 +172,26 @@ public final class RemoteCodeExecutor {
             }
             final Method defineClassMethod = defineClassMethods.get(0);
 
-            // Create a remote byte array in the target VM to hold our bytecode. Both mirrors come
-            // back pinned (createPinned) and stay pinned for the duration of the call.
-            final ArrayReference remoteByteArray = createRemoteByteArray(vm, bytecode);
-            log.debug("[Executor] Created remote byte array of {} bytes", bytecode.length);
+            // Create a remote byte array in the target VM to hold our bytecode. Both mirrors stay
+            // pinned for the duration of the call.
             final Value loadedClassObject;
-            try {
-                final StringReference remoteClassName = createPinned(() -> vm.mirrorOf(className));
-                try {
-                    // Prepare arguments for defineClass: (className, remoteByteArray, 0, bytecode.length)
-                    final List<Value> args = List.of(
-                        remoteClassName,
-                        remoteByteArray,
-                        vm.mirrorOf(0),
-                        vm.mirrorOf(bytecode.length)
-                    );
+            try (PinnedMirrors pins = new PinnedMirrors()) {
+                final ArrayReference remoteByteArray = createRemoteByteArray(vm, bytecode, pins);
+                log.debug("[Executor] Created remote byte array of {} bytes", bytecode.length);
 
-                    // Invoke ClassLoader.defineClass(...)
-                    log.debug("[Executor] Invoking defineClass on classloader");
-                    loadedClassObject = classLoader.invokeMethod(
-                        thread, defineClassMethod, args, ClassType.INVOKE_SINGLE_THREADED
-                    );
-                } finally {
-                    enableCollectionQuietly(remoteClassName);
-                }
-            } finally {
-                enableCollectionQuietly(remoteByteArray);
+                // Prepare arguments for defineClass: (className, remoteByteArray, 0, bytecode.length)
+                final List<Value> args = List.of(
+                    pins.string(vm, className),
+                    remoteByteArray,
+                    vm.mirrorOf(0),
+                    vm.mirrorOf(bytecode.length)
+                );
+
+                // Invoke ClassLoader.defineClass(...)
+                log.debug("[Executor] Invoking defineClass on classloader");
+                loadedClassObject = classLoader.invokeMethod(
+                    thread, defineClassMethod, args, ClassType.INVOKE_SINGLE_THREADED
+                );
             }
             if (!(loadedClassObject instanceof ClassObjectReference classObjectReference)) {
                 log.error("[Executor] defineClass returned unexpected type: {}",
@@ -226,53 +215,23 @@ public final class RemoteCodeExecutor {
     }
 
     /**
-     * Creates an object in the target and pins it against garbage collection. An object created
-     * through JDI is referenced by nothing in the target until it is pinned, so a GC in between
-     * collects it (and the call it was meant for fails with {@code ObjectCollectedException}) — the
-     * object is created again then. Unpin it with {@link #enableCollectionQuietly}.
-     */
-    private static <T extends ObjectReference> T createPinned(Supplier<T> creation) {
-        for (int attempt = 1; ; attempt++) {
-            final T object = creation.get();
-            try {
-                object.disableCollection();
-                return object;
-            } catch (UnsupportedOperationException e) {
-                // The VM cannot pin: the object is used unpinned.
-                return object;
-            } catch (ObjectCollectedException e) {
-                if (attempt == PIN_ATTEMPTS) {
-                    throw e;
-                }
-            }
-        }
-    }
-
-    private static void enableCollectionQuietly(ObjectReference object) {
-        try {
-            object.enableCollection();
-        } catch (RuntimeException ignored) {
-            // Collected or VM gone — nothing left to release.
-        }
-    }
-
-    /**
      * Mirrors a JVM-local `byte[]` into the target VM by allocating a fresh array of the same length
      * and populating it element-by-element via {@link VirtualMachine#mirrorOf(byte)}. Cost is
      * O(bytecode.length) JDWP round-trips for the per-byte mirror calls — expensive for large
      * bytecode but unavoidable without cooperating native code in the target VM, since
-     * {@link ArrayReference#setValues} requires already-mirrored values. The array comes back
-     * pinned ({@link #createPinned}); the caller unpins it.
+     * {@link ArrayReference#setValues} requires already-mirrored values. The array stays pinned
+     * until {@code pins} closes.
      */
-    private static ArrayReference createRemoteByteArray(VirtualMachine vm, byte[] bytes) throws JdiEvaluationException {
-        log.debug("[Executor] Creating remote byte array of {} bytes", bytes.length);
-
-        // Find the byte[] array type
-        final ArrayType byteArrayType = (ArrayType) vm.classesByName("byte[]").get(0);
-        // Create a new instance of byte[] in the target VM
-        final ArrayReference arrayRef = createPinned(() -> byteArrayType.newInstance(bytes.length));
-        boolean populated = false;
+    private static ArrayReference createRemoteByteArray(VirtualMachine vm, byte[] bytes, PinnedMirrors pins)
+        throws JdiEvaluationException {
         try {
+            log.debug("[Executor] Creating remote byte array of {} bytes", bytes.length);
+
+            // Find the byte[] array type
+            final ArrayType byteArrayType = (ArrayType) vm.classesByName("byte[]").get(0);
+            // Create a new instance of byte[] in the target VM
+            final ArrayReference arrayRef = pins.pin(() -> byteArrayType.newInstance(bytes.length));
+
             // To set the values, we need to create a List<Value> of ByteValue mirrors. The per-byte
             // mirrorOf call is the dominant cost here — batching happens at the setValues call below
             // but the values themselves still have to round-trip individually.
@@ -284,16 +243,11 @@ public final class RemoteCodeExecutor {
             // Set the array elements in the target VM
             arrayRef.setValues(0, mirrorBytes, 0, bytes.length);
             log.debug("[Executor] Remote byte array created and populated");
-            populated = true;
             return arrayRef;
 
         } catch (ClassNotLoadedException | InvalidTypeException e) {
             log.error("[Executor] Failed to create remote byte array: {}", e.getClass().getSimpleName(), e);
             throw new JdiEvaluationException("Failed to create remote byte array: " + e.getMessage(), e);
-        } finally {
-            if (!populated) {
-                enableCollectionQuietly(arrayRef);
-            }
         }
     }
 
@@ -324,18 +278,16 @@ public final class RemoteCodeExecutor {
                 "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"
             ).get(0);
 
-            // Prepare arguments: (className, true, classLoader)
-            final StringReference classNameRef = createPinned(() -> vm.mirrorOf(className));
-            final BooleanValue initializeRef = vm.mirrorOf(true);
-
-            final List<Value> args = List.of(classNameRef, initializeRef, classLoader);
-
-            // Invoke Class.forName() to force initialization
             final Value classObject;
-            try {
+            try (PinnedMirrors pins = new PinnedMirrors()) {
+                // Prepare arguments: (className, true, classLoader)
+                final StringReference classNameRef = pins.string(vm, className);
+                final BooleanValue initializeRef = vm.mirrorOf(true);
+
+                final List<Value> args = List.of(classNameRef, initializeRef, classLoader);
+
+                // Invoke Class.forName() to force initialization
                 classObject = classClass.invokeMethod(thread, forNameMethod, args, ClassType.INVOKE_SINGLE_THREADED);
-            } finally {
-                enableCollectionQuietly(classNameRef);
             }
 
             log.debug("[Executor] Class {} initialization completed", className);
