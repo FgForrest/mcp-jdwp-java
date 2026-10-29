@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -796,7 +797,9 @@ public class JdiEventListener {
     }
 
     /**
-     * Test hook: waits until the dispatcher has processed every event set handed to it so far.
+     * Test hook: waits until the dispatcher has processed every event set handed to it so far, or
+     * dropped it — at VM death the listener shuts the dispatcher down with {@code shutdownNow()},
+     * which discards the queued tasks, this hook's marker included, without ever completing them.
      *
      * @return whether it did within {@code timeoutMs}
      */
@@ -805,15 +808,26 @@ public class JdiEventListener {
         if (sessionDispatcher == null) {
             return true;
         }
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        final Future<?> marker;
         try {
-            sessionDispatcher.submit(() -> { }).get(timeoutMs, TimeUnit.MILLISECONDS);
-            return true;
+            marker = sessionDispatcher.submit(() -> { });
         } catch (RejectedExecutionException e) {
             // The listener already exited and shut the dispatcher down; let it finish.
             return sessionDispatcher.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (ExecutionException | TimeoutException e) {
-            return false;
         }
+        while (!marker.isDone()) {
+            final long remaining = deadline - System.nanoTime();
+            if (sessionDispatcher.isShutdown()) {
+                // The marker may have been discarded; let the set in progress finish.
+                return sessionDispatcher.awaitTermination(Math.max(remaining, 0L), TimeUnit.NANOSECONDS);
+            }
+            if (remaining <= 0L) {
+                return false;
+            }
+            Thread.sleep(10L);
+        }
+        return true;
     }
 
     /**
