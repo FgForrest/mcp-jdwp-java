@@ -203,6 +203,32 @@ final class JDWPToolsTestSupport {
 	}
 
 	/**
+	 * Overload with caller-supplied watchers, evaluator and {@link FastLogpointService} — needed by
+	 * tests of watchers on fast breakpoints.
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		FastLogpointService fastLogpoints
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			new EventHistory(),
+			new EvaluationGuard(),
+			mock(JvmDiscoveryService.class),
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider(),
+			fastLogpoints
+		);
+	}
+
+	/**
 	 * Overload that accepts a caller-supplied {@link FastLogpointService} — needed by tests of the
 	 * fast-logpoint tool surface (consent gate, routing of clear / get_events / reset).
 	 */

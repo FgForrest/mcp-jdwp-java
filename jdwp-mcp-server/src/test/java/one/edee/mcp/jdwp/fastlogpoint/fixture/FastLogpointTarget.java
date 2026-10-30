@@ -60,7 +60,7 @@ public class FastLogpointTarget {
 
     public int compute(int i) {
         final int doubled = i * 2;
-        final String label = "v" + doubled;
+        final String label = "v" + doubled; // MARK: label
         final int result = doubled + base + label.length(); // MARK: probe
         CALLS.incrementAndGet();
         return result;

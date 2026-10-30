@@ -672,7 +672,6 @@ public class JDIConnectionService {
         final int port = lastPort;
 
         final BreakpointTracker.ReconnectSnapshot snapshot = breakpointTracker.snapshotForReconnect();
-        final int watcherCount = watcherManager.getAllWatchers().size();
         final int markedCount = markedInstances.list().size();
         final int objectCacheCount = objectCache.size();
 
@@ -697,8 +696,15 @@ public class JDIConnectionService {
         // (bounded — reconnect exists for wedged VMs) and consent never transfers to the fresh attach.
         final FastLogpointService flps = fastLogpoints;
         if (flps != null) {
+            // Their watchers go with them.
+            for (List<Integer> ids : flps.breakpointIdsByLocation().values()) {
+                for (int id : ids) {
+                    watcherManager.deleteWatchersForBreakpoint(id);
+                }
+            }
             flps.disarmAll("jdwp_reconnect");
         }
+        final int watcherCount = watcherManager.getAllWatchers().size();
         if (vm != null) {
             try {
                 vm.dispose();

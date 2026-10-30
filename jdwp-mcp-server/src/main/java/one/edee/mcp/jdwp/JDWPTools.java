@@ -2645,6 +2645,10 @@ public class JDWPTools {
         try {
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
+            final String fastTrigger = refuseFastInChain(triggerBreakpointId, "Trigger");
+            if (fastTrigger != null) {
+                return fastTrigger;
+            }
             if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
             }
@@ -3299,7 +3303,11 @@ public class JDWPTools {
         try {
             final String fastLogpointReport = fastLogpoints.clear(breakpointId);
             if (fastLogpointReport != null) {
-                return fastLogpointReport;
+                // A cleared fast breakpoint never stops again, even while its class's restore waits or failed.
+                final int watchersRemoved = watcherManager.deleteWatchersForBreakpoint(breakpointId);
+                return watchersRemoved > 0
+                    ? fastLogpointReport + String.format("%n%d associated watcher(s) also removed.", watchersRemoved)
+                    : fastLogpointReport;
             }
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
             // CHAIN_BROKEN events land in front of the removal confirmation.
@@ -3357,6 +3365,23 @@ public class JDWPTools {
     }
 
     /**
+     * Refuses a fast logpoint or fast breakpoint in a breakpoint dependency: the target decides its
+     * hits, so it can neither arm a dependent nor be disarmed by a trigger.
+     *
+     * @param role "Trigger" or "Dependent"
+     * @return the error reply, or {@code null} when {@code id} names neither
+     */
+    @Nullable
+    private String refuseFastInChain(@Nullable Integer id, String role) {
+        final FastLogpointService.Kind kind = id != null ? fastLogpoints.listedKind(id) : null;
+        if (kind == null) {
+            return null;
+        }
+        return String.format("Error: %s breakpoint #%d is a %s — a breakpoint dependency cannot include fast "
+            + "breakpoints or fast logpoints: the target JVM decides their hits.", role, id, kind.noun());
+    }
+
+    /**
      * Detaches every dependent that was waiting on {@code removedTriggerId}, arms them when
      * possible, and emits one {@code CHAIN_BROKEN} event per detached edge. Called from the
      * BP-removal code paths so the dependent BPs collapse back to plain (unconditional) BPs when
@@ -3409,6 +3434,14 @@ public class JDWPTools {
         try {
             if (dependentId == triggerId) {
                 return "Error: A breakpoint cannot be its own trigger";
+            }
+            final String fastDependent = refuseFastInChain(dependentId, "Dependent");
+            if (fastDependent != null) {
+                return fastDependent;
+            }
+            final String fastTrigger = refuseFastInChain(triggerId, "Trigger");
+            if (fastTrigger != null) {
+                return fastTrigger;
             }
             if (!breakpointTracker.isKnownBreakpointId(dependentId)) {
                 return String.format("Error: Dependent breakpoint #%d does not exist", dependentId);
@@ -3623,6 +3656,10 @@ public class JDWPTools {
             }
             final boolean effectiveCaught = caught == null || caught;
             final boolean effectiveUncaught = uncaught == null || uncaught;
+            final String fastTrigger = refuseFastInChain(triggerBreakpointId, "Trigger");
+            if (fastTrigger != null) {
+                return fastTrigger;
+            }
             if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
             }
@@ -3808,6 +3845,10 @@ public class JDWPTools {
                     return String.format(
                         "Error: invalid mode '%s' — expected one of: access, modification, both", mode);
                 }
+            }
+            final String fastTrigger = refuseFastInChain(triggerBreakpointId, "Trigger");
+            if (fastTrigger != null) {
+                return fastTrigger;
             }
             if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
@@ -4860,6 +4901,7 @@ public class JDWPTools {
         out.append(String.format("%ss: %d match%s\n", kind.label, toClear.size(), toClear.size() == 1 ? "" : "es"));
         for (int id : toClear) {
             appendBulkClearLine(out, "#" + id + " — " + fastLogpoints.clear(id));
+            watcherManager.deleteWatchersForBreakpoint(id);
         }
         return toClear.size();
     }
@@ -5035,7 +5077,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Attach a watcher to a breakpoint to evaluate a Java expression when hit. Returns the watcher ID. Supports `{ block }` syntax for multi-statement.")
+    @McpTool(description = "Attach a watcher to a breakpoint to evaluate a Java expression when hit. Returns the watcher ID. Supports `{ block }` syntax for multi-statement. Fast breakpoints take watchers; fast logpoints never stop, so they don't.")
     public String jdwp_attach_watcher(
         @McpToolParam(description = "Breakpoint request ID (from jdwp_overview)") int breakpointId,
         @McpToolParam(description = "Descriptive label for this watcher (e.g., 'Trace entity ID', 'Check user name')") String label,
@@ -5047,9 +5089,13 @@ public class JDWPTools {
             if (label.trim().isEmpty()) {
                 return "Error: No label provided";
             }
+            final String fastRefusal = fastLogpoints.watcherRefusal(breakpointId);
+            if (fastRefusal != null) {
+                return fastRefusal;
+            }
             // P1-1: refuse watchers targeting a BP id that doesn't exist. The previous "silently
             // accept any id" behaviour produced inert watchers and a misleading success message.
-            if (!breakpointTracker.isKnownBreakpointId(breakpointId)) {
+            if (!breakpointTracker.isKnownBreakpointId(breakpointId) && fastLogpoints.listedKind(breakpointId) == null) {
                 return String.format(
                     "[ERROR] No breakpoint with ID %d — use jdwp_overview() to list active and pending BPs.",
                     breakpointId);
@@ -5256,15 +5302,16 @@ public class JDWPTools {
 
     /**
      * Evaluates watchers across the entire call stack by scanning each frame's location against
-     * the breakpoint location map. Only frames that match a known breakpoint have their watchers evaluated.
+     * the breakpoint location map. Only frames that match a known breakpoint have their watchers
+     * evaluated — the watchers of every breakpoint at that line, ordinary and fast.
      *
      * @param thread the suspended thread whose full stack will be scanned
      * @param result accumulator for formatted evaluation output
      * @return total number of watchers successfully evaluated across all matching frames
      */
     private int evaluateWatchersFullStack(ThreadReference thread, StringBuilder result) throws Exception {
-        final Map<String, Integer> locationToBreakpointId = breakpointTracker.getBreakpointLocationMap();
-        if (locationToBreakpointId.isEmpty()) {
+        final Map<String, List<Integer>> breakpointIdsByLocation = breakpointIdsByLocation();
+        if (breakpointIdsByLocation.isEmpty()) {
             result.append("No breakpoints found. Cannot evaluate watchers.\n");
             return 0;
         }
@@ -5285,35 +5332,52 @@ public class JDWPTools {
             final Location location = view.frame(frameIndex).location();
             final String locationKey = location.declaringType().name() + ':' + location.lineNumber();
 
-            final Integer breakpointId = locationToBreakpointId.get(locationKey);
-            if (breakpointId == null) {
+            final List<Integer> breakpointIds = breakpointIdsByLocation.get(locationKey);
+            if (breakpointIds == null) {
                 continue;
             }
 
-            final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(breakpointId);
-            if (watchers.isEmpty()) {
-                continue;
-            }
+            for (int breakpointId : breakpointIds) {
+                final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(breakpointId);
+                if (watchers.isEmpty()) {
+                    continue;
+                }
 
-            result.append(String.format("─── Frame #%d: %s:%d (Breakpoint ID: %d) ───\n\n",
-                frameIndex, location.declaringType().name(), location.lineNumber(), breakpointId));
+                result.append(String.format("─── Frame #%d: %s:%d (Breakpoint ID: %d) ───\n\n",
+                    frameIndex, location.declaringType().name(), location.lineNumber(), breakpointId));
 
-            for (Watcher watcher : watchers) {
-                result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
-                try {
-                    // Fresh frame per watcher — see comment above.
-                    final StackFrame freshFrame = view.frame(frameIndex);
-                    final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
-                    result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
-                    succeeded++;
-                } catch (Exception e) {
-                    result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
-                    errored++;
+                for (Watcher watcher : watchers) {
+                    result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
+                    try {
+                        // Fresh frame per watcher — see comment above.
+                        final StackFrame freshFrame = view.frame(frameIndex);
+                        final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
+                        result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
+                        succeeded++;
+                    } catch (Exception e) {
+                        result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
+                        errored++;
+                    }
                 }
             }
         }
         appendWatcherTally(result, succeeded, errored);
         return succeeded + errored;
+    }
+
+    /**
+     * Every breakpoint at a line, by {@code "class:line"}: the tracker's active ones and this session's
+     * fast breakpoints, IDs ascending.
+     */
+    private Map<String, List<Integer>> breakpointIdsByLocation() {
+        final Map<String, List<Integer>> byLocation = new HashMap<>(breakpointTracker.getBreakpointLocationMap());
+        for (Map.Entry<String, List<Integer>> fast : fastLogpoints.breakpointIdsByLocation().entrySet()) {
+            final List<Integer> ids = new ArrayList<>(byLocation.getOrDefault(fast.getKey(), List.of()));
+            ids.addAll(fast.getValue());
+            Collections.sort(ids);
+            byLocation.put(fast.getKey(), ids);
+        }
+        return byLocation;
     }
 
     /**

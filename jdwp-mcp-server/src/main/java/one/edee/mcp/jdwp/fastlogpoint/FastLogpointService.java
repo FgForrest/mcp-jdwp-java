@@ -2434,12 +2434,15 @@ public class FastLogpointService {
         final BreakpointRequest request = flp.armingRequest;
         flp.armingRequest = null;
         if (request != null) {
-            byArmingRequest.remove(request);
+            // Delete before forgetting, as BreakpointTracker.removeBreakpoint does: a hit still queued
+            // is then claimed and dropped by arm(), or finds its request deleted — never an enabled
+            // request nobody knows, which the listener would keep stopped as an untracked breakpoint.
             try {
                 flp.vm.eventRequestManager().deleteEventRequest(request);
             } catch (Exception ignored) {
                 // Already deleted (redefinition) or VM gone.
             }
+            byArmingRequest.remove(request);
         }
     }
 
@@ -2636,6 +2639,56 @@ public class FastLogpointService {
     public String stopReason(int id) {
         final FastLogpoint flp = logpoints.get(id);
         return flp != null && flp.kind == Kind.BREAKPOINT ? flp.lastStopReason : null;
+    }
+
+    /**
+     * The kind of the listed fast logpoint or fast breakpoint {@code id}, own or leftover; {@code null}
+     * when {@code id} names none — a cleared one whose class waits for its restore included.
+     */
+    @Nullable
+    public Kind listedKind(int id) {
+        final FastLogpoint flp = logpoints.get(id);
+        return flp != null && flp.state != State.REMOVAL_PENDING ? flp.kind : null;
+    }
+
+    /**
+     * Why no watcher can attach to {@code id}, or {@code null} when one can or {@code id} names no listed
+     * fast logpoint or fast breakpoint. Watchers attach only to a fast breakpoint this session set that
+     * can still stop: {@link State#PENDING} or {@link State#ARMED}.
+     */
+    @Nullable
+    public String watcherRefusal(int id) {
+        final FastLogpoint flp = logpoints.get(id);
+        if (flp == null || flp.state == State.REMOVAL_PENDING) {
+            return null;
+        }
+        if (flp.kind == Kind.LOGPOINT) {
+            return String.format("[ERROR] #%d is a fast logpoint: it never stops, so a watcher on it would never run "
+                + "— put the expression into the fast logpoint itself, or set a breakpoint.", id);
+        }
+        if (flp.isLeftover()) {
+            return String.format("[ERROR] #%d is a fast breakpoint an earlier session left behind: it never stops "
+                + "in this session, so a watcher on it would never run.", id);
+        }
+        if (flp.state != State.PENDING && flp.state != State.ARMED) {
+            return String.format("[ERROR] Fast breakpoint %d is %s and never stops — clear it with "
+                + "jdwp_clear_breakpoint(%d) and set it again.", id, flp.state, id);
+        }
+        return null;
+    }
+
+    /**
+     * The listed fast breakpoints this session set, by {@code "class:line"} of their line: the
+     * full-stack watcher scan's view of them (a fast stop's logical frame 0 is at that line).
+     */
+    public Map<String, List<Integer>> breakpointIdsByLocation() {
+        final Map<String, List<Integer>> byLocation = new HashMap<>();
+        for (FastLogpoint flp : logpoints.values()) {
+            if (flp.kind == Kind.BREAKPOINT && !flp.isLeftover() && flp.state != State.REMOVAL_PENDING) {
+                byLocation.computeIfAbsent(flp.className() + ':' + flp.line, k -> new ArrayList<>()).add(flp.id);
+            }
+        }
+        return byLocation;
     }
 
     /**

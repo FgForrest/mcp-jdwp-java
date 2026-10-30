@@ -1,10 +1,14 @@
 package one.edee.mcp.jdwp;
 
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -13,6 +17,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Pins the contract that watchers survive {@code jdwp_reconnect}. The natural risk: the JDI
@@ -62,6 +67,32 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		assertThat(watchers.getAllWatchers())
 			.as("watcher count after failed reconnect")
 			.hasSize(1);
+	}
+
+	/**
+	 * Fast breakpoints are not carried across a reconnect — their instrumentation is reverted — so
+	 * their watchers would be left on IDs nothing answers to any more. Every other watcher survives.
+	 */
+	@Test
+	@DisplayName("the watchers of this session's fast breakpoints go with them; the others survive")
+	void shouldDropTheWatchersOfFastBreakpoints() throws Exception {
+		final WatcherManager watchers = new WatcherManager();
+		final BreakpointTracker tracker = new BreakpointTracker();
+		final JdiEventListener listener = new JdiEventListener(tracker, new EventHistory(),
+			mock(JdiExpressionEvaluator.class), new EvaluationGuard(), null, new MarkedInstanceRegistry());
+		final JDIConnectionService service = new JDIConnectionService(listener, tracker, new EventHistory(), watchers,
+			new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor());
+		final FastLogpointService fastLogpoints = mock(FastLogpointService.class);
+		when(fastLogpoints.breakpointIdsByLocation()).thenReturn(Map.of("com.example.Cart:42", List.of(5)));
+		service.setFastLogpointService(fastLogpoints);
+		watchers.createWatcher("trace.id", 1, "entity.id");
+		watchers.createWatcher("total", 5, "total");
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
+
+		assertThatThrownBy(service::reconnectPreservingSpecs).isInstanceOf(Exception.class);
+
+		assertThat(watchers.getAllWatchers()).singleElement()
+			.satisfies(watcher -> assertThat(watcher.getBreakpointId()).isEqualTo(1));
 	}
 
 	/**

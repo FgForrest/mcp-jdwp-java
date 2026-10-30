@@ -33,8 +33,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End-to-end verification of {@code jdwp_set_fast_breakpoint} against a real forked JVM: the consent
  * gate, a stop-once breakpoint that parks every thread and is re-armed, an every-hit breakpoint that
  * parks only its thread, a failing condition that stops once and then installs, a first hit that
- * stops before anything is installed, restoration of the original bytecode, and an evaluation that
- * survives another thread's stop-all.
+ * stops before anything is installed, restoration of the original bytecode — at once, or once a stopped
+ * thread is released, for one entry or two in the same class —, an evaluation that survives another
+ * thread's stop-all, and watchers by fast-breakpoint ID.
  * <p>
  * Opt-in like {@link FastLogpointLiveTest}:
  * {@code mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastBreakpointLiveTest}.
@@ -388,6 +389,65 @@ class FastBreakpointLiveTest {
 				return false;
 			}
 		});
+	}
+
+	@Test
+	@Order(11)
+	@DisplayName("watchers by fast ID: refused on a fast logpoint, evaluated at the fast stop in both scopes, removed by clear")
+	void watchersOnAFastBreakpoint() throws Exception {
+		final int logpoint = idOf(tools.jdwp_set_fast_logpoint(TARGET, lineOf("// MARK: other"), "i", null, true, null,
+			null));
+		assertThat(tools.jdwp_attach_watcher(logpoint, "i", "i")).startsWith("[ERROR] #" + logpoint + " is a fast logpoint");
+		assertThat(tools.jdwp_clear_breakpoint(logpoint)).contains("cleared");
+
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(tools.jdwp_attach_watcher(id, "doubled", "doubled")).startsWith("✓ Watcher [");
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
+		final long threadId = stoppedThread().uniqueID();
+
+		// The probe frames on top are hidden: the user's frame at the line is frame #0, in both scopes.
+		assertThat(tools.jdwp_evaluate_watchers(threadId, "current_frame", null))
+			.contains("Current Frame #0: " + TARGET + ':' + probeLine + " (Breakpoint ID: " + id + ")")
+			.contains("doubled = ")
+			.doesNotContain("[ERROR");
+		assertThat(tools.jdwp_evaluate_watchers(threadId, "full_stack", null))
+			.contains("Frame #0: " + TARGET + ':' + probeLine + " (Breakpoint ID: " + id + ")")
+			.contains("doubled = ")
+			.doesNotContain("[ERROR");
+
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("disabled now").endsWith("1 associated watcher(s) also removed.");
+		assertThat(tools.jdwp_list_watchers_for_breakpoint(id)).startsWith("No watchers attached");
+		assertThat(tools.jdwp_resume()).contains("Cleared fast breakpoint " + id + ": the original bytecode of "
+			+ TARGET + " is restored.");
+		assertBytecodeRestored();
+	}
+
+	@Test
+	@Order(12)
+	@DisplayName("two cleared entries of one class wait for the same stopped thread; its release restores the class")
+	void twoPendingRemovalsInOneClassRestoreTogether() throws Exception {
+		final int logpoint = idOf(tools.jdwp_set_fast_logpoint(TARGET, lineOf("// MARK: label"), "i", null, true, null,
+			null));
+		await("the fast logpoint armed", () -> state(logpoint) == FastLogpointService.State.ARMED);
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
+		final ThreadReference stopped = stoppedThread();
+
+		// Both sites are in compute(), where the stopped thread is: neither removal may redefine it yet.
+		assertThat(tools.jdwp_clear_breakpoint(logpoint))
+			.contains("Fast logpoint " + logpoint + " disabled now")
+			.contains("thread " + stopped.name() + " is stopped in compute");
+		assertThat(tools.jdwp_clear_breakpoint(id)).contains("Fast breakpoint " + id + " disabled now");
+		assertThat(fastLogpoints.list()).isEmpty();
+		assertThat(bytecodeIsOriginal()).isFalse();
+
+		assertThat(tools.jdwp_resume())
+			.contains("Cleared fast logpoint " + logpoint + ": the original bytecode of " + TARGET + " is restored.")
+			.contains("Cleared fast breakpoint " + id + ": the original bytecode of " + TARGET + " is restored.");
+		assertBytecodeRestored();
+		assertThat(eventTypes()).contains("FAST_LOGPOINT_DISARMED", "FAST_BREAKPOINT_DISARMED");
 	}
 
 	// ── helpers ──

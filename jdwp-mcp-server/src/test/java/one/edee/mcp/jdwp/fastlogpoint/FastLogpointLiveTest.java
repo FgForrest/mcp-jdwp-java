@@ -32,7 +32,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End-to-end verification of {@code jdwp_set_fast_logpoint} against a real forked JVM: arming on the
  * first hit, in-target evaluation without suspending, breakpoint survival across redefinition, the
  * bytecode guard, buffer-overrun reporting, and restoration of the original bytecode by clear,
- * reset and disconnect. Also prints the per-hit cost against {@code jdwp_set_logpoint}.
+ * reset and disconnect — refused when it would undo another agent's redefinition. Also prints the
+ * per-hit cost against {@code jdwp_set_logpoint}.
  * <p>
  * Forks a JVM and attaches over JDWP, which the test suite otherwise never does (see
  * {@code docs/testing.md}), so it is opt-in:
@@ -480,6 +481,34 @@ class FastLogpointLiveTest {
 		} finally {
 			tools.jdwp_clear_breakpoint(otherId);
 		}
+		assertBytecodeRestored();
+	}
+
+	@Test
+	@Order(16)
+	@DisplayName("a restore that would undo another agent's redefinition is refused: the entry stays DISABLED and clear retries")
+	void restoreRefusedAfterAForeignRedefinition() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null));
+		awaitArmed(id);
+		// Stand-in for another agent: the class redefined from its class file, which drops the probe's call.
+		redefineTargetWithClassFile();
+
+		assertThat(tools.jdwp_clear_breakpoint(id))
+			.startsWith("Fast logpoint " + id + ": restoring the original bytecode of " + TARGET + " failed")
+			.contains("differs from what this server installed")
+			.contains("(kill switch set)")
+			.endsWith("jdwp_clear_breakpoint(" + id + ") retries.");
+		assertThat(fastLogpoints.list()).singleElement().satisfies(info -> {
+			assertThat(info.state()).isEqualTo(FastLogpointService.State.DISABLED);
+			assertThat(info.enabled()).isFalse();
+		});
+		assertThat(tools.jdwp_clear_breakpoint(id)).as("the retry meets the same change")
+			.contains("differs from what this server installed");
+
+		// The class already runs its class file; the reset forgets the entry, and the next discovery
+		// finds a disabled probe nothing calls — inert, not listed.
+		tools.jdwp_reset();
+		assertThat(fastLogpoints.list()).isEmpty();
 		assertBytecodeRestored();
 	}
 

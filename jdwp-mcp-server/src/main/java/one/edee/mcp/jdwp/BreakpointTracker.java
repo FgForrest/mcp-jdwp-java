@@ -339,14 +339,18 @@ public class BreakpointTracker {
     }
 
     /**
-     * Build a location map: "className:lineNumber" -> breakpoint ID (active only).
+     * Build a location map: "className:lineNumber" -> the IDs of every active breakpoint at that
+     * line, ascending — a breakpoint and a logpoint, or two with different filters, can share one.
      */
-    public Map<String, Integer> getBreakpointLocationMap() {
-        final Map<String, Integer> map = new HashMap<>();
+    public Map<String, List<Integer>> getBreakpointLocationMap() {
+        final Map<String, List<Integer>> map = new HashMap<>();
         for (Map.Entry<Integer, BreakpointRequest> entry : breakpointsById.entrySet()) {
             final Location loc = entry.getValue().location();
             final String key = loc.declaringType().name() + ':' + loc.lineNumber();
-            map.put(key, entry.getKey());
+            map.computeIfAbsent(key, k -> new ArrayList<>()).add(entry.getKey());
+        }
+        for (List<Integer> ids : map.values()) {
+            Collections.sort(ids);
         }
         return map;
     }
