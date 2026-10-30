@@ -3175,15 +3175,16 @@ public class JDWPTools {
             + "timing matters.", idList, method.name());
     }
 
-    @McpTool(description = "RARE — needs the user's explicit consent. Removes fast logpoints that an EARLIER debugging "
-        + "session left in the target JVM (listed by jdwp_overview as RECOVERED after that session's server died without "
-        + "restoring the class): redefines the class with the class file that session saved, which removes every such "
-        + "fast logpoint in that class. CONSENT PROTOCOL: call it without userApproved first — nothing changes and a "
-        + "briefing is returned (what is removed, what was and was not verified). Relay it to the user and ask; pass "
-        + "userApproved=true only after the user agreed in this conversation. jdwp_clear_breakpoint(id) is the "
-        + "no-consent alternative: it only switches the leftover off. Never restore leftovers on your own initiative.")
+    @McpTool(description = "RARE — needs the user's explicit consent. Removes fast logpoints and fast breakpoints that an "
+        + "EARLIER debugging session left in the target JVM (listed by jdwp_overview as RECOVERED after that session's "
+        + "server died without restoring the class): redefines the class with the class file that session saved, which "
+        + "removes every such fast logpoint and fast breakpoint in that class. CONSENT PROTOCOL: call it without "
+        + "userApproved first — nothing changes and a briefing is returned (what is removed, what was and was not "
+        + "verified). Relay it to the user and ask; pass userApproved=true only after the user agreed in this "
+        + "conversation. jdwp_clear_breakpoint(id) is the no-consent alternative: it only switches the leftover off. "
+        + "Never restore leftovers on your own initiative.")
     public String jdwp_restore_fast_logpoints(
-        @McpToolParam(description = "ID of a RECOVERED fast logpoint, as listed by jdwp_overview") int id,
+        @McpToolParam(description = "ID of a RECOVERED fast logpoint or fast breakpoint, as listed by jdwp_overview") int id,
         @McpToolParam(required = false, description = "Set to true ONLY after the user explicitly approved restoring this class in this conversation. Missing or false returns the briefing and changes nothing.") @Nullable Boolean userApproved) {
         try {
             return fastLogpoints.restore(id, userApproved != null && userApproved);
@@ -3298,7 +3299,7 @@ public class JDWPTools {
             locations.size(), boundDesc, kind);
     }
 
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, field breakpoints and fast logpoints share one ID space (clearing a fast logpoint restores the class's original bytecode). After clearing mid-session, continue with jdwp_resume_until_event.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception and field breakpoints, fast logpoints and fast breakpoints share one ID space. Clearing a fast logpoint or fast breakpoint switches it off and restores the class's original bytecode — while a thread is stopped in the method, once that thread is released. Clearing removes the breakpoint's watchers. After clearing mid-session, continue with jdwp_resume_until_event.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
             final String fastLogpointReport = fastLogpoints.clear(breakpointId);
@@ -4038,7 +4039,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, fast logpoints — restoring the original bytecode —, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
+    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, fast logpoints and fast breakpoints — restoring the original bytecode at once and releasing every stop —, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
     public String jdwp_reset() {
         final int activeBp = breakpointTracker.getAllBreakpoints().size();
         final int pendingBp = breakpointTracker.getAllPendingBreakpoints().size();
