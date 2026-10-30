@@ -5,6 +5,64 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.11.0] — 2026-10-30
+
+### New — fast logpoints and fast breakpoints: conditions evaluated inside the target JVM
+
+A logpoint or conditional breakpoint on a hot line goes through the debugger on every
+pass — milliseconds each — which slows a busy application to a crawl and makes the
+very races it should catch disappear. Two new tools move that work into the target:
+`jdwp_set_fast_logpoint` (#40) and `jdwp_set_fast_breakpoint` (#42) compile a small
+probe class, define it in the declaring class's loader and redefine the method to call
+it, so hits that don't matter never involve the debugger. Both rewrite the
+application's bytecode, so neither arms anything without `userApproved=true`; without
+it they return a risk briefing to relay to the user.
+
+- **`jdwp_set_fast_logpoint`** — evaluates the expression (and an optional condition)
+  in the target and appends each hit to an in-target ring buffer that
+  `jdwp_get_events` drains with plain field reads.
+- **`jdwp_set_fast_breakpoint`** — evaluates the condition in the target; when it
+  holds, the probe calls an empty `stop()` method that carries an ordinary breakpoint
+  with the requested suspend policy, so the user's method stays JIT-compiled. It stops
+  once per generation (call the tool again to re-arm) or on every hit; a condition that
+  fails stops once.
+- **Safe restore** — clear, `jdwp_reset`, disconnect, reconnect and shutdown restore
+  the original bytecode. Arming is refused when the live bytecode differs from the
+  class file (another agent changed it). A method in which a stopped thread has a frame
+  is never redefined: arming waits, and a clear restores the class once that thread is
+  released.
+- **Leftovers of a dead server** — the next attach lists the fast logpoints and fast
+  breakpoints a crashed server left behind; clearing switches them off, and
+  `jdwp_restore_fast_logpoints` restores their class only with the user's approval.
+- **Fast stops look like your code** — probe frames are hidden from every frame index,
+  steps never enter probe classes, and watchers attach to fast breakpoints.
+- **Test flight #10 "The Oversold House"** — a highly concurrent sandbox target for both
+  tools.
+
+### Fixed — no more hangs or lost stops when events and evaluations overlap
+
+Conditions, logpoint expressions and evaluations invoke code in the target. A
+breakpoint hit inside that code, or a stop-all breakpoint on another thread, could
+freeze the invocation and the debugger with it (#43), and a resume could release a
+stop nobody had seen yet (#44). Every suspension the debugger causes now has exactly
+one owner, which alone releases it (#45).
+
+- **The event queue is always drained** — the listener only drains and routes; event
+  sets are processed in order on a dispatcher thread, and a set raised inside an
+  evaluation is suppressed at once.
+- **Each stop is held in its own context** — `jdwp_resume` releases only the stops a
+  tool has shown (plus `jdwp_suspend_thread` holds); `jdwp_resume_until_event` presents
+  an unseen stop first instead of resuming past it; steps are atomic.
+- **Evaluations are leased and bounded** — a thread the debugger invokes on is exempt
+  from other threads' stop-all events. A tool's invocation waits at most 20 s, then
+  answers `[STILL_RUNNING]` and records the late result as `EVALUATION_COMPLETED_LATE`.
+  A watchdog frees a condition or logpoint evaluation stuck on a monitor that a queued
+  stop's thread holds.
+- **Objects the debugger creates in the target are pinned** from the moment they exist;
+  a garbage collection in between surfaced as a spurious "condition failed".
+
+Follow-ups are tracked in #47.
+
 ## [2.10.1] — 2026-07-11
 
 ### Fixed — locals survive missing debug info, and attach/error messages stop lying
