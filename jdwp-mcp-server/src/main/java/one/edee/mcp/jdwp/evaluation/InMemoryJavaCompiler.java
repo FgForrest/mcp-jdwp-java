@@ -55,6 +55,21 @@ public class InMemoryJavaCompiler {
      * Materialises the source for {@code className} under {@code tempDir}, creating any required
      * package subdirectories. Returns the path of the written {@code .java} file.
      */
+    /**
+     * "Line 7 ({@code return (Object) (sold());}): The method sold() is undefined …" — the line of
+     * the generated source the problem is on, so it reads without the temporary file.
+     */
+    static String describeProblem(long lineNumber, String message, String[] sourceLines) {
+        if (lineNumber < 1 || lineNumber > sourceLines.length) {
+            return message;
+        }
+        String code = sourceLines[(int) lineNumber - 1].trim();
+        if (code.length() > 100) {
+            code = code.substring(0, 100) + "…";
+        }
+        return "Line " + lineNumber + (code.isEmpty() ? "" : " (`" + code + "`)") + ": " + message;
+    }
+
     private static Path writeSourceFileToTemp(Path tempDir, String className, String sourceCode) throws IOException {
         final @Nullable String[] packageAndClass = getPackageAndClassName(className);
         Path packageDir = tempDir;
@@ -162,12 +177,13 @@ public class InMemoryJavaCompiler {
             final boolean success = task.call();
 
             if (!success) {
+                // One line per distinct problem — the compiler can report one twice — with the
+                // offending source line instead of the temporary file's path.
+                final String[] sourceLines = sourceCode.split("\n", -1);
                 final String errors = diagnostics.getDiagnostics().stream()
                     .filter(d -> d.getKind() == Diagnostic.Kind.ERROR)
-                    .map(d -> {
-                        final String location = "Line " + d.getLineNumber() + " in " + d.getSource().getName();
-                        return location + ": " + d.getMessage(null);
-                    })
+                    .map(d -> describeProblem(d.getLineNumber(), d.getMessage(null), sourceLines))
+                    .distinct()
                     .collect(Collectors.joining("\n"));
                 final long elapsed = System.currentTimeMillis() - startTime;
                 log.error("[Compiler] Compilation failed after {}ms:\n{}", elapsed, errors);

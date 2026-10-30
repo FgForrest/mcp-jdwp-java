@@ -115,6 +115,22 @@ class JDWPToolsDumpLocksTest {
 	}
 
 	@Test
+	@DisplayName("a thread in Object.wait() (e.g. Thread.join) is not counted as blocked — it is listed apart (#50)")
+	void shouldListWaitersApartFromTheGraph() throws Exception {
+		final ThreadReference main = thread(1L, "main", ThreadReference.THREAD_STATUS_WAIT);
+		final ThreadReference worker = thread(2L, "worker-1", ThreadReference.THREAD_STATUS_RUNNING);
+		final ObjectReference joined = monitor(301L, "java.lang.Thread", null);
+		when(main.currentContendedMonitor()).thenReturn(joined);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(main, worker));
+
+		assertThat(tools.jdwp_dump_locks(null))
+			.startsWith("No threads are currently blocked on a Java monitor.")
+			.contains("In Object.wait() — the monitor is released, so not part of the lock graph: #1 main on "
+				+ "java.lang.Thread@301");
+	}
+
+	@Test
 	@DisplayName("no monitor-blocked threads → explicit none message, not an empty table")
 	void shouldReportNoneWhenNothingBlocked() throws Exception {
 		final ThreadReference t = thread(1L, "main", ThreadReference.THREAD_STATUS_RUNNING);

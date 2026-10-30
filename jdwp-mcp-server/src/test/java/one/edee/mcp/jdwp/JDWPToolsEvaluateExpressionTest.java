@@ -83,6 +83,24 @@ class JDWPToolsEvaluateExpressionTest {
 	}
 
 	@Test
+	@DisplayName("without threadId it evaluates on the current stop's thread — and says so when there is none (#50)")
+	void shouldDefaultToTheCurrentStop() throws Exception {
+		when(jdiService.getVM()).thenReturn(vm);
+
+		assertThat(tools.jdwp_evaluate_expression(null, "1 + 2", null))
+			.startsWith("Error: No current stop. Provide a threadId, or hit a breakpoint first");
+	}
+
+	@Test
+	@DisplayName("a block or a long expression is echoed shortened, whitespace collapsed (#50)")
+	void shouldShortenTheEcho() {
+		assertThat(JDWPTools.echoed("  x +\n   y ")).isEqualTo("x + y");
+		final String block = "{ final java.lang.reflect.Field f = _this.getClass().getDeclaredField(\"owners\");\n"
+			+ "  f.setAccessible(true);\n  return ((int[]) f.get(_this)).length; }";
+		assertThat(JDWPTools.echoed(block)).hasSize(80).startsWith("{ final java.lang.reflect.Field f").endsWith("…");
+	}
+
+	@Test
 	@DisplayName("returns 'Thread not found' when threadId is unknown")
 	void shouldReturnThreadNotFoundWhenThreadIdIsUnknown() throws Exception {
 		when(jdiService.getVM()).thenReturn(vm);

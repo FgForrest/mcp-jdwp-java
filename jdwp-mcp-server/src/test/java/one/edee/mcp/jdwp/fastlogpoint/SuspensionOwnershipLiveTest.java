@@ -1,6 +1,9 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
 import com.sun.jdi.Location;
+import com.sun.jdi.LongValue;
+import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.BreakpointRequest;
@@ -178,7 +181,128 @@ class SuspensionOwnershipLiveTest {
 		});
 	}
 
+	@Test
+	@Order(3)
+	@DisplayName("jdwp_reset while an evaluation runs: every count ends at 0 and the application keeps running (#47 § 4)")
+	void resetDuringAnInvocation() throws Exception {
+		final ThreadReference evaluating = thread("worker-0");
+		tools.jdwp_set_field_logpoint(TARGET, "base", "access",
+			"{ java.util.concurrent.locks.LockSupport.parkNanos(1_500_000_000L); return \"slept\"; }", null,
+			evaluating.uniqueID(), null, null, null, null, null);
+		await("an evaluation in flight on worker-0", () -> sessionState().contains("leases=[worker-0]"));
+
+		assertThat(tools.jdwp_reset()).startsWith("Reset complete (VM connection preserved).");
+
+		await("the evaluation to end", () -> !sessionState().contains("leases=[worker-0]"));
+		assertApplicationRuns();
+	}
+
+	@Test
+	@Order(4)
+	@DisplayName("a fast logpoint and a fast breakpoint on one line, set before either fires: one stop, both armed in the end (#47 § 4)")
+	void coDeliveredArmingHits() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final int line = lineOf("// MARK: probe");
+		final int logpointId;
+		final int breakpointId;
+		// Both arming requests in place before a worker reaches the line: their hits come in one set.
+		vm.suspend();
+		try {
+			logpointId = idOf(tools.jdwp_set_fast_logpoint(TARGET, line, "\"i=\" + i", "i % 100000 == 0", true, null,
+				null));
+			breakpointId = idOf(tools.jdwp_set_fast_breakpoint(TARGET, line, "i >= 0", true, "thread", true, null));
+		} finally {
+			vm.resume();
+		}
+		try {
+			final String stop = tools.jdwp_resume_until_event((int) TIMEOUT.toMillis());
+			assertThat(stop).contains("fast_breakpoint=" + breakpointId + ", condition true");
+			assertThat(tools.jdwp_resume()).contains("Resumed:");
+			await("the fast logpoint armed", () -> session.fastLogpoints.list().stream()
+				.anyMatch(i -> i.id() == logpointId && i.state() == FastLogpointService.State.ARMED));
+			await("in-target hits", () -> {
+				tools.jdwp_get_events(1);
+				return history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(e -> "FAST_LOGPOINT".equals(e.type())
+					&& !e.details().containsKey("armingHit"));
+			});
+		} finally {
+			tools.jdwp_reset();
+		}
+		assertApplicationRuns();
+	}
+
+	@Test
+	@Order(5)
+	@DisplayName("an invocation that does not return, then disconnect: the server lets go and the application runs on (#47 § 4)")
+	void disconnectDuringAnInvocation() throws Exception {
+		final ThreadReference evaluating = thread("worker-1");
+		tools.jdwp_set_field_logpoint(TARGET, "base", "access",
+			"{ java.util.concurrent.locks.LockSupport.parkNanos(3_000_000_000L); return \"slept\"; }", null,
+			evaluating.uniqueID(), null, null, null, null, null);
+		await("an evaluation in flight on worker-1", () -> sessionState().contains("leases=[worker-1]"));
+
+		assertThat(tools.jdwp_disconnect()).startsWith("Disconnected from 127.0.0.1:" + session.port);
+
+		// The target lets go of the debugger's suspensions on detach; after the evaluation's park the
+		// worker runs on. Attach again to look.
+		reattach();
+		assertApplicationRuns();
+	}
+
 	// ── helpers ──
+
+	/**
+	 * Every worker's and the holder's suspend count is 0, and the workers make progress.
+	 */
+	private void assertApplicationRuns() throws Exception {
+		await("every thread running again", () -> {
+			try {
+				for (ThreadReference thread : connection.getVM().allThreads()) {
+					if ((thread.name().startsWith("worker-") || thread.name().equals("lock-holder"))
+						&& thread.suspendCount() != 0) {
+						return false;
+					}
+				}
+				return true;
+			} catch (Exception e) {
+				return false;
+			}
+		});
+		final long before = calls();
+		await("the workers to make progress", () -> {
+			try {
+				return calls() > before;
+			} catch (Exception e) {
+				return false;
+			}
+		});
+	}
+
+	private long calls() throws Exception {
+		final ReferenceType type = connection.getVM().classesByName(TARGET).get(0);
+		final ObjectReference counter = (ObjectReference) type.getValue(type.fieldByName("CALLS"));
+		return ((LongValue) counter.getValue(counter.referenceType().fieldByName("value"))).value();
+	}
+
+	/**
+	 * Attaches again after a detach; the agent takes a moment to listen again.
+	 */
+	private void reattach() throws Exception {
+		final long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+		while (true) {
+			try {
+				connection.connect("127.0.0.1", session.port);
+				Thread.sleep(300);
+				connection.getVM().allThreads();
+				return;
+			} catch (Exception e) {
+				if (System.nanoTime() > deadline) {
+					throw e;
+				}
+				Thread.sleep(100);
+			}
+		}
+	}
 
 	private ThreadReference thread(String name) throws Exception {
 		return connection.getVM().allThreads().stream().filter(t -> name.equals(t.name())).findFirst().orElseThrow();

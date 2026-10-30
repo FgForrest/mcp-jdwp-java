@@ -208,6 +208,16 @@ public final class SuspensionSession {
     }
 
     /**
+     * What {@link #reset} released.
+     *
+     * @param stops held stops, seen or not
+     * @param holds {@code jdwp_suspend_thread} holds
+     */
+    public record ResetResult(int stops, int holds) {
+        public static final ResetResult NONE = new ResetResult(0, 0);
+    }
+
+    /**
      * Outcome of {@link #nextStop}.
      */
     public enum Outcome {
@@ -1175,11 +1185,11 @@ public final class SuspensionSession {
      * {@code jdwp_reset}: a new generation — sets of the old one can no longer publish — then every
      * held stop (seen or not) and every manual hold is released and pending steps are dropped.
      *
-     * @return how many stops were released
+     * @return how many stops and manual holds were released
      */
-    public synchronized int reset() {
+    public synchronized ResetResult reset() {
         if (closed) {
-            return 0;
+            return ResetResult.NONE;
         }
         generation++;
         int released = 0;
@@ -1189,6 +1199,7 @@ public final class SuspensionSession {
                 released++;
             }
         }
+        final int holds = manual.size();
         for (ThreadReference thread : manual) {
             releaseManual(thread);
         }
@@ -1199,7 +1210,7 @@ public final class SuspensionSession {
         pendingSteps.clear();
         current = null;
         notifyAll();
-        return released;
+        return new ResetResult(released, holds);
     }
 
     /**

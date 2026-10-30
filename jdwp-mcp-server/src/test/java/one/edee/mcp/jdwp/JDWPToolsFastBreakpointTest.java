@@ -154,6 +154,28 @@ class JDWPToolsFastBreakpointTest {
 	}
 
 	@Test
+	@DisplayName("two stops of one fast breakpoint held at once keep their own reasons (#47 § 1)")
+	void eachStopKeepsItsReason() {
+		final ThreadReference first = mock(ThreadReference.class);
+		final ThreadReference second = mock(ThreadReference.class);
+		when(first.name()).thenReturn("worker-0");
+		when(first.uniqueID()).thenReturn(1L);
+		when(second.name()).thenReturn("worker-1");
+		when(second.uniqueID()).thenReturn(2L);
+		tracker.recordStopDetail(first, BreakpointTracker.EventKind.BREAKPOINT, 7, "condition true");
+		tracker.recordStopDetail(second, BreakpointTracker.EventKind.BREAKPOINT, 7,
+			"condition failed: NullPointerException");
+		// The entry remembers only the latest reason.
+		when(fastLogpoints.stopReason(7)).thenReturn("condition failed: NullPointerException");
+
+		tracker.setLastBreakpointThread(first, 7);
+		assertThat(tools.jdwp_get_current_thread()).contains("fast_breakpoint=7, condition true")
+			.doesNotContain("NullPointerException");
+		tracker.setLastBreakpointThread(second, 7);
+		assertThat(tools.jdwp_get_current_thread()).contains("fast_breakpoint=7, condition failed: NullPointerException");
+	}
+
+	@Test
 	@DisplayName("a step from a fast breakpoint's stop excludes every probe class before its count filter")
 	void stepFromFastStopExcludesProbes() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);

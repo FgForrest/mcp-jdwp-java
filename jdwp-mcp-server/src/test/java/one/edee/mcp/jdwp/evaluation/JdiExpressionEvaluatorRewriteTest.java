@@ -479,4 +479,30 @@ class JdiExpressionEvaluatorRewriteTest {
 		// The outer brace then never closes → not block-mode. Must not throw.
 		assertThat(JdiExpressionEvaluator.isBlockMode("{ /* unterminated }")).isFalse();
 	}
+
+	@Test
+	@DisplayName("rewrites an unqualified call of a method of this, not a qualified one or a constructor (#50)")
+	void shouldRewriteUnqualifiedMethodCalls() {
+		final String result = JdiExpressionEvaluator.rewriteThisMemberReferences(
+			"sold() + office.sold() + new sold().size() + seats ( )",
+			Set.of(), Set.of("sold", "seats"), NO_SHADOWS);
+
+		assertThat(result).isEqualTo("_this.sold() + office.sold() + new sold().size() + _this.seats ( )");
+	}
+
+	@Test
+	@DisplayName("a field name followed by a parenthesis is a call: rewritten only when it is also a method")
+	void shouldTellCallsFromFields() {
+		assertThat(JdiExpressionEvaluator.rewriteThisMemberReferences("sold(1) + sold", Set.of("sold"), Set.of(),
+			NO_SHADOWS)).isEqualTo("sold(1) + _this.sold");
+		assertThat(JdiExpressionEvaluator.rewriteThisMemberReferences("sold() + sold.get()", Set.of("sold"),
+			Set.of("sold"), NO_SHADOWS)).isEqualTo("_this.sold() + _this.sold.get()");
+	}
+
+	@Test
+	@DisplayName("a call inside a string literal is left alone")
+	void shouldNotRewriteCallsInLiterals() {
+		assertThat(JdiExpressionEvaluator.rewriteThisMemberReferences("\"sold()\" + sold()", Set.of(),
+			Set.of("sold"), NO_SHADOWS)).isEqualTo("\"sold()\" + _this.sold()");
+	}
 }

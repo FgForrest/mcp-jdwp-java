@@ -22,11 +22,14 @@ import java.util.function.LongSupplier;
  * blocks on a monitor that a thread parked by a set still queued (or being processed) holds, the
  * dispatcher never gets to that set, and no tool releases a set before it is processed.
  * <p>
- * Every {@link #PERIOD_MS} it looks at the dispatcher invocations of its session. One watched for
- * more than {@link #MIN_AGE_NANOS} whose thread is blocked on a monitor in two consecutive samples
- * has the monitor's owner asked for — a balanced suspend of the invoking thread around the query —
- * and {@link SuspensionSession#unblock} releases that owner if, under the session's monitor, it is
- * held by such sets alone. Worker invocations are not watched: their tool's wait is bounded
+ * Every {@link #PERIOD_MS} it looks at the dispatcher invocations of its session. A lease chains
+ * host-side work (compiling, classpath discovery) and several method invocations in the target; the
+ * thread is suspended between them and runs only inside one. So each invocation is aged from the
+ * sample that first sees the thread running, and a sample that sees it suspended starts the next one
+ * afresh (#47 § 2). One running for more than {@link #MIN_AGE_NANOS} whose thread is blocked on the
+ * same monitor in two consecutive samples has the monitor's owner asked for — a balanced suspend of
+ * the invoking thread around each query — and {@link SuspensionSession#unblock} releases that owner
+ * if, under the session's monitor, it is held by such sets alone. Worker invocations are not watched: their tool's wait is bounded
  * ({@link InvocationRunner}). Spins, native waits and dependencies on a published stop are not
  * detected: {@code jdwp_resume} or {@code jdwp_reconnect} recover those.
  */
@@ -49,11 +52,17 @@ public final class SuspensionWatchdog {
     private final SuspensionSession session;
     private final LongSupplier clock;
     /**
-     * When each invocation (by token) was first seen; samples of an ended one are dropped, so a
-     * later invocation on the same thread starts afresh.
+     * When the current invocation of each lease (by token) was first seen running; dropped when the
+     * thread is seen suspended between two invocations or the lease ends, so a later invocation
+     * starts afresh.
      */
     private final Map<Object, Long> firstSeen = new HashMap<>();
     private final Map<Object, Integer> monitorSamples = new HashMap<>();
+    /**
+     * The monitor the latest blocked sample of each lease waited for: consecutive samples count only
+     * while it is the same one.
+     */
+    private final Map<Object, ObjectReference> sampledMonitor = new HashMap<>();
     @Nullable
     private ScheduledExecutorService scheduler;
 
@@ -105,6 +114,7 @@ public final class SuspensionWatchdog {
             }
             firstSeen.keySet().retainAll(live);
             monitorSamples.keySet().retainAll(live);
+            sampledMonitor.keySet().retainAll(live);
             final long now = clock.getAsLong();
             for (SuspensionSession.Invocation invocation : invocations) {
                 sample(invocation, now);
@@ -116,12 +126,28 @@ public final class SuspensionWatchdog {
 
     private void sample(SuspensionSession.Invocation invocation, long now) {
         final Object token = invocation.token();
+        if (isSuspended(invocation.thread())) {
+            // Between two invocations of the chain: host-side work, or the next call not made yet.
+            firstSeen.remove(token);
+            forgetSamples(token);
+            return;
+        }
         final long since = firstSeen.computeIfAbsent(token, key -> now);
         if (now - since < MIN_AGE_NANOS) {
             return;
         }
         if (statusOf(invocation.thread()) != ThreadReference.THREAD_STATUS_MONITOR) {
-            monitorSamples.remove(token);
+            forgetSamples(token);
+            return;
+        }
+        final ObjectReference monitor = contendedMonitor(invocation.thread());
+        if (monitor == null) {
+            forgetSamples(token);
+            return;
+        }
+        // Samples straddling two invocations, or one invocation blocked twice, wait for other monitors.
+        if (!monitor.equals(sampledMonitor.put(token, monitor))) {
+            monitorSamples.put(token, 1);
             return;
         }
         if (monitorSamples.merge(token, 1, Integer::sum) < MONITOR_SAMPLES) {
@@ -129,8 +155,39 @@ public final class SuspensionWatchdog {
         }
         final String released = unblock(token, invocation.thread());
         if (released != null) {
-            monitorSamples.remove(token);
+            forgetSamples(token);
             log.info("[Watchdog] Released {}", released);
+        }
+    }
+
+    private void forgetSamples(Object token) {
+        monitorSamples.remove(token);
+        sampledMonitor.remove(token);
+    }
+
+    private static boolean isSuspended(ThreadReference thread) {
+        try {
+            return thread.isSuspended();
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The monitor {@code thread} waits for, asked during a brief, balanced suspension (JDI answers only
+     * for a suspended thread); {@code null} when none or unreadable.
+     */
+    @Nullable
+    private static ObjectReference contendedMonitor(ThreadReference thread) {
+        try {
+            thread.suspend();
+            try {
+                return thread.currentContendedMonitor();
+            } finally {
+                thread.resume();
+            }
+        } catch (Exception e) {
+            return null;
         }
     }
 

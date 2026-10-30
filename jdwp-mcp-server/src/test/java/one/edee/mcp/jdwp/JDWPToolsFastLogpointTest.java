@@ -16,6 +16,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.inOrder;
@@ -123,17 +124,62 @@ class JDWPToolsFastLogpointTest {
 	}
 
 	@Test
-	@DisplayName("an unloaded class is refused with a hint")
-	void requiresLoadedClass() throws Exception {
+	@DisplayName("an unloaded class is waited for: the fast logpoint arms once it loads (#48 B1)")
+	void waitsForAnUnloadedClass() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
 		when(jdiService.getRawVM()).thenReturn(vm);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
 		when(vm.canGetConstantPool()).thenReturn(true);
+		when(fastLogpoints.registerWaiting(vm, FastLogpointService.Kind.LOGPOINT, "com.example.Cart", 42, "total",
+			null, FastLogpointService.DEFAULT_BUFFER_SIZE, EventRequest.SUSPEND_EVENT_THREAD, false)).thenReturn(9);
+
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
-			.contains("is not loaded").contains("forceLoad=true");
+			.startsWith("Fast logpoint set at com.example.Cart:42 (ID: 9")
+			.contains("WAITING: com.example.Cart is not loaded yet.")
+			.contains("FAST_LOGPOINT_CLASS_LOADED")
+			.doesNotContain("forceLoad=true could not load it");
 		verify(fastLogpoints, never()).register(any(), any(), anyString(), any(), anyInt());
+	}
+
+	@Test
+	@DisplayName("forceLoad that cannot load the class (VM start) falls back to waiting and says why")
+	void forceLoadFailureFallsBackToWaiting() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.canRedefineClasses()).thenReturn(true);
+		when(vm.canGetBytecodes()).thenReturn(true);
+		when(vm.canGetConstantPool()).thenReturn(true);
+		when(fastLogpoints.registerWaiting(any(), any(), anyString(), anyInt(), anyString(), any(), anyInt(), anyInt(),
+			anyBoolean())).thenReturn(9);
+
+		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, true))
+			.contains("WAITING: com.example.Cart is not loaded yet (forceLoad=true could not load it")
+			.contains("at VM start");
+	}
+
+	@Test
+	@DisplayName("a class that loads while the wait is registered is set at once, under a new ID")
+	void classLoadedDuringRegistration() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getRawVM()).thenReturn(vm);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.canRedefineClasses()).thenReturn(true);
+		when(vm.canGetBytecodes()).thenReturn(true);
+		when(vm.canGetConstantPool()).thenReturn(true);
+		final ReferenceType cart = mock(ReferenceType.class);
+		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(null, cart);
+		when(fastLogpoints.registerWaiting(any(), any(), anyString(), anyInt(), anyString(), any(), anyInt(), anyInt(),
+			anyBoolean())).thenReturn(9);
+		when(cart.name()).thenReturn("com.example.Cart");
+		when(cart.classLoader()).thenReturn(mock(ClassLoaderReference.class));
+		when(cart.locationsOfLine(42)).thenReturn(List.of());
+
+		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
+			.contains("No executable code at line 42");
+		verify(fastLogpoints).clear(9);
 	}
 
 	@Test

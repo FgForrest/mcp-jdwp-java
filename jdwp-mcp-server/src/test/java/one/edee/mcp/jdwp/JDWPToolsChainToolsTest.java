@@ -419,7 +419,7 @@ class JDWPToolsChainToolsTest {
 		@DisplayName("rejects an unknown trigger")
 		void shouldRejectExceptionBpWithUnknownTrigger() throws Exception {
 			String result = tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, 999, false, null);
+				"java.lang.RuntimeException", null, null, 999, false, null, null);
 
 			assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 		}
@@ -435,7 +435,7 @@ class JDWPToolsChainToolsTest {
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 			String result = tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, triggerId, false, null);
+				"java.lang.RuntimeException", null, null, triggerId, false, null, null);
 
 			assertThat(result).contains("Chain: trigger=#" + triggerId)
 				.contains("sticky");
@@ -452,7 +452,7 @@ class JDWPToolsChainToolsTest {
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 			tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, triggerId, false, null);
+				"java.lang.RuntimeException", null, null, triggerId, false, null, null);
 
 			// The exception request must never be enabled while a chain is wired up — same race
 			// window as the line-BP variant above.

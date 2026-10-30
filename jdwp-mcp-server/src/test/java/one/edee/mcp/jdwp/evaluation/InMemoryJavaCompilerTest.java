@@ -85,7 +85,12 @@ class InMemoryJavaCompilerTest {
 
 			assertThatThrownBy(() -> compiler.compile("BadClass", badSource))
 				.isInstanceOf(JdiEvaluationException.class)
-				.hasMessageContaining("Compilation failed");
+				.hasMessageContaining("Compilation failed")
+				// The offending line, not the temporary file the source was written to.
+				.hasMessageContaining("Line 1 (`public class BadClass")
+				.hasMessageNotContaining("mcp-compiler-")
+				.satisfies(e -> assertThat(e.getMessage().split("undeclaredMethod", -1)).as("listed once")
+					.hasSizeLessThanOrEqualTo(3));
 		}
 
 		@Test

@@ -91,6 +91,44 @@ class JDWPToolsAppendUserFramesTest {
 		}
 
 		@Test
+		@DisplayName("JDK frames below the first harness frame collapse with it; the gap is named where it is (#50)")
+		void shouldCollapseJdkFramesInsideTheHarness() throws Exception {
+			final List<StackFrame> frames = new ArrayList<>();
+			frames.add(userFrame("com.example.A", "a", "A.java", 1));
+			frames.add(userFrame("java.util.ArrayList", "forEach", "ArrayList.java", 1596));
+			frames.add(userFrame("com.example.ATest", "test", "ATest.java", 9));
+			frames.add(userFrame("org.junit.platform.engine.X", "x", "X.java", 4));
+			frames.add(userFrame("java.util.ArrayList", "forEach", "ArrayList.java", 1596));
+			frames.add(userFrame("org.junit.platform.engine.Y", "y", "Y.java", 5));
+			frames.add(userFrame("java.util.ArrayList", "forEach", "ArrayList.java", 1596));
+
+			final StringBuilder out = new StringBuilder();
+			invokeAppend(out, frames, 100, false, "");
+
+			assertThat(out.toString())
+				.contains("#1 java.util.ArrayList.forEach")
+				.doesNotContain("#4 java.util.ArrayList.forEach")
+				.doesNotContain("#6 java.util.ArrayList.forEach")
+				.contains("4 junit/maven/reflection frame(s) collapsed");
+		}
+
+		@Test
+		@DisplayName("a gap in the frame numbers is named before the next rendered frame")
+		void shouldNameTheGap() throws Exception {
+			final List<StackFrame> frames = List.of(
+				userFrame("com.example.A", "a", "A.java", 1),
+				userFrame("org.junit.platform.engine.X", "x", "X.java", 4),
+				userFrame("org.junit.platform.engine.Y", "y", "Y.java", 5),
+				userFrame("com.example.Launcher", "main", "Launcher.java", 3));
+
+			final StringBuilder out = new StringBuilder();
+			invokeAppend(out, frames, 100, false, "");
+
+			assertThat(out.toString()).contains("#0 com.example.A.a (A.java:1)\n  (2 frame(s) collapsed)\n"
+				+ "#3 com.example.Launcher.main");
+		}
+
+		@Test
 		void shouldRenderNoiseInlineWhenIncludeNoiseTrue() throws Exception {
 			List<StackFrame> frames = List.of(
 				userFrame("com.example.A", "a", "A.java", 1),
@@ -191,6 +229,32 @@ class JDWPToolsAppendUserFramesTest {
 	 * Builds a mocked {@link StackFrame} whose {@code location()} reports the given declaring
 	 * class, method name, source file, and line number.
 	 */
+	@Test
+	@DisplayName("a thread blocked entering synchronized shows the monitorenter's line, not the next one (#50)")
+	void shouldShowTheLineOfTheMonitorenter() throws Exception {
+		final StackFrame frame = mock(StackFrame.class);
+		final com.sun.jdi.ThreadReference thread = mock(com.sun.jdi.ThreadReference.class);
+		final Location location = mock(Location.class);
+		final Location enter = mock(Location.class);
+		final Method method = mock(Method.class);
+		when(frame.thread()).thenReturn(thread);
+		when(frame.location()).thenReturn(location);
+		when(thread.status()).thenReturn(com.sun.jdi.ThreadReference.THREAD_STATUS_MONITOR);
+		when(location.lineNumber()).thenReturn(36);
+		when(location.codeIndex()).thenReturn(12L);
+		when(location.method()).thenReturn(method);
+		final byte[] code = new byte[20];
+		code[11] = (byte) 0xC2;
+		when(method.bytecodes()).thenReturn(code);
+		when(method.locationOfCodeIndex(11L)).thenReturn(enter);
+		when(enter.lineNumber()).thenReturn(35);
+
+		assertThat(JDWPTools.displayedLine(frame, 0)).isEqualTo(35);
+		assertThat(JDWPTools.displayedLine(frame, 1)).as("only the top frame is blocked").isEqualTo(36);
+		when(thread.status()).thenReturn(com.sun.jdi.ThreadReference.THREAD_STATUS_RUNNING);
+		assertThat(JDWPTools.displayedLine(frame, 0)).as("a running thread is where it says").isEqualTo(36);
+	}
+
 	private static StackFrame userFrame(String declaringType, String methodName, String sourceName, int line) {
 		try {
 			StackFrame frame = mock(StackFrame.class);

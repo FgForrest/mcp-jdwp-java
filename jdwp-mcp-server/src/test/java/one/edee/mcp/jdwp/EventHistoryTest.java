@@ -173,4 +173,18 @@ class EventHistoryTest {
 
 		assertThat(history.getRecent(1).get(0).sessionEpoch()).isEqualTo(7);
 	}
+
+	@Test
+	@DisplayName("counts logpoint-type entries until marked read; other types are not counted (#50)")
+	void countsUnreadLogpointEntries() {
+		final EventHistory history = new EventHistory();
+		history.record(new EventHistory.DebugEvent("FIELD_LOGPOINT", "a"));
+		history.record(new EventHistory.DebugEvent("FIELD_LOGPOINT", "b"));
+		history.record(new EventHistory.DebugEvent("LOGPOINT", "c"));
+		history.record(new EventHistory.DebugEvent("BREAKPOINT", "d"));
+
+		assertThat(history.unreadSummary()).isEqualTo("2 FIELD_LOGPOINT, 1 LOGPOINT");
+		history.markRead();
+		assertThat(history.unreadSummary()).isEmpty();
+	}
 }

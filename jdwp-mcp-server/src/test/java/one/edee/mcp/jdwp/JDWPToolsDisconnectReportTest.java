@@ -7,6 +7,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -60,7 +63,8 @@ class JDWPToolsDisconnectReportTest {
 		final String result = tools.jdwp_disconnect();
 
 		assertThat(result)
-			.isEqualTo("Disconnected from localhost:5005. No breakpoints, watchers or cached state had been set.");
+			.isEqualTo("Disconnected from localhost:5005. Nothing was left to clear (no breakpoints, watchers or "
+				+ "cached state).");
 		assertThat(result).doesNotContain("jdwp_reconnect");
 	}
 
@@ -70,6 +74,21 @@ class JDWPToolsDisconnectReportTest {
 		when(jdiService.disconnect()).thenReturn(JDIConnectionService.DisconnectResult.notConnected());
 
 		assertThat(tools.jdwp_disconnect()).isEqualTo("Not connected — nothing to disconnect.");
+	}
+
+	@Test
+	@DisplayName("after the target exited, the reply says so and names what its exit dropped")
+	void shouldReportTheTargetsExit() {
+		final JDIConnectionService.VmExit exit = new JDIConnectionService.VmExit(
+			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 2, 0, 1, 1, 0, List.of());
+		when(jdiService.disconnect()).thenReturn(new JDIConnectionService.DisconnectResult(
+			false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit));
+
+		assertThat(tools.jdwp_disconnect())
+			.startsWith("Not connected — the target VM at localhost:5005 exited at ")
+			.contains("which ended the session; its 2 breakpoints, 1 field breakpoint and 1 in-target probe went "
+				+ "with it")
+			.endsWith("Nothing left to disconnect.");
 	}
 
 	@Test

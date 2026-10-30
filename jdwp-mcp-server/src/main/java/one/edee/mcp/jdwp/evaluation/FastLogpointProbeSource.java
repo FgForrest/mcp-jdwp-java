@@ -58,6 +58,12 @@ public final class FastLogpointProbeSource {
      */
     public static final String SEQ_FIELD = "SEQ";
     /**
+     * Static {@code AtomicInteger}: threads inside the recorder right now. The recorder re-checks the
+     * kill switch inside it, so once the server set the switch and read 0 here, no entry is written
+     * any more — the final read of the ring misses none and none arrives after it (#47 § 3).
+     */
+    public static final String WRITERS_FIELD = "WRITERS";
+    /**
      * Static {@code String[]} ring buffer.
      */
     public static final String RING_FIELD = "RING";
@@ -164,11 +170,11 @@ public final class FastLogpointProbeSource {
             .append("        }\n")
             .append("    }\n\n");
         if (condition != null) {
-            source.append("    private static Object __mcpCondition(").append(declaredParameters).append(") {\n")
+            source.append("    private static Object __mcpCondition(").append(declaredParameters).append(") throws Throwable {\n")
                 .append(JdiExpressionEvaluator.generateMethodBody(condition))
                 .append("    }\n\n");
         }
-        source.append("    private static Object __mcpExpression(").append(declaredParameters).append(") {\n")
+        source.append("    private static Object __mcpExpression(").append(declaredParameters).append(") throws Throwable {\n")
             .append(JdiExpressionEvaluator.generateMethodBody(expression))
             .append("    }\n\n");
         appendRecorder(source);
@@ -242,6 +248,8 @@ public final class FastLogpointProbeSource {
             .append("    public static final String ").append(ABOUT_FIELD).append(" = ").append(literal(about)).append(";\n")
             .append("    public static final java.util.concurrent.atomic.AtomicLong ").append(SEQ_FIELD)
             .append(" = new java.util.concurrent.atomic.AtomicLong();\n")
+            .append("    public static final java.util.concurrent.atomic.AtomicInteger ").append(WRITERS_FIELD)
+            .append(" = new java.util.concurrent.atomic.AtomicInteger();\n")
             .append("    public static final String[] ").append(RING_FIELD)
             .append(" = new String[").append(bufferSize).append("];\n")
             .append("    private static final long __MCP_MASK = ").append(bufferSize - 1).append("L;\n\n")
@@ -267,11 +275,21 @@ public final class FastLogpointProbeSource {
             .append("        } catch (Throwable ignored) {\n")
             .append("        }\n")
             .append("    }\n\n")
+            // Counted in, then the kill switch again: a hit that passed the switch at the top of hit()
+            // before the server set it writes nothing once it is set (see WRITERS_FIELD).
             .append("    private static void __mcpRecord(char kind, String value) {\n")
-            .append("        final long seq = ").append(SEQ_FIELD).append(".getAndIncrement();\n")
-            .append("        ").append(RING_FIELD).append("[(int) (seq & __MCP_MASK)] = seq + \"\\0\" + System.currentTimeMillis()")
+            .append("        ").append(WRITERS_FIELD).append(".incrementAndGet();\n")
+            .append("        try {\n")
+            .append("            if (!").append(ENABLED_FIELD).append(") {\n")
+            .append("                return;\n")
+            .append("            }\n")
+            .append("            final long seq = ").append(SEQ_FIELD).append(".getAndIncrement();\n")
+            .append("            ").append(RING_FIELD).append("[(int) (seq & __MCP_MASK)] = seq + \"\\0\" + System.currentTimeMillis()")
             .append(" + \"\\0\" + System.nanoTime() + \"\\0\" + kind + \"\\0\" + Thread.currentThread().getName()")
             .append(" + \"\\0\" + value;\n")
+            .append("        } finally {\n")
+            .append("            ").append(WRITERS_FIELD).append(".decrementAndGet();\n")
+            .append("        }\n")
             .append("    }\n\n")
             .append("    private static String __mcpRender(Object value) {\n")
             .append("        if (value == null) {\n")

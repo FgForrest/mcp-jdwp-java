@@ -108,6 +108,19 @@ class FastLogpointProbeSourceTest {
 	}
 
 	@Test
+	@DisplayName("a hit that passed the kill switch before it was set writes nothing once it is set (#47 § 3)")
+	void killSwitchSetMidHitWritesNothing() throws Exception {
+		// The expression runs inside the probe class, so it can flip the switch the way the server does
+		// while a hit is between the check at the top of hit() and the recorder.
+		final Probe probe = compile("{ " + FastLogpointProbeSource.ENABLED_FIELD + " = false; return i; }", null, 16);
+		probe.hit(3, "x");
+
+		assertThat(probe.seq()).isZero();
+		assertThat(probe.slot(0)).isNull();
+		assertThat(probe.writers()).as("the recorder counted itself out").isZero();
+	}
+
+	@Test
 	@DisplayName("entry s lives in slot s & (size - 1)")
 	void wrapsAround() throws Exception {
 		final Probe probe = compile("i", null, 16);
@@ -246,6 +259,11 @@ class FastLogpointProbeSourceTest {
 
 		long seq() throws Exception {
 			return ((AtomicLong) type.getField(FastLogpointProbeSource.SEQ_FIELD).get(null)).get();
+		}
+
+		int writers() throws Exception {
+			return ((java.util.concurrent.atomic.AtomicInteger) type.getField(FastLogpointProbeSource.WRITERS_FIELD)
+				.get(null)).get();
 		}
 
 		String slot(int index) throws Exception {
