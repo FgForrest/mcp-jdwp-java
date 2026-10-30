@@ -23,6 +23,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
@@ -30,6 +31,7 @@ import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -184,6 +186,54 @@ class JdiEventListenerFieldWatchpointTest {
 		assertThat(hasEventOfType("FIELD_ACCESS")).isFalse();
 		// BP-id is still recorded by setLastBreakpointThread, but we don't gate on it — condition-
 		// false is a non-hit, and the caller will infer state from the absent FIELD_* event.
+	}
+
+	@Test
+	@DisplayName("A field BP with no condition and no expression creates no binding strings in the target")
+	void shouldNotCreateBindingStringsWithoutAnExpression() throws Exception {
+		AccessWatchpointRequest req = mock(AccessWatchpointRequest.class);
+		tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Foo", "counter", BreakpointTracker.FieldWatchMode.ACCESS,
+				null, null, null),
+			req, null);
+		AccessWatchpointEvent event = mockAccessEvent(mockThread("worker-plain", 4010L), req, "com.Foo",
+			"counter", mockIntValue(1));
+		VirtualMachine vm = event.virtualMachine();
+
+		runListenerWith(listener, mockEventSet(event));
+
+		verify(vm, never()).mirrorOf(anyString());
+	}
+
+	@Test
+	@DisplayName("A condition's binding strings stay pinned while it evaluates and are released after it")
+	void shouldPinBindingStringsForTheEvaluation() throws Exception {
+		ModificationWatchpointRequest req = mock(ModificationWatchpointRequest.class);
+		int bpId = tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Foo", "level", BreakpointTracker.FieldWatchMode.MODIFICATION,
+				null, null, "level > 100"),
+			null, req);
+		tracker.setCondition(bpId, "level > 100");
+		ThreadReference thread = mockThread("worker-pinned", 4011L);
+		when(thread.frame(0)).thenReturn(mock(StackFrame.class));
+		BooleanValue falseResult = mock(BooleanValue.class);
+		when(falseResult.value()).thenReturn(false);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), any())).thenReturn(falseResult);
+		ModificationWatchpointEvent event = mockModificationEvent(thread, req, "com.Foo", "level",
+			mockIntValue(50), mockIntValue(60));
+		StringReference fieldNameMirror = event.virtualMachine().mirrorOf("level");
+		StringReference modeMirror = event.virtualMachine().mirrorOf("modification");
+
+		runListenerWith(listener, mockEventSet(event));
+
+		InOrder order = inOrder(fieldNameMirror, modeMirror, evaluator);
+		order.verify(fieldNameMirror).disableCollection();
+		order.verify(modeMirror).disableCollection();
+		order.verify(evaluator).evaluate(any(StackFrame.class), anyString(), any());
+		order.verify(fieldNameMirror).enableCollection();
+		order.verify(modeMirror).enableCollection();
 	}
 
 	@Test

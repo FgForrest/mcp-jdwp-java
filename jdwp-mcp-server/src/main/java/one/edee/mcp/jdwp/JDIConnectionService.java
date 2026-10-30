@@ -11,6 +11,7 @@ import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService.JdkNotFoundException;
+import one.edee.mcp.jdwp.evaluation.PinnedMirrors;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -671,7 +672,6 @@ public class JDIConnectionService {
         final int port = lastPort;
 
         final BreakpointTracker.ReconnectSnapshot snapshot = breakpointTracker.snapshotForReconnect();
-        final int watcherCount = watcherManager.getAllWatchers().size();
         final int markedCount = markedInstances.list().size();
         final int objectCacheCount = objectCache.size();
 
@@ -696,8 +696,15 @@ public class JDIConnectionService {
         // (bounded — reconnect exists for wedged VMs) and consent never transfers to the fresh attach.
         final FastLogpointService flps = fastLogpoints;
         if (flps != null) {
+            // Their watchers go with them.
+            for (List<Integer> ids : flps.breakpointIdsByLocation().values()) {
+                for (int id : ids) {
+                    watcherManager.deleteWatchersForBreakpoint(id);
+                }
+            }
             flps.disarmAll("jdwp_reconnect");
         }
+        final int watcherCount = watcherManager.getAllWatchers().size();
         if (vm != null) {
             try {
                 vm.dispose();
@@ -1545,7 +1552,6 @@ public class JDIConnectionService {
         final ThreadReference thread;
         final ClassType classClass;
         final Method forName;
-        final StringReference nameRef;
         synchronized (this) {
             if (vm == null) {
                 return null;
@@ -1589,7 +1595,6 @@ public class JDIConnectionService {
                 log.warn("[JDI] Class.forName(String) method not found");
                 return null;
             }
-            nameRef = vmRef.mirrorOf(className);
         }
 
         // Phase 2: invokeMethod OUTSIDE the monitor.
@@ -1598,14 +1603,11 @@ public class JDIConnectionService {
                 className, thread.name(), thread.isSuspended(), tryFrameCount(thread));
             // Reentrancy guard: forcing Class.forName runs the target class's <clinit>, which
             // may hit a user breakpoint. Without the guard the listener would re-suspend the
-            // thread we are driving and the outer invokeMethod would hang. Capture the id up
-            // front so a thread death during <clinit> does not leak a guard entry.
-            final long guardedThreadId = thread.uniqueID();
-            evaluationGuard.enter(guardedThreadId);
-            try {
-                classClass.invokeMethod(thread, forName, List.of(nameRef), ClassType.INVOKE_SINGLE_THREADED);
-            } finally {
-                evaluationGuard.exit(guardedThreadId);
+            // thread we are driving and the outer invokeMethod would hang.
+            try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread);
+                 PinnedMirrors pins = new PinnedMirrors()) {
+                classClass.invokeMethod(thread, forName, List.of(pins.string(vmRef, className)),
+                    ClassType.INVOKE_SINGLE_THREADED);
             }
             log.info("[JDI] Force-loaded class '{}' via Class.forName", className);
         } catch (Exception e) {
@@ -1642,9 +1644,13 @@ public class JDIConnectionService {
             return null;
         }
         try {
-            // First preference: the thread that most recently hit a breakpoint — known to be
-            // suspended at a method-invocation event, which is what JDI requires for invokeMethod.
-            final ThreadReference lastBp = breakpointTracker.getLastBreakpointThread();
+            // First preference: the thread of the current stop — suspended at its own event, which
+            // is what JDI requires for invokeMethod (issue #45).
+            final SuspensionSession session = breakpointTracker.suspensionSession();
+            final BreakpointTracker.LastBreakpoint current = session != null ? session.currentStop() : null;
+            final ThreadReference lastBp = session != null
+                ? (current != null ? current.thread() : null)
+                : breakpointTracker.getLastBreakpointThread();
             if (lastBp != null && isUsableForInvoke(lastBp)) {
                 return lastBp;
             }

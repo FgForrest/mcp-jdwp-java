@@ -34,6 +34,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** (
 - **`jdwp_set_exception_breakpoint`** catches at the throw site, *before* the stack unwinds — invaluable when wrappers (`CompletionException`, `RuntimeException` cause chains) obscure the original.
 - **`jdwp_assert_expression(expr, expected)`** is your sanity check: "is the hash what I think it is?", "is the total what I think it is?". Returns MATCH or MISMATCH with the actual value.
 - **`jdwp_evaluate_expression(expr)`** is your "what is this right now?" tool. Use freely.
+- **`jdwp_set_fast_logpoint` / `jdwp_set_fast_breakpoint`** rewrite the target's bytecode, so they need the user's explicit consent: call once without `userApproved`, relay the risk briefing word for word, and ask. Never pass `userApproved=true` on your own.
 
 ## Reporting back
 
@@ -43,7 +44,7 @@ After each flight, tell the user:
 - **What you would change to fix it** — but do NOT make the change. The sandbox is intentionally broken.
 - **Your tool-call count** for the flight, against its **par** (listed per flight in `README.md`). Par = ⭐⭐⭐, within 2× = ⭐⭐, solved = ⭐.
 
-After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 9/9".
+After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 10/10".
 
 ## What you may freely do
 

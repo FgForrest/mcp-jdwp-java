@@ -148,7 +148,7 @@ Produced by `vmDisconnectedMessage` (`JDWPTools.java:654-657`). Returned by tool
 Run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach.
 ```
 
-Produced by `vmGoneEnvelope` (`JDWPTools.java:1049-1067`). Returned by the resume-until-event watchdog path (lines 975, 978) when a transport failure surfaces while we were waiting on the next-event latch. The envelope walks the cause chain to surface the deepest transport-level message — "Connection refused" rather than the outer JDI wrapper.
+Produced by `vmGoneEnvelope`. Returned by `jdwp_resume_until_event` when the VM was disposed underneath it or a transport failure surfaces while it waits for the next stop (`SuspensionSession.nextStop`). The envelope walks the cause chain to surface the deepest transport-level message — "Connection refused" rather than the outer JDI wrapper.
 
 ### Detection
 
@@ -168,7 +168,7 @@ The classes checked are `VMDisconnectedException`, `SocketException`, `EOFExcept
 
 ### `EventKind` is *not* a transport-loss code
 
-`BreakpointTracker.EventKind` (`BreakpointTracker.java:1582-1589`) is the three-value enum `BREAKPOINT | STEP | EXCEPTION` attached to `LastBreakpoint` snapshots. It is the classifier that lets event rendering describe *why* a thread is parked when transport is fine — see [event-pipeline.md](event-pipeline.md) § 10. Not to be confused with the transport-loss envelopes above.
+`BreakpointTracker.EventKind` is the four-value enum `BREAKPOINT | STEP | EXCEPTION | VM_START` attached to `LastBreakpoint` snapshots (`VM_START` marks the stop of a VM suspended at start). It is the classifier that lets event rendering describe *why* a thread is parked when transport is fine — see [event-pipeline.md](event-pipeline.md) § 10. Not to be confused with the transport-loss envelopes above.
 
 ## 6. MCP timeouts — `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT`
 

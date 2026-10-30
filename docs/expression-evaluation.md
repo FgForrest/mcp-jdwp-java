@@ -26,7 +26,7 @@ RemoteCodeExecutor.execute(vm, thread, classLoader,
 JDI Value  → MCP tool layer for formatting
 ```
 
-Every successful evaluation produces a permanent class in the target classloader (see [memory-and-references.md](memory-and-references.md) § 5 for the lifecycle). Every recursive hit during the in-VM call is swallowed by the reentrancy guard (see [threading-and-safety.md](threading-and-safety.md) § 5).
+Every successful evaluation produces a permanent class in the target classloader (see [memory-and-references.md](memory-and-references.md) § 5 for the lifecycle). Every invocation runs under an `EvaluationGuard` lease: the connection's `SuspensionSession` admits the thread first, and every recursive hit during the in-VM call is suppressed (see [threading-and-safety.md](threading-and-safety.md) § 5).
 
 ## 2. Component responsibilities
 
@@ -115,7 +115,9 @@ JDK validation checks:
 
 ### `EvaluationGuard`
 
-Per-thread reentrancy guard. Tracks which target-VM threads are currently mid-evaluation so the JDI event listener can suppress recursive breakpoint / exception / step / watchpoint events on them. Without this, the listener would try to suspend a thread the outer `invokeMethod` is waiting on, producing a cross-thread deadlock. Counted, not boolean, so layered call sites (`configureCompilerClasspath` → `discoverClasspath` → `invokeMethod` nested inside an outer `evaluate()`) stack correctly. Full coverage in [threading-and-safety.md](threading-and-safety.md) § 5.
+The lease façade for invocations. Every `invokeMethod` the pipeline makes runs inside `evaluationGuard.lease(thread)`. A target thread is held by one invocation chain — the Java thread running it — which may re-enter (a nested lease ends nothing); any other caller is refused. The outermost lease is admitted by the connection's `SuspensionSession`: the thread must be stopped at an event of its own that a tool has presented, and it is taken out of every other stop that suspends it, so the invocation can run. The JDI event listener suppresses the breakpoint / exception / step / watchpoint events the invoked code raises on a leased thread. Without this, the listener would try to suspend a thread the outer `invokeMethod` is waiting on, producing a cross-thread deadlock.
+
+A lease spans invocations only, never frame reads: JDI invalidates every `StackFrame` of a thread whenever the debugger resumes it, and the lease's own exemption or another stop's release is such a resume. So `evaluate` reads its frame — the locals, `this`, the frame's class loader — before it leases the thread, and leases it only around the remote execution (with its `getSystemClassLoader` fallback). When a resume elsewhere invalidated the frame during those reads, it reads the same frame afresh (the thread's one frame at the same location) and repeats them, at most three times. Full coverage in [threading-and-safety.md](threading-and-safety.md) § 5.
 
 ## 3. Design decisions
 
@@ -213,11 +215,11 @@ Dynamically derived from the target JVM's major version: `1.8` for Java 8, the b
 
 ### Thread must be suspended at an invocation event
 
-`INVOKE_SINGLE_THREADED` requires a thread stopped at a breakpoint, step, or exception event. A thread suspended via `ThreadReference.suspend()` (manual suspension) is **not** at an invocation event — method calls will throw `IncompatibleThreadStateException`.
+`INVOKE_SINGLE_THREADED` requires a thread stopped at a breakpoint, step, or exception event. A thread suspended via `ThreadReference.suspend()` (manual suspension) is **not** at an invocation event — method calls would throw `IncompatibleThreadStateException`. The lease's admission refuses such a thread before anything is invoked and names the reason: a `jdwp_suspend_thread` hold, a bystander of another thread's stop-all, a VM-start stop, or a thread this session did not stop.
 
 ### Classpath configuration must precede evaluation
 
-`configureCompilerClasspath(thread)` issues its own `invokeMethod` calls (to discover JARs via the classloader hierarchy). Calling it from inside `evaluate()` would nest JDI invocations, risking deadlocks or `IncompatibleThreadStateException`. The caller is responsible for calling `configureCompilerClasspath` **before** `evaluate`. The reentrancy guard handles the nesting correctly (it is counted), but `ClasspathDiscoverer` needs a thread that is genuinely at an invocation event.
+`configureCompilerClasspath(thread)` issues its own `invokeMethod` calls (to discover JARs via the classloader hierarchy). Calling it from inside `evaluate()` would nest JDI invocations, risking deadlocks or `IncompatibleThreadStateException`. The caller is responsible for calling `configureCompilerClasspath` **before** `evaluate`. The guard lets the same invocation chain lease the thread again (the nested lease ends nothing), but `ClasspathDiscoverer` needs a thread that is genuinely at an invocation event.
 
 ### Injected classes persist in the target JVM
 
@@ -283,7 +285,7 @@ User-defined marks (`$label`) flow through the same `extraBindings` map. See [me
 
 ## 7. Reentrancy protection (cross-reference)
 
-The `EvaluationGuard` is the key mechanism preventing deadlocks during evaluation. Short summary: every MCP-driven `invokeMethod` path increments a per-thread depth counter; the JDI event listener checks the counter on every suspending event and suppresses events on guarded threads. The full mechanism — including why `long` not `ThreadReference`, why counted not boolean, and the recursive walkthrough — is in [threading-and-safety.md](threading-and-safety.md) § 5.
+The `EvaluationGuard` is the key mechanism preventing deadlocks during evaluation. Short summary: every MCP-driven `invokeMethod` path runs inside a lease of its thread; the JDI event listener suppresses a set raised on a leased thread before routing it, and the handlers check again. The full mechanism — one invocation chain per thread, admission by the `SuspensionSession`, why a lease spans invocations only, why `long` for the key, the recursive walkthrough, and the bounded wait for tool invocations — is in [threading-and-safety.md](threading-and-safety.md) § 5.
 
 Covered invocation sites:
 
@@ -292,3 +294,4 @@ Covered invocation sites:
 - `jdwp_to_string`.
 - Classpath discovery (`ClasspathDiscoverer` calls via the evaluator's `configureCompilerClasspath`).
 - Deferred class loading via `Class.forName`.
+- Fast-logpoint arming: reading the class file, defining the probe.

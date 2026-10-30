@@ -94,7 +94,7 @@ final class ProbeCallScanner {
                 if (op == INVOKESTATIC && pc + 2 < code.length) {
                     final String owner = pool.methodOwner(u2(code, pc + 1));
                     final String simpleName = owner.substring(owner.lastIndexOf('/') + 1);
-                    if (simpleName.startsWith(FastLogpointProbeSource.CLASS_PREFIX)) {
+                    if (FastLogpointService.isProbeClassName(simpleName)) {
                         probes.add(owner.replace('/', '.'));
                     }
                 }

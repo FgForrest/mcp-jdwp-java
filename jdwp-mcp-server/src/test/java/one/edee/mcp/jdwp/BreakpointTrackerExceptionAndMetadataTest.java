@@ -362,10 +362,10 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			BreakpointRequest bp = mockBreakpointAt("com.Foo", 42);
 			int id = tracker.registerBreakpoint(bp);
 
-			Map<String, Integer> map = tracker.getBreakpointLocationMap();
+			Map<String, List<Integer>> map = tracker.getBreakpointLocationMap();
 
 			assertThat(map).hasSize(1);
-			assertThat(map).containsEntry("com.Foo:42", id);
+			assertThat(map).containsEntry("com.Foo:42", List.of(id));
 		}
 
 		@Test
@@ -375,11 +375,23 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int id1 = tracker.registerBreakpoint(bp1);
 			int id2 = tracker.registerBreakpoint(bp2);
 
-			Map<String, Integer> map = tracker.getBreakpointLocationMap();
+			Map<String, List<Integer>> map = tracker.getBreakpointLocationMap();
 
 			assertThat(map).hasSize(2);
-			assertThat(map).containsEntry("com.Foo:42", id1);
-			assertThat(map).containsEntry("com.Bar:17", id2);
+			assertThat(map).containsEntry("com.Foo:42", List.of(id1));
+			assertThat(map).containsEntry("com.Bar:17", List.of(id2));
+		}
+
+		/**
+		 * A breakpoint and a logpoint, or two breakpoints with different filters, can share a line;
+		 * the full-stack watcher scan needs every one of them, not whichever the map kept last.
+		 */
+		@Test
+		void shouldKeepEveryBreakpointAtOneLineInAscendingOrder() {
+			int id1 = tracker.registerBreakpoint(mockBreakpointAt("com.Foo", 42));
+			int id2 = tracker.registerBreakpoint(mockBreakpointAt("com.Foo", 42));
+
+			assertThat(tracker.getBreakpointLocationMap()).containsOnly(Map.entry("com.Foo:42", List.of(id1, id2)));
 		}
 	}
 

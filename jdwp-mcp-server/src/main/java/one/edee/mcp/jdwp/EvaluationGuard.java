@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
+import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,13 +15,18 @@ import java.util.concurrent.ConcurrentMap;
  * {@code invokeMethod} is waiting on, producing a cross-thread deadlock (the MCP server freezes
  * until the evaluation times out).
  *
- * <p><b>Usage contract:</b> every MCP-driven {@code invokeMethod} path captures the
- * {@link ThreadReference#uniqueID()} of the invoking thread ONCE at the top of the call and
- * passes the resulting {@code long} to both {@link #enter(long)} and {@link #exit(long)} via a
- * try/finally. Capturing the id up front — rather than re-querying it from a {@code ThreadReference}
- * inside {@code exit} — is deliberate: if the target thread dies during the evaluation, its
- * {@code ThreadReference.uniqueID()} call throws {@code ObjectCollectedException}, which would
+ * <p><b>Usage contract:</b> every MCP-driven {@code invokeMethod} path runs inside
+ * {@code try (EvaluationGuard.Lease lease = guard.lease(thread))}. The lease captures the thread's
+ * {@link ThreadReference#uniqueID()} once, up front: if the target thread dies during the
+ * evaluation, a later {@code uniqueID()} call throws {@code ObjectCollectedException}, which would
  * propagate out of the cleanup and leave a dangling entry in the depth map.
+ *
+ * <p><b>Leases (issue #45):</b> the outermost lease of a thread is also taken in the bound
+ * {@link SuspensionSession}, which admits the invocation or refuses it with a reason
+ * ({@link EvaluationRefusedException}) and takes the thread out of every other stop suspending it,
+ * so the invocation can run. Without a bound session (unit tests) only the depth is counted.
+ * Only the chain holding a thread re-enters; another caller is refused. {@link #enter(long)} /
+ * {@link #exit(long)} mark a thread as evaluating by depth alone (no session, no ownership).
  *
  * <p>The guard is counted (not a boolean) so layered call sites — e.g. {@code configureCompilerClasspath}
  * calling {@code discoverClasspath} which itself issues {@code invokeMethod} calls nested inside
@@ -43,12 +49,116 @@ import java.util.concurrent.ConcurrentMap;
 public class EvaluationGuard {
 
     /**
-     * Depth counter per target-VM thread. An entry is present iff the thread is currently inside
-     * at least one MCP-driven {@code invokeMethod} chain; the value is the current nesting depth.
-     * Absent entries mean "not evaluating" — we remove entries on the last {@code exit} to keep
-     * the map compact and {@link #isEvaluating} branch-free.
+     * The session of the current connection, bound by {@link JdiEventListener} when it starts.
+     */
+    @Nullable
+    private volatile SuspensionSession session;
+
+    /**
+     * Depth counter per target-VM thread for {@link #enter(long)} / {@link #exit(long)}. An entry is
+     * present iff the thread is marked as inside an MCP-driven {@code invokeMethod} chain; the value
+     * is the nesting depth.
      */
     private final ConcurrentMap<Long, Integer> depthByThreadId = new ConcurrentHashMap<>();
+
+    /**
+     * The invocation chain holding each target thread (by uniqueID) through a {@link #lease}: the
+     * Java thread running it and the session that admitted it. Only that chain re-enters.
+     */
+    private final ConcurrentMap<Long, Hold> holds = new ConcurrentHashMap<>();
+
+    private record Hold(Thread chain, @Nullable SuspensionSession session) {
+    }
+
+    /**
+     * Binds the session whose leases the outermost {@link #lease} of a thread takes. Holds of an
+     * earlier connection are dropped: they neither suppress nor admit anything on this one, and
+     * their leases end only in their own session.
+     */
+    public void bind(@Nullable SuspensionSession session) {
+        this.session = session;
+        holds.clear();
+    }
+
+    /**
+     * Enters an MCP-driven invocation chain on {@code thread}; close the lease when the chain ends.
+     * The chain that holds the thread may lease it again (nested calls); any other caller is
+     * refused — the JDWP agent runs one invocation per thread, and a second chain would spend the
+     * suspension the first one borrows. The outermost lease is admitted by the bound session (see
+     * the class Javadoc).
+     *
+     * @throws EvaluationRefusedException when another chain holds the thread or the session refuses
+     */
+    public Lease lease(ThreadReference thread) {
+        final long threadUniqueId = thread.uniqueID();
+        final Thread chain = Thread.currentThread();
+        final Hold held = holds.get(threadUniqueId);
+        if (held != null) {
+            if (held.chain() == chain) {
+                return new Lease(threadUniqueId, thread, null);
+            }
+            throw alreadyRunning(thread);
+        }
+        final SuspensionSession bound = this.session;
+        final Hold hold = new Hold(chain, bound);
+        if (holds.putIfAbsent(threadUniqueId, hold) != null) {
+            throw alreadyRunning(thread);
+        }
+        if (bound != null) {
+            try {
+                bound.lease(thread);
+            } catch (RuntimeException e) {
+                holds.remove(threadUniqueId, hold);
+                throw e;
+            }
+        }
+        return new Lease(threadUniqueId, thread, hold);
+    }
+
+    private static EvaluationRefusedException alreadyRunning(ThreadReference thread) {
+        String name;
+        try {
+            name = thread.name();
+        } catch (RuntimeException e) {
+            name = "#" + thread.uniqueID();
+        }
+        return new EvaluationRefusedException("an evaluation on thread " + name + " is already running — try again "
+            + "when it has finished");
+    }
+
+    /**
+     * One level of an invocation chain; {@link #close} leaves it.
+     */
+    public final class Lease implements AutoCloseable {
+        private final long threadUniqueId;
+        private final ThreadReference thread;
+        /**
+         * The hold this lease took — only the chain's outermost lease has one, and only it ends the chain.
+         */
+        @Nullable
+        private final Hold hold;
+
+        private Lease(long threadUniqueId, ThreadReference thread, @Nullable Hold hold) {
+            this.threadUniqueId = threadUniqueId;
+            this.thread = thread;
+            this.hold = hold;
+        }
+
+        @Override
+        public void close() {
+            final Hold taken = this.hold;
+            if (taken == null) {
+                return;
+            }
+            // Unlease before the hold is dropped, so the thread's own events stay suppressed meanwhile.
+            final SuspensionSession admittedBy = taken.session();
+            if (admittedBy != null) {
+                admittedBy.unlease(this.thread);
+            }
+            // By identity: a hold of an earlier connection never removes one of the current connection.
+            holds.remove(this.threadUniqueId, taken);
+        }
+    }
 
     /**
      * Marks the thread with the given {@code threadUniqueId} as entering an MCP-driven
@@ -82,7 +192,8 @@ public class EvaluationGuard {
      * {@code uniqueID()} here cannot throw {@code ObjectCollectedException}.
      */
     public boolean isEvaluating(ThreadReference thread) {
-        return depthByThreadId.containsKey(thread.uniqueID());
+        final long threadUniqueId = thread.uniqueID();
+        return holds.containsKey(threadUniqueId) || depthByThreadId.containsKey(threadUniqueId);
     }
 
     /**

@@ -32,7 +32,8 @@ class ProbeCallScannerTest {
 
 		assertThat(ProbeCallScanner.probeCalls(pool, reader.readUnsignedShort(8),
 			ClassFileMethods.codeByMethod(classFile).values()))
-			.containsExactly("p.McpFastLogpoint_iface", "p.McpFastLogpoint_one", "q.McpFastLogpoint_two");
+			.containsExactly("p.McpFastBreakpoint_three", "p.McpFastLogpoint_iface", "p.McpFastLogpoint_one",
+				"q.McpFastLogpoint_two");
 	}
 
 	@Test
@@ -102,6 +103,7 @@ class ProbeCallScannerTest {
 		mv.visitVarInsn(ILOAD, 0);
 		mv.visitMethodInsn(INVOKESTATIC, "q/McpFastLogpoint_two", "hit", "(I)V", false);
 		mv.visitMethodInsn(INVOKESTATIC, "p/NotMcpFastLogpoint_x", "hit", "()V", false);
+		mv.visitMethodInsn(INVOKESTATIC, "p/McpFastBreakpoint_three", "hit", "()V", false);
 		mv.visitJumpInsn(GOTO, done);
 		mv.visitLabel(fourth);
 		mv.visitMethodInsn(INVOKESTATIC, "p/McpFastLogpoint_iface", "hit", "()V", true);

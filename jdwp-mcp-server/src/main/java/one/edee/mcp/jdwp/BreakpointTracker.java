@@ -146,6 +146,11 @@ public class BreakpointTracker {
      */
     @Nullable
     private volatile LastBreakpoint lastBreakpoint;
+    /**
+     * Suspension ownership of the current connection; see {@link #openSuspensionSession}.
+     */
+    @Nullable
+    private volatile SuspensionSession suspensionSession;
 
     /**
      * Single-shot latch backing {@link JDWPTools#jdwp_resume_until_event(Integer)}.
@@ -268,12 +273,16 @@ public class BreakpointTracker {
         // Try active breakpoints first
         final BreakpointRequest bp = breakpointsById.remove(id);
         if (bp != null) {
-            breakpointIdsByRequest.remove(bp);
+            // Delete before forgetting the request: a hit still queued then finds either its ID or
+            // a disabled request, never an enabled one nobody knows — the listener would keep that
+            // thread stopped as an untracked breakpoint. The metadata goes last, after the request
+            // is deleted, which lets the listener tell a hit whose metadata vanished meanwhile.
             try {
                 bp.virtualMachine().eventRequestManager().deleteEventRequest(bp);
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            breakpointIdsByRequest.remove(bp);
             breakpointMetadata.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
@@ -330,14 +339,18 @@ public class BreakpointTracker {
     }
 
     /**
-     * Build a location map: "className:lineNumber" -> breakpoint ID (active only).
+     * Build a location map: "className:lineNumber" -> the IDs of every active breakpoint at that
+     * line, ascending — a breakpoint and a logpoint, or two with different filters, can share one.
      */
-    public Map<String, Integer> getBreakpointLocationMap() {
-        final Map<String, Integer> map = new HashMap<>();
+    public Map<String, List<Integer>> getBreakpointLocationMap() {
+        final Map<String, List<Integer>> map = new HashMap<>();
         for (Map.Entry<Integer, BreakpointRequest> entry : breakpointsById.entrySet()) {
             final Location loc = entry.getValue().location();
             final String key = loc.declaringType().name() + ':' + loc.lineNumber();
-            map.put(key, entry.getKey());
+            map.computeIfAbsent(key, k -> new ArrayList<>()).add(entry.getKey());
+        }
+        for (List<Integer> ids : map.values()) {
+            Collections.sort(ids);
         }
         return map;
     }
@@ -794,13 +807,14 @@ public class BreakpointTracker {
     public synchronized boolean removeExceptionBreakpoint(int id) {
         final ExceptionBreakpointInfo info = exceptionBreakpointsById.remove(id);
         if (info != null) {
-            exceptionInfoByRequest.remove(info.request);
-            exceptionIdsByRequest.remove(info.request);
+            // Delete first, as removeBreakpoint does.
             try {
                 info.request.virtualMachine().eventRequestManager().deleteEventRequest(info.request);
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            exceptionInfoByRequest.remove(info.request);
+            exceptionIdsByRequest.remove(info.request);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -1392,19 +1406,20 @@ public class BreakpointTracker {
     }
 
     /**
-     * Removes the {@code req → info} and {@code req → id} reverse-index entries for the given field
-     * watchpoint, then best-effort deletes the underlying JDI request — exceptions are swallowed so
-     * a removal can still complete against a VM in mid-disconnect. Shared by the access and
-     * modification arms of {@link #removeFieldBreakpoint}; callers null-guard before invocation.
+     * Best-effort deletes the JDI request of the given field watchpoint — exceptions are swallowed
+     * so a removal can still complete against a VM in mid-disconnect — then removes its
+     * {@code req → info} and {@code req → id} reverse-index entries, in that order for the reason
+     * {@link #removeBreakpoint} gives. Shared by the access and modification arms of
+     * {@link #removeFieldBreakpoint}; callers null-guard before invocation.
      */
     private void tearDownFieldRequestQuietly(WatchpointRequest req) {
-        fieldInfoByRequest.remove(req);
-        fieldIdsByRequest.remove(req);
         try {
             req.virtualMachine().eventRequestManager().deleteEventRequest(req);
         } catch (Exception e) {
             // VM may already be disconnected
         }
+        fieldInfoByRequest.remove(req);
+        fieldIdsByRequest.remove(req);
     }
 
     // ── Chain (dependency) operations ──
@@ -1719,7 +1734,7 @@ public class BreakpointTracker {
      * @see #setLastSuspendingEvent(ThreadReference, EventKind)
      */
     public void setLastBreakpointThread(ThreadReference thread, int breakpointId) {
-        this.lastBreakpoint = new LastBreakpoint(thread, breakpointId);
+        publishOrCandidate(new LastBreakpoint(thread, breakpointId));
     }
 
     /**
@@ -1743,7 +1758,50 @@ public class BreakpointTracker {
     public void setLastSuspendingEvent(ThreadReference thread, EventKind kind) {
         final LastBreakpoint prior = this.lastBreakpoint;
         final Integer inheritedId = (kind == EventKind.STEP && prior != null) ? prior.id() : null;
-        this.lastBreakpoint = new LastBreakpoint(thread, inheritedId, kind);
+        publishOrCandidate(new LastBreakpoint(thread, inheritedId, kind));
+    }
+
+    /**
+     * While the dispatcher processes an event set under a {@link SuspensionSession}, a handler's
+     * snapshot is a stop <em>candidate</em> of that set, published once the whole set is processed;
+     * otherwise (no session — unit tests of single handlers) it is written at once.
+     */
+    private void publishOrCandidate(LastBreakpoint stop) {
+        if (!SuspensionSession.candidate(stop)) {
+            this.lastBreakpoint = stop;
+        }
+    }
+
+    /**
+     * Records a stop the session has just published as the latest snapshot; called by
+     * {@link SuspensionSession}. Tools that default their thread use the session's live current
+     * stop, not this snapshot.
+     */
+    void published(LastBreakpoint report) {
+        this.lastBreakpoint = report;
+    }
+
+    /**
+     * Opens the suspension-ownership session of a new connection, closing the previous one; called
+     * by {@link JdiEventListener#start}.
+     */
+    public SuspensionSession openSuspensionSession(EventHistory history) {
+        final SuspensionSession previous = suspensionSession;
+        if (previous != null) {
+            previous.close();
+        }
+        final SuspensionSession session = new SuspensionSession(this, history);
+        suspensionSession = session;
+        return session;
+    }
+
+    /**
+     * The suspension-ownership session of the current connection, or {@code null} before the first
+     * connection.
+     */
+    @Nullable
+    public SuspensionSession suspensionSession() {
+        return suspensionSession;
     }
 
     /**
@@ -1801,6 +1859,10 @@ public class BreakpointTracker {
      * hanging.
      */
     public synchronized void fireNextEvent() {
+        if (SuspensionSession.isProcessing()) {
+            // Publication at the end of the set notifies the session's waiters.
+            return;
+        }
         // Signal "something happened" independently of whether a latch is currently armed. A
         // waiter that arrives AFTER this method runs will still see the flag via
         // consumePendingFire() and short-circuit without re-resuming the VM.
@@ -1857,7 +1919,9 @@ public class BreakpointTracker {
         /** A {@code StepRequest} landed (step into / over / out). No BP id is associated. */
         STEP,
         /** An exception event matched a tracked filter. No BP id is associated. */
-        EXCEPTION
+        EXCEPTION,
+        /** The VM is suspended at start ({@code suspend=y}). No BP id is associated. */
+        VM_START
     }
 
     /**
@@ -1880,7 +1944,7 @@ public class BreakpointTracker {
          * stepped FROM, inherited by {@link #setLastSuspendingEvent}).
          */
         public LastBreakpoint {
-            if (kind == EventKind.EXCEPTION) {
+            if (kind == EventKind.EXCEPTION || kind == EventKind.VM_START) {
                 id = null;
             }
         }

@@ -1,17 +1,24 @@
 package one.edee.mcp.jdwp.fastlogpoint.fixture;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Target program for {@code FastLogpointLiveTest}, run in a forked JVM with a JDWP agent. Worker
- * threads call {@link #compute} and {@link #other} in a tight loop until standard input closes. The
- * test locates lines by the {@code // MARK:} comments, so the code can move without breaking it.
+ * threads call {@link #compute} and {@link #other} in a tight loop until standard input closes; a
+ * {@code lock-holder} thread holds {@link #LOCK} nearly all the time. The test locates lines by the
+ * {@code // MARK:} comments, so the code can move without breaking it.
  */
 public class FastLogpointTarget {
     /**
      * Total {@link #compute} calls — read by the test over JDWP to measure throughput.
      */
     static final AtomicLong CALLS = new AtomicLong();
+    /**
+     * Held by the {@code lock-holder} thread, which sleeps while holding it: a monitor an evaluation
+     * can wait for.
+     */
+    public static final Object LOCK = new Object();
 
     /**
      * Package-private so the probe — defined in this package — can read it by its bare name.
@@ -33,6 +40,16 @@ public class FastLogpointTarget {
             worker.setDaemon(true);
             worker.start();
         }
+        final Thread holder = new Thread(() -> {
+            while (true) {
+                synchronized (LOCK) {
+                    LockSupport.parkNanos(5_000_000L); // MARK: holding
+                }
+                LockSupport.parkNanos(1_000_000L);
+            }
+        }, "lock-holder");
+        holder.setDaemon(true);
+        holder.start();
         System.out.println("TARGET READY");
         System.out.flush();
         // Runs until the test closes our standard input.
@@ -43,7 +60,7 @@ public class FastLogpointTarget {
 
     public int compute(int i) {
         final int doubled = i * 2;
-        final String label = "v" + doubled;
+        final String label = "v" + doubled; // MARK: label
         final int result = doubled + base + label.length(); // MARK: probe
         CALLS.incrementAndGet();
         return result;

@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Shared scaffolding for tests that build a {@link JDWPTools} instance. Removes the
@@ -52,8 +53,18 @@ final class JDWPToolsTestSupport {
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
-			mock(FastLogpointService.class)
+			fastLogpointsMock()
 		);
+	}
+
+	/**
+	 * A mock fast-logpoint service whose pending-removal retry, which the resume tools call after
+	 * every release, restores nothing.
+	 */
+	static FastLogpointService fastLogpointsMock() {
+		final FastLogpointService fastLogpoints = mock(FastLogpointService.class);
+		when(fastLogpoints.retryPendingRemovals()).thenReturn("");
+		return fastLogpoints;
 	}
 
 	/**
@@ -98,7 +109,7 @@ final class JDWPToolsTestSupport {
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
-			mock(FastLogpointService.class)
+			fastLogpointsMock()
 		);
 	}
 
@@ -128,7 +139,7 @@ final class JDWPToolsTestSupport {
 			new MarkedInstanceRegistry(),
 			new JdiHealthMonitor(),
 			localClasspathProvider,
-			mock(FastLogpointService.class)
+			fastLogpointsMock()
 		);
 	}
 
@@ -157,7 +168,7 @@ final class JDWPToolsTestSupport {
 			markedInstances,
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider(),
-			mock(FastLogpointService.class)
+			fastLogpointsMock()
 		);
 	}
 
@@ -187,7 +198,33 @@ final class JDWPToolsTestSupport {
 			markedInstances,
 			healthMonitor,
 			defaultEmptyClasspathProvider(),
-			mock(FastLogpointService.class)
+			fastLogpointsMock()
+		);
+	}
+
+	/**
+	 * Overload with caller-supplied watchers, evaluator and {@link FastLogpointService} — needed by
+	 * tests of watchers on fast breakpoints.
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		FastLogpointService fastLogpoints
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			new EventHistory(),
+			new EvaluationGuard(),
+			mock(JvmDiscoveryService.class),
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider(),
+			fastLogpoints
 		);
 	}
 

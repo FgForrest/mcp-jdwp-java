@@ -18,8 +18,10 @@ import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -59,7 +61,7 @@ class JdiEventListenerUntrackedBreakpointTest {
 	}
 
 	@Test
-	@DisplayName("Untracked BP suspends without touching tracker state or event history")
+	@DisplayName("Untracked BP suspends as a stop without an ID and records no history")
 	void shouldSuspendAndIgnoreUntrackedBreakpoint() throws Exception {
 		ThreadReference thread = mockThread("worker-untracked", 700L);
 		// Note: request is NEVER registered with the tracker — simulates a leftover stale request.
@@ -74,8 +76,9 @@ class JdiEventListenerUntrackedBreakpointTest {
 		// Suspending: resume() must NOT have been called.
 		verify(eventSet, never()).resume();
 
-		// Tracker state must be untouched — no setLastBreakpointThread call.
-		assertThat(tracker.getLastBreakpointThread()).isNull();
+		// Published as a stop of its thread without an ID (issue #45): a held suspension must be one a
+		// tool can show and the user can release.
+		assertThat(tracker.getLastBreakpointThread()).isSameAs(thread);
 		assertThat(tracker.getLastBreakpointId()).isNull();
 
 		// No BREAKPOINT entry must be recorded. The disconnect-sentinel adds a VM_DEATH, but no
@@ -94,7 +97,7 @@ class JdiEventListenerUntrackedBreakpointTest {
 	 * to attribute the hit to.
 	 */
 	@Test
-	@DisplayName("Null event.request() is handled defensively: suspends without tracker mutation or history record")
+	@DisplayName("Null event.request() is handled defensively: suspends as a stop without an ID, no history record")
 	void shouldSuspendWithoutSideEffectsWhenEventRequestIsNull() throws Exception {
 		ThreadReference thread = mockThread("worker-null-request", 800L);
 
@@ -114,7 +117,8 @@ class JdiEventListenerUntrackedBreakpointTest {
 		runListenerWith(listener, eventSet);
 
 		verify(eventSet, never()).resume();
-		assertThat(tracker.getLastBreakpointThread()).isNull();
+		assertThat(tracker.getLastBreakpointThread()).isSameAs(thread);
+		assertThat(tracker.getLastBreakpointId()).isNull();
 		assertThat(eventHistory.getRecent(10))
 			.extracting(EventHistory.DebugEvent::type)
 			.doesNotContain("BREAKPOINT", "BREAKPOINT_SUPPRESSED");
@@ -146,6 +150,41 @@ class JdiEventListenerUntrackedBreakpointTest {
 		assertThat(eventHistory.getRecent(10))
 			.extracting(EventHistory.DebugEvent::type)
 			.doesNotContain("BREAKPOINT", "LOGPOINT", "LOGPOINT_ERROR");
+	}
+
+	/**
+	 * The same clear, landing while the dispatcher reads the hit: it found the ID before the clear
+	 * forgot it, but the logpoint expression it reads next is already gone. Without the rule above
+	 * the logpoint's hit would stop as a plain breakpoint nobody set.
+	 */
+	@Test
+	@DisplayName("A logpoint cleared while its hit was being read is dropped, not stopped as a breakpoint")
+	void shouldDropHitOfLogpointClearedWhileRead() throws Exception {
+		BreakpointTracker clearing = spy(new BreakpointTracker());
+		JdiEventListener reading = new JdiEventListener(clearing, eventHistory, mock(JdiExpressionEvaluator.class),
+			new EvaluationGuard(), null, new MarkedInstanceRegistry());
+		try {
+			ThreadReference thread = mockThread("worker-clearing", 902L);
+			BreakpointRequest request = mock(BreakpointRequest.class);
+			int id = clearing.registerBreakpoint(request);
+			clearing.setLogpointExpression(id, "i");
+			BreakpointEvent event = mockBreakpointEvent(thread, request, "com.example.Clearing", 14);
+			EventSet eventSet = mockEventSet(event);
+			clearing.removeBreakpoint(id);
+			when(request.isEnabled()).thenReturn(false);
+			// The ID lookup ran before the clear forgot the request.
+			doReturn(id).when(clearing).findIdByRequest(request);
+
+			runListenerWith(reading, eventSet);
+
+			verify(eventSet).resume();
+			assertThat(clearing.getLastBreakpointThread()).isNull();
+			assertThat(eventHistory.getRecent(10))
+				.extracting(EventHistory.DebugEvent::type)
+				.doesNotContain("BREAKPOINT", "LOGPOINT", "LOGPOINT_ERROR");
+		} finally {
+			reading.stop();
+		}
 	}
 
 	/**

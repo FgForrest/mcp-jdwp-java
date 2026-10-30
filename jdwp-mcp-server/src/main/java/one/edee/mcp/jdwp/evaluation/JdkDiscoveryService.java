@@ -372,14 +372,16 @@ public class JdkDiscoveryService {
     private String getSystemProperty(ThreadReference suspendedThread, String propertyName) throws Exception {
         final ClassType systemClass = (ClassType) vm.classesByName("java.lang.System").get(0);
         final Method getPropertyMethod = systemClass.methodsByName("getProperty", "(Ljava/lang/String;)Ljava/lang/String;").get(0);
-        final StringReference nameArg = vm.mirrorOf(propertyName);
-
-        final Value result = systemClass.invokeMethod(
-            suspendedThread,
-            getPropertyMethod,
-            Collections.singletonList(nameArg),
-            ClassType.INVOKE_SINGLE_THREADED
-        );
+        final Value result;
+        try (PinnedMirrors pins = new PinnedMirrors()) {
+            final StringReference nameArg = pins.string(vm, propertyName);
+            result = systemClass.invokeMethod(
+                suspendedThread,
+                getPropertyMethod,
+                Collections.singletonList(nameArg),
+                ClassType.INVOKE_SINGLE_THREADED
+            );
+        }
 
         if (!(result instanceof StringReference sr)) {
             throw new IllegalStateException(

@@ -70,7 +70,7 @@ Everything the agent reads through the server — an `order` local, a `request.g
 
 ## Components
 
-The seven core classes do the heavy lifting. Everything else is shape: data records, formatters, package-info files.
+The ten core classes do the heavy lifting. Everything else is shape: data records, formatters, package-info files.
 
 ### `JDWPMcpServerApplication`
 
@@ -88,19 +88,33 @@ The singleton that holds the live `com.sun.jdi.VirtualMachine`. It is the one pl
 
 ### `BreakpointTracker`
 
-The breakpoint registry. Six concurrent maps hold every flavour of breakpoint — line, exception, field, plus pending (deferred) variants — and the dependency graph that powers breakpoint chains. Synthetic integer IDs are minted from a single `AtomicInteger` so line, exception, and field BPs share one ID space (`BreakpointTracker.java:45`). Details in [breakpoints.md](breakpoints.md).
+The breakpoint registry. Six concurrent maps hold every flavour of breakpoint — line, exception, field, plus pending (deferred) variants — and the dependency graph that powers breakpoint chains. Synthetic integer IDs are minted from a single `AtomicInteger` so line, exception, and field BPs share one ID space. Details in [breakpoints.md](breakpoints.md).
+
+It also opens each connection's `SuspensionSession` (`openSuspensionSession`) and keeps the report of the last published stop (`getLastBreakpoint()`) for display. Which stop is current — the one tools act on when their thread is omitted — is the session's call, not the tracker's.
 
 ### `JdiEventListener`
 
-The daemon thread that drains the JDI event queue (`JdiEventListener.java:200-212`). One thread, started per connection, joined on disconnect. Every breakpoint hit, step, exception, field access, and class-load event in the target arrives here. The listener decides — per event — whether to suspend the thread, auto-resume it, log it, evaluate a condition, promote a deferred breakpoint, or break a chain. The decision matrix is documented in [event-pipeline.md](event-pipeline.md).
+The daemon thread that drains the JDI event queue. One thread, started per connection, joined on disconnect. Every breakpoint hit, step, exception, field access, and class-load event in the target arrives here. The listener only routes: a set raised inside an evaluation is suppressed on the spot; every other set becomes a context of the `SuspensionSession` and is processed, in arrival order, on the `jdi-event-dispatcher` thread. There the handlers decide — per event — whether to stop, log, evaluate a condition, promote a deferred breakpoint, or break a chain, and `SuspensionSession.finish` publishes the stop or releases the set. The decision matrix is documented in [event-pipeline.md](event-pipeline.md).
+
+### `SuspensionSession`
+
+Who owns each suspension of one connection. Every routed event set becomes a context — QUEUED, PROCESSING, then HELD (a published stop) or RELEASED — and only its context releases its suspension. The dispatcher's `finish` publishes a set's first stop candidate or releases the set. Tools present stops (`presentCurrent`, `nextStop`) and release only the stops they have presented, plus `jdwp_suspend_thread` holds (`releaseAll`, `releaseThread`); a set still queued or being processed is out of their reach. Steps, `jdwp_reset` (a new generation), invocation leases (admission, exemptions, ownership transfer) and the watchdog's `unblock` go through the same single monitor. `JdiEventListener.start` opens one per connection; `stop()` and VM death close it. See [event-pipeline.md](event-pipeline.md) § 14.
+
+### `SuspensionWatchdog`
+
+A per-session daemon, `jdi-suspension-watchdog`, that frees a dispatcher evaluation (a condition, a logpoint, a fast-logpoint arming) stuck on a monitor whose owner a set still queued keeps parked — nobody else can, because no tool releases a set before it is processed. Every 500 ms it samples the dispatcher's leases; one older than 3 s and blocked on a monitor in two consecutive samples has the monitor's owner released through `SuspensionSession.unblock`, which re-checks everything under the session monitor and never touches a published stop. See [event-pipeline.md](event-pipeline.md) § 14.
+
+### `InvocationRunner`
+
+Runs a tool's invoking work — an evaluation, `toString()`, force-loading a class — on the `jdi-invoker-N` pool and waits at most 20 s, so a blocked invocation never takes the serialized MCP worker with it. Past the wait the tool answers `[STILL_RUNNING]`, naming what blocks the thread when JDI can tell; the job keeps running and its result lands in the event history as `EVALUATION_COMPLETED_LATE`. A target thread with a job still running refuses another. See [threading-and-safety.md](threading-and-safety.md) § 5.
 
 ### `EvaluationGuard`
 
-A counted, per-thread reentrancy guard (`EvaluationGuard.java`). Keys are target-VM `ThreadReference.uniqueID()` values. Its sole job is to tell the event listener "the MCP server is already running code on this thread — don't suspend it again". Without this guard, an expression evaluation that re-enters a breakpointed line would deadlock the entire server. See [threading-and-safety.md](threading-and-safety.md) for the full mechanism.
+The lease façade for invocations. Every MCP-driven `invokeMethod` runs inside `try (EvaluationGuard.Lease lease = guard.lease(thread))`. A target thread is held by one invocation chain — the Java thread running it; that chain may re-enter, any other caller is refused. The outermost lease is admitted by the bound `SuspensionSession`, which refuses a thread not stopped at a presented event of its own and takes the thread out of every other stop suspending it, so the invocation can run. The listener asks `isEvaluating(thread)` to suppress the events the invoked code raises — without that, an expression evaluation that re-enters a breakpointed line would deadlock the entire server. `bind()` drops an earlier connection's holds. See [threading-and-safety.md](threading-and-safety.md) § 5 for the full mechanism.
 
 ### `EventHistory`
 
-A 500-entry FIFO ring buffer (`EventHistory.java`) of every JDWP event the listener has seen — including the ones it suppressed. Backed by a `ConcurrentLinkedDeque` so the producer (listener thread) and the consumers (MCP tool calls) never block each other.
+A 500-entry FIFO ring buffer (`EventHistory.java`) of every JDWP event the pipeline has seen — including the ones it suppressed — plus diagnostics such as `RECONNECT` and the suspension records (`EVALUATION_UNBLOCKED`, `EVALUATION_COMPLETED_LATE`, …). The entries of an event set are buffered while it is processed and appended when it finishes. Backed by a `ConcurrentLinkedDeque` so the producers (the listener, the session, invoker threads, tool methods) and the consumers (MCP tool calls) never block each other.
 
 ## Subsystem packages
 
@@ -124,23 +138,25 @@ A typical "set a breakpoint and inspect" cycle:
    → result string back through MCP → Claude
 
 2. Claude → jdwp_resume_until_event(timeoutMs=60000)
-   → JDWPTools arms a CountDownLatch on BreakpointTracker
-   → vm.resume()
-   → MCP tool thread blocks on the latch
+   → SuspensionSession.nextStop: no stop waits unseen, so it releases
+     the stops Claude has seen and waits on the session monitor
 
 3. Target JVM hits line 42:
    JDI event queue ← BreakpointEvent
-   → JdiEventListener.handleBreakpointEvent
-   → reentrancy guard check (no, not a recursive hit)
-   → BreakpointTracker.setLastBreakpointThread(...)
-   → EventHistory.record("BREAKPOINT", …)
-   → BreakpointTracker.fireNextEvent() (releases latch)
+   → JdiEventListener routes the set: a QUEUED context
+   → jdi-event-dispatcher: JdiEventListener.handleBreakpointEvent
+     → reentrancy guard check (no, not a recursive hit)
+     → BreakpointTracker.setLastBreakpointThread(...)   (a stop candidate)
+     → EventHistory.record("BREAKPOINT", …)             (buffered)
+   → SuspensionSession.finish: append the history, publish the stop
+     (HELD), notifyAll
 
-4. The MCP tool thread wakes up, builds the event-context response,
-   returns it through MCP → Claude.
+4. nextStop wakes, presents the stop (it becomes the current stop);
+   the tool builds the event-context response and returns it
+   through MCP → Claude.
 ```
 
-Everything in step 3 happens on the event dispatcher thread the listener hands the event set to; everything in step 4 happens on the MCP dispatch thread. The hand-off is the latch. The full sequence is covered in [event-pipeline.md](event-pipeline.md).
+Routing in step 3 happens on the listener thread, processing on the event dispatcher thread; step 4 happens on the MCP worker. The hand-off is the session monitor: publication and the waiting `nextStop` meet under it. The full sequence is covered in [event-pipeline.md](event-pipeline.md).
 
 ## Project layout
 
@@ -154,7 +170,7 @@ mcp-jdwp-java/
 ├── jdwp-mcp-server/           the real MCP server
 │   ├── pom.xml                NullAway + Error Prone wired into javac
 │   └── src/
-│       ├── main/java/…        ~ 12,100 lines, 7 main classes + 4 packages
+│       ├── main/java/…        ~ 12,100 lines, 10 main classes + 4 packages
 │       ├── main/resources/    application.properties, logback-spring.xml
 │       └── test/java/…        ~ 80 test files, ~ 850 @Test methods
 └── jdwp-sandbox/              deliberately broken target classes

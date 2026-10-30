@@ -47,6 +47,11 @@ public class JdiExpressionEvaluator {
     private static final Logger log = LoggerFactory.getLogger(JdiExpressionEvaluator.class);
 
     /**
+     * How often {@link #evaluate} reads its frame when a resume elsewhere invalidated it meanwhile.
+     */
+    private static final int FRAME_READ_ATTEMPTS = 3;
+
+    /**
      * Default package used for the generated wrapper class when {@code this} is public (or absent).
      * Kept short and isolated from app code. Non-public {@code this} types may instead emit the
      * wrapper into {@code this}'s own package so package-private fields and the type itself become
@@ -882,37 +887,39 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Locates a non-null {@link ClassLoaderReference} for injecting the wrapper class. Three-level
-     * fallback:
+     * The class loader for injecting the wrapper class, read from the frame:
      * 1. `frame.thisObject().referenceType().classLoader()` — works for instance methods.
      * 2. `frame.location().declaringType().classLoader()` — works for static methods.
-     * 3. Invokes `ClassLoader.getSystemClassLoader()` in the target VM as a last resort.
      * <p>
-     * Throws {@link JdiEvaluationException} if all three return null — typically meaning the frame
+     * {@code null} for a bootstrap-loaded class; {@link #systemClassLoader} is the last resort then.
+     */
+    @Nullable
+    private static ClassLoaderReference frameClassLoader(StackFrame frame) {
+        final ObjectReference thisObject = frame.thisObject();
+        if (thisObject != null) {
+            return thisObject.referenceType().classLoader();
+        }
+        // Static method — use the declaring type's classloader
+        return frame.location().declaringType().classLoader();
+    }
+
+    /**
+     * Invokes `ClassLoader.getSystemClassLoader()` in the target VM, for a frame of a
+     * bootstrap-loaded class ({@link #frameClassLoader} returned null). Runs under the caller's lease.
+     * <p>
+     * Throws {@link JdiEvaluationException} if it is unavailable too — typically meaning the frame
      * is in a bootstrap-loaded class on a JVM where the system classloader is also unreachable.
      */
-    private static ClassLoaderReference findClassLoader(StackFrame frame) throws JdiEvaluationException {
-        final ObjectReference thisObject = frame.thisObject();
-        final ClassLoaderReference cl;
-        if (thisObject != null) {
-            cl = thisObject.referenceType().classLoader();
-        } else {
-            // Static method — use the declaring type's classloader
-            cl = frame.location().declaringType().classLoader();
-        }
-        if (cl != null) {
-            return cl;
-        }
-
-        // All lookups returned null (bootstrap class context) — invoke ClassLoader.getSystemClassLoader() in the target VM
+    private static ClassLoaderReference systemClassLoader(VirtualMachine vm, ThreadReference thread)
+        throws JdiEvaluationException {
         try {
-            final List<ReferenceType> clTypes = frame.virtualMachine().classesByName("java.lang.ClassLoader");
+            final List<ReferenceType> clTypes = vm.classesByName("java.lang.ClassLoader");
             if (!clTypes.isEmpty()) {
                 final ClassType clType = (ClassType) clTypes.get(0);
                 final Method getSystemCL = clType.concreteMethodByName("getSystemClassLoader", "()Ljava/lang/ClassLoader;");
                 if (getSystemCL != null) {
                     final Value result = clType.invokeMethod(
-                        frame.thread(), getSystemCL, Collections.emptyList(), ObjectReference.INVOKE_SINGLE_THREADED
+                        thread, getSystemCL, Collections.emptyList(), ObjectReference.INVOKE_SINGLE_THREADED
                     );
                     if (result instanceof ClassLoaderReference clRef) {
                         return clRef;
@@ -966,44 +973,31 @@ public class JdiExpressionEvaluator {
      */
     public @Nullable Value evaluate(StackFrame frame, String expression, Map<String, Value> extraBindings)
         throws JdiEvaluationException {
-        // Reentrancy guard: mark the firing thread as mid-evaluation BEFORE touching JDI so the
-        // event listener suppresses any recursive breakpoint / exception event that fires while
-        // we are inside the invokeMethod chain (defineClass / forName / user wrapper method /
-        // findClassLoader's getSystemClassLoader fallback). The guard is counted, so a nested
-        // call — e.g. from a conditional breakpoint expression — safely stacks onto an enclosing
-        // enter.
-        //
-        // Capture uniqueID up front and pass the long to both enter and exit. If the target
-        // thread dies mid-evaluation, re-querying uniqueID() on the dead ThreadReference would
-        // throw ObjectCollectedException and leak a dangling entry in the guard's depth map.
-        final long guardedThreadId = frame.thread().uniqueID();
+        // The invocations run under a lease of the thread (see evaluateInPackage), which is the
+        // reentrancy guard and, since issue #45, the admission: a thread not stopped at an event
+        // of its own is refused with the reason, reported as the evaluation's failure.
         final long startTime = System.currentTimeMillis();
-        evaluationGuard.enter(guardedThreadId);
         try {
             // NOTE: Classpath configuration must be done BEFORE calling evaluate() to avoid nested JDI calls
             // The caller (e.g., jdwp_evaluate_watchers) is responsible for calling configureCompilerClasspath()
 
-            // 0. Decide which package the wrapper class will live in. For a non-public `this` in an
-            //    addressable package, we emit the wrapper alongside it so package-private fields and
-            //    the type itself become reachable; otherwise we use the default isolated package.
-            final ObjectReference thisObject = frame.thisObject();
-            final String wrapperPackage = resolveWrapperPackage(thisObject);
-
-            try {
-                return evaluateInPackage(frame, expression, extraBindings, wrapperPackage, startTime);
-            } catch (JdiClassDefinitionException defineFailure) {
-                // The wrapper could not be DEFINED into the chosen package — a sealed package, module
-                // strong-encapsulation, or a restrictive custom classloader can reject defineClass for
-                // an application package while still accepting the isolated default package. The user
-                // expression never ran (the failure is in the define phase, before invoke), so it is
-                // safe to retry once in the default package. This preserves the pre-target-package
-                // behaviour for public-only expressions instead of regressing them to a hard failure.
-                if (wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)) {
-                    throw defineFailure;
+            // JDI invalidates every StackFrame of a thread the debugger resumes — also a resume that
+            // leaves it suspended, such as another set's release or the arming's VM-wide suspend
+            // (issue #45). Only the reads before the invocation use the frame, and they change
+            // nothing in the target, so they are repeated on the same frame read afresh.
+            final ThreadReference thread = frame.thread();
+            final Location location = frame.location();
+            StackFrame current = frame;
+            for (int attempt = 1; ; attempt++) {
+                try {
+                    return evaluateAt(current, thread, location, expression, extraBindings, startTime);
+                } catch (InvalidStackFrameException invalidated) {
+                    final StackFrame refreshed = attempt < FRAME_READ_ATTEMPTS ? sameFrame(thread, location) : null;
+                    if (refreshed == null) {
+                        throw invalidated;
+                    }
+                    current = refreshed;
                 }
-                log.warn("[Evaluator] Defining wrapper into package '{}' failed ({}); retrying in default package '{}'",
-                    wrapperPackage, defineFailure.getMessage(), DEFAULT_EVALUATION_PACKAGE);
-                return evaluateInPackage(frame, expression, extraBindings, DEFAULT_EVALUATION_PACKAGE, startTime);
             }
         } catch (Exception e) {
             log.warn("[Evaluator] Expression evaluation failed after {}ms: {}",
@@ -1023,8 +1017,64 @@ public class JdiExpressionEvaluator {
             // to the exception's simple class name so the cause is always identifiable.
             final String cause = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             throw new JdiEvaluationException("Expression evaluation failed: " + cause, e);
-        } finally {
-            evaluationGuard.exit(guardedThreadId);
+        }
+    }
+
+    /**
+     * {@link #evaluate} on {@code frame}: picks the wrapper package, and retries once in the default
+     * package when defining the wrapper into the preferred one is refused.
+     */
+    private @Nullable Value evaluateAt(StackFrame frame, ThreadReference thread, Location location, String expression,
+                                       Map<String, Value> extraBindings, long startTime)
+        throws JdiEvaluationException, AbsentInformationException {
+        // 0. Decide which package the wrapper class will live in. For a non-public `this` in an
+        //    addressable package, we emit the wrapper alongside it so package-private fields and
+        //    the type itself become reachable; otherwise we use the default isolated package.
+        final ObjectReference thisObject = frame.thisObject();
+        final String wrapperPackage = resolveWrapperPackage(thisObject);
+
+        try {
+            return evaluateInPackage(frame, expression, extraBindings, wrapperPackage, startTime);
+        } catch (JdiClassDefinitionException defineFailure) {
+            // The wrapper could not be DEFINED into the chosen package — a sealed package, module
+            // strong-encapsulation, or a restrictive custom classloader can reject defineClass for
+            // an application package while still accepting the isolated default package. The user
+            // expression never ran (the failure is in the define phase, before invoke), so it is
+            // safe to retry once in the default package. This preserves the pre-target-package
+            // behaviour for public-only expressions instead of regressing them to a hard failure.
+            if (wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)) {
+                throw defineFailure;
+            }
+            log.warn("[Evaluator] Defining wrapper into package '{}' failed ({}); retrying in default package '{}'",
+                wrapperPackage, defineFailure.getMessage(), DEFAULT_EVALUATION_PACKAGE);
+            // The defineClass invocation invalidated the frame: read it afresh.
+            final StackFrame refreshed = sameFrame(thread, location);
+            if (refreshed == null) {
+                throw defineFailure;
+            }
+            return evaluateInPackage(refreshed, expression, extraBindings, DEFAULT_EVALUATION_PACKAGE, startTime);
+        }
+    }
+
+    /**
+     * The frame of {@code thread} at {@code location}, read afresh; {@code null} when the thread no
+     * longer has exactly one frame there — it ran on, or recursion makes the frame ambiguous.
+     */
+    @Nullable
+    private static StackFrame sameFrame(ThreadReference thread, Location location) {
+        try {
+            StackFrame match = null;
+            for (StackFrame candidate : thread.frames()) {
+                if (candidate.location().equals(location)) {
+                    if (match != null) {
+                        return null;
+                    }
+                    match = candidate;
+                }
+            }
+            return match;
+        } catch (IncompatibleThreadStateException | RuntimeException e) {
+            return null;
         }
     }
 
@@ -1106,20 +1156,30 @@ public class JdiExpressionEvaluator {
             compilationCache.put(cacheKey, new CachedCompilation(className, bytecode));
         }
 
-        // 3. Find a suitable class loader in the target VM
-        final ClassLoaderReference classLoader = findClassLoader(frame);
+        // 3. Everything else the invocation needs from the frame is read before the lease: taking
+        //    the thread out of another stop resumes it (issue #45), and JDI invalidates every
+        //    StackFrame of a thread it resumes.
+        final ThreadReference thread = frame.thread();
+        final VirtualMachine vm = frame.virtualMachine();
+        final ClassLoaderReference frameLoader = frameClassLoader(frame);
 
-        // 4. Execute the code remotely. A define-phase rejection surfaces as
-        //    JdiClassDefinitionException, which the caller may catch to retry in the default package.
-        final Value value = RemoteCodeExecutor.execute(
-            frame.virtualMachine(),
-            frame.thread(),
-            classLoader,
-            className,
-            bytecode,
-            EVALUATION_METHOD_NAME,
-            context.getValues()
-        );
+        // 4. Execute the code remotely under a lease: the reentrancy guard — the listener suppresses
+        //    a breakpoint / exception event the invoked code raises on this thread — and the
+        //    admission. A define-phase rejection surfaces as JdiClassDefinitionException, which the
+        //    caller may catch to retry in the default package.
+        final Value value;
+        try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
+            final ClassLoaderReference classLoader = frameLoader != null ? frameLoader : systemClassLoader(vm, thread);
+            value = RemoteCodeExecutor.execute(
+                vm,
+                thread,
+                classLoader,
+                className,
+                bytecode,
+                EVALUATION_METHOD_NAME,
+                context.getValues()
+            );
+        }
         log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
             System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
         return value;
@@ -1177,10 +1237,57 @@ public class JdiExpressionEvaluator {
                                                       String expression, @Nullable String condition, int bufferSize,
                                                       FastLogpointProbeSource.Metadata metadata)
         throws JdiEvaluationException {
+        final List<FastLogpointProbeSource.Parameter> parameters = probeParameters(frame, includeThis, wrapperPackage);
+        final String effectiveExpression = rewriteForProbe(expression, frame, includeThis, wrapperPackage, parameters);
+        final String effectiveCondition = condition != null
+            ? rewriteForProbe(condition, frame, includeThis, wrapperPackage, parameters)
+            : null;
+        final String className = probeClassName(wrapperPackage, FastLogpointProbeSource.CLASS_PREFIX);
+        return compileProbe(className, parameters, FastLogpointProbeSource.generate(
+            className, parameters, effectiveExpression, effectiveCondition, bufferSize, metadata));
+    }
+
+    /**
+     * Compiles the in-target probe class of a fast breakpoint ({@code jdwp_set_fast_breakpoint}) for
+     * the location {@code frame} is stopped at: the same {@code hit} parameters, {@code _this}
+     * typing and naming as {@link #compileFastLogpointProbe}, with the condition evaluated inside
+     * the target VM and a {@code stop} method for the server's breakpoint (see
+     * {@link FastBreakpointProbeSource}).
+     * <p>
+     * Must be called on a thread suspended by an event, after {@link #configureCompilerClasspath}.
+     *
+     * @param frame          the frame stopped at the breakpoint's location
+     * @param includeThis    whether {@code this} is passed to the probe
+     * @param wrapperPackage package the probe class is generated into
+     * @param condition      the condition, as the user entered it
+     * @param stopOnce       whether only the first true hit of an epoch stops
+     * @param bufferSize     capacity of the condition-failure ring; must be a power of two
+     * @param metadata       what the probe records about itself (target, user text, arming session)
+     * @return the probe's class name, bytecode, and {@code hit} parameter names in declaration order
+     * @throws JdiEvaluationException when the probe does not compile or the frame's context cannot be read
+     */
+    public FastLogpointProbe compileFastBreakpointProbe(StackFrame frame, boolean includeThis, String wrapperPackage,
+                                                        String condition, boolean stopOnce, int bufferSize,
+                                                        FastLogpointProbeSource.Metadata metadata)
+        throws JdiEvaluationException {
+        final List<FastLogpointProbeSource.Parameter> parameters = probeParameters(frame, includeThis, wrapperPackage);
+        final String effectiveCondition = rewriteForProbe(condition, frame, includeThis, wrapperPackage, parameters);
+        final String className = probeClassName(wrapperPackage, FastBreakpointProbeSource.CLASS_PREFIX);
+        return compileProbe(className, parameters, FastBreakpointProbeSource.generate(
+            className, parameters, effectiveCondition, stopOnce, bufferSize, metadata));
+    }
+
+    /**
+     * The {@code hit} parameters of a probe at {@code frame}'s location: {@code _this} (typed from the
+     * declaring class) when {@code includeThis}, then every visible local except the outer-instance
+     * {@code this$N}.
+     */
+    private List<FastLogpointProbeSource.Parameter> probeParameters(StackFrame frame, boolean includeThis,
+                                                                    String wrapperPackage) {
         final List<FastLogpointProbeSource.Parameter> parameters = new ArrayList<>();
-        final ReferenceType declaringType = frame.location().declaringType();
         if (includeThis) {
-            parameters.add(new FastLogpointProbeSource.Parameter("_this", getDeclaredType(declaringType, wrapperPackage)));
+            parameters.add(new FastLogpointProbeSource.Parameter("_this",
+                getDeclaredType(frame.location().declaringType(), wrapperPackage)));
         }
         try {
             for (LocalVariable var : frame.visibleVariables()) {
@@ -1190,33 +1297,42 @@ public class JdiExpressionEvaluator {
                 }
             }
         } catch (AbsentInformationException noLocals) {
-            log.debug("[Evaluator] No local-variable table at the fast-logpoint location — probe receives `this` only.");
+            log.debug("[Evaluator] No local-variable table at the probe location — probe receives `this` only.");
         }
+        return parameters;
+    }
 
-        String effectiveExpression = expression;
-        String effectiveCondition = condition;
-        if (includeThis && declaringType instanceof ClassType thisClass) {
-            final Set<String> localNames = parameters.stream()
-                .map(FastLogpointProbeSource.Parameter::name)
-                .collect(Collectors.toSet());
-            effectiveExpression = rewriteBareThisFields(expression, thisClass, wrapperPackage, localNames);
-            if (condition != null) {
-                effectiveCondition = rewriteBareThisFields(condition, thisClass, wrapperPackage, localNames);
-            }
+    /**
+     * Rewrites the bare {@code this} fields in a probe's user text to {@code _this.field}, as an
+     * evaluation wrapper does; unchanged when {@code this} is not passed.
+     */
+    private String rewriteForProbe(String text, StackFrame frame, boolean includeThis, String wrapperPackage,
+                                   List<FastLogpointProbeSource.Parameter> parameters) {
+        if (!includeThis || !(frame.location().declaringType() instanceof ClassType thisClass)) {
+            return text;
         }
+        final Set<String> localNames = parameters.stream()
+            .map(FastLogpointProbeSource.Parameter::name)
+            .collect(Collectors.toSet());
+        return rewriteBareThisFields(text, thisClass, wrapperPackage, localNames);
+    }
 
+    private static String probeClassName(String wrapperPackage, String classPrefix) {
         final String uniqueId = UUID.randomUUID().toString().replace("-", "");
-        final String className = wrapperPackage.isEmpty()
-            ? FastLogpointProbeSource.CLASS_PREFIX + uniqueId
-            : wrapperPackage + '.' + FastLogpointProbeSource.CLASS_PREFIX + uniqueId;
-        final String sourceCode = FastLogpointProbeSource.generate(
-            className, parameters, effectiveExpression, effectiveCondition, bufferSize, metadata);
+        return wrapperPackage.isEmpty() ? classPrefix + uniqueId : wrapperPackage + '.' + classPrefix + uniqueId;
+    }
+
+    /**
+     * Compiles a probe's source; the probe must compile to exactly one class.
+     */
+    private FastLogpointProbe compileProbe(String className, List<FastLogpointProbeSource.Parameter> parameters,
+                                           String sourceCode) throws JdiEvaluationException {
         final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
         if (compiledCode.size() > 1) {
             // The probe is defined as a single class; a nested/anonymous class in the user code
             // would compile to a second class file that is never defined in the target.
-            throw new JdiEvaluationException("Fast logpoint expressions and conditions cannot declare "
-                + "anonymous or nested classes (compiled to " + compiledCode.size() + " classes)");
+            throw new JdiEvaluationException("Fast logpoint and fast breakpoint expressions and conditions cannot "
+                + "declare anonymous or nested classes (compiled to " + compiledCode.size() + " classes)");
         }
         final byte[] bytecode = findCompiledBytecode(compiledCode, className);
         return new FastLogpointProbe(className, bytecode,
@@ -1299,10 +1415,7 @@ public class JdiExpressionEvaluator {
         // Reentrancy guard: discoverClasspath walks the target-VM classloader hierarchy via
         // invokeMethod calls. If any of those invocations land on a breakpointed line the
         // listener must suppress the hit rather than re-suspend the thread we are driving.
-        // Capture uniqueID up front so a thread death mid-discovery does not leak a map entry.
-        final long guardedThreadId = suspendedThread.uniqueID();
-        evaluationGuard.enter(guardedThreadId);
-        try {
+        try (EvaluationGuard.Lease lease = evaluationGuard.lease(suspendedThread)) {
             // A null discovered-JDK path means either first use on this connection or a
             // post-reconnect cache wipe. Either way, any compiler state left over from a previous
             // connection now points at the wrong target VM. Clear BOTH the compilation cache and
@@ -1386,8 +1499,6 @@ public class JdiExpressionEvaluator {
                 localClasspathMerged = true;
             }
             log.info("[Evaluator] Compiler configured in {}ms", System.currentTimeMillis() - startTime);
-        } finally {
-            evaluationGuard.exit(guardedThreadId);
         }
     }
 

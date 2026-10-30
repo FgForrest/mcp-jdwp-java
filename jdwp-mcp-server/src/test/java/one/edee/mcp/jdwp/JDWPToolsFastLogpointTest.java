@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.ClassLoaderReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,7 +46,7 @@ class JDWPToolsFastLogpointTest {
 		jdiService = mock(JDIConnectionService.class);
 		tracker = new BreakpointTracker();
 		history = new EventHistory();
-		fastLogpoints = mock(FastLogpointService.class);
+		fastLogpoints = JDWPToolsTestSupport.fastLogpointsMock();
 		tools = JDWPToolsTestSupport.newTools(jdiService, tracker, history, fastLogpoints);
 	}
 
@@ -161,7 +162,7 @@ class JDWPToolsFastLogpointTest {
 		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(type);
 		when(type.name()).thenReturn("com.example.Cart");
 		when(type.classLoader()).thenReturn(mock(ClassLoaderReference.class));
-		when(fastLogpoints.leftoversIn(type)).thenReturn("refusing to arm: com.example.Cart still carries ...");
+		when(fastLogpoints.leftoversIn(type, FastLogpointService.Kind.LOGPOINT)).thenReturn("refusing to arm: com.example.Cart still carries ...");
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
 			.isEqualTo("Error: refusing to arm: com.example.Cart still carries ...");
 		verify(fastLogpoints, never()).register(any(), any(), anyString(), any(), anyInt());
@@ -197,7 +198,8 @@ class JDWPToolsFastLogpointTest {
 	@DisplayName("jdwp_reset disarms every fast logpoint and reports it")
 	void resetDisarms() {
 		when(fastLogpoints.disarmAll("jdwp_reset")).thenReturn(2);
-		assertThat(tools.jdwp_reset()).contains("Fast logpoints cleared:        2 (original bytecode restored)");
+		assertThat(tools.jdwp_reset())
+			.contains("In-target probes cleared:      2 (fast logpoints and breakpoints; original bytecode restored)");
 		verify(fastLogpoints).disarmAll("jdwp_reset");
 	}
 
@@ -212,7 +214,7 @@ class JDWPToolsFastLogpointTest {
 		when(fastLogpoints.discover(vm)).thenReturn("\n\nFAST LOGPOINTS LEFT BY AN EARLIER SESSION — 1 found");
 
 		assertThat(tools.jdwp_reset())
-			.contains("Earlier sessions' fast logpoints: 1 disabled (kill switch; bytecode unchanged)")
+			.contains("Earlier sessions' probes:      1 disabled (kill switch; bytecode unchanged)")
 			.endsWith("FAST LOGPOINTS LEFT BY AN EARLIER SESSION — 1 found");
 		final InOrder order = inOrder(jdiService, fastLogpoints);
 		order.verify(jdiService).getVM();
@@ -226,9 +228,9 @@ class JDWPToolsFastLogpointTest {
 	void overviewListsFastLogpoints() {
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(3, "com.example.Cart", 42, "total", "total < 0",
-				FastLogpointService.State.ARMED, null, 4096, 10, 2, 15, true, null),
+				FastLogpointService.State.ARMED, null, 4096, 10, 2, 15, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
 			new FastLogpointService.Info(4, "com.example.Order", 7, "id", null,
-				FastLogpointService.State.FAILED, "refusing to arm: ...", 4096, 0, 0, -1, false, null)));
+				FastLogpointService.State.FAILED, "refusing to arm: ...", 4096, 0, 0, -1, false, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null)));
 
 		final String all = tools.jdwp_overview("fast_logpoint", null, null);
 		assertThat(all)
@@ -247,9 +249,9 @@ class JDWPToolsFastLogpointTest {
 			Instant.parse("2026-10-28T15:02:11Z"), "mcp-jdwp-java, session 3fa1c2d9", "AppClassLoader#12", 4096);
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(7, "com.example.Cart", 42, "total", null,
-				FastLogpointService.State.RECOVERED, null, 4096, 3, 0, 18342, false, provenance),
+				FastLogpointService.State.RECOVERED, null, 4096, 3, 0, 18342, false, provenance, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
 			new FastLogpointService.Info(8, "com.example.Cart", 50, "qty", null,
-				FastLogpointService.State.STRANDED, "the class's bytecode differs", 4096, 0, 0, 9, true, provenance)));
+				FastLogpointService.State.STRANDED, "the class's bytecode differs", 4096, 0, 0, 9, true, provenance, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null)));
 
 		assertThat(tools.jdwp_overview("fast_logpoint", null, null))
 			.contains("#7  com.example.Cart:42  [RECOVERED, kill switch set — written=18342 read=3 dropped=0 buffer=4096; "

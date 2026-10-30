@@ -33,10 +33,11 @@ Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Targe
 
 ### Core Components
 
-- **JDWPTools** — Exposes ~30 MCP tools via `@McpTool` annotations. This is the main interface: connection, thread/stack/variable inspection, breakpoints, stepping, and watcher evaluation. All tool methods return formatted `String` responses.
+- **JDWPTools** — Exposes 50 MCP tools via `@McpTool` annotations. This is the main interface: connection, thread/stack/variable inspection, breakpoints, stepping, and watcher evaluation. All tool methods return formatted `String` responses.
 - **JDIConnectionService** — Singleton holding the persistent `VirtualMachine` (JDI) connection. Manages object caching (`ConcurrentHashMap<Long, ObjectReference>`) and smart collection rendering (ArrayList, HashMap, HashSet internals). Also drives classpath discovery for expression evaluation.
-- **BreakpointTracker** — Maintains a registry of breakpoints with synthetic integer IDs (since JDI `BreakpointRequest` has no user-facing ID). Tracks the last thread that hit a breakpoint.
-- **JdiEventListener** — Daemon thread consuming the JDI event queue; the event sets are processed in order on a `jdi-event-dispatcher` thread, except a set raised inside an MCP-driven evaluation, which the listener handles (suppresses and resumes) at once. Updates `BreakpointTracker` on breakpoint/step events. Breakpoint events do NOT auto-resume — threads stay suspended for user inspection.
+- **BreakpointTracker** — Maintains a registry of breakpoints with synthetic integer IDs (since JDI `BreakpointRequest` has no user-facing ID). Keeps the last published stop's report for display; which stop is current is `SuspensionSession`'s call.
+- **JdiEventListener** — Daemon thread consuming the JDI event queue; the event sets are processed in order on a `jdi-event-dispatcher` thread, except a set raised inside an MCP-driven evaluation, which the listener suppresses and releases at once. Handlers only propose stop candidates; `SuspensionSession.finish` publishes the first one or releases the set. A published stop stays suspended for user inspection.
+- **SuspensionSession** (#45) — One per connection; every routed event set is a context (QUEUED → PROCESSING → HELD | RELEASED) and only its context releases its suspension. Tools release only stops a tool has presented, plus `jdwp_suspend_thread` holds — never blindly. It also runs steps, the `jdwp_reset` generation and invocation leases (admission, exemptions, ownership transfer). **SuspensionWatchdog** frees a dispatcher evaluation stuck on a monitor a queued set's thread holds; **InvocationRunner** bounds a tool's invocation at 20 s (`[STILL_RUNNING]`, later `EVALUATION_COMPLETED_LATE`). See `docs/event-pipeline.md` § 14.
 
 ### Expression Evaluation Pipeline (`evaluation/` package)
 
@@ -54,9 +55,11 @@ Evaluates arbitrary Java expressions at breakpoints by compiling and injecting b
 
 Watchers are MCP-side only — they store expressions that get evaluated via the expression pipeline when a breakpoint is hit.
 
-### Fast Logpoints (`fastlogpoint/` package)
+### Fast Logpoints and Fast Breakpoints (`fastlogpoint/` package)
 
 `jdwp_set_fast_logpoint` evaluates a logpoint inside the target JVM: on the first hit, **FastLogpointService** compiles a probe class (`FastLogpointProbeSource`), defines it in the declaring class's loader, and redefines the class with a call to it (**ProbeInstrumenter**, ASM). Hits append to an in-target ring buffer that `jdwp_get_events` drains via plain field reads (**ProbeRing**). It rewrites the application's bytecode, so the tool arms nothing without `userApproved=true` (it returns **FastLogpointRiskBriefing** instead). Arming is refused when the live bytecode differs from the class file (**ClassFileMethods**); tracked breakpoints in the class are re-created after every redefinition; clear / reset / disconnect / reconnect / shutdown restore the original bytes. Each probe describes itself (`MCP_*` constants) and carries the class's install record (**GenerationRecord**: original bytes + the bytecode HotSpot installed), so the next attach finds fast logpoints a dead server left behind (**LeftoverClassifier**, wiring observed by **ProbeCallScanner**) and lists them as RECOVERED / STRANDED; they are never owned by the new session — clear only disables them, and `jdwp_restore_fast_logpoints` restores their class only with `userApproved=true`. See `docs/breakpoints.md` § 5a and § 5b.
+
+`jdwp_set_fast_breakpoint` is the same machinery with a condition (`FastBreakpointProbeSource`, `Kind.BREAKPOINT`): the probe evaluates the condition in the target and, when it holds, calls an empty `stop()` method that carries an ordinary JDI breakpoint with the user's suspend policy, so the user's method holds no breakpoint and stays JIT-compiled. Two gates with server-written generations decide which hits stop (once per generation, or every hit; condition failures once). At a fast stop **FrameView** hides the leading probe frames: every frame index the tools take or print counts from the user's frame. Arming and restoring never redefine a method in which a thread the user may see stopped has a frame — arming waits, and a clear switches the probe off at once but restores the class after that thread is released (the redefinition rule, `heldFrameIn`). See `docs/breakpoints.md` § 5c and § 5d.
 
 ### Nullness
 

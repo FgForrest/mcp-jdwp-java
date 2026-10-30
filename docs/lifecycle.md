@@ -89,17 +89,18 @@ The "exactly one attempt" behaviour matters: a `getVM()` call cannot spiral into
 
 Polls `connect()` every 200 ms up to a timeout (default 30 s) — `JDWPTools.java:296-359`. `IllegalConnectorArgumentsException` fails fast (a bad host or port — no point retrying). `IOException` and other exceptions are retried (the target is simply not listening yet). On timeout, the tool runs JVM discovery (see [diagnostics.md](diagnostics.md)) so the agent can see "what JVMs did come up but on a different port".
 
-On success, the tool returns a one-line hint that the VM is at `VM_START` — set breakpoints, then `jdwp_resume_until_event`.
+On success — as after `jdwp_connect` — the tool waits, outside the connection service's monitor, up to 500 ms for the VMStart event (`SuspensionSession.acknowledgeStart`). A VM suspended at start has that stop marked as seen, and the reply says it is suspended at `VM_START`; a VM started with `suspend=n` is reported as running. Either way the hint is the same: set breakpoints, then `jdwp_resume_until_event`, whose first call releases the start stop.
 
 ## 3. The event listener — started here, stopped on disconnect
 
-`JdiEventListener.start(vm)` (`JdiEventListener.java:200-212`) spawns the daemon thread that drains the JDI event queue, plus the `jdi-event-dispatcher` thread that processes the drained event sets. The listener thread is named `jdi-event-listener` and is created fresh on every `connect()` — `start()` calls `stop()` first so two listeners never overlap (line 201).
+`JdiEventListener.start(vm)` spawns the daemon thread that drains the JDI event queue, plus the `jdi-event-dispatcher` thread that processes the drained event sets. The listener thread is named `jdi-event-listener` and is created fresh on every `connect()` — `start()` calls `stop()` first so two listeners never overlap. `start()` also opens the connection's `SuspensionSession` (which owns every suspension the debugger causes), binds it to the `EvaluationGuard`, and starts its `jdi-suspension-watchdog`.
 
-`stop()` (`JdiEventListener.java:243-263`):
+`stop()`:
 
-1. Interrupts the thread.
-2. Joins for up to 500 ms.
-3. Fires the VM-death latch and `breakpointTracker.fireNextEvent()` to wake any tool blocked in `jdwp_resume_until_event`.
+1. Closes the `SuspensionSession`. Every later call on it is a no-op, and a tool blocked in `jdwp_resume_until_event` (`SuspensionSession.nextStop`) wakes and answers `[VM_DEATH]`. The session resumes nothing — `vm.dispose()` releases the target's threads.
+2. Stops the watchdog and shuts the dispatcher down.
+3. Interrupts the listener thread and joins it for up to 500 ms.
+4. Runs the VM-death hook (at most once per session).
 
 The full event-routing contract is in [event-pipeline.md](event-pipeline.md).
 
@@ -111,7 +112,7 @@ There are two cleanup paths, and the difference matters.
 
 `JDIConnectionService.disconnect()` (`JDIConnectionService.java:383-389`) is called when the agent explicitly asks to detach (`jdwp_disconnect`). It delegates to `cleanupSessionState()` (`JDIConnectionService.java:428-461`):
 
-1. `eventListener.stop()` (line 429).
+1. `eventListener.stop()` — which also closes the suspension session (§ 3).
 2. `breakpointTracker.clearAll(vm.eventRequestManager())` deletes live JDI requests, falling back to in-memory `reset()` if the VM is already dead (lines 434-440).
 3. Clears `watcherManager`, `markedInstances`, `objectCache`, classpath cache, `discoveredJdkPath`, `targetMajorVersion`, `eventHistory` (lines 442-448).
 4. Calls `vm.dispose()` for a clean JDWP teardown (lines 451-456). Best-effort: any exception is swallowed because the VM may already be gone.
@@ -147,6 +148,8 @@ Everything else (object cache, watchers, marks, classpath cache, target version)
 - The object cache
 - The event history
 
+It also releases every held stop — seen or not — and every `jdwp_suspend_thread` hold, deletes pending step requests, and starts a new suspension generation, so an event set still being processed can no longer publish a stop.
+
 It does **not** clear marks (those are persistent labels the agent set deliberately) and does **not** touch `lastHost` / `lastPort` (the connection stays live).
 
 ## 6. The clearing matrix
@@ -155,6 +158,7 @@ It does **not** clear marks (those are persistent labels the agent set deliberat
 |---|---|---|---|---|---|
 | `vm` reference + `vm.dispose()` | yes | yes | no | no-op short-circuit | yes (then re-attach) |
 | Event listener thread | stopped | stops itself | no | no | stopped, restarted |
+| Suspension session (held stops, manual holds) | closed; `vm.dispose()` releases the threads | closed | stops and holds released, new generation | no | closed, new session |
 | Active JDI breakpoint requests | yes | reset in-memory | yes | no | yes |
 | Pending BPs, ID counter, dependency graph | yes | yes | yes | no | yes |
 | Watchers | yes | yes | yes | no | yes |

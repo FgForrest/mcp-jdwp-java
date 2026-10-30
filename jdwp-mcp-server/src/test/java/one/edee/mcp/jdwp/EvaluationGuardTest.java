@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.ThreadReference;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -10,7 +11,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -215,6 +222,110 @@ class EvaluationGuardTest {
 		}
 
 		assertThat(guard.depth(THREAD_A)).isEqualTo(workers);
+	}
+
+	@Test
+	@DisplayName("without a bound session a lease marks the thread evaluating until its outermost lease closes")
+	void leaseWithoutSessionMarksTheThread() {
+		EvaluationGuard guard = new EvaluationGuard();
+		ThreadReference thread = mockThread(THREAD_A);
+
+		try (EvaluationGuard.Lease outer = guard.lease(thread)) {
+			try (EvaluationGuard.Lease inner = guard.lease(thread)) {
+				assertThat(guard.isEvaluating(thread)).isTrue();
+			}
+			assertThat(guard.isEvaluating(thread)).as("the outermost lease still holds").isTrue();
+		}
+
+		assertThat(guard.isEvaluating(thread)).isFalse();
+	}
+
+	@Test
+	@DisplayName("another invocation chain is refused while one holds the thread, and admitted after it ends")
+	void competingChainIsRefused() throws Exception {
+		EvaluationGuard guard = new EvaluationGuard();
+		SuspensionSession session = mock(SuspensionSession.class);
+		guard.bind(session);
+		ThreadReference thread = mockThread(THREAD_A);
+		ExecutorService other = Executors.newSingleThreadExecutor();
+		try {
+			try (EvaluationGuard.Lease held = guard.lease(thread)) {
+				assertThatThrownBy(() -> other.submit(() -> guard.lease(thread)).get(5, TimeUnit.SECONDS))
+					.hasCauseInstanceOf(EvaluationRefusedException.class)
+					.hasMessageContaining("already running");
+				verify(session, times(1)).lease(thread);
+			}
+			verify(session).unlease(thread);
+
+			other.submit(() -> guard.lease(thread).close()).get(5, TimeUnit.SECONDS);
+			verify(session, times(2)).lease(thread);
+		} finally {
+			other.shutdownNow();
+		}
+	}
+
+	@Test
+	@DisplayName("a reconnect drops the earlier connection's holds; closing an old lease leaves the new one alone")
+	void reconnectDropsEarlierHolds() throws Exception {
+		EvaluationGuard guard = new EvaluationGuard();
+		SuspensionSession earlier = mock(SuspensionSession.class);
+		SuspensionSession current = mock(SuspensionSession.class);
+		ThreadReference oldThread = mockThread(THREAD_A);
+		ThreadReference newThread = mockThread(THREAD_A);
+		guard.bind(earlier);
+		EvaluationGuard.Lease old = guard.lease(oldThread);
+
+		guard.bind(current);
+		assertThat(guard.isEvaluating(newThread)).as("the old hold suppresses nothing on the new connection").isFalse();
+		ExecutorService other = Executors.newSingleThreadExecutor();
+		try {
+			EvaluationGuard.Lease fresh = other.submit(() -> guard.lease(newThread)).get(5, TimeUnit.SECONDS);
+			old.close();
+			verify(earlier).unlease(oldThread);
+			assertThat(guard.isEvaluating(newThread)).as("the old lease did not end the new one").isTrue();
+			fresh.close();
+			verify(current).unlease(newThread);
+		} finally {
+			other.shutdownNow();
+		}
+		assertThat(guard.isEvaluating(newThread)).isFalse();
+	}
+
+	@Test
+	@DisplayName("only a thread's outermost lease is taken in the session, and released when it closes")
+	void outermostLeaseDelegatesToTheSession() {
+		EvaluationGuard guard = new EvaluationGuard();
+		SuspensionSession session = mock(SuspensionSession.class);
+		guard.bind(session);
+		ThreadReference thread = mockThread(THREAD_A);
+
+		try (EvaluationGuard.Lease outer = guard.lease(thread)) {
+			try (EvaluationGuard.Lease inner = guard.lease(thread)) {
+				verify(session, times(1)).lease(thread);
+			}
+			verify(session, never()).unlease(thread);
+		}
+
+		InOrder order = inOrder(session);
+		order.verify(session).lease(thread);
+		order.verify(session).unlease(thread);
+		assertThat(guard.depth(THREAD_A)).isZero();
+	}
+
+	@Test
+	@DisplayName("a refused lease propagates the refusal and leaves no hold behind")
+	void refusedLeaseLeavesNoDepth() {
+		EvaluationGuard guard = new EvaluationGuard();
+		SuspensionSession session = mock(SuspensionSession.class);
+		ThreadReference thread = mockThread(THREAD_A);
+		doThrow(new EvaluationRefusedException("parked")).when(session).lease(thread);
+		guard.bind(session);
+
+		assertThatThrownBy(() -> guard.lease(thread)).isInstanceOf(EvaluationRefusedException.class)
+			.hasMessage("parked");
+
+		assertThat(guard.isEvaluating(thread)).isFalse();
+		verify(session, never()).unlease(thread);
 	}
 
 	/**
