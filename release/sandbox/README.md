@@ -1,6 +1,6 @@
 # JDWP Test Flights — Sandbox Edition
 
-Nine deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
+Ten deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
 
 Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the ten, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
 
@@ -58,9 +58,11 @@ The rules:
    the problem statement.
 3. Don't fix the bug. Diagnose it. The broken state is load-bearing for future flights.
 4. Don't read this project's main README or the spoiler blocks anywhere — that's cheating.
-5. Score yourself: count the JDWP tool calls you made to crack this flight. Each flight
-   has a "par" — the minimum tool count that cleanly reveals the root cause. Hitting par
-   = ⭐⭐⭐. Within 2× par = ⭐⭐. Solved at all = ⭐. Report the count when you finish.
+5. Score yourself: count every jdwp_* call, from the first call after attaching until
+   the root cause is evident; the attach and the clean-up afterwards are free. Each
+   flight has a "par" — the minimum tool count that cleanly reveals the root cause.
+   Hitting par = ⭐⭐⭐. Within 2× par = ⭐⭐. Solved at all = ⭐. Report the count when
+   you finish.
 
 Now attach via jdwp_wait_for_attach(port=5005), set the breakpoints the flight calls
 for, and tell me:
@@ -115,11 +117,11 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 ### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 5
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
 
-**Hint:** You will not find the write by ripgrep'ing for `setDisplayName` — the public setter is never called. A line BP on the setter never fires. Whatever path the write travels, the field's value still flips. Let the JVM tell you exactly when it changes, regardless of how the write reaches the field.
+**Hint:** The public setter is never called, so neither ripgrep nor a line BP on `setDisplayName` will find the write. A watch on the field fires once, for the constructor's assignment, and then stays silent, yet the value still flips before the assertion. That silence tells you how the write travels. Where it happens is yours to pin down.
 
 ### #6 The Doppelgänger Cart
 
@@ -139,7 +141,7 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 ### #8 The Magic Patch
 
-**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 3
+**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 4
 
 **Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
 
@@ -161,6 +163,8 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
 
+**Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
+
 ## Scorecard
 
 **Flights solved** — did you find the root cause?
@@ -172,7 +176,7 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 | 6-9    | Impressive. You found bugs that would take hours with println.       |
 | 10     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
+**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
 
 ## Where the spoilers live
 

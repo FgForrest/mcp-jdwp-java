@@ -232,18 +232,26 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3 | **Exercises:** event history as evidence
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 5 | **Exercises:** field watchpoint blind spot + before/after bisect
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
 
-**Hint:** You will not find the write by ripgrep'ing for `setDisplayName` — the public setter is never called. A line BP on the setter never fires. Whatever path the write travels, the field's value still flips. Let the JVM tell you exactly when it changes, regardless of how the write reaches the field.
+**Hint:** The public setter is never called, so neither ripgrep nor a line BP on `setDisplayName` will find the write. A watch on the field fires once, for the constructor's assignment, and then stays silent, yet the value still flips before the assertion. That silence tells you how the write travels. Where it happens is yours to pin down.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName` — bypassing the public setter entirely. From the test's perspective the formatter is read-only; from JDI's perspective every reflective write is still a real field modification.
+`LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper, which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName`, bypassing the public setter. From the test's side the formatter looks read-only, and a field watchpoint cannot see the write either: JDI watchpoints fire only on the `putfield`/`getfield` bytecodes (and JNI field access). `Field.set` ends in an `Unsafe` store straight to memory, which trips no watchpoint, in `modification` mode or in `access` mode.
 
-**Debug path:** `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")` — JDI watchpoints fire on every JVM-level field store, including stores issued through `Field.set` and `Unsafe`. The next write suspends the thread inside `DisplayNameMirror.mirror`; `jdwp_get_stack` walks back through `canonicalForm` to `LoginNormalizer.welcomeMessage` and names the culprit. A line BP on `UserProfile.setDisplayName` would never fire — the setter is genuinely unused.
+**Debug path:** The tell is a modification watchpoint that fires for the constructor's ordinary assignment and then stays silent while the value flips: the write does not go through a field store. So stop waiting for the watchpoint and bisect. Compare `profile.getDisplayName()` before and after each suspect call, or `System.identityHashCode(profile.getDisplayName())` when the old and new strings could be equal. The identity flips across exactly the method doing the hidden write. The test has one suspect call, `welcomeMessage` on line 24, so the par path takes five calls:
+
+1. `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")`. The class is not loaded yet, so the watchpoint waits for it.
+2. `jdwp_set_breakpoint("one.edee.jdwp.sandbox.userprofile.UserProfileTest", 27)`, just after `welcomeMessage`, so the test cannot end before you look.
+3. `jdwp_resume_until_event`: the watchpoint fires in the `UserProfile` constructor, which stores `"Alice"`.
+4. `jdwp_resume_until_event`: the thread stops at line 27. The watchpoint did not fire in between.
+5. `jdwp_evaluate_expression("profile.getDisplayName()")`: `"alice"`. The value flipped across `welcomeMessage` with no field store the JVM could see, so the write is reflective or goes through `Unsafe`.
+
+That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `DisplayNameMirror.mirror` → `Field.set`. To name the writing call from the debugger alone, break at line 24 instead and keep bisecting inside `welcomeMessage` with `jdwp_step_into` / `jdwp_step_over`, comparing the identity after each line: it flips across `DisplayNameMirror.mirror(profile, canonical)` in `canonicalForm`. A line BP on `UserProfile.setDisplayName` never fires — the setter is genuinely unused.
 
 </details>
 
@@ -289,7 +297,7 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #8 The Magic Patch
 
-**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 3 | **Exercises:** runtime mutation (`set_local`)
+**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 4 | **Exercises:** runtime mutation (`set_local`)
 
 **Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
 
@@ -300,7 +308,7 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 `DateParser.parse` splits `YYYY-MM-DD` and `Integer.parseInt`s each part. The feed delivers `"2026-05-15 "` with a trailing space, so `parseInt("15 ")` throws. The parser never trims its input.
 
-**Debug path:** Break at the top of `parse`, observe `input = "2026-05-15 "`, then `jdwp_set_local("input", "2026-05-15")` and resume. The parse now succeeds and the test passes — confirming the trailing space is the whole story, with no rebuild.
+**Debug path:** Four calls. `jdwp_set_breakpoint` at the top of `parse`, `jdwp_resume_until_event` to stop there, `jdwp_set_local("input", "2026-05-15")` to drop the trailing space (or break on the test's line 19 and patch `fromFeed` instead), and `jdwp_resume`. The parse now succeeds and the test passes — confirming the trailing space is the whole story, with no rebuild. The exception message already shows the stray space, so the stop needs no inspection call; the confirming resume counts.
 
 </details>
 
@@ -333,14 +341,22 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
 
+**Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
+
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`BoxOffice.trySell` checks that the seat is free, prices it (reading the pricing desk's volatile surcharge), and only then records the buyer: a check-then-act race. Two windows that check the same free seat within the pricing step both sell it, and `sold` counts both. About six seats per performance are sold twice.
+`BoxOffice.trySell` checks that the seat is free, prices it (reading the pricing desk's volatile surcharge), and only then records the buyer: a check-then-act race. Two windows that check the same free seat within the pricing step both sell it, and `sold` counts both. About six seats per performance are sold twice. Customer numbers are window numbers, and `owners[]` keeps only the last buyer, so counting seats against `sold()` after the fact shows the overselling but cannot name the window that sold a seat first. Only catching the collision can.
 
-**Debug path:** On the sell line (`seatOwners[seat] = customer`), the condition `seatOwners[seat] != 0` is true exactly when another window sold the seat after this one checked it. Each of these tools needs the user's explicit consent, because it rewrites the class's bytecode: call it once without `userApproved`, relay the briefing, and ask.
-- `jdwp_set_fast_logpoint` with that condition and the expression `seat + " sold to " + seatOwners[seat] + ", resold to " + customer`, then `jdwp_get_events` after the run: every double sale is listed with both windows.
-- `jdwp_set_fast_breakpoint` with that condition, then `jdwp_resume_until_event`: the first double sale stops with every window parked. `jdwp_get_breakpoint_context` shows the seat and its second buyer (`customer`); `seatOwners[seat]` evaluates to the first.
+**Debug path:** On the sell line (`BoxOffice.java:54`, `seatOwners[seat] = customer`), the condition `seatOwners[seat] != 0` is true when another window sold the seat after this one checked it. Both in-target tools rewrite the class's bytecode, so each needs the user's explicit consent: the first call, without `userApproved`, arms nothing and returns a risk briefing to relay word for word. `BoxOffice` is not loaded when the test JVM starts; the approved probe waits for the class to load and arms on its next hit.
+- **Fast logpoint, 4 calls (par):**
+  1. `jdwp_set_fast_logpoint` on `one.edee.jdwp.sandbox.boxoffice.BoxOffice` line 54, with that condition and the expression `seat + " sold to " + seatOwners[seat] + ", resold to " + customer`, without `userApproved`: the risk briefing, relayed to the user.
+  2. The same call with `userApproved=true`, once the user agrees.
+  3. `jdwp_resume_until_event`: the test runs to its end. The reply is `[VM_DEATH]` and says how many `FAST_LOGPOINT` hits were recorded.
+  4. `jdwp_get_events`: the double sales, each with its seat and the first and second window.
+- **Fast breakpoint, 5 calls:** the briefing and the approved `jdwp_set_fast_breakpoint` call with the same condition, then `jdwp_resume_until_event`: the first double sale stops with every window parked. `jdwp_get_breakpoint_context` shows `seat` and its second buyer, `customer`. `jdwp_evaluate_expression("seatOwners[seat]")` gives the first buyer; array elements are not in the context dump.
+
+The logpoint does not catch every double sale. Its condition reads a plain `int[]` without synchronization, so a window that reads the seat before the other window's write is visible logs nothing; one live run caught 1,460 of 2,472 double sales. One is enough to solve the flight. The probe also sits inside the race window, between the check and the write, so it widens the race rather than hiding it: runs with the probe sold more seats twice, not fewer.
 
 An ordinary conditional breakpoint or logpoint on that line goes through the debugger on each of about 60 million passes, at 3–30 ms each. The box office closes first, and the serialized windows stop colliding.
 
@@ -359,7 +375,7 @@ An ordinary conditional breakpoint or logpoint on that line goes through the deb
 | 6-9    | Impressive. You found bugs that would take hours with println.       |
 | 10     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
+**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
 
 ## Features beyond standard JDWP
 

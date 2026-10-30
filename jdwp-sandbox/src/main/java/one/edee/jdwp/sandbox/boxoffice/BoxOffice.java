@@ -4,8 +4,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Sells the seats of one performance from several box-office windows at once. A seat is checked
- * before it is sold, so every seat is sold at most once.
+ * Sells the seats of one performance from several box-office windows at once. Each seat goes to
+ * the first customer who asks for it.
  */
 public class BoxOffice {
 

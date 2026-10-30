@@ -30,7 +30,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** (
 ## Tool reminders
 
 - **`jdwp_resume_until_event`** blocks until the next breakpoint / step / exception event, or times out (default 30s). On timeout, the response includes a structured diagnostic — *read it* rather than blindly retrying with a larger timeout.
-- **`jdwp_set_field_breakpoint(className, fieldName, mode)`** suspends on every JVM-level field read (`mode="access"`) or write (`"modification"`), including reflective writes via `Field.set` and `Unsafe`. This is the only way to catch a write whose call site does not name the setter.
+- **`jdwp_set_field_breakpoint(className, fieldName, mode)`** suspends when bytecode reads (`mode="access"`) or writes (`"modification"`) the field: the `getfield`/`putfield` instructions (and JNI field access). It does not see writes made through `Field.set` or `Unsafe`, which store straight to memory.
 - **`jdwp_set_exception_breakpoint`** catches at the throw site, *before* the stack unwinds — invaluable when wrappers (`CompletionException`, `RuntimeException` cause chains) obscure the original.
 - **`jdwp_assert_expression(expr, expected)`** is your sanity check: "is the hash what I think it is?", "is the total what I think it is?". Returns MATCH or MISMATCH with the actual value.
 - **`jdwp_evaluate_expression(expr)`** is your "what is this right now?" tool. Use freely.
@@ -42,7 +42,7 @@ After each flight, tell the user:
 - **What the bug actually is** (root cause in one sentence).
 - **Which JVM observation revealed it** (the specific tool call + the value that contradicted the assumption from source reading).
 - **What you would change to fix it** — but do NOT make the change. The sandbox is intentionally broken.
-- **Your tool-call count** for the flight, against its **par** (listed per flight in `README.md`). Par = ⭐⭐⭐, within 2× = ⭐⭐, solved = ⭐.
+- **Your tool-call count** for the flight, against its **par** (listed per flight in `README.md`). Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Par = ⭐⭐⭐, within 2× = ⭐⭐, solved = ⭐.
 
 After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 10/10".
 
