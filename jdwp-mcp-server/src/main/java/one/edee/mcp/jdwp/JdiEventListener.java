@@ -268,12 +268,6 @@ public class JdiEventListener {
     }
 
     /**
-     * Formats a JDI value for the human-readable logpoint output. Mirrors the format used by
-     * {@link JDIConnectionService#formatFieldValue} but without its side effects (no object cache
-     * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
-     * history, so the simpler implementation is preferred.
-     */
-    /**
      * {@code Class.method:line} of {@code location} (simple class name); best-effort.
      */
     static String describeSite(@Nullable Location location) {
@@ -323,6 +317,12 @@ public class JdiEventListener {
         return null;
     }
 
+    /**
+     * Formats a JDI value for the human-readable logpoint output. Mirrors the format used by
+     * {@link JDIConnectionService#formatFieldValue} but without its side effects (no object cache
+     * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
+     * history, so the simpler implementation is preferred.
+     */
     public static String formatLogpointResult(@Nullable Value value) {
         if (value == null) {
             return "null";

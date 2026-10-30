@@ -202,6 +202,14 @@ final class LiveSession implements AutoCloseable {
 	}
 
 	/**
+	 * Makes the target call {@code System.exit(0)} — how a forked test JVM ends.
+	 */
+	void exitTarget() throws Exception {
+		process.getOutputStream().write('X');
+		process.getOutputStream().flush();
+	}
+
+	/**
 	 * Enables a one-shot request while every thread is suspended. JDI drops an event the target
 	 * raises before the enable reply is read, and on a hot line that spends the count filter: the
 	 * request would never report a hit (the service's arming requests do the same).

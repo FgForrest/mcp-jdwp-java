@@ -4,7 +4,7 @@ You are debugging in the **JDWP test-flight sandbox**. This is not a real codeba
 
 ## Read this before you touch anything
 
-The scenarios are designed to expose bugs that **source-level reading misses** (mutation through ostensibly read-only paths, hash-key drift after key mutation, reflective field writes, partial-init races, etc.). If you read the source code first and pattern-match a fix, you have defeated the point of the exercise — and you will likely *also* miss the actual bug because the symptoms can have several plausible code-level explanations and only one of them is the one the JVM actually does at runtime.
+The scenarios are designed to expose bugs that **source-level reading misses** — the code looks right, and only the running JVM shows what it actually does. If you read the source code first and pattern-match a fix, you have defeated the point of the exercise — and you will likely *also* miss the actual bug because the symptoms can have several plausible code-level explanations and only one of them is the one the JVM actually does at runtime.
 
 ## Rules
 

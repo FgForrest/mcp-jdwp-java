@@ -15,7 +15,7 @@ An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
 - **Trace without stopping** — line/exception/field logpoints write to an event log, the thread runs on
-- **Catch the writer of a mutating field** — watchpoints suspend at the JVM-level store, including reflective `Field.set` that a line BP can never see
+- **Catch the writer of a mutating field** — watchpoints suspend at every bytecode store to the field, wherever it is; a write through reflection or `Unsafe` is the one they cannot see, and the `[VM_DEATH]` reply's hit count shows when a watchpoint stayed silent
 - **Pure STDIO** — no daemon, no extra port, no GUI
 
 The agent gets the same power as IntelliJ's debugger, with extras that exist specifically because an agent isn't a human staring at a UI (filtering, blocking resume, one-shot context dumps, recursion guards, reconnect after a wedge).

@@ -62,7 +62,7 @@ public class JDWPTools {
 
     /**
      * Default JDWP port. Resolved at class load via the `-DJVM_JDWP_PORT` system property
-     * (typically passed by the MCP client through `.mcp.json`); falls back to 5005 if unset.
+     * (typically set in the MCP server entry's {@code args}); falls back to 5005 if unset.
      */
     private static final int JVM_JDWP_PORT = Integer.parseInt(
         System.getProperty("JVM_JDWP_PORT", "5005")
@@ -453,7 +453,7 @@ public class JDWPTools {
             thread.name(), id, ThreadFormatting.formatStatus(status), id);
     }
 
-    @McpTool(description = "Connect to the JDWP server using configuration from .mcp.json")
+    @McpTool(description = "Connect to the JDWP server on localhost at the port the server was started with (-DJVM_JDWP_PORT, default 5005). To attach to another host or port, use jdwp_wait_for_attach.")
     public String jdwp_connect() {
         final String host = "localhost";
         final int port = JVM_JDWP_PORT;

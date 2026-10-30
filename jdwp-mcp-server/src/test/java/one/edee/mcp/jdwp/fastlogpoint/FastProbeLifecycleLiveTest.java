@@ -96,16 +96,17 @@ class FastProbeLifecycleLiveTest {
 	@DisplayName("hits nobody read are read when the target exits; the [VM_DEATH] reply says so and names a silent field watch")
 	void hitsAreReadWhenTheTargetExits() throws Exception {
 		session = LiveSession.start(List.of());
-		final String reply = session.tools.jdwp_set_fast_logpoint(TARGET, lineOf("// MARK: probe"), "\"i=\" + i",
-			"i % 1000000 == 0", true, null, null);
-		final int id = idOf(reply);
-		await("the fast logpoint armed", () -> state(id).equals(Optional.of(FastLogpointService.State.ARMED)));
-		// Never written after the constructor, which ran before the attach.
+		// Never written after the constructor, which ran before the attach. Set first: a field watch can
+		// send compiled code back to the interpreter, which slows the workers for a while.
 		final String watch = session.tools.jdwp_set_field_logpoint(TARGET, "base", "modification", "$newValue",
 			null, null, null, null, null, null, null);
 		final int watchId = idOf(watch);
+		final String reply = session.tools.jdwp_set_fast_logpoint(TARGET, lineOf("// MARK: probe"), "\"i=\" + i",
+			"i % 100000 == 0", true, null, null);
+		final int id = idOf(reply);
+		await("the fast logpoint armed", () -> state(id).equals(Optional.of(FastLogpointService.State.ARMED)));
 		// Hits accumulate in the ring; nothing reads it (no jdwp_get_events).
-		Thread.sleep(1_500);
+		awaitWritten(id);
 
 		final CompletableFuture<String> waiter =
 			CompletableFuture.supplyAsync(() -> session.tools.jdwp_resume_until_event(60_000));
@@ -124,12 +125,47 @@ class FastProbeLifecycleLiveTest {
 		final List<EventHistory.DebugEvent> hits = session.history.getRecent(EventHistory.MAX_EVENTS).stream()
 			.filter(e -> "FAST_LOGPOINT".equals(e.type()) && !e.details().containsKey("armingHit"))
 			.toList();
-		assertThat(hits).as("the probe's hits, read at the exit").isNotEmpty()
+		assertThat(hits).as("the probe's hits, read at the exit; history: %s", session.history.getRecent(40))
+			.isNotEmpty()
 			.allSatisfy(e -> assertThat(e.details().get("result")).startsWith("i="));
 		assertThat(session.history.getRecent(EventHistory.MAX_EVENTS))
 			.anySatisfy(e -> assertThat(e.type()).isEqualTo("FAST_LOGPOINT_READ_AT_EXIT"));
 		assertThat(session.tools.jdwp_reset()).startsWith("Reset complete — there is no target to reset:")
 			.contains("1 in-target probe");
+	}
+
+	@Test
+	@DisplayName("hits nobody read are read when the target ends with System.exit, as a forked test JVM does")
+	void hitsAreReadWhenTheTargetCallsSystemExit() throws Exception {
+		session = LiveSession.start(List.of());
+		final int id = idOf(session.tools.jdwp_set_fast_logpoint(TARGET, lineOf("// MARK: probe"), "\"i=\" + i",
+			"i % 100000 == 0", true, null, null));
+		await("the fast logpoint armed", () -> state(id).equals(Optional.of(FastLogpointService.State.ARMED)));
+		awaitWritten(id);
+
+		final CompletableFuture<String> waiter =
+			CompletableFuture.supplyAsync(() -> session.tools.jdwp_resume_until_event(60_000));
+		Thread.sleep(500);
+		session.exitTarget();
+
+		assertThat(session.process.waitFor(30, TimeUnit.SECONDS)).as("System.exit completes: the death set was resumed")
+			.isTrue();
+		assertThat(waiter.get(30, TimeUnit.SECONDS)).startsWith("[VM_DEATH]").contains("FAST_LOGPOINT_READ_AT_EXIT");
+		assertThat(session.history.getRecent(EventHistory.MAX_EVENTS))
+			.anySatisfy(e -> assertThat(e.type()).isEqualTo("FAST_LOGPOINT_READ_AT_EXIT"))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("FAST_LOGPOINT");
+				assertThat(e.details()).doesNotContainKey("armingHit");
+			});
+	}
+
+	/**
+	 * Waits until probe {@code id} has written entries — its live sequence counter, read without
+	 * draining the ring.
+	 */
+	private void awaitWritten(int id) throws Exception {
+		await("probe hits written in the target", () -> session.fastLogpoints.list().stream()
+			.anyMatch(i -> i.id() == id && i.written() > 0));
 	}
 
 	private Optional<FastLogpointService.State> state(int id) {
