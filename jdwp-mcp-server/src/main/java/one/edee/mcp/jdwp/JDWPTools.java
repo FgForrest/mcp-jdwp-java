@@ -1223,13 +1223,14 @@ public class JDWPTools {
 
     /**
      * The refusal of a frame tool on a thread an evaluation is running on — its frames are then
-     * those of the invoked code, not of its stop — or {@code null}.
+     * those of the invoked code, not of its stop — or {@code null}. A job that outlived its tool's
+     * wait counts from its start: while it still compiles it holds no lease yet, but invokes next.
      */
     @Nullable
     private String evaluationRunningOn(ThreadReference thread) {
-        return evaluationGuard.isEvaluating(thread)
-            ? "Error: an evaluation is running on thread " + thread.name() + " — its frames are the invoked code's "
-            + "now; try again when it has finished."
+        return evaluationGuard.isEvaluating(thread) || invocations.isRunning(thread)
+            ? "Error: an evaluation is running on thread " + thread.name() + " — its frames are, or are about to be, "
+            + "the invoked code's; try again when it has finished (EVALUATION_COMPLETED_LATE in jdwp_get_events)."
             : null;
     }
 

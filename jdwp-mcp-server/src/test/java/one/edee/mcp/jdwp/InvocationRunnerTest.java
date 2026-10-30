@@ -126,6 +126,64 @@ class InvocationRunnerTest {
 	}
 
 	@Test
+	@DisplayName("a job counts as running on its thread until it ends, also after its tool stopped waiting")
+	void jobRunsUntilItEnds() throws Exception {
+		final InvocationRunner runner = runner(100);
+		final CountDownLatch release = new CountDownLatch(1);
+		final ThreadReference main = thread("main", 1);
+		assertThat(runner.isRunning(main)).isFalse();
+		assertThatThrownBy(() -> runner.run(main, "evaluating slow()", () -> release.await(10, TimeUnit.SECONDS)))
+			.isInstanceOf(InvocationRunner.StillRunning.class);
+		assertThat(runner.isRunning(main)).as("still compiling or invoking: frame tools refuse it").isTrue();
+
+		release.countDown();
+		awaitLateRecords(1);
+		assertThat(runner.isRunning(main)).isFalse();
+	}
+
+	@Test
+	@DisplayName("a job of an ended connection neither refuses nor counts for a thread of the next one with the same ID")
+	void jobOfAnEndedConnectionDoesNotBlockTheNext() throws Exception {
+		final InvocationRunner runner = runner(100);
+		final CountDownLatch release = new CountDownLatch(1);
+		try {
+			assertThatThrownBy(() -> runner.run(thread("main", 1), "evaluating slow()",
+				() -> release.await(10, TimeUnit.SECONDS))).isInstanceOf(InvocationRunner.StillRunning.class);
+
+			session.close();
+			session = new BreakpointTracker().openSuspensionSession(history);
+			final ThreadReference reused = thread("worker", 1);
+			assertThat(runner.isRunning(reused)).isFalse();
+			assertThat(runner.run(reused, "evaluating 5", () -> 5)).isEqualTo(5);
+		} finally {
+			release.countDown();
+		}
+	}
+
+	@Test
+	@DisplayName("the still-running report does not wait for a JDWP reply that never comes")
+	void blockerReportIsBounded() throws Exception {
+		final InvocationRunner runner = runner(100);
+		final ThreadReference main = thread("main", 1);
+		final CountDownLatch replies = new CountDownLatch(1);
+		when(main.status()).thenAnswer(invocation -> {
+			replies.await(10, TimeUnit.SECONDS);
+			return ThreadReference.THREAD_STATUS_RUNNING;
+		});
+		final CountDownLatch release = new CountDownLatch(1);
+		final long started = System.nanoTime();
+		try {
+			assertThatThrownBy(() -> runner.run(main, "evaluating slow()", () -> release.await(10, TimeUnit.SECONDS)))
+				.isInstanceOf(InvocationRunner.StillRunning.class)
+				.hasMessageContaining("its state is unknown (JDI did not answer within 2 s)");
+			assertThat(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started)).isLessThan(5);
+		} finally {
+			replies.countDown();
+			release.countDown();
+		}
+	}
+
+	@Test
 	@DisplayName("work the caller gave up on before it started never runs")
 	void abandonedBeforeStartNeverRuns() throws Exception {
 		final List<Runnable> held = new ArrayList<>();

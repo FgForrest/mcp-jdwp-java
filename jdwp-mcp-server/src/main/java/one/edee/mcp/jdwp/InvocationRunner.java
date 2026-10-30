@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,7 +33,11 @@ import java.util.function.Supplier;
  * {@code EVALUATION_COMPLETED_LATE} in the session it started in. Exactly one of the two happens:
  * the caller's timeout and the job's completion are settled by one compare-and-set. A thread with a
  * job still running refuses another one before anything is read from it. A hung job pins its pool
- * thread until the connection ends ({@code jdwp_reconnect} or {@code jdwp_disconnect}).
+ * thread until the connection ends ({@code jdwp_reconnect} or {@code jdwp_disconnect}); a job of an
+ * ended connection never refuses a thread of the next one.
+ * <p>
+ * A job runs only at the stop it was started at: it records the holds its thread had then, and its
+ * invocations are refused once none of them holds the thread any more ({@link SuspensionSession#lease}).
  */
 public final class InvocationRunner {
     private static final Logger log = LoggerFactory.getLogger(InvocationRunner.class);
@@ -41,6 +46,10 @@ public final class InvocationRunner {
      * How long a tool waits for its invocation — well under the MCP client's tool timeout.
      */
     public static final long TIMEOUT_MS = 20_000;
+    /**
+     * How long a {@link StillRunning} report waits for JDI to say what blocks the thread.
+     */
+    private static final long BLOCKER_TIMEOUT_MS = 2_000;
 
     private static final int PENDING = 0;
     private static final int RUNNING = 1;
@@ -105,9 +114,16 @@ public final class InvocationRunner {
      */
     public <T> T run(@Nullable ThreadReference thread, String what, Callable<T> work) throws Exception {
         final long key = thread != null ? thread.uniqueID() : -1L;
-        final Job<T> job = new Job<>(what, thread, work, currentSession.get());
+        final SuspensionSession session = currentSession.get();
+        final Set<Long> holds = thread != null && session != null ? session.holdsOn(thread) : Set.of();
+        final Job<T> job = new Job<>(what, thread, work, session, holds);
         if (thread != null) {
-            final Job<?> other = running.putIfAbsent(key, job);
+            Job<?> other = running.putIfAbsent(key, job);
+            // A job of an ended connection may still be unwinding: its thread ID can name a thread of
+            // this one now.
+            while (other != null && other.session != session) {
+                other = running.replace(key, other, job) ? null : running.putIfAbsent(key, job);
+            }
             if (other != null) {
                 throw new StillRunning(String.format("[STILL_RUNNING] %s on thread %s has been running in the target for "
                     + "%d s — wait for EVALUATION_COMPLETED_LATE in jdwp_get_events before starting another "
@@ -137,6 +153,15 @@ public final class InvocationRunner {
         }
     }
 
+    /**
+     * Whether a job of the current connection runs on {@code thread} — also one whose tool already
+     * answered {@link StillRunning}, and one still preparing (compiling) before it invokes anything.
+     */
+    public boolean isRunning(ThreadReference thread) {
+        final Job<?> job = running.get(thread.uniqueID());
+        return job != null && job.session == currentSession.get();
+    }
+
     private static <T> T unwrap(Job<T> job) throws Exception {
         try {
             return job.outcome.get();
@@ -159,13 +184,32 @@ public final class InvocationRunner {
     private String stillRunningReport(Job<?> job) {
         final ThreadReference thread = job.thread;
         final String on = thread != null ? " on thread " + nameOf(thread) : "";
-        final String blocker = thread != null ? "; " + blockerOf(thread) : "";
+        final String blocker = thread != null ? "; " + boundedBlockerOf(thread) : "";
         return String.format("[STILL_RUNNING] %s%s did not finish within %d s and is still running in the target%s. "
                 + "When it ends, its result is recorded as EVALUATION_COMPLETED_LATE (jdwp_get_events)%s. Meanwhile: "
                 + "jdwp_resume_thread releases a parked thread it waits for; jdwp_resume releases your stops (the "
                 + "evaluating thread stays suspended until the evaluation ends); jdwp_reconnect ends everything.",
             job.what, on, timeoutMs / 1000, blocker,
             thread != null ? " and the thread can be evaluated on again" : "");
+    }
+
+    /**
+     * {@link #blockerOf}, waited for at most {@link #BLOCKER_TIMEOUT_MS}: the report must not hang
+     * on a JDWP reply. Given up on, the probe still ends on its pool thread and resumes what it
+     * suspended.
+     */
+    private String boundedBlockerOf(ThreadReference thread) {
+        try {
+            return CompletableFuture.supplyAsync(() -> blockerOf(thread), executor)
+                .get(BLOCKER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            return "its state is unknown (JDI did not answer within " + BLOCKER_TIMEOUT_MS / 1000 + " s)";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "its state is unknown (interrupted)";
+        } catch (Exception e) {
+            return "its state is unknown (" + e.getClass().getSimpleName() + ")";
+        }
     }
 
     /**
@@ -225,16 +269,21 @@ public final class InvocationRunner {
         private final Callable<T> work;
         @Nullable
         private final SuspensionSession session;
+        /**
+         * The holds on {@link #thread} when the job was admitted; empty when none was known.
+         */
+        private final Set<Long> holds;
         private final long startedNanos = System.nanoTime();
         private final AtomicInteger state = new AtomicInteger(PENDING);
         private final CompletableFuture<T> outcome = new CompletableFuture<>();
 
         private Job(String what, @Nullable ThreadReference thread, Callable<T> work,
-                    @Nullable SuspensionSession session) {
+                    @Nullable SuspensionSession session, Set<Long> holds) {
             this.what = what;
             this.thread = thread;
             this.work = work;
             this.session = session;
+            this.holds = holds;
         }
 
         private long elapsedMs() {
@@ -249,7 +298,7 @@ public final class InvocationRunner {
             T value = null;
             Throwable failure = null;
             try {
-                value = work.call();
+                value = thread != null ? SuspensionSession.admittedUnder(thread, holds, work) : work.call();
             } catch (Throwable t) {
                 failure = t;
             } finally {

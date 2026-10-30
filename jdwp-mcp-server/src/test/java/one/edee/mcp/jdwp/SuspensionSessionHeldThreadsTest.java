@@ -106,7 +106,7 @@ class SuspensionSessionHeldThreadsTest {
 	}
 
 	@Test
-	@DisplayName("a leased thread keeps its stop's hold, and the share it keeps after a release is no unknown hold")
+	@DisplayName("a leased thread keeps its stop's hold; once that stop is released it is an unknown hold until the lease ends")
 	void leasedThreadCountIsNotJudged() throws Exception {
 		final SuspensionSession.Context stop = stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1);
 		session.presentCurrent();
@@ -116,11 +116,14 @@ class SuspensionSessionHeldThreadsTest {
 			.containsOnly(Map.entry(t.ref, Set.of(stop.id())));
 
 		session.releaseAll();
+		// Mid-invocation the count says nothing: a set not routed yet may keep the thread.
+		assertThat(held(false, 0)).containsOnly(Map.entry(t.ref, Set.of(SuspensionSession.UNKNOWN_HOLD)));
 		model.completeInvocation(t);
 		assertThat(t.count).as("the released stop's share waits for the lease's end").isEqualTo(1);
-		assertThat(held(false, 0)).isEmpty();
+		assertThat(held(false, 0)).containsOnly(Map.entry(t.ref, Set.of(SuspensionSession.UNKNOWN_HOLD)));
 		session.unlease(t.ref);
 		assertThat(t.count).isZero();
+		assertThat(held(false, 0)).isEmpty();
 	}
 
 	@Test

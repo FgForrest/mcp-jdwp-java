@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.Location;
+import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.ClassPrepareEvent;
@@ -18,12 +19,14 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
 
 /**
  * Who owns each suspension of one JDI connection (issue #45; {@code PROPOSAL-suspension-ownership.md}).
@@ -257,6 +260,15 @@ public final class SuspensionSession {
     }
 
     /**
+     * The thread an {@link InvocationRunner} job runs for, and the holds it was admitted under — on
+     * the job's pool thread, for {@link #lease}.
+     */
+    private static final ThreadLocal<Admitted> ADMITTED = new ThreadLocal<>();
+
+    private record Admitted(ThreadReference thread, Set<Long> holds) {
+    }
+
+    /**
      * An invocation chain on {@code thread}: the context whose suspension it borrows, the contexts it
      * took the thread out of, whether it took the thread's manual hold out too, and the shares of
      * released contexts it holds on to until it ends.
@@ -463,8 +475,10 @@ public final class SuspensionSession {
 
     /**
      * Ends processing: publishes the first candidate as a stop, or releases the set. A set of an
-     * earlier generation (reset meanwhile, or a request created before the reset) and a set that
-     * suspends nothing never publish.
+     * earlier generation (reset meanwhile, or a request created before the reset), a set that
+     * suspends nothing, and a set routed as one that never stops never publish — the last not even
+     * a handler's fail-safe stop: the redefinition rule did not count its thread, so the method it
+     * stopped in may have been redefined meanwhile, its frame obsolete.
      *
      * @return whether a stop was published
      */
@@ -482,8 +496,11 @@ public final class SuspensionSession {
         context.history.clear();
         if (current && !context.cancelled && !context.candidates.isEmpty()
             && context.policy != EventRequest.SUSPEND_NONE) {
-            publish(context);
-            return true;
+            if (context.mayStop) {
+                publish(context);
+                return true;
+            }
+            log.warn("[Suspension] {} was routed as never stopping; its handler's fail-safe stop is dropped", context);
         }
         release(context);
         if (context.vmStart) {
@@ -778,8 +795,12 @@ public final class SuspensionSession {
             if (pendingSteps.containsKey(thread)) {
                 holds.add(STEP_HOLD);
             }
-            // A leased thread's count is in flux (its invocation, the shares it keeps); its holds are known.
-            if (!leases.containsKey(thread) && suspendCountOf(thread) > suspensions) {
+            // A leased thread's count is in flux (its invocation borrows one), so the count tells
+            // nothing — its holds are known while its anchor lasts. Once the anchor was released (its
+            // share handed to the lease), no known hold explains what may still keep the thread, say
+            // a set not routed yet: it counts as unknown until the evaluation ends.
+            final Lease lease = leases.get(thread);
+            if (lease != null ? lease.debt > 0 : suspendCountOf(thread) > suspensions) {
                 holds.add(UNKNOWN_HOLD);
             }
             if (!holds.isEmpty()) {
@@ -844,13 +865,23 @@ public final class SuspensionSession {
      * <p>
      * The dispatcher may invoke on the event thread of the set it processes. Any other caller needs
      * the thread stopped at an event of its own that a tool has shown, and no set covering it still
-     * queued, processed or unseen.
+     * queued, processed or unseen. A tool's job must also still find one of the holds it was started
+     * under ({@link #admittedUnder}).
      *
      * @throws EvaluationRefusedException when the invocation is not admitted
      */
     public synchronized void lease(ThreadReference thread) {
         if (closed) {
             return;
+        }
+        // A job that outlived its tool's wait runs only at the stop it was started at: once none of
+        // its holds is left, the thread may have run on, and a later stop at the same place is
+        // another activation.
+        final Admitted admitted = ADMITTED.get();
+        if (admitted != null && admitted.thread().equals(thread) && !admitted.holds().isEmpty()
+            && Collections.disjoint(admitted.holds(), holdsOn(thread))) {
+            throw new EvaluationRefusedException("thread " + safeName(thread) + " was released from the stop this "
+                + "evaluation started at, and may have run on since — evaluate again at the stop it is at now");
         }
         final Context anchor = leaseAnchor(thread);
         final List<Context> others = new ArrayList<>();
@@ -880,6 +911,25 @@ public final class SuspensionSession {
             lease.manualExempt = true;
         }
         leases.put(thread, lease);
+    }
+
+    /**
+     * Runs an {@link InvocationRunner} job's {@code work} for {@code thread}, admitted under
+     * {@code holds} ({@link #holdsOn} when the tool started it): every lease of the thread inside is
+     * refused once none of those holds is left. Empty {@code holds} check nothing.
+     */
+    public static <T> T admittedUnder(ThreadReference thread, Set<Long> holds, Callable<T> work) throws Exception {
+        final Admitted previous = ADMITTED.get();
+        ADMITTED.set(new Admitted(thread, holds));
+        try {
+            return work.call();
+        } finally {
+            if (previous != null) {
+                ADMITTED.set(previous);
+            } else {
+                ADMITTED.remove();
+            }
+        }
     }
 
     /**
@@ -942,15 +992,18 @@ public final class SuspensionSession {
      * stuck on — from the sets holding it, when all of them are still queued or being processed:
      * nobody else can release those while the dispatcher is stuck (A1). Everything is re-checked
      * under the monitor: the invocation is still {@code token}'s; the owner is not leased, reserved,
-     * manually held, or held by a published stop; and its count is exactly those sets' holds, so
-     * they are all it waits for — a hold the session does not know (a set not routed yet, a VM-wide
-     * suspend in progress) is never released. A bystander of a stop-all joins its {@code released}
-     * and makes the stop partial; the event thread of a queued set cancels it ({@link #cancel}).
+     * manually held, or held by a published stop; its count is exactly those sets' holds, so they
+     * are all it waits for — a hold the session does not know (a set not routed yet, a VM-wide
+     * suspend in progress) is never released; and, the owner thus proven parked, it still owns
+     * {@code monitor} — not a monitor it left before it stopped at a new event. The caller keeps the
+     * invoking thread suspended meanwhile, so the invocation still waits for that monitor. A
+     * bystander of a stop-all joins its {@code released} and makes the stop partial; the event thread
+     * of a queued set cancels it ({@link #cancel}).
      *
      * @return what was released, or {@code null} when nothing was
      */
     @Nullable
-    public synchronized String unblock(Object token, ThreadReference owner) {
+    public synchronized String unblock(Object token, ThreadReference owner, ObjectReference monitor) {
         if (closed || !(token instanceof Lease lease) || leases.get(lease.thread) != lease || !lease.dispatcher
             || leases.containsKey(owner) || reserved.containsKey(owner) || manual.contains(owner)) {
             return null;
@@ -965,7 +1018,7 @@ public final class SuspensionSession {
             }
             holding.add(context);
         }
-        if (holding.isEmpty() || suspendCountOf(owner) != holding.size()) {
+        if (holding.isEmpty() || suspendCountOf(owner) != holding.size() || !owner.equals(owningThreadOf(monitor))) {
             return null;
         }
         final List<String> from = new ArrayList<>();
@@ -984,6 +1037,15 @@ public final class SuspensionSession {
         history.record(new EventHistory.DebugEvent("EVALUATION_UNBLOCKED", "The watchdog released " + summary,
             Map.of("thread", safeName(owner), "evaluatingThread", safeName(lease.thread))));
         return summary;
+    }
+
+    @Nullable
+    private static ThreadReference owningThreadOf(ObjectReference monitor) {
+        try {
+            return monitor.owningThread();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

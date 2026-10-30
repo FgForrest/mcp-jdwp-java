@@ -1,8 +1,10 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -170,6 +172,18 @@ class SuspensionSessionUnblockTest {
 	}
 
 	@Test
+	@DisplayName("an owner that no longer owns the monitor is not released: it left it before it stopped again")
+	void ownerThatLeftTheMonitorIsLeftAlone() throws Exception {
+		processing(t, EventRequest.SUSPEND_ALL);
+		final SuspensionSession.Invocation invocation = invoking(t);
+
+		assertThat(unblock(invocation, u.ref, monitorOwnedBy(null))).isNull();
+		assertThat(unblock(invocation, u.ref, monitorOwnedBy(w.ref))).isNull();
+		assertThat(u.count).isEqualTo(1);
+		assertThat(types()).doesNotContain("EVALUATION_UNBLOCKED");
+	}
+
+	@Test
 	@DisplayName("a set whose handling needs its thread stopped (a fast breakpoint's stop) is never cancelled")
 	void keepsThreadSetIsNeverCancelled() throws Exception {
 		processing(t, EventRequest.SUSPEND_EVENT_THREAD);
@@ -200,7 +214,18 @@ class SuspensionSessionUnblockTest {
 	 * plays the dispatcher, whose history entries are buffered until its set finishes.
 	 */
 	private String unblock(SuspensionSession.Invocation invocation, ThreadReference owner) throws Exception {
-		return CompletableFuture.supplyAsync(() -> session.unblock(invocation.token(), owner)).get();
+		return unblock(invocation, owner, monitorOwnedBy(owner));
+	}
+
+	private String unblock(SuspensionSession.Invocation invocation, ThreadReference owner, ObjectReference monitor)
+		throws Exception {
+		return CompletableFuture.supplyAsync(() -> session.unblock(invocation.token(), owner, monitor)).get();
+	}
+
+	private static ObjectReference monitorOwnedBy(@Nullable ThreadReference owner) throws Exception {
+		final ObjectReference monitor = mock(ObjectReference.class);
+		when(monitor.owningThread()).thenReturn(owner);
+		return monitor;
 	}
 
 	/**

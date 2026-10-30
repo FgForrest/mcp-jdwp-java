@@ -75,6 +75,24 @@ class SuspensionWatchdogTest {
 	}
 
 	@Test
+	@DisplayName("an owner that left the monitor between the query and the decision is not released")
+	void ownerThatLeftTheMonitorIsLeftAlone() throws Exception {
+		final ObjectReference monitor = mock(ObjectReference.class);
+		// Owned by u when asked; by the time the session decides, u has left it (and may have stopped elsewhere).
+		when(monitor.owningThread()).thenReturn(u.ref, (ThreadReference) null);
+		when(t.ref.currentContendedMonitor()).thenReturn(monitor);
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		watchdog.tick();
+		advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		watchdog.tick();
+
+		assertThat(u.count).isEqualTo(1);
+		assertThat(model.invocationRuns(t)).as("the brief suspension around the query is undone").isTrue();
+	}
+
+	@Test
 	@DisplayName("a young invocation is not sampled, however blocked")
 	void youngInvocationIsLeftAlone() throws Exception {
 		t.status = ThreadReference.THREAD_STATUS_MONITOR;

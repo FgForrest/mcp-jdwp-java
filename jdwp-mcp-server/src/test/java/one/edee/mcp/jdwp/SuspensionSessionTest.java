@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -156,6 +157,49 @@ class SuspensionSessionTest {
 		assertThat(session.finish(context)).isFalse();
 		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
 		assertThat(history.getRecent(10)).as("the stale history is dropped").isEmpty();
+	}
+
+	@Test
+	@DisplayName("a tool's job admitted at one stop cannot lease its thread at the next: it may have run on in between")
+	void jobLeasesOnlyAtTheStopItWasAdmittedAt() throws Exception {
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1);
+		session.presentCurrent();
+		final Set<Long> holds = session.holdsOn(t.ref);
+		SuspensionSession.admittedUnder(t.ref, holds, () -> {
+			session.lease(t.ref);
+			session.unlease(t.ref);
+			return null;
+		});
+
+		// The tool's wait ended; the user released the stop, and t stopped again at the same place.
+		session.releaseAll();
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1);
+		session.presentCurrent();
+		assertThatThrownBy(() -> SuspensionSession.admittedUnder(t.ref, holds, () -> {
+			session.lease(t.ref);
+			return null;
+		})).isInstanceOf(EvaluationRefusedException.class).hasMessageContaining("was released from the stop");
+		assertThat(t.count).isEqualTo(1);
+
+		// A new tool call is admitted at the new stop.
+		session.lease(t.ref);
+		session.unlease(t.ref);
+	}
+
+	@Test
+	@DisplayName("a set routed as never stopping does not publish a handler's fail-safe stop: it is released, its history kept")
+	void neverStoppingSetIsReleased() {
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false, false);
+		session.begin(context);
+		// A field logpoint whose handler failed and fell back to a stop.
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 1));
+		session.record(context, new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR", "failed"));
+
+		assertThat(session.finish(context)).isFalse();
+		assertThat(session.unseenCount()).isZero();
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+		assertThat(history.getRecent(10)).extracting(EventHistory.DebugEvent::type).containsExactly("FIELD_LOGPOINT_ERROR");
 	}
 
 	@Test

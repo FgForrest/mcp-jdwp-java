@@ -127,11 +127,7 @@ public final class SuspensionWatchdog {
         if (monitorSamples.merge(token, 1, Integer::sum) < MONITOR_SAMPLES) {
             return;
         }
-        final ThreadReference owner = monitorOwner(invocation.thread());
-        if (owner == null) {
-            return;
-        }
-        final String released = session.unblock(token, owner);
+        final String released = unblock(token, invocation.thread());
         if (released != null) {
             monitorSamples.remove(token);
             log.info("[Watchdog] Released {}", released);
@@ -147,16 +143,20 @@ public final class SuspensionWatchdog {
     }
 
     /**
-     * The owner of the monitor {@code thread} is blocked on, asked for during a brief, balanced
-     * suspension of the thread (JDI answers only for a suspended thread); {@code null} when unknown.
+     * Asks which monitor the invoking {@code thread} is blocked on and who owns it, and lets the
+     * session release that owner — all during one brief, balanced suspension of the thread (JDI
+     * answers only for a suspended thread). Suspended, the thread cannot take the monitor and move
+     * on before the decision, and the session confirms the owner still owns it once the owner is
+     * proven parked. {@code null} when nothing was released.
      */
     @Nullable
-    private static ThreadReference monitorOwner(ThreadReference thread) {
+    private String unblock(Object token, ThreadReference thread) {
         try {
             thread.suspend();
             try {
                 final ObjectReference monitor = thread.currentContendedMonitor();
-                return monitor != null ? monitor.owningThread() : null;
+                final ThreadReference owner = monitor != null ? monitor.owningThread() : null;
+                return owner != null ? session.unblock(token, owner, monitor) : null;
             } finally {
                 thread.resume();
             }
