@@ -164,8 +164,8 @@ Routing in step 3 happens on the listener thread, processing on the event dispat
 mcp-jdwp-java/
 ├── pom.xml                    Maven reactor
 ├── mvnw / mvnw.cmd            Maven wrapper (pinned 3.9.x)
-├── .mcp.json                  Claude Code MCP registration
-├── hooks/hooks.json           SessionStart auto-build hook
+├── .claude-plugin/plugin.json plugin manifest + MCP server registration
+├── hooks/                     SessionStart auto-build hook (hooks.json → ensure-server-jar.sh)
 ├── docs/                      ← you are here
 ├── jdwp-mcp-server/           the real MCP server
 │   ├── pom.xml                NullAway + Error Prone wired into javac

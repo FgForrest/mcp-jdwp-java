@@ -117,7 +117,7 @@ The classification matters because `LISTENING` and `SUSPENDED` both mean "you ca
 
 **No rotation, no size cap, no time-based roll.** Long-running sessions grow the log file unbounded. For automation, plan an external `logrotate` or a launcher that truncates between runs.
 
-The `.mcp.json` shipped with the plugin (`/.mcp.json:7`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log`. Rationale: when launched as a Claude Code plugin, the log should live next to the plugin install rather than in the user's working directory. When the JAR is launched directly without that flag, the log falls back to `${java.io.tmpdir}`. Documented inline at `application.properties:12-18`.
+The plugin's MCP server entry (`mcpServers` in `.claude-plugin/plugin.json`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log`. Rationale: when launched as a Claude Code plugin, the log should live next to the plugin install rather than in the user's working directory. When the JAR is launched directly without that flag, the log falls back to `${java.io.tmpdir}`. Documented inline at `application.properties:12-18`.
 
 ### A stale logger override
 
@@ -172,7 +172,7 @@ The classes checked are `VMDisconnectedException`, `SocketException`, `EOFExcept
 
 ## 6. MCP timeouts — `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT`
 
-Both are **client-side** Claude Code timeouts, set in `.mcp.json:11-12` (`30000` and `120000` ms respectively). They do not appear in the Java code — `grep` returns zero hits across the server source. The reasoning lives at `README.md:79`:
+Both are **client-side** Claude Code timeouts, set in the `env` of the plugin's MCP server entry in `.claude-plugin/plugin.json` (`30000` and `120000` ms respectively). They do not appear in the Java code — `grep` returns zero hits across the server source. The reasoning lives at `README.md:79`:
 
 - `MCP_TIMEOUT=30000` — Spring Boot context init plus JDI module load takes several seconds. The default Claude Code stdio timeout is too short for a Spring Boot Java process; without this, Claude Code gives up before the server is ready.
 - `MCP_TOOL_TIMEOUT=120000` — first-time `jdwp_evaluate_expression` walks the target classloader hierarchy, calls `JdkDiscoveryService`, and compiles a wrapper class with Eclipse JDT. That first call can run for many seconds; subsequent calls hit the compilation cache and are fast.
@@ -188,25 +188,28 @@ Two `@McpResource`-annotated methods on `JDWPTools` expose read-only resources:
 
 The annotation is `org.springframework.ai.mcp.annotation.McpResource` (`JDWPTools.java:17`). Resources are discovered automatically by Spring AI via the same `spring.ai.mcp.server.enabled=true` flag that picks up `@McpTool`. Resource updates are **not pushed** to the client — re-attach the URI to see fresh content.
 
-## 8. `.mcp.json` and the SessionStart hook
+## 8. The MCP server entry and the SessionStart hook
 
-Two adjacent files at the repo root configure the plugin lifecycle.
+Two files configure the plugin lifecycle.
 
-### `.mcp.json`
+### `mcpServers` in `.claude-plugin/plugin.json`
 
-17 lines. Registers the `jdwp-inspector` MCP server with a `java --add-modules jdk.jdi,jdk.attach -jar …` command. Sets `-DLOG_PATH` and the two timeout env vars. The `${CLAUDE_PLUGIN_ROOT}` expansion is what makes the plugin relocatable — log path, JAR path, and any other paths resolve to the plugin install directory regardless of where Claude Code is launched.
+Registers the `jdwp-inspector` MCP server with a `java --add-modules jdk.jdi,jdk.attach -jar …` command. Sets `-DLOG_PATH` and the two timeout env vars. The `${CLAUDE_PLUGIN_ROOT}` expansion is what makes the plugin relocatable — log path, JAR path, and any other paths resolve to the plugin install directory regardless of where Claude Code is launched.
 
-### `hooks/hooks.json`
+The entry lives in the manifest rather than in a root `.mcp.json` on purpose: Claude Code also reads a root `.mcp.json` as the *project* MCP config of a checkout of this repository, where `${CLAUDE_PLUGIN_ROOT}` does not expand, so contributors got a broken project-level `jdwp-inspector` next to the plugin's.
 
-15 lines, one hook: a `SessionStart` shell command that **rebuilds the JAR on session start when needed**. The command:
+### `hooks/hooks.json` and `hooks/ensure-server-jar.sh`
 
-1. Resolves `$JAR = $PLUGIN/jdwp-mcp-server/target/mcp-jdwp-java.jar` and `$MARKER = $PLUGIN/jdwp-mcp-server/target/.build-sha`.
-2. Computes `EXPECTED = git rev-parse HEAD` (falls back to `no-git` if not in a checkout).
-3. Computes `ACTUAL = cat $MARKER`.
-4. If the JAR is missing or `EXPECTED != ACTUAL`, rebuilds via `$PLUGIN/mvnw -pl jdwp-mcp-server -am package -DskipTests -q` and writes `EXPECTED` to `.build-sha`.
-5. Otherwise, no-op.
+One `SessionStart` hook runs `hooks/ensure-server-jar.sh`, which **rebuilds the JAR on session start when needed**:
 
-Net effect: every session launches against a JAR built from the current commit, with a fast-path when nothing has changed. The hook depends on `JAVA_HOME` pointing at a JDK 17+, but does not require Maven to be installed — `./mvnw` is the bundled wrapper.
+1. Computes `EXPECTED = git rev-parse HEAD` (falls back to `no-git` outside a checkout — the plugin cache copy has no `.git`).
+2. Does nothing if `jdwp-mcp-server/target/mcp-jdwp-java.jar` exists and `jdwp-mcp-server/target/.build-sha` equals `EXPECTED`.
+3. Otherwise takes a lock (`target/.build-lock` holding the hook's PID, so parallel sessions do not run Maven in the same `target/`; a lock whose owner is dead, or older than 30 minutes, is broken), moves the old JAR aside to `mcp-jdwp-java.jar.prev`, and runs `package -DskipTests -pl jdwp-mcp-server -am` with `./mvnw`, then `mvn -o`, then `mvn`, stopping at the first success. The wrapper fails when it cannot install Maven under a read-only `~/.m2`; offline goes before online because it needs no network and fails fast when the local repository lacks something.
+4. On success, deletes the `.prev` JAR and writes `EXPECTED` to `.build-sha`. On failure, puts the `.prev` JAR back (or removes whatever the build left), so no partial JAR stays at the launch path, and leaves the marker alone so the next session tries again.
+
+Maven output goes to `jdwp-mcp-server/target/server-build.log`. When the hook built something or failed, it prints one JSON object: `systemMessage` is shown to the user (on failure: what failed, the log path and the exact command to build by hand) and `additionalContext` tells Claude the same. Claude Code starts plugin MCP servers while SessionStart hooks still run, and the launch path is empty for the whole build, so in a session that builds `jdwp-inspector` may have failed to start; the message says to reconnect it in `/mcp`. A server started from the old JAR keeps running from `.prev` (moved, never overwritten); the hook deletes `.prev` once the new JAR is in place.
+
+The hook needs a JDK 21+ for the build (`JAVA_HOME` or `java` on `PATH`), but not a Maven install — `./mvnw` is the bundled wrapper.
 
 ## 9. The diagnostic mental model
 

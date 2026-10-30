@@ -24,7 +24,7 @@ The point is: tool calls do not run concurrently with each other. Event sets do 
 `application.properties:9` sets `spring.ai.mcp.server.type=SYNC`. The Spring AI MCP framework serialises tool invocations on the STDIO dispatch thread. Implications:
 
 - **Request order = execution order = response order.** No reordering, no interleaved responses, no out-of-order replies. The client always sees responses in the order it issued requests.
-- **A long tool call blocks the next one.** `jdwp_evaluate_expression` on a cold cache (classpath discovery + ECJ compilation) can take many seconds; nothing else moves until it returns. The MCP_TOOL_TIMEOUT in `.mcp.json` is sized for this (120 s). Tools that invoke in the target wait at most 20 s for it (§ 5), so a blocked invocation cannot take the user's tools away.
+- **A long tool call blocks the next one.** `jdwp_evaluate_expression` on a cold cache (classpath discovery + ECJ compilation) can take many seconds; nothing else moves until it returns. The MCP_TOOL_TIMEOUT in the plugin's MCP server entry (`.claude-plugin/plugin.json`) is sized for this (120 s). Tools that invoke in the target wait at most 20 s for it (§ 5), so a blocked invocation cannot take the user's tools away.
 - **No reactor pool, no Netty.** Consistent with `web-application-type=none`. The JVM stays small.
 
 The trade is simpler reasoning about state. We do not have to defend `BreakpointTracker.registerBreakpoint` against being called twice in parallel from two tool calls because that cannot happen.

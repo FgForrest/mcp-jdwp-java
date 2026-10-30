@@ -3,5 +3,19 @@
   "description": "Java JDWP debugger via MCP — set breakpoints, inspect runtime state, evaluate expressions, mutate variables, catch exceptions at throw site, trace execution with logpoints.",
   "author": {
     "name": "Jan (Novoj) Novotný"
+  },
+  "mcpServers": {
+    "jdwp-inspector": {
+      "command": "java",
+      "args": [
+        "--add-modules", "jdk.jdi,jdk.attach",
+        "-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log",
+        "-jar", "${CLAUDE_PLUGIN_ROOT}/jdwp-mcp-server/target/mcp-jdwp-java.jar"
+      ],
+      "env": {
+        "MCP_TIMEOUT": "30000",
+        "MCP_TOOL_TIMEOUT": "120000"
+      }
+    }
   }
 }

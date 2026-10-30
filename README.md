@@ -35,20 +35,20 @@ This MCP server runs **entirely on your local machine**:
 - **JDK 17+** on PATH to **run** the server (must be a JDK, not a JRE — JDI lives in `jdk.jdi`).
 - **JDK 21+ to build from source** — the build toolchain pins to JDK ≥ 21 because Error Prone 2.48 ships Java-21 bytecode. The bytecode target stays at Java 17, so the resulting JAR still runs on a JDK 17 runtime.
 
-No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. The SessionStart hook and every build command in this README use the wrapper.
+No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. Every build command in this README uses the wrapper; the SessionStart hook does too, and falls back to `mvn` on `PATH` when the wrapper cannot set itself up.
 
 ### 1. Install the plugin
 
 **Option A: Plugin marketplace (recommended)**
 
-Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, gotchas), and the `.mcp.json` configuration in one step:
+Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, gotchas), and the MCP server registration in one step:
 
 ```bash
 /plugin marketplace add https://github.com/FgForrest/mcp-jdwp-java.git
 /plugin install jdwp-debugging@mcp-jdwp-java
 ```
 
-The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 17+ on PATH — no Maven install needed). The hook is content-aware: it rebuilds when `git HEAD` moves, not just when the JAR is missing, so `git pull` + restart picks up updates without manual intervention. Restart Claude Code to pick up the plugin.
+The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 21+ — no Maven install needed). The hook is content-aware: it rebuilds when the JAR is missing or, in a git checkout, when `HEAD` moves, so `git pull` + restart picks up updates without manual intervention. When the wrapper cannot set itself up (for example, `~/.m2` is read-only in a sandbox), the hook tries `mvn -o` and then `mvn` from `PATH`. If every attempt fails, a warning at session start names the build log and the exact command to build by hand. A build runs while Claude Code starts the MCP server and the JAR is absent until it finishes, so after a build (first install, update, moved `HEAD`) `jdwp-inspector` may show as failed in `/mcp`; reconnect it there once the build is done. Restart Claude Code to pick up the plugin.
 
 <details>
 <summary><strong>Alternative: manual MCP registration (without plugin)</strong></summary>
@@ -903,12 +903,12 @@ mcp-jdwp-java/
 ├── mvnw / mvnw.cmd                      # Maven wrapper
 ├── README.md
 ├── CHANGELOG.md
-├── .mcp.json                            # MCP server configuration
 ├── .claude-plugin/
-│   ├── plugin.json                      # Claude Code plugin metadata
+│   ├── plugin.json                      # Claude Code plugin metadata + MCP server configuration
 │   └── marketplace.json                 # Plugin marketplace registry
 ├── hooks/
-│   └── hooks.json                       # SessionStart hook: auto-builds JAR if missing or git HEAD moved
+│   ├── hooks.json                       # SessionStart hook registration
+│   └── ensure-server-jar.sh             # Auto-builds the JAR if missing or git HEAD moved
 ├── skills/
 │   ├── java-debug/                      # Debugging skill (workflows, recipes, gotchas)
 │   └── release/                         # Release-cutting skill
@@ -988,6 +988,8 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | `tools.jar not found` / `jdk.jdi not available` | Ensure `JAVA_HOME` points to a JDK, not a JRE. Launch with `--add-modules jdk.jdi`.                                                                                 |
 | Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check port matches `-DJVM_JDWP_PORT`.                                                                     |
 | MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                   |
+| `jdwp-debugging: could not build the MCP server JAR` at session start | The plugin's SessionStart hook tried `./mvnw`, `mvn -o` and `mvn`. Read the build log the message names, run the command it gives (it also writes the `.build-sha` marker), then reconnect `jdwp-inspector` in `/mcp`. |
+| `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`. |
 | MCP server times out on startup                 | JVM startup takes several seconds. Ensure `MCP_TIMEOUT=30000` (or higher) is set in the MCP registration — the default is too short for a Spring Boot Java process. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | Expression evaluation timeout                   | First evaluation is slow (classpath discovery). Increase `MCP_TOOL_TIMEOUT`. Subsequent evaluations use cache.                                                      |
