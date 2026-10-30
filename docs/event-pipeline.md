@@ -183,7 +183,7 @@ For each event type, the handler returns `true` (it wants a stop: its candidate 
 | `VMStartEvent` | always | **true** | `VM_START` candidate: the VM stays suspended so the agent can set up. Not invocable — an evaluation needs a later stop (§ 14) |
 | `VMDisconnect` / `VMDeath` | always | exits loop | Death set only, processed on the listener without a context; sets `running=false`, runs the death hook |
 
-Fast logpoints and fast breakpoints are decided by `FastLogpointService` (`handleArmingHit` → `STOPPED` / `RESUME`, `handleStopHit`) under the same candidate rules; see [breakpoints.md](breakpoints.md) § 5a.
+Fast logpoints and fast breakpoints are decided by `FastLogpointService` (`handleArmingHit` → `STOPPED` / `RESUME`, `handleStopHit`) under the same candidate rules; see [breakpoints.md](breakpoints.md) § 5a and § 5c. Arming and removal never redefine a method a held thread is in (§ 5d).
 
 A few things stand out from the matrix:
 
@@ -238,7 +238,7 @@ RECONNECT, VM_START, VM_DEATH,
 STEP_INTERRUPTED, EVENT_CANCELLED, EVALUATION_UNBLOCKED, EVALUATION_COMPLETED_LATE,
 FAST_LOGPOINT, FAST_LOGPOINT_ERROR, FAST_LOGPOINT_DROPPED, FAST_LOGPOINT_RESTORED,
 FAST_BREAKPOINT, FAST_BREAKPOINT_ERROR, FAST_BREAKPOINT_STALE, FAST_BREAKPOINT_SUPPRESSED,
-FAST_LOGPOINT_* and FAST_BREAKPOINT_* with ARMED, ARM_FAILED, DISARMED, WARNING, RECOVERED
+FAST_LOGPOINT_* and FAST_BREAKPOINT_* with ARMED, ARM_FAILED, ARMING_DEFERRED, REMOVAL_DEFERRED, DISARMED, WARNING, RECOVERED
 ```
 
 The list is what production code emits (`new EventHistory.DebugEvent(` across the main sources; the last line's types are built from the fast kind's prefix). The four suspension-ownership types:

@@ -209,6 +209,25 @@ This is a situational tool, not an upgrade: `jdwp_set_logpoint` stays the defaul
 - `STRANDED` — the class changed after the probe was installed, or its wiring is unknown. Only `jdwp_clear_breakpoint(id)` (the kill switch) is offered; the injected call stays until the JVM restarts.
 - A class with leftovers refuses new fast logpoints until they are restored; use `jdwp_set_logpoint` meanwhile.
 
+### "Stop only on the rare bad case in a hot path" — fast breakpoint (rare, needs the user's consent)
+
+A conditional `jdwp_set_breakpoint` evaluates its condition through the server on every hit — milliseconds each, one hit at a time — and a method holding a breakpoint is never JIT-compiled. On a hot path where the condition is rarely true, the run slows from seconds to hours, and a race you are chasing stops happening. `jdwp_set_fast_breakpoint(className, lineNumber, condition, suspendPolicy?, stopOnce?)` evaluates the condition **inside the target JVM** and stops only when it holds; the method keeps running compiled.
+
+Same rule as for the fast logpoint: `jdwp_set_breakpoint` with a condition stays the default. Use the fast variant only when going through the debugger on every hit would distort the behaviour under investigation.
+
+**Consent protocol — the fast logpoint's, unchanged:** call it without `userApproved`, relay the risk briefing to the user word for word, and call again with the same arguments and `userApproved=true` only after the user explicitly agreed in this conversation. Never infer or reuse consent. If the user declines, use `jdwp_set_breakpoint` with the condition.
+
+**Then:**
+- The class must already be loaded (or pass `forceLoad=true`). The next hit of the line evaluates the condition through the debugger: if it holds, that hit is the stop; otherwise the probe is installed then.
+- Wait with `jdwp_resume_until_event`. The report says `fast_breakpoint=N, condition true`, or `condition failed: <text>` — a condition that throws stops once; later failures are only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
+- `suspendPolicy="all"` (default) parks every thread, but the other threads a moment after the hitting one, so they may have moved past the state you want; `"thread"` parks only the hitting thread.
+- `stopOnce=true` (default): only the first hit that meets the condition stops. To catch the next one, call the tool again with exactly the same arguments — that re-arms it under the same ID. `stopOnce=false`: every such hit stops.
+- At the stop, frame #0 is your method: the probe's frames are hidden. Stack, locals, `jdwp_evaluate_expression`, `jdwp_set_local` and steps work as at any breakpoint; a step first lands on the stop line itself. On a virtual thread, `jdwp_set_local` needs one step first.
+- The condition runs unsynchronized on every thread that passes the line: thread-safe, free of side effects, possibly reading stale values. Locals, `this` and non-private members are reachable; private fields are not.
+- Watchers attach by the fast breakpoint's ID (`jdwp_attach_watcher`) and evaluate at the stop. Chains (`jdwp_set_breakpoint_dependency`, `triggerBreakpointId`) refuse fast breakpoints.
+- Clear it as soon as you have your answer: `jdwp_clear_breakpoint(id)`. While a thread is stopped in the method, the clear only switches it off — the class is restored once `jdwp_resume` releases that thread, and the reply says so. `jdwp_reset` restores at once.
+- Leftovers of an earlier session are handled as for fast logpoints (above); a leftover fast breakpoint never stops.
+
 ### "Track a specific instance across many breakpoints"
 
 You found the interesting object at one breakpoint (a particular `Cart`, `Session`, `User`, etc.) and want to reference it by name later — in conditions, in logpoint expressions, in watchers — even from frames where the variable name is different or absent.
@@ -307,7 +326,7 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 - **Exception breakpoints on bootstrap classes** (`NullPointerException`, `IllegalStateException`, etc.) start as `[PENDING]`. They auto-promote when any tool runs while a thread is suspended at a breakpoint. Pair with a regular line BP upstream — see the "Exception buried under wrappers" recipe.
 - **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but no thread is at a breakpoint yet. `evaluate_expression`, `to_string`, and `set_exception_breakpoint` cannot work until at least one BP has been hit. Set breakpoints first, then resume.
 - **First `evaluate_expression` is slow** (~1-3s) — the expression compiler discovers the target's classpath lazily. Subsequent evals are fast (cached).
-- **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations. If the per-hit pause itself is the problem (a race that disappears under a logpoint), see the fast-logpoint recipe — but only with the user's explicit consent.
+- **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations. If the per-hit pause itself is the problem (a race that disappears under a logpoint), see the fast-logpoint recipe — but only with the user's explicit consent. The same goes for a conditional breakpoint on a hot line whose condition is rarely true: see the fast-breakpoint recipe.
 - **Field watchpoints are expensive.** Each access/modification of a watched field traps into the debugger; on a hot field this can dominate target-VM CPU. Use the narrowest mode that answers your question (`modification` is usually enough), and add `threadFilterId` / `objectFilterId` / `condition` to scope the catches. `jdwp_diagnose` reports `canWatchFieldAccess` / `canWatchFieldModification` plus this warning when connected. Pending field BPs registered before class load promote synchronously on `ClassPrepareEvent`, so `<clinit>` writes are caught.
 - **Short-running tests can finish before a watchpoint suspends.** A field watchpoint (or any breakpoint armed late) on a test that completes in milliseconds can race `VM_DEATH`: the write happens, but the test tears the VM down before the suspend lands, so `jdwp_resume_until_event` returns `[VM_DEATH]` with no usable stop. **Set a line breakpoint at the failing assertion first, as a safety net,** then add the field watchpoint. The assertion BP guarantees at least one inspectable stop even if the watchpoint loses the race, and you can still read the write's effect from there. The deeper fix for a sub-second test: launch it with `suspend=y` (e.g. `-Dmaven.surefire.debug`) and attach with `jdwp_wait_for_attach` — the JVM blocks at VM_START until you've armed every breakpoint, so a fast test can't tear the VM down before your setup lands.
 - **`$newValue` is bound on both halves of a `mode="both"` field watchpoint.** On a modification event it is the value-to-be; on an access event it is bound as `null` (there is no incoming value). So an expression like `"$oldValue + \" -> \" + $newValue"` renders `… -> null` on reads instead of failing — you do **not** need two separate `access` / `modification` logpoints just to keep the expression compiling.
@@ -339,7 +358,7 @@ After any step, `jdwp_resume_until_event` blocks until the `STEP` event lands. T
 
 ## Inspecting and clearing debug state
 
-Use `jdwp_overview()` for a unified read of every kind of debug state (breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, watchers, marked instances) in one call. Filter by type (`types="breakpoint,watcher"`) or by substring (`filter="Cart"`).
+Use `jdwp_overview()` for a unified read of every kind of debug state (breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, fast breakpoints, watchers, marked instances) in one call. Filter by type (`types="breakpoint,watcher"`) or by substring (`filter="Cart"`).
 
 To bulk-clear: `jdwp_clear(types="...", filter="...")`. The `types` parameter is required so an empty call cannot wipe everything. To preview a clear safely, call `jdwp_overview` with the same `types`/`filter` first — the matching rows are exactly what `jdwp_clear` would remove. Per-id clears still go through `jdwp_clear_breakpoint(id)` / `jdwp_detach_watcher(id)`.
 

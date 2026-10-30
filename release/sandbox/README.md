@@ -155,7 +155,7 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 ### #10 The Oversold House
 
-**Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 3
+**Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 4
 
 **Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
 
