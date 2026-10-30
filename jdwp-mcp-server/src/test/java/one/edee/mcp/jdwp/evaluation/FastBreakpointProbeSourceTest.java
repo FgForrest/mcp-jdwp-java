@@ -105,6 +105,34 @@ class FastBreakpointProbeSourceTest {
 	}
 
 	@Test
+	@DisplayName("a failure of an evaluation that started before a re-arm cannot claim the error generation the re-arm opened")
+	void errorClaimsTheGenerationReadBeforeEvaluating() throws Exception {
+		// The first evaluation re-arms the error gate (as the server would, concurrently) and then fails.
+		final Probe probe = compile("{ if (i == 1) { ERROR_EPOCH = 2; } return label.isEmpty(); }", false);
+		probe.hit(1, null);
+		assertThat(probe.stops()).isEqualTo(1);
+		assertThat(probe.int32(FastBreakpointProbeSource.ERROR_CLAIMED_FIELD)).isEqualTo(1);
+
+		// The generation the re-arm opened is still unclaimed: the next failure stops.
+		probe.hit(2, null);
+		assertThat(probe.stops()).isEqualTo(2);
+		assertThat(probe.int32(FastBreakpointProbeSource.ERROR_CLAIMED_FIELD)).isEqualTo(2);
+	}
+
+	@Test
+	@DisplayName("stop() is empty: the breakpoint's step into it has nothing to enter")
+	void stopMethodIsEmpty() throws Exception {
+		final Probe probe = compile("true", false);
+		final Method stop = probe.type().getMethod(FastBreakpointProbeSource.STOP_METHOD, int.class, int.class,
+			String.class);
+		stop.invoke(null, FastBreakpointProbeSource.STOP_CONDITION_TRUE, 1, null);
+		assertThat(probe.stops()).as("only hit() counts stops").isZero();
+
+		probe.hit(1, "x");
+		assertThat(probe.stops()).isEqualTo(1);
+	}
+
+	@Test
 	@DisplayName("an error stop does not spend the true-hit allowance of once mode")
 	void errorGateIsSeparate() throws Exception {
 		final Probe probe = compile("label.length() > 0", true);

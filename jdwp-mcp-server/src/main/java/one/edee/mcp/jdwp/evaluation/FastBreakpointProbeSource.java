@@ -31,7 +31,9 @@ import static one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource.literal;
  *       new generation. The true-hit gate is used in once mode only; the first error of each error
  *       generation stops in both modes, later ones are only recorded.</li>
  *   <li>{@value #TRUE_HITS_FIELD}, {@value #ERRORS_FIELD}, {@value #STOPS_FIELD} — counters: the
- *       condition held, the condition failed, {@code stop()} was reached.</li>
+ *       condition held, the condition failed, {@code stop()} was called. The stop count is taken just
+ *       before the call, so {@code stop()} stays empty: a step into it from the stop has nothing to
+ *       enter.</li>
  * </ul>
  * The ring buffer holds condition failures only ({@code C} entries). The failure text is also
  * passed to {@code stop()}, so the stop reports it even after its ring slot was overwritten. Nothing
@@ -141,6 +143,9 @@ public final class FastBreakpointProbeSource {
             .append("            return;\n")
             .append("        }\n")
             .append("        final int __mcpEpoch = ").append(EPOCH_FIELD).append(";\n")
+            // Read before the condition runs, like the true-hit generation: a failure of an evaluation
+            // that started before a re-arm must not claim the error generation the re-arm opened.
+            .append("        final int __mcpErrorEpoch = ").append(ERROR_EPOCH_FIELD).append(";\n")
             .append("        if (").append(ONCE_FIELD).append(" && ").append(CLAIMED_FIELD).append(".get() >= __mcpEpoch) {\n")
             .append("            return;\n")
             .append("        }\n")
@@ -148,11 +153,11 @@ public final class FastBreakpointProbeSource {
             .append("        try {\n")
             .append("            __mcpPassed = __mcpCondition(").append(arguments).append(");\n")
             .append("        } catch (Throwable __mcpFailure) {\n")
-            .append("            __mcpError(__mcpFailure, null);\n")
+            .append("            __mcpError(__mcpFailure, null, __mcpErrorEpoch);\n")
             .append("            return;\n")
             .append("        }\n")
             .append("        if (!(__mcpPassed instanceof Boolean)) {\n")
-            .append("            __mcpError(null, __mcpPassed);\n")
+            .append("            __mcpError(null, __mcpPassed, __mcpErrorEpoch);\n")
             .append("            return;\n")
             .append("        }\n")
             .append("        if (!((Boolean) __mcpPassed).booleanValue()) {\n")
@@ -162,25 +167,26 @@ public final class FastBreakpointProbeSource {
             .append("        if (").append(ONCE_FIELD).append(" && !__mcpClaim(").append(CLAIMED_FIELD).append(", __mcpEpoch)) {\n")
             .append("            return;\n")
             .append("        }\n")
+            .append("        ").append(STOPS_FIELD).append(".incrementAndGet();\n")
             // Last statement: a step from the stop leaves hit() without running anything else of it.
             .append("        ").append(STOP_METHOD).append('(').append(STOP_CONDITION_TRUE).append(", __mcpEpoch, null);\n")
             .append("    }\n\n")
+            // Empty: the breakpoint sits on its only instruction, and a step into it enters nothing.
             .append("    public static void ").append(STOP_METHOD).append("(int kind, int epoch, String error) {\n")
-            .append("        ").append(STOPS_FIELD).append(".incrementAndGet();\n")
             .append("    }\n\n")
             .append("    private static Object __mcpCondition(").append(declaredParameters).append(") {\n")
             .append(JdiExpressionEvaluator.generateMethodBody(condition))
             .append("    }\n\n")
-            // Records a failed condition and stops on the first failure of the error generation. Never
-            // throws: at worst the record is missing.
-            .append("    private static void __mcpError(Throwable failure, Object result) {\n")
+            // Records a failed condition and stops on the first failure of error generation epoch, read
+            // before the condition ran. Never throws: at worst the record is missing.
+            .append("    private static void __mcpError(Throwable failure, Object result, int epoch) {\n")
             .append("        try {\n")
             .append("            ").append(ERRORS_FIELD).append(".incrementAndGet();\n")
             .append("            final String text = failure != null ? __mcpDescribe(failure)\n")
             .append("                : \"condition did not evaluate to a boolean: \" + __mcpRender(result);\n")
             .append("            __mcpRecord('C', text);\n")
-            .append("            final int epoch = ").append(ERROR_EPOCH_FIELD).append(";\n")
             .append("            if (__mcpClaim(").append(ERROR_CLAIMED_FIELD).append(", epoch)) {\n")
+            .append("                ").append(STOPS_FIELD).append(".incrementAndGet();\n")
             .append("                ").append(STOP_METHOD).append('(').append(STOP_CONDITION_ERROR).append(", epoch, text);\n")
             .append("            }\n")
             .append("        } catch (Throwable ignored) {\n")

@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import one.edee.mcp.jdwp.evaluation.FastBreakpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
 import one.edee.mcp.jdwp.fastlogpoint.LeftoverClassifier.Kind;
 import one.edee.mcp.jdwp.fastlogpoint.LeftoverClassifier.Probe;
@@ -151,10 +152,32 @@ class LeftoverClassifierTest {
 	@Test
 	@DisplayName("a probe of an unknown format the class calls: STRANDED, kill switch only")
 	void unknownFormat() {
-		final Result result = classify(List.of(new Probe(A, FastLogpointProbeSource.FORMAT + 1, true, RECORD_KEY)),
+		final Result result = classify(List.of(new Probe(A, FastLogpointProbeSource.FORMAT + 1, true, RECORD_KEY,
+				FastLogpointProbeSource.KIND)),
 			INSTALLED, Set.of(A), record(A));
 		assertThat(kind(result, A)).isEqualTo(Kind.STRANDED);
 		assertThat(result.verdicts().get(A).reason()).contains("probe format 2");
+	}
+
+	@Test
+	@DisplayName("a probe of an unknown kind in a matching install: STRANDED, never offered for restore")
+	void unknownKind() {
+		final Result result = classify(List.of(new Probe(A, FastLogpointProbeSource.FORMAT, true, RECORD_KEY,
+				"WATCHPOINT")),
+			INSTALLED, Set.of(A), record(A));
+		assertThat(kind(result, A)).isEqualTo(Kind.STRANDED);
+		assertThat(result.verdicts().get(A).reason()).contains("probe kind WATCHPOINT");
+		assertThat(result.record()).as("the class does not verify, so nothing can be restored").isNull();
+	}
+
+	@Test
+	@DisplayName("a fast breakpoint's probe in a matching install: RECOVERED like a fast logpoint's")
+	void breakpointKindRecovers() {
+		final Result result = classify(List.of(new Probe(A, FastLogpointProbeSource.FORMAT, true, RECORD_KEY,
+				FastBreakpointProbeSource.KIND), probe(B, true, RECORD_KEY)),
+			INSTALLED, Set.of(A, B), record(A, B));
+		assertThat(kind(result, A)).isEqualTo(Kind.RECOVERED);
+		assertThat(kind(result, B)).isEqualTo(Kind.RECOVERED);
 	}
 
 	private static Result classify(List<Probe> probes, Map<String, byte[]> live, @Nullable Set<String> wired,
@@ -163,7 +186,7 @@ class LeftoverClassifierTest {
 	}
 
 	private static Probe probe(String name, boolean enabled, @Nullable Object imageKey) {
-		return new Probe(name, FastLogpointProbeSource.FORMAT, enabled, imageKey);
+		return new Probe(name, FastLogpointProbeSource.FORMAT, enabled, imageKey, FastLogpointProbeSource.KIND);
 	}
 
 	private static Map<Object, GenerationRecord> record(String... probes) {

@@ -115,6 +115,35 @@ class JdiEventListenerFastLogpointRoutingTest {
 	}
 
 	@Test
+	@DisplayName("a fast breakpoint's arming hit is handled before a fast logpoint's in the same set, which then defers")
+	void breakpointArmingBeforeLogpointArming() throws Exception {
+		final ThreadReference thread = mockThread("worker", 15L);
+		final BreakpointEvent logpointArming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
+		final BreakpointEvent breakpointArming = mockBreakpointEvent(thread, mock(BreakpointRequest.class), "com.example.Hot", 10);
+		when(fastLogpoints.claimsArmingEvent(logpointArming)).thenReturn(true);
+		when(fastLogpoints.armingNeverStops(logpointArming)).thenReturn(true);
+		when(fastLogpoints.claimsArmingEvent(breakpointArming)).thenReturn(true);
+		final List<BreakpointEvent> order = new ArrayList<>();
+		final List<Boolean> setStops = new ArrayList<>();
+		doAnswer(invocation -> {
+			final BreakpointEvent hit = invocation.getArgument(0);
+			order.add(hit);
+			setStops.add(invocation.getArgument(1));
+			return hit == breakpointArming
+				? FastLogpointService.ArmingOutcome.STOPPED : FastLogpointService.ArmingOutcome.RESUME;
+		}).when(fastLogpoints).handleArmingHit(any(), anyBoolean());
+		// The logpoint's arming first in the set: arming it first would redefine the class and lose the
+		// breakpoint's hit, which may be its only true one.
+		final EventSet eventSet = mockEventSet(logpointArming, breakpointArming);
+
+		runListenerWith(listener, eventSet);
+
+		assertThat(order).containsExactly(breakpointArming, logpointArming);
+		assertThat(setStops).as("the logpoint's arming learns that the set stops, so it defers").containsExactly(false, true);
+		verify(eventSet, never()).resume();
+	}
+
+	@Test
 	@DisplayName("an arming hit the service published as a fast-breakpoint stop keeps its set suspended")
 	void publishedArmingHitStaysSuspended() throws Exception {
 		final ThreadReference thread = mockThread("worker", 13L);

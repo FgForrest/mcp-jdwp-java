@@ -553,7 +553,14 @@ public class JdiEventListener {
                 if (armingHits == null) {
                     armingHits = new ArrayList<>(1);
                 }
-                armingHits.add(bpEvent);
+                // A fast breakpoint's arming hit goes first: it may be the stop. A fast logpoint's
+                // arming redefines the class and replaces the other arming request, whose event
+                // would then be lost; after a stop it is deferred instead (the set keeps the thread).
+                if (fastLogpointService.armingNeverStops(bpEvent)) {
+                    armingHits.add(bpEvent);
+                } else {
+                    armingHits.add(0, bpEvent);
+                }
                 continue;
             }
             if (event instanceof VMDisconnectEvent || event instanceof VMDeathEvent) {
@@ -1359,6 +1366,16 @@ public class JdiEventListener {
                 } catch (Exception bindEx) {
                     log.warn("[JDI] Could not build bindings for field event on {}.{}: {}",
                         className, fieldName, bindEx.getMessage());
+                    if (spec.logOnly()) {
+                        // A field logpoint never stops: its set was routed so (mayStop), and the
+                        // redefinition rule did not count its thread. The failure is the logpoint's.
+                        eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
+                            String.format("Field %s.%s %s on thread %s — its bindings could not be built: %s",
+                                className, fieldName, modeStr, threadName, bindEx.getMessage()),
+                            Map.of("breakpointId", String.valueOf(bpId), "class", className, "field", fieldName,
+                                "error", String.valueOf(bindEx.getMessage()))));
+                        return false;
+                    }
                     return true;
                 }
             }

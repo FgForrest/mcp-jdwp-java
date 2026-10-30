@@ -35,7 +35,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * parks only its thread, a failing condition that stops once and then installs, a first hit that
  * stops before anything is installed, restoration of the original bytecode — at once, or once a stopped
  * thread is released, for one entry or two in the same class —, an evaluation that survives another
- * thread's stop-all, and watchers by fast-breakpoint ID.
+ * thread's stop-all, watchers by fast-breakpoint ID, a re-arm after a failed first hit, and a step into
+ * from a fast stop.
  * <p>
  * Opt-in like {@link FastLogpointLiveTest}:
  * {@code mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastBreakpointLiveTest}.
@@ -167,7 +168,6 @@ class FastBreakpointLiveTest {
 		assertThat(waitForStop())
 			.contains("fast_breakpoint=" + id + ", condition true");
 		tools.jdwp_resume();
-		// stop() counts after its breakpoint, so the count follows the resume.
 		await("the second stop counted", () -> counters(id).stops() == 2);
 
 		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, null, null, null))
@@ -448,6 +448,50 @@ class FastBreakpointLiveTest {
 			.contains("Cleared fast breakpoint " + id + ": the original bytecode of " + TARGET + " is restored.");
 		assertBytecodeRestored();
 		assertThat(eventTypes()).contains("FAST_LOGPOINT_DISARMED", "FAST_BREAKPOINT_DISARMED");
+	}
+
+	@Test
+	@Order(13)
+	@DisplayName("re-arming a breakpoint whose first hit failed reopens its error gate: the next failure stops again")
+	void reArmAfterAFailedFirstHit() throws Exception {
+		final String condition = "10 / (i - i) == 0";
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition failed:");
+		assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
+
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null))
+			.contains("still waits for its first hit").contains("re-armed");
+		tools.jdwp_resume();
+		assertThat(waitForStop()).as("the reopened error gate stops the next failure")
+			.contains("fast_breakpoint=" + id + ", condition failed:");
+		tools.jdwp_resume();
+		tools.jdwp_clear_breakpoint(id);
+		assertBytecodeRestored();
+	}
+
+	@Test
+	@Order(14)
+	@DisplayName("a step into from a fast stop, true or failed, lands in the user's code, never in the probe's helpers")
+	void stepIntoFromAFastStopLandsInTheUsersCode() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
+			null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
+		final long trueStop = stoppedThread().uniqueID();
+		tools.jdwp_step_into(trueStop);
+		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':').contains("via=step");
+		releaseEverything();
+		tools.jdwp_clear_breakpoint(id);
+		await("the dispatcher to finish its sets", this::dispatcherIdle);
+		releaseEverything();
+
+		// The first hit is false and installs the probe; a later one fails inside it.
+		final int failing = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine,
+			"i % 2000000 == 1999999 && 10 / (i - i) == 0", true, "thread", null, null));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + failing + ", condition failed:");
+		assertThat(state(failing)).as("the failure came through the probe").isEqualTo(FastLogpointService.State.ARMED);
+		final long errorStop = stoppedThread().uniqueID();
+		tools.jdwp_step_into(errorStop);
+		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':').contains("via=step");
 	}
 
 	// ── helpers ──

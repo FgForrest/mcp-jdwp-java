@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import one.edee.mcp.jdwp.evaluation.FastBreakpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
 import org.jspecify.annotations.Nullable;
 
@@ -66,7 +67,7 @@ final class LeftoverClassifier {
         final Set<String> candidates = new HashSet<>();
         final Set<Object> imageKeys = new LinkedHashSet<>();
         for (Probe probe : probes) {
-            if (probe.format() == FastLogpointProbeSource.FORMAT && probe.imageKey() != null
+            if (understood(probe) && probe.imageKey() != null
                 && (wired == null || wired.contains(probe.name()))) {
                 candidates.add(probe.name());
                 imageKeys.add(probe.imageKey());
@@ -99,14 +100,14 @@ final class LeftoverClassifier {
 
         final Set<String> calls = verified != null ? new HashSet<>(verified.probes()) : wired;
         for (Probe probe : probes) {
-            final boolean known = probe.format() == FastLogpointProbeSource.FORMAT;
+            final boolean known = understood(probe);
             if (calls == null) {
                 // Wiring unknown: nothing is proven uncalled, so nothing is hidden.
-                verdicts.put(probe.name(), new Verdict(Kind.STRANDED, known ? reason : unknownFormat(probe), false));
+                verdicts.put(probe.name(), new Verdict(Kind.STRANDED, known ? reason : notUnderstood(probe), false));
             } else if (calls.contains(probe.name())) {
                 verdicts.put(probe.name(), verified != null && known
                     ? new Verdict(Kind.RECOVERED, null, false)
-                    : new Verdict(Kind.STRANDED, known ? reason : unknownFormat(probe), false));
+                    : new Verdict(Kind.STRANDED, known ? reason : notUnderstood(probe), false));
             } else if (probe.enabled()) {
                 verdicts.put(probe.name(), new Verdict(Kind.STRANDED, UNWIRED_ENABLED, true));
             } else {
@@ -116,9 +117,19 @@ final class LeftoverClassifier {
         return new Result(verdicts, verified);
     }
 
-    private static String unknownFormat(Probe probe) {
-        return "written by another mcp-jdwp-java version (probe format " + probe.format()
-            + ") — only its kill switch is understood";
+    /**
+     * Whether this version understands {@code probe} beyond its kill switch: its format and its kind.
+     */
+    private static boolean understood(Probe probe) {
+        return probe.format() == FastLogpointProbeSource.FORMAT
+            && (FastLogpointProbeSource.KIND.equals(probe.kind()) || FastBreakpointProbeSource.KIND.equals(probe.kind()));
+    }
+
+    private static String notUnderstood(Probe probe) {
+        final String what = probe.format() != FastLogpointProbeSource.FORMAT
+            ? "probe format " + probe.format()
+            : "probe kind " + probe.kind();
+        return "written by another mcp-jdwp-java version (" + what + ") — only its kill switch is understood";
     }
 
     /**
@@ -147,8 +158,9 @@ final class LeftoverClassifier {
      * @param format   its {@code MCP_FORMAT}
      * @param enabled  its kill switch
      * @param imageKey identity of the install record its {@code MCP_IMAGE} references, or {@code null}
+     * @param kind     its {@code MCP_KIND}; a probe without one is a fast logpoint
      */
-    record Probe(String name, int format, boolean enabled, @Nullable Object imageKey) {
+    record Probe(String name, int format, boolean enabled, @Nullable Object imageKey, String kind) {
     }
 
     /**

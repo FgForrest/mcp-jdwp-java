@@ -32,8 +32,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End-to-end verification of {@code jdwp_set_fast_logpoint} against a real forked JVM: arming on the
  * first hit, in-target evaluation without suspending, breakpoint survival across redefinition, the
  * bytecode guard, buffer-overrun reporting, and restoration of the original bytecode by clear,
- * reset and disconnect — refused when it would undo another agent's redefinition. Also prints the
- * per-hit cost against {@code jdwp_set_logpoint}.
+ * reset and disconnect — refused when it would undo another agent's redefinition, and a leftover's
+ * approved restore refused while a thread is stopped in its method. Also prints the per-hit cost
+ * against {@code jdwp_set_logpoint}.
  * <p>
  * Forks a JVM and attaches over JDWP, which the test suite otherwise never does (see
  * {@code docs/testing.md}), so it is opt-in:
@@ -508,6 +509,48 @@ class FastLogpointLiveTest {
 		// The class already runs its class file; the reset forgets the entry, and the next discovery
 		// finds a disabled probe nothing calls — inert, not listed.
 		tools.jdwp_reset();
+		assertThat(fastLogpoints.list()).isEmpty();
+		assertBytecodeRestored();
+	}
+
+	@Test
+	@Order(17)
+	@DisplayName("an approved restore is refused while a thread is stopped in the method, changing nothing; after the release it restores")
+	void restoreWaitsForAThreadStoppedInTheMethod() throws Exception {
+		awaitArmed(idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null)));
+		simulateServerCrash();
+		connection.takeAttachNotice();
+		final int recovered = fastLogpoints.list().stream().filter(info -> info.line() == probeLine).findFirst()
+			.orElseThrow().id();
+
+		final VirtualMachine vm = connection.getVM();
+		final ThreadReference parked = vm.allThreads().stream()
+			.filter(t -> "worker-0".equals(t.name())).findFirst().orElseThrow();
+		final Location location = vm.classesByName(TARGET).get(0).locationsOfLine(probeLine).get(0);
+		final BreakpointRequest park = vm.eventRequestManager().createBreakpointRequest(location);
+		park.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+		park.addThreadFilter(parked);
+		park.addCountFilter(1);
+		final int parkId = tracker.registerBreakpoint(park);
+		enableSuspended(park);
+		try {
+			await("worker-0 parked on the probe line", parked::isSuspended);
+			// Restoring compute() now would leave worker-0's frame there obsolete, without its locals.
+			assertThat(tools.jdwp_restore_fast_logpoints(recovered, true))
+				.startsWith("Not restored: thread worker-0 is stopped in compute")
+				.endsWith("Nothing was changed.");
+			assertThat(fastLogpoints.list()).filteredOn(info -> info.id() == recovered).singleElement()
+				.satisfies(info -> {
+					assertThat(info.state()).isEqualTo(FastLogpointService.State.RECOVERED);
+					assertThat(info.enabled()).isTrue();
+				});
+			assertThat(parked.frame(0).location().method().isObsolete()).isFalse();
+		} finally {
+			tools.jdwp_clear_breakpoint(parkId);
+			Objects.requireNonNull(tracker.suspensionSession()).reset();
+		}
+
+		assertThat(tools.jdwp_restore_fast_logpoints(recovered, true)).startsWith("Restored the class file of " + TARGET);
 		assertThat(fastLogpoints.list()).isEmpty();
 		assertBytecodeRestored();
 	}
