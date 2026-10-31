@@ -5,6 +5,74 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.11.1] — 2026-10-31
+
+### Fixed — fast probes wait for their class and keep their hits at exit
+
+The 2.11.0 test flights showed two ways a fast logpoint or fast breakpoint lost its
+work (#48). One set before its class was loaded was refused, so a test that loads the
+class late could not be probed from the start. And the hits still in the in-target
+ring buffer when the target exited were lost — the usual end of a test run. Both now
+behave as you would expect.
+
+- **Probes wait for their class** — set before the class loads, a fast logpoint or
+  fast breakpoint registers as waiting (`WAITING_FOR_CLASS` in `jdwp_overview`) and
+  arms when the class loads, keeping its ID.
+- **Hits are read at the target's exit** — while a probe is armed, the debugger holds
+  the target at VM death until every ring buffer is drained, also when it ends through
+  `System.exit` (a forked test JVM). The `[VM_DEATH]` reply says what the run recorded
+  and how often each field breakpoint fired, and notes that a field breakpoint does not
+  see writes made through reflection or `Unsafe`.
+- **`jdwp_reset` counts what it releases**, including `jdwp_suspend_thread` holds, and
+  `jdwp_reset` / `jdwp_disconnect` say so when the target has already exited.
+
+### Fixed — stops and replies say what happened
+
+The test flights also showed replies that left the agent guessing (#50).
+
+- **Exception stops** name the exception's type and message, and
+  `jdwp_set_exception_breakpoint` takes `suspendPolicy` (`thread` | `all`) — `all`
+  keeps a test's other threads from running on to its timeout.
+- **Field-breakpoint stops** are labelled as such and show the access site and the old
+  and new value; field logpoint entries show them too.
+- **A stop names the logpoint hits** recorded since the last `jdwp_get_events`.
+- **`jdwp_evaluate_expression`** accepts code that throws checked exceptions and
+  unqualified calls to the frame's own methods, defaults to the current stop's thread,
+  and lists each compile error once, with the offending code.
+- **Stacks** collapse JDK frames inside the test harness, and a thread waiting to enter
+  a `synchronized` block shows that line (HotSpot reports the next one).
+  `jdwp_dump_locks` lists threads in `Object.wait()` apart from the lock graph.
+
+### Fixed — races between stops, frame tools and evaluations
+
+The follow-ups of the 2.11.0 review (#47), and three races the new tests for them found.
+
+- **Each fast-breakpoint stop keeps its own reason**, also when two threads stop at the
+  same probe at once.
+- **A frame tool and an evaluation never overlap** — an evaluation waits while a tool
+  reads its thread's frames, and a frame tool re-reads invalidated frames only while a
+  published stop or a `jdwp_suspend_thread` hold keeps the thread at its stop, so it
+  can no longer write into the frame of the thread's next stop.
+- **The watchdog** times each invocation in the target rather than the whole evaluation,
+  and now also frees an evaluation that JDWP reports as running while it waits for a
+  monitor.
+- **Clearing a fast logpoint** waits briefly for hits a probe is still writing, so they
+  reach the last read instead of being dropped.
+
+### Fixed — the plugin installs where `./mvnw` cannot run
+
+The SessionStart hook builds the server JAR with `./mvnw`, then `mvn -o`, then `mvn`,
+and says what to do when all three fail (#51). The `jdwp-inspector` server is now
+declared in `.claude-plugin/plugin.json`; the root `.mcp.json` is gone. After a build at
+session start, reconnect `jdwp-inspector` in `/mcp` if its tools are missing.
+
+### Docs — test flights are puzzles again
+
+Flights #5, #8 and #10 match what the tools do, and the scoring rule is written down
+(#49). No flight gives its answer away: test comments, class Javadocs and the README
+hint lines no longer name the root cause. Flight #5 (par 3) teaches the field-watchpoint
+blind spot. The sandbox zip needs plugin 2.11.1 or newer.
+
 ## [2.11.0] — 2026-10-30
 
 ### New — fast logpoints and fast breakpoints: conditions evaluated inside the target JVM
