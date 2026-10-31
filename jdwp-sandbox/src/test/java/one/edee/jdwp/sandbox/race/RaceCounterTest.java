@@ -27,7 +27,7 @@ class RaceCounterTest {
 		racer1.join(2000);
 		racer2.join(2000);
 
-		// Fails: both threads read 0 before either wrote, so both wrote 1 — one increment is lost.
+		// Fails: the count is 1.
 		assertThat(counter.getCount())
 			.describedAs("Two increments should yield 2")
 			.isEqualTo(2);

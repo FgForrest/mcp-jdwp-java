@@ -174,7 +174,7 @@ public final class FastBreakpointProbeSource {
             // Empty: the breakpoint sits on its only instruction, and a step into it enters nothing.
             .append("    public static void ").append(STOP_METHOD).append("(int kind, int epoch, String error) {\n")
             .append("    }\n\n")
-            .append("    private static Object __mcpCondition(").append(declaredParameters).append(") {\n")
+            .append("    private static Object __mcpCondition(").append(declaredParameters).append(") throws Throwable {\n")
             .append(JdiExpressionEvaluator.generateMethodBody(condition))
             .append("    }\n\n")
             // Records a failed condition and stops on the first failure of error generation epoch, read

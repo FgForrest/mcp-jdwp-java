@@ -249,6 +249,15 @@ class SuspensionSessionTest {
 	}
 
 	@Test
+	@DisplayName("jdwp_reset counts the manual holds it releases apart from the stops")
+	void resetCountsManualHolds() {
+		assertThat(session.suspendThread(u.ref)).isNull();
+
+		assertThat(session.reset()).isEqualTo(new SuspensionSession.ResetResult(0, 1));
+		assertThat(u.count).isZero();
+	}
+
+	@Test
 	@DisplayName("jdwp_resume_thread refuses while a covering set is queued, processed, or not yet seen")
 	void releaseThreadRefusals() {
 		final SuspensionSession.Context queued = session.route(
@@ -607,7 +616,7 @@ class SuspensionSessionTest {
 		session.lease(t.ref);
 		model.beginInvocation(t);
 
-		assertThat(session.reset()).isEqualTo(1);
+		assertThat(session.reset()).isEqualTo(new SuspensionSession.ResetResult(1, 0));
 		model.completeInvocation(t);
 		session.unlease(t.ref);
 

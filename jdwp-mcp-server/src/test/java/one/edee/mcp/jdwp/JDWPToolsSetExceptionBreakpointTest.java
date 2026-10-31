@@ -71,7 +71,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	void shouldExposeClassParameterAsClassName() throws Exception {
 		final java.lang.reflect.Parameter first = JDWPTools.class
 			.getMethod("jdwp_set_exception_breakpoint",
-				String.class, Boolean.class, Boolean.class, Integer.class, Boolean.class, Boolean.class)
+				String.class, Boolean.class, Boolean.class, Integer.class, Boolean.class, Boolean.class, String.class)
 			.getParameters()[0];
 
 		assertThat(first.getName()).isEqualTo("className");
@@ -88,7 +88,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects a null class name with a hard error, never touches the VM, and registers nothing")
 	void shouldRejectNullClassName() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			null, true, true, null, null, null);
+			null, true, true, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("required");
 		verify(jdiService, never()).getVM();
@@ -100,7 +100,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects a blank class name with a hard error, never touches the VM, and registers nothing")
 	void shouldRejectBlankClassName() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"   ", true, true, null, null, null);
+			"   ", true, true, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("required");
 		verify(jdiService, never()).getVM();
@@ -117,7 +117,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null, null, null);
 
 		assertThat(result).contains("Caught: true").contains("Uncaught: true").contains("Mode: suspend");
 		verify(erm).createExceptionRequest(refType, true, true);
@@ -131,7 +131,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"com.example.MyException", null, null, null, null, null);
+			"com.example.MyException", null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("com.example.MyException");
@@ -143,7 +143,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, 999, null, null);
+			"java.lang.RuntimeException", null, null, 999, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 	}
@@ -159,7 +159,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, triggerId, true, null);
+			"java.lang.RuntimeException", null, null, triggerId, true, null, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}

@@ -12,6 +12,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Central registry for breakpoints owned by the MCP server and a parking spot for the last thread
@@ -396,6 +397,7 @@ public class BreakpointTracker {
      * are {@code synchronized} methods so the helper does not re-acquire it.
      */
     private void clearAllInMemoryStateLocked() {
+        stopDetails.clear();
         breakpointsById.clear();
         breakpointIdsByRequest.clear();
         pendingBreakpointsById.clear();
@@ -1187,10 +1189,11 @@ public class BreakpointTracker {
 
                     final ExceptionRequest exReq = erm.createExceptionRequest(
                         refType, pending.isCaught(), pending.isUncaught());
-                    // Always SUSPEND_EVENT_THREAD: even logOnly BPs need a brief suspend so the
-                    // listener can read the exception object / evaluate the optional expression.
-                    // Auto-resume happens in JdiEventListener.handleExceptionEvent.
-                    exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    // The spec's policy — SUSPEND_EVENT_THREAD unless the user asked for all: even
+                    // logOnly BPs need a brief suspend so the listener can read the exception object /
+                    // evaluate the optional expression. Auto-resume happens in
+                    // JdiEventListener.handleExceptionEvent.
+                    exReq.setSuspendPolicy(pending.getSpec().suspendPolicy());
                     exReq.enable();
                     disarmIfChained(id, exReq);
                     if (!promotePendingExceptionToActive(id, exReq)) {
@@ -1755,6 +1758,44 @@ public class BreakpointTracker {
      *               {@link EventKind#BREAKPOINT})
      * @see #setLastBreakpointThread(ThreadReference, int)
      */
+    /**
+     * What the latest exception or field-breakpoint stop of a thread was about — the exception's
+     * type and message, or the field, its values and the access site — by thread ID, for the stop
+     * header ({@link #stopDetail}).
+     */
+    private final ConcurrentHashMap<Long, StopDetail> stopDetails = new ConcurrentHashMap<>();
+
+    /**
+     * One {@link #stopDetails} entry: {@code text} describes the stop of {@code kind} and {@code id}.
+     */
+    private record StopDetail(EventKind kind, @Nullable Integer id, String text) {
+    }
+
+    /**
+     * Records what the stop a handler is about to propose is about; see {@link #stopDetail}.
+     */
+    public void recordStopDetail(ThreadReference thread, EventKind kind, @Nullable Integer id, String text) {
+        stopDetails.put(thread.uniqueID(), new StopDetail(kind, id, text));
+    }
+
+    /**
+     * What {@code stop} is about — e.g. {@code java.lang.IllegalStateException: Insufficient stock
+     * (thrown at …)} — or {@code null} when its handler recorded nothing for it.
+     */
+    @Nullable
+    public String stopDetail(LastBreakpoint stop) {
+        final StopDetail detail = stopDetails.get(stop.thread().uniqueID());
+        return detail != null && detail.kind() == stop.kind() && Objects.equals(detail.id(), stop.id())
+            ? detail.text() : null;
+    }
+
+    /**
+     * Whether {@code id} names an active field breakpoint or field logpoint.
+     */
+    public boolean isFieldBreakpoint(int id) {
+        return fieldBreakpointsById.containsKey(id);
+    }
+
     public void setLastSuspendingEvent(ThreadReference thread, EventKind kind) {
         final LastBreakpoint prior = this.lastBreakpoint;
         final Integer inheritedId = (kind == EventKind.STEP && prior != null) ? prior.id() : null;
@@ -2270,14 +2311,34 @@ public class BreakpointTracker {
         boolean caught,
         boolean uncaught,
         boolean logOnly,
-        @Nullable String expression
+        @Nullable String expression,
+        int suspendPolicy
     ) {
+        /**
+         * A spec whose request suspends only the throwing thread — what every log-only one needs
+         * (it is resumed right after the record) and the default of a suspending one.
+         */
+        public ExceptionBreakpointSpec(String exceptionClass, boolean caught, boolean uncaught, boolean logOnly,
+                                       @Nullable String expression) {
+            this(exceptionClass, caught, uncaught, logOnly, expression, EventRequest.SUSPEND_EVENT_THREAD);
+        }
+
         /**
          * Default suspending behaviour: the throwing thread is parked at the throw site for
          * inspection and no expression is evaluated.
          */
         public static ExceptionBreakpointSpec suspending(String exceptionClass, boolean caught, boolean uncaught) {
             return new ExceptionBreakpointSpec(exceptionClass, caught, uncaught, false, null);
+        }
+
+        /**
+         * Suspending behaviour with an explicit suspend policy: {@link EventRequest#SUSPEND_ALL} parks
+         * every thread at the throw, so a test's main thread cannot run on to its timeout and end
+         * the JVM while the stop is inspected.
+         */
+        public static ExceptionBreakpointSpec suspending(String exceptionClass, boolean caught, boolean uncaught,
+                                                         int suspendPolicy) {
+            return new ExceptionBreakpointSpec(exceptionClass, caught, uncaught, false, null, suspendPolicy);
         }
 
         /**
@@ -2385,6 +2446,11 @@ public class BreakpointTracker {
         private final AccessWatchpointRequest accessRequest;
         @Nullable
         private final ModificationWatchpointRequest modificationRequest;
+        /**
+         * Watchpoint events this field breakpoint received (before its condition), so a watchpoint
+         * that never fired can be told apart at the target's exit.
+         */
+        private final AtomicLong hits = new AtomicLong();
 
         /**
          * Precondition: at least one of {@code accessRequest} / {@code modificationRequest} is
@@ -2410,6 +2476,20 @@ public class BreakpointTracker {
         @Nullable
         public ModificationWatchpointRequest getModificationRequest() {
             return modificationRequest;
+        }
+
+        /**
+         * Counts one watchpoint event of this field breakpoint.
+         */
+        public void recordHit() {
+            hits.incrementAndGet();
+        }
+
+        /**
+         * Watchpoint events received so far.
+         */
+        public long hits() {
+            return hits.get();
         }
     }
 

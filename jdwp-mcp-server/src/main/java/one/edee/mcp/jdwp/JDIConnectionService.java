@@ -22,7 +22,12 @@ import org.springframework.stereotype.Service;
 
 import java.io.File;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -117,6 +122,13 @@ public class JDIConnectionService {
     /** Port of the last SUCCESSFUL attach. See {@link #lastHost} for semantics. */
     private int lastPort = 0;
     /**
+     * What the target's exit took with it — set by {@link #notifyVmDied}, cleared by the next attach
+     * and by {@link #disconnect}. Lets {@code jdwp_reset} and {@code jdwp_disconnect} say that the
+     * target exited instead of reporting an empty session.
+     */
+    @Nullable
+    private volatile VmExit lastExit;
+    /**
      * Host of the most recent {@link #connect} attempt, successful or not. Distinct from
      * {@link #lastHost} so a failed first connect can be rendered in {@code jdwp_diagnose}
      * ("tried foo:5005 and got Connection refused") without seeding the reconnect target.
@@ -169,6 +181,7 @@ public class JDIConnectionService {
         this.healthMonitor = healthMonitor;
         // Wire post-mortem cleanup so the listener can null the VM the moment the target dies.
         eventListener.setVmDeathHook(this::notifyVmDied);
+        eventListener.setVmExitingHook(this::captureExit);
         // Wire traffic observation so every JDI event drained from the queue advances the
         // health monitor's last-traffic timestamp without the listener knowing about the monitor.
         eventListener.setTrafficObserver(healthMonitor::notifyTraffic);
@@ -423,6 +436,7 @@ public class JDIConnectionService {
         lastHost = host;
         lastPort = port;
         lastConnectError = null;
+        lastExit = null;
 
         // Advance the event-history session epoch before any event of this attach is recorded. If a
         // prior VM died and its events were preserved in the buffer (notifyVmDied keeps them), this
@@ -535,7 +549,9 @@ public class JDIConnectionService {
      */
     public synchronized DisconnectResult disconnect() {
         if (vm == null) {
-            return DisconnectResult.notConnected();
+            final VmExit exit = lastExit;
+            lastExit = null;
+            return DisconnectResult.notConnected(exit);
         }
         // Snapshot the state about to be wiped, before cleanupSessionState() zeroes it.
         final DisconnectResult result = new DisconnectResult(
@@ -549,6 +565,32 @@ public class JDIConnectionService {
             eventHistory.size());
         cleanupSessionState();
         return result;
+    }
+
+    /**
+     * Snapshots what the target's exit takes with it into {@link #lastExit}. The listener calls it
+     * when the target exits — after reading the in-target probes, before closing the session, which
+     * wakes a {@code jdwp_resume_until_event} waiter — so that waiter's {@code [VM_DEATH]} reply, and
+     * a later {@code jdwp_reset} or {@code jdwp_disconnect}, can report it; {@link #notifyVmDied}
+     * drops the state right after. Takes no lock: the listener must not wait behind a tool call.
+     */
+    void captureExit() {
+        final List<VmExit.FieldWatch> watches = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> entry
+            : breakpointTracker.getAllFieldBreakpoints().entrySet()) {
+            final BreakpointTracker.FieldBreakpointSpec spec = entry.getValue().getSpec();
+            watches.add(new VmExit.FieldWatch(entry.getKey(), spec.className() + '.' + spec.fieldName(),
+                spec.mode().name().toLowerCase(Locale.ROOT), spec.logOnly(), entry.getValue().hits()));
+        }
+        watches.sort(Comparator.comparingInt(VmExit.FieldWatch::id));
+        final FastLogpointService flps = fastLogpoints;
+        lastExit = new VmExit(Instant.now(), lastHost, lastPort,
+            breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size(),
+            breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size(),
+            breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size(),
+            flps != null ? flps.ownCount() : 0,
+            watcherManager.getAllWatchers().size(),
+            List.copyOf(watches));
     }
 
     /**
@@ -640,6 +682,7 @@ public class JDIConnectionService {
 
         lastHost = null;
         lastPort = 0;
+        lastExit = null;
         healthMonitor.stop();
     }
 
@@ -883,6 +926,8 @@ public class JDIConnectionService {
      * @param markedInstances      marked instances released
      * @param objectCacheEntries   cached object references dropped
      * @param eventHistoryEntries  event-history entries cleared
+     * @param exit                 in the not-connected case, the target's exit that ended the session
+     *                             (or {@code null})
      */
     public record DisconnectResult(
         boolean wasConnected,
@@ -894,10 +939,22 @@ public class JDIConnectionService {
         int watchers,
         int markedInstances,
         int objectCacheEntries,
-        int eventHistoryEntries
+        int eventHistoryEntries,
+        @Nullable VmExit exit
     ) {
+        public DisconnectResult(boolean wasConnected, @Nullable String host, int port, int lineBreakpoints,
+                                int exceptionBreakpoints, int fieldBreakpoints, int watchers, int markedInstances,
+                                int objectCacheEntries, int eventHistoryEntries) {
+            this(wasConnected, host, port, lineBreakpoints, exceptionBreakpoints, fieldBreakpoints, watchers,
+                markedInstances, objectCacheEntries, eventHistoryEntries, null);
+        }
+
         static DisconnectResult notConnected() {
-            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0);
+            return notConnected(null);
+        }
+
+        static DisconnectResult notConnected(@Nullable VmExit exit) {
+            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit);
         }
 
         /** Total breakpoints across line/exception/field, active + deferred. */
@@ -909,6 +966,76 @@ public class JDIConnectionService {
         public boolean clearedAnything() {
             return totalBreakpoints() + watchers + markedInstances + objectCacheEntries + eventHistoryEntries > 0;
         }
+    }
+
+    /**
+     * The target VM's exit, and the session state it took with it: {@link #notifyVmDied} drops the
+     * breakpoints, probes and watchers of a VM that is gone, and the tools that run afterwards report
+     * this instead of an empty session.
+     *
+     * @param at                   when the server noticed the exit
+     * @param host                 host of the attach that ended ({@code null} when unknown)
+     * @param port                 port of that attach
+     * @param lineBreakpoints      line breakpoints and logpoints dropped (active + deferred)
+     * @param exceptionBreakpoints exception breakpoints dropped (active + deferred)
+     * @param fieldBreakpoints     field breakpoints dropped (active + deferred)
+     * @param probes               fast logpoints and fast breakpoints dropped
+     * @param watchers             watchers dropped
+     * @param fieldWatches         the active field breakpoints and how often each fired
+     */
+    public record VmExit(Instant at, @Nullable String host, int port, int lineBreakpoints, int exceptionBreakpoints,
+                         int fieldBreakpoints, int probes, int watchers, List<FieldWatch> fieldWatches) {
+
+        /**
+         * An active field breakpoint at the exit.
+         *
+         * @param id      its ID
+         * @param field   {@code declaring.Class.field}
+         * @param mode    {@code access}, {@code modification} or {@code both}
+         * @param logOnly whether it is a field logpoint
+         * @param hits    watchpoint events it received
+         */
+        public record FieldWatch(int id, String field, String mode, boolean logOnly, long hits) {
+        }
+
+        /**
+         * "the target VM at host:port exited at 18:42:10" — the clock of the server's time zone.
+         */
+        public String describe() {
+            final String target = host != null ? "the target VM at " + host + ':' + port : "the target VM";
+            return target + " exited at " + DateTimeFormatter.ofPattern("HH:mm:ss z")
+                .format(at.atZone(ZoneId.systemDefault()));
+        }
+
+        /**
+         * "2 breakpoints, 1 field breakpoint and 1 in-target probe", or {@code ""} when nothing was set.
+         */
+        public String droppedState() {
+            final List<String> parts = new ArrayList<>(5);
+            addCount(parts, lineBreakpoints, "breakpoint");
+            addCount(parts, exceptionBreakpoints, "exception breakpoint");
+            addCount(parts, fieldBreakpoints, "field breakpoint");
+            addCount(parts, probes, "in-target probe");
+            addCount(parts, watchers, "watcher");
+            if (parts.size() <= 1) {
+                return parts.isEmpty() ? "" : parts.get(0);
+            }
+            return String.join(", ", parts.subList(0, parts.size() - 1)) + " and " + parts.get(parts.size() - 1);
+        }
+
+        private static void addCount(List<String> parts, int count, String noun) {
+            if (count > 0) {
+                parts.add(count + " " + noun + (count == 1 ? "" : "s"));
+            }
+        }
+    }
+
+    /**
+     * The exit that ended the last session, while no new attach followed it; {@code null} otherwise.
+     */
+    @Nullable
+    public VmExit lastExit() {
+        return lastExit;
     }
 
     /**

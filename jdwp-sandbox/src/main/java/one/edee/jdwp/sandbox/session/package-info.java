@@ -1,4 +1,4 @@
 /**
- * Scenario 3: The Identity Crisis — HashMap key mutation via mutable hashCode fields.
+ * Flight #1: The Phantom Session — a session is stored, upgraded, and then vanishes from the map.
  */
 package one.edee.jdwp.sandbox.session;

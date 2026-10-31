@@ -1,8 +1,8 @@
 package one.edee.jdwp.sandbox.bank;
 
 /**
- * Transfers funds between accounts. Each individual operation is synchronized,
- * but the transfer as a whole is not atomic.
+ * Transfers funds between accounts and keeps an audit trail of the balances. Every account
+ * operation is synchronized, so the books always balance.
  */
 public class TransferService {
 
@@ -13,13 +13,13 @@ public class TransferService {
 	}
 
 	/**
-	 * Transfers amount from one account to another.
-	 * Snapshots balances for auditing between the two operations.
+	 * Transfers {@code amount} from one account to another and snapshots both balances for the
+	 * audit trail.
 	 */
 	public void transfer(BankAccount from, BankAccount to, int amount) {
 		from.withdraw(amount);
 
-		// Snapshot balances for audit trail — happens BETWEEN withdraw and deposit
+		// Snapshot balances for the audit trail
 		auditService.snapshotBalances(from, to);
 
 		to.deposit(amount);

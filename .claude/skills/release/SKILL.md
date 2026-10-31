@@ -18,7 +18,6 @@ End-to-end workflow for releasing the `jdwp-debugging` plugin from this repo.
 | Annotated git tag `vX.Y.Z`                      | **YES**                         |
 | `pom.xml` `<version>` (Maven artifact)          | NO — internal build id only     |
 | `jdwp-mcp-server/pom.xml` `<version>`           | NO                              |
-| `.mcp.json`                                     | NO                              |
 | `README.md`                                     | NO (no version reference there) |
 
 The plugin version (in `marketplace.json`) is **decoupled** from the Maven version. Don't try to keep them in sync.

@@ -7,7 +7,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * Test flight #6 — "The Field That Lies". The welcome message renders correctly, yet the user's
+ * Test flight #5 — "The Field That Lies". The welcome message renders correctly, yet the user's
  * stored display name comes back with different casing than the caller set — and nothing visibly
  * calls {@link UserProfile#setDisplayName}.
  */

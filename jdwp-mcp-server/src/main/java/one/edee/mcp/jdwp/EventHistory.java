@@ -7,7 +7,11 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Bounded ring buffer of debug events for post-mortem inspection via the `jdwp_get_events` tool.
@@ -55,6 +59,16 @@ public class EventHistory {
      * {@link JDIConnectionService}), so a plain {@code ++} is safe.
      */
     private volatile int currentEpoch = 0;
+    /**
+     * Logpoint-type entries recorded since the last {@link #markRead}, by type — the hits that pile
+     * up while nobody reads the history, which a stop reply mentions.
+     */
+    private final Map<String, AtomicInteger> unread = new ConcurrentHashMap<>();
+    /**
+     * The types {@link #unread} counts: what logpoints, field logpoints and exception logpoints record.
+     */
+    private static final Set<String> UNREAD_TYPES = Set.of("LOGPOINT", "LOGPOINT_ERROR", "FIELD_LOGPOINT",
+        "FIELD_LOGPOINT_ERROR", "EXCEPTION_LOG", "EXCEPTION_LOG_ERROR");
 
     /**
      * Appends an event and evicts the oldest entries until the buffer is at or below {@link #MAX_EVENTS}.
@@ -80,6 +94,31 @@ public class EventHistory {
         while (events.size() > MAX_EVENTS) {
             events.pollFirst();
         }
+        if (UNREAD_TYPES.contains(stamped.type())) {
+            unread.computeIfAbsent(stamped.type(), type -> new AtomicInteger()).incrementAndGet();
+        }
+    }
+
+    /**
+     * Marks everything recorded so far as read — {@code jdwp_get_events} calls it.
+     */
+    public void markRead() {
+        unread.clear();
+    }
+
+    /**
+     * "2 FIELD_LOGPOINT, 1 LOGPOINT" — the logpoint-type entries recorded since the last
+     * {@link #markRead}, or {@code ""} when there are none.
+     */
+    public String unreadSummary() {
+        final List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, AtomicInteger> entry : new TreeMap<>(unread).entrySet()) {
+            final int count = entry.getValue().get();
+            if (count > 0) {
+                parts.add(count + " " + entry.getKey());
+            }
+        }
+        return String.join(", ", parts);
     }
 
     /**
@@ -108,6 +147,7 @@ public class EventHistory {
 
     public void clear() {
         events.clear();
+        unread.clear();
     }
 
     public int size() {

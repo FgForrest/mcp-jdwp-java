@@ -2,9 +2,12 @@ package one.edee.mcp.jdwp.fastlogpoint;
 
 import com.sun.jdi.*;
 import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.VMDeathRequest;
 import jakarta.annotation.PreDestroy;
 import one.edee.mcp.jdwp.BreakpointTracker;
 import one.edee.mcp.jdwp.EvaluationGuard;
@@ -118,6 +121,10 @@ public class FastLogpointService {
      */
     private static final long STALLED_ENTRY_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(1);
     /**
+     * How long a clear waits for the threads inside a probe's recorder — see {@link #awaitWriters}.
+     */
+    private static final long WRITERS_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
+    /**
      * How long the redefinition rule waits, the VM suspended, for the listener to route a set the
      * target raised before the suspension — see {@link #heldFrameIn}.
      */
@@ -179,6 +186,14 @@ public class FastLogpointService {
      */
     private final Map<Integer, FastLogpoint> logpoints = new ConcurrentHashMap<>();
     /**
+     * Fast logpoints and fast breakpoints set before their class was loaded, by ID. Each waits on a
+     * {@code ClassPrepareRequest} of its own — never the tracker's, whose lifetime follows its own
+     * pending breakpoints — and becomes an ordinary {@link State#PENDING} entry under the same ID when
+     * the class loads ({@link #promoteWaiting}). Arming them needs no running code, unlike
+     * {@code forceLoad}, which cannot load anything at VM start.
+     */
+    private final Map<Integer, WaitingProbe> waiting = new ConcurrentHashMap<>();
+    /**
      * Pending arming request → fast logpoint, for O(1) routing of breakpoint events.
      */
     private final Map<EventRequest, FastLogpoint> byArmingRequest = new ConcurrentHashMap<>();
@@ -213,6 +228,14 @@ public class FastLogpointService {
      * hold the monitor.
      */
     private volatile boolean teardownStuck;
+    /**
+     * A {@code VMDeathRequest} with {@code SUSPEND_ALL}, kept while this session has a fast logpoint
+     * or fast breakpoint: the target then waits at its exit until the listener has read every probe's
+     * ring ({@link #readBeforeExit}) and resumed it. Without it, hits nobody read before the target
+     * exited are lost. {@code null} when none is needed or the VM cannot report its death.
+     */
+    @Nullable
+    private volatile VMDeathRequest exitRequest;
 
     public FastLogpointService(BreakpointTracker breakpointTracker, EventHistory eventHistory,
                                EvaluationGuard evaluationGuard, JdiExpressionEvaluator expressionEvaluator,
@@ -279,6 +302,15 @@ public class FastLogpointService {
                               @Nullable String condition, int bufferSize, int suspendPolicy, boolean stopOnce) {
         retryPendingRemovals();
         final int id = breakpointTracker.allocateId();
+        registerEntry(id, vm, location, kind, expression, condition, bufferSize, suspendPolicy, stopOnce);
+        return id;
+    }
+
+    /**
+     * Registers an entry under {@code id} in {@link State#PENDING} state. Caller holds the monitor.
+     */
+    private void registerEntry(int id, VirtualMachine vm, Location location, Kind kind, String expression,
+                               @Nullable String condition, int bufferSize, int suspendPolicy, boolean stopOnce) {
         final Method method = location.method();
         final ReferenceType refType = location.declaringType();
         final FastLogpoint flp = new FastLogpoint(id, kind, vm, refType, refType.name(), location.lineNumber(),
@@ -288,15 +320,195 @@ public class FastLogpointService {
         logpoints.put(id, flp);
         byArmingRequest.put(request, flp);
         enableArmingRequest(vm, request);
+        ensureExitRequest(vm);
         log.info("[{}] #{} registered at {}:{} — arms on first hit", kind.tag, id, flp.className(), flp.line);
+    }
+
+    // ── Waiting for the class to load ──
+
+    /**
+     * Registers a fast logpoint ({@code kind} {@link Kind#LOGPOINT}) or fast breakpoint whose class is
+     * not loaded yet: it waits for the class to load, then becomes {@link State#PENDING} under the
+     * returned ID ({@link #promoteWaiting}). The line is checked only then. The caller re-checks
+     * whether the class loaded meanwhile and, if so, promotes it at once.
+     *
+     * @return the new entry's ID (shared ID space with every other breakpoint kind)
+     */
+    public synchronized int registerWaiting(VirtualMachine vm, Kind kind, String className, int line,
+                                            String expression, @Nullable String condition, int bufferSize,
+                                            int suspendPolicy, boolean stopOnce) {
+        retryPendingRemovals();
+        final int id = breakpointTracker.allocateId();
+        final ClassPrepareRequest request = vm.eventRequestManager().createClassPrepareRequest();
+        request.addClassFilter(className);
+        // The loading thread waits while the arming request is installed, so the class's first run
+        // already passes it.
+        request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        waiting.put(id, new WaitingProbe(id, kind, vm, className, line, expression, condition, bufferSize,
+            suspendPolicy, stopOnce, request, null));
+        request.enable();
+        ensureExitRequest(vm);
+        log.info("[{}] #{} waits for {} to load (line {})", kind.tag, id, className, line);
         return id;
+    }
+
+    /**
+     * The waiting entry of {@code kind} at {@code className:line}, or {@code null}.
+     */
+    @Nullable
+    public Integer findWaiting(Kind kind, String className, int line) {
+        for (WaitingProbe probe : waiting.values()) {
+            if (probe.kind() == kind && probe.className().equals(className) && probe.line() == line) {
+                return probe.id();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Promotes the waiting entries whose {@code ClassPrepareRequest} raised {@code event}. Runs on the
+     * JDI event dispatcher; creates event requests only, so the loading thread is never invoked.
+     */
+    public void handleClassPrepare(ClassPrepareEvent event) {
+        final EventRequest request = event.request();
+        if (request == null || waiting.isEmpty()) {
+            return;
+        }
+        for (WaitingProbe probe : waiting.values()) {
+            if (probe.request().equals(request)) {
+                promoteWaiting(probe.id(), event.referenceType());
+            }
+        }
+    }
+
+    /**
+     * Turns waiting entry {@code id} into a {@link State#PENDING} one now that {@code refType} is
+     * loaded, or marks it failed when the line cannot host it (recorded as {@code _ARM_FAILED}).
+     * Idempotent: an entry already promoted, failed or cleared is left alone.
+     */
+    public synchronized void promoteWaiting(int id, ReferenceType refType) {
+        final WaitingProbe probe = waiting.get(id);
+        if (probe == null || probe.failure() != null) {
+            return;
+        }
+        deleteQuietly(probe.request());
+        final Kind kind = probe.kind();
+        String failure;
+        Location location = null;
+        try {
+            failure = rejectHost(refType, kind);
+            if (failure == null) {
+                failure = leftoversIn(refType, kind);
+            }
+            if (failure == null) {
+                final List<Location> locations = refType.locationsOfLine(probe.line());
+                if (locations.isEmpty()) {
+                    failure = "no executable code at line " + probe.line();
+                } else if (locations.get(0).method().isStaticInitializer()) {
+                    failure = "the line is in a static initializer (<clinit>), which runs once — use " + kind.fallbackTool;
+                } else {
+                    location = locations.get(0);
+                }
+            }
+        } catch (AbsentInformationException e) {
+            failure = "no line number information (compile with -g)";
+        } catch (Exception e) {
+            failure = describe(e);
+        }
+        if (location == null) {
+            failWaiting(probe, Objects.requireNonNullElse(failure, "the line could not be resolved"));
+            return;
+        }
+        waiting.remove(id);
+        try {
+            registerEntry(id, probe.vm(), location, kind, probe.expression(), probe.condition(), probe.bufferSize(),
+                probe.suspendPolicy(), probe.stopOnce());
+        } catch (Exception e) {
+            failWaiting(probe, "registering it failed: " + describe(e));
+            return;
+        }
+        eventHistory.record(new EventHistory.DebugEvent(kind.eventPrefix + "_CLASS_LOADED",
+            String.format("[%s %d] %s loaded — PENDING: arms on the next hit of line %d", kind.tag, id,
+                probe.className(), probe.line()),
+            Map.of("breakpointId", String.valueOf(id), "class", probe.className(),
+                "line", String.valueOf(probe.line()))));
+    }
+
+    /**
+     * Keeps waiting entry {@code probe} listed as failed for {@code reason} and records
+     * {@code _ARM_FAILED}. Caller holds the monitor.
+     */
+    private void failWaiting(WaitingProbe probe, String reason) {
+        final Kind kind = probe.kind();
+        waiting.put(probe.id(), probe.failed(reason));
+        eventHistory.record(new EventHistory.DebugEvent(kind.eventPrefix + "_ARM_FAILED",
+            String.format("[%s %d] %s loaded, but the %s cannot be set at line %d: %s", kind.tag, probe.id(),
+                probe.className(), kind.noun(), probe.line(), reason),
+            Map.of("breakpointId", String.valueOf(probe.id()), "class", probe.className(),
+                "line", String.valueOf(probe.line()), "reason", reason)));
+    }
+
+    /**
+     * Drops a waiting entry and its {@code ClassPrepareRequest}. Caller holds the monitor.
+     */
+    private String clearWaiting(WaitingProbe probe) {
+        waiting.remove(probe.id(), probe);
+        deleteQuietly(probe.request());
+        return String.format("%s %d cleared (it was %s; the class was never modified)", probe.kind().label,
+            probe.id(), probe.failure() != null ? "FAILED: " + probe.failure()
+                : "waiting for " + probe.className() + " to load");
+    }
+
+    private synchronized void clearWaitingIfCurrent(WaitingProbe probe) {
+        if (waiting.get(probe.id()) == probe) {
+            clearWaiting(probe);
+        }
+    }
+
+    private static void deleteQuietly(EventRequest request) {
+        try {
+            request.virtualMachine().eventRequestManager().deleteEventRequest(request);
+        } catch (Exception e) {
+            log.debug("[FastLogpoint] request not deleted: {}", describe(e));
+        }
+    }
+
+    /**
+     * The cleared fast logpoints and fast breakpoints whose class still waits for its restore, each
+     * as "#7 com.example.BoxOffice:54 — thread box-office-3 is stopped in trySell", for
+     * {@code jdwp_overview}. Unsynchronized, like {@link #list}.
+     */
+    public List<String> pendingRestores() {
+        final List<String> out = new ArrayList<>();
+        for (FastLogpoint flp : logpoints.values()) {
+            if (flp.state == State.REMOVAL_PENDING) {
+                out.add(String.format("#%d %s:%d — %s", flp.id, flp.className(), flp.line,
+                    Objects.requireNonNullElse(flp.removalBlocker, "a thread the user may see stopped is in it")));
+            }
+        }
+        out.sort(null);
+        return out;
     }
 
     /**
      * Whether {@code id} names a fast logpoint or a fast breakpoint (any state, including leftovers).
      */
     public boolean isFastLogpoint(int id) {
-        return logpoints.containsKey(id);
+        return logpoints.containsKey(id) || waiting.containsKey(id);
+    }
+
+    /**
+     * How many fast logpoints and fast breakpoints this session set and has not cleared (leftovers of
+     * earlier sessions excluded). Unsynchronized, like {@link #list}.
+     */
+    public int ownCount() {
+        int count = waiting.size();
+        for (FastLogpoint flp : logpoints.values()) {
+            if (!flp.isLeftover() && flp.state != State.REMOVAL_PENDING) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
@@ -509,7 +721,101 @@ public class FastLogpointService {
     public synchronized void drainAll() {
         retryPendingRemovals();
         for (FastLogpoint flp : logpoints.values()) {
-            drain(flp);
+            drain(flp, false);
+        }
+    }
+
+    /**
+     * Reads every probe's ring one last time as the target exits: the listener calls this for the
+     * VM-death event set, before it resumes that set and the VM goes away. With {@link #exitRequest}
+     * in place the set suspended every thread, so no probe writes meanwhile and an entry still
+     * missing now never arrives (it counts as lost). Records one {@code _READ_AT_EXIT} event per
+     * probe, so the {@code [VM_DEATH]} reply and {@code jdwp_get_events} show what was read. Bounded
+     * by {@link #TEARDOWN_TIMEOUT_MS}: the listener must resume the set in any case, or the target
+     * waits at its exit for good. Never throws.
+     */
+    public void readBeforeExit() {
+        if (logpoints.isEmpty()) {
+            return;
+        }
+        final ExecutorService executor = daemonExecutor("fast-logpoint-exit-read");
+        try {
+            executor.submit(this::drainAtExit).get(TEARDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (TimeoutException | ExecutionException e) {
+            final String cause = e instanceof TimeoutException
+                ? "no answer within " + TEARDOWN_TIMEOUT_MS + " ms"
+                : describe(e.getCause() != null ? e.getCause() : e);
+            eventHistory.record(new EventHistory.DebugEvent("FAST_LOGPOINT_WARNING",
+                "The in-target probes could not be read before the target exited (" + cause
+                    + ") — hits since the last jdwp_get_events are lost"));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private synchronized void drainAtExit() {
+        for (FastLogpoint flp : logpoints.values()) {
+            if (flp.ring == null || flp.seq == null || !(flp.state == State.ARMED || flp.isLeftover())) {
+                continue;
+            }
+            final long loggedBefore = flp.logged;
+            final long droppedBefore = flp.dropped;
+            drain(flp, true);
+            final long read = flp.logged - loggedBefore;
+            final long dropped = flp.dropped - droppedBefore;
+            eventHistory.record(new EventHistory.DebugEvent(flp.kind.eventPrefix + "_READ_AT_EXIT",
+                String.format("[%s %d] read before the target exited: %d new %s recorded%s (%d in all)", flp.kind.tag,
+                    flp.id, read, flp.kind == Kind.LOGPOINT ? "hit(s)" : "condition failure(s)",
+                    dropped > 0 ? ", " + dropped + " dropped (" + flp.kind.eventPrefix + "_DROPPED says why)" : "",
+                    flp.logged),
+                Map.of("breakpointId", String.valueOf(flp.id), "class", flp.className(),
+                    "line", String.valueOf(flp.line), "read", String.valueOf(read),
+                    "dropped", String.valueOf(dropped))));
+        }
+    }
+
+    /**
+     * Creates {@link #exitRequest} unless it exists or the VM cannot report its death. Caller holds
+     * the monitor.
+     */
+    private void ensureExitRequest(VirtualMachine vm) {
+        if (exitRequest != null) {
+            return;
+        }
+        try {
+            if (!vm.canRequestVMDeathEvent()) {
+                return;
+            }
+            final VMDeathRequest request = vm.eventRequestManager().createVMDeathRequest();
+            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            request.enable();
+            exitRequest = request;
+        } catch (Exception e) {
+            log.debug("[FastLogpoint] No VM-death request — hits are read only by jdwp_get_events: {}", describe(e));
+        }
+    }
+
+    /**
+     * Deletes {@link #exitRequest} once this session has no fast logpoint or fast breakpoint left.
+     * Caller holds the monitor.
+     */
+    private void releaseExitRequestIfUnused() {
+        final VMDeathRequest request = exitRequest;
+        if (request == null || !waiting.isEmpty()) {
+            return;
+        }
+        for (FastLogpoint flp : logpoints.values()) {
+            if (!flp.isLeftover()) {
+                return;
+            }
+        }
+        exitRequest = null;
+        try {
+            request.virtualMachine().eventRequestManager().deleteEventRequest(request);
+        } catch (Exception e) {
+            log.debug("[FastLogpoint] VM-death request not deleted: {}", describe(e));
         }
     }
 
@@ -523,6 +829,12 @@ public class FastLogpointService {
      */
     @Nullable
     public synchronized String clear(int id) {
+        final WaitingProbe probe = waiting.get(id);
+        if (probe != null) {
+            final String report = clearWaiting(probe);
+            releaseExitRequestIfUnused();
+            return report;
+        }
         final FastLogpoint flp = logpoints.get(id);
         if (flp == null) {
             return null;
@@ -530,6 +842,7 @@ public class FastLogpointService {
         final String report = clearEntry(flp, true);
         // Its own class was just attempted.
         retryPendingRemovals(flp.refType);
+        releaseExitRequestIfUnused();
         return report;
     }
 
@@ -559,10 +872,14 @@ public class FastLogpointService {
         final boolean deferredBefore = flp.state == State.REMOVAL_PENDING;
         if (!deferredBefore) {
             // Kill switch first: one static-field write stops the probe immediately, even if the
-            // redefinition below fails or has to wait.
+            // redefinition below fails or has to wait. Then the threads already inside its recorder
+            // finish, so the final drain misses no entry and none is written after it.
             flp.killSwitchSet = setKillSwitch(flp);
+            if (flp.killSwitchSet) {
+                awaitWriters(flp);
+            }
             deleteStopRequest(flp);
-            drain(flp);
+            drain(flp, false);
             flp.state = State.REMOVAL_PENDING;
         }
         final HeldFrame held = removeLeaving(flp.refType, underRule);
@@ -576,6 +893,7 @@ public class FastLogpointService {
             }
             case REMOVAL_PENDING -> {
                 final String blocker = held != null ? held.describe() : "a thread the user may see stopped is in it";
+                flp.removalBlocker = blocker;
                 if (!deferredBefore) {
                     eventHistory.record(new EventHistory.DebugEvent(flp.kind.eventPrefix + "_REMOVAL_DEFERRED",
                         String.format("[%s %d] disabled; restoring %s waits: %s", flp.kind.tag, id, flp.className(),
@@ -614,8 +932,9 @@ public class FastLogpointService {
                 own.add(flp);
             }
         }
+        final List<WaitingProbe> waitingProbes = new ArrayList<>(waiting.values());
         teardownStuck = false;
-        if (own.isEmpty()) {
+        if (own.isEmpty() && waitingProbes.isEmpty()) {
             forgetAll();
             return 0;
         }
@@ -625,9 +944,13 @@ public class FastLogpointService {
             // a logpoint a later session registered under a reused ID.
             final Future<?> teardown = executor.submit(() -> {
                 try {
+                    for (WaitingProbe probe : waitingProbes) {
+                        clearWaitingIfCurrent(probe);
+                    }
                     for (FastLogpoint flp : own) {
                         clearIfCurrent(flp);
                     }
+                    releaseExitRequestIfUnused();
                 } finally {
                     // A worker that outlived the deadline no longer holds the monitor from here on.
                     teardownStuck = false;
@@ -649,8 +972,8 @@ public class FastLogpointService {
         // Whatever is left goes with the VM handle: own logpoints whose restore failed (the target
         // records them, so the next attach lists them) and leftovers of earlier sessions.
         forgetAll();
-        log.info("[FastLogpoint] Disarmed {} fast logpoint(s) ({})", own.size(), reason);
-        return own.size();
+        log.info("[FastLogpoint] Disarmed {} fast logpoint(s) ({})", own.size() + waitingProbes.size(), reason);
+        return own.size() + waitingProbes.size();
     }
 
     private synchronized void clearIfCurrent(FastLogpoint flp) {
@@ -669,10 +992,13 @@ public class FastLogpointService {
             sessionEpoch.incrementAndGet();
             discoveryIncomplete = false;
             logpoints.clear();
+            waiting.clear();
             byArmingRequest.clear();
             byStopRequest.clear();
             retiredStopRequests.clear();
             instrumentedClasses.clear();
+            // Gone with the VM, or deleted by the JDWP agent when the debugger lets go of it.
+            exitRequest = null;
         }
     }
 
@@ -713,6 +1039,11 @@ public class FastLogpointService {
             out.add(new Info(flp.id, flp.className(), flp.line, flp.expression, flp.condition, flp.state,
                 flp.failureReason, flp.bufferSize, flp.logged, flp.dropped, written, flp.enabled, provenance, flp.kind,
                 flp.suspendPolicy, flp.stopOnce, counters));
+        }
+        for (WaitingProbe probe : waiting.values()) {
+            out.add(new Info(probe.id(), probe.className(), probe.line(), probe.expression(), probe.condition(),
+                probe.failure() != null ? State.FAILED : State.WAITING_FOR_CLASS, probe.failure(), probe.bufferSize(),
+                0, 0, -1, true, null, probe.kind(), probe.suspendPolicy(), probe.stopOnce(), null));
         }
         out.sort(Comparator.comparingInt(Info::id));
         return out;
@@ -898,7 +1229,7 @@ public class FastLogpointService {
                         + "class was not changed.";
                 }
                 member.enabled = false;
-                drain(member);
+                drain(member, false);
             }
             try {
                 redefine(flp.vm, flp.refType, record.original());
@@ -981,7 +1312,7 @@ public class FastLogpointService {
                 + "may still be evaluating.", flp.id);
         }
         flp.enabled = false;
-        drain(flp);
+        drain(flp, false);
         releaseRing(flp);
         if (flp.provenUnwired) {
             retire(flp);
@@ -2036,8 +2367,14 @@ public class FastLogpointService {
                                   Set<String> methods, boolean countProcessing, int callerSuspends) {
         final Map<ThreadReference, Set<Long>> held = session.heldThreads(vm.allThreads(), countProcessing,
             callerSuspends);
+        // The current stop's thread first: under a suspend-all stop every held thread may be in the
+        // method, and the one the user is looking at is the one to name.
+        final BreakpointTracker.LastBreakpoint current = session.currentStop();
+        final ThreadReference stopThread = current != null ? current.thread() : null;
+        final List<Map.Entry<ThreadReference, Set<Long>>> ordered = new ArrayList<>(held.entrySet());
+        ordered.sort(Comparator.comparing(entry -> !entry.getKey().equals(stopThread)));
         HeldFrame unrouted = null;
-        for (Map.Entry<ThreadReference, Set<Long>> entry : held.entrySet()) {
+        for (Map.Entry<ThreadReference, Set<Long>> entry : ordered) {
             final ThreadReference thread = entry.getKey();
             try {
                 for (StackFrame frame : thread.frames()) {
@@ -2311,8 +2648,11 @@ public class FastLogpointService {
     /**
      * Copies the new entries of one evaluating fast logpoint into the event history; see
      * {@link ProbeRing} for the slot rules. Caller holds the monitor. Never throws.
+     *
+     * @param atExit whether the target is at its exit with every thread suspended: an entry still
+     *               missing then never arrives, so it counts as lost and the read goes on past it
      */
-    private void drain(FastLogpoint flp) {
+    private void drain(FastLogpoint flp, boolean atExit) {
         if (flp.ring == null || flp.seq == null || !(flp.state == State.ARMED || flp.isLeftover())) {
             return;
         }
@@ -2343,7 +2683,8 @@ public class FastLogpointService {
                         flp.logged++;
                     } else if (state == ProbeRing.SlotState.OVERWRITTEN) {
                         lapped++;
-                    } else if (flp.stalledSeq == seq && System.nanoTime() - flp.stalledSince > STALLED_ENTRY_TIMEOUT_NANOS) {
+                    } else if (atExit
+                        || flp.stalledSeq == seq && System.nanoTime() - flp.stalledSince > STALLED_ENTRY_TIMEOUT_NANOS) {
                         lost++;
                     } else {
                         if (flp.stalledSeq != seq) {
@@ -2551,6 +2892,39 @@ public class FastLogpointService {
     }
 
     /**
+     * Waits, at most {@link #WRITERS_WAIT_NANOS}, until no thread is inside the probe's recorder
+     * ({@link FastLogpointProbeSource#WRITERS_FIELD}). The kill switch is set already, and the
+     * recorder re-checks it after counting itself in, so a thread arriving later writes nothing: once
+     * the count reads 0, the ring is final (#47 § 3). A probe of an earlier format has no counter; a
+     * thread suspended inside the recorder holds the wait to its bound. Caller holds the monitor.
+     */
+    private static void awaitWriters(FastLogpoint flp) {
+        final ClassType probeType = flp.probeType;
+        if (probeType == null) {
+            return;
+        }
+        try {
+            final Field writersField = probeType.fieldByName(FastLogpointProbeSource.WRITERS_FIELD);
+            if (writersField == null || !(probeType.getValue(writersField) instanceof ObjectReference writers)) {
+                return;
+            }
+            final Field value = writers.referenceType().fieldByName("value");
+            final long deadline = System.nanoTime() + WRITERS_WAIT_NANOS;
+            while (((IntegerValue) writers.getValue(value)).value() > 0) {
+                if (System.nanoTime() > deadline) {
+                    log.debug("[FastLogpoint] #{} a writer is still inside the recorder; reading the ring anyway", flp.id);
+                    return;
+                }
+                Thread.sleep(1);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            log.debug("[FastLogpoint] #{} recorder writers unreadable: {}", flp.id, describe(e));
+        }
+    }
+
+    /**
      * Drops the install record of a probe that is disabled and no longer called, freeing the
      * record's memory in the target once no probe references it. Best-effort; later sessions skip
      * the probe either way (it is uncalled and disabled).
@@ -2711,6 +3085,10 @@ public class FastLogpointService {
      */
     @Nullable
     public Kind listedKind(int id) {
+        final WaitingProbe probe = waiting.get(id);
+        if (probe != null) {
+            return probe.kind();
+        }
         final FastLogpoint flp = logpoints.get(id);
         return flp != null && flp.state != State.REMOVAL_PENDING ? flp.kind : null;
     }
@@ -2722,6 +3100,15 @@ public class FastLogpointService {
      */
     @Nullable
     public String watcherRefusal(int id) {
+        final WaitingProbe probe = waiting.get(id);
+        if (probe != null) {
+            if (probe.kind() == Kind.LOGPOINT) {
+                return String.format("[ERROR] #%d is a fast logpoint: it never stops, so a watcher on it would never "
+                    + "run — put the expression into the fast logpoint itself, or set a breakpoint.", id);
+            }
+            return probe.failure() == null ? null : String.format("[ERROR] Fast breakpoint %d is FAILED (%s) and "
+                + "never stops — clear it with jdwp_clear_breakpoint(%d).", id, probe.failure(), id);
+        }
         final FastLogpoint flp = logpoints.get(id);
         if (flp == null || flp.state == State.REMOVAL_PENDING) {
             return null;
@@ -2859,6 +3246,9 @@ public class FastLogpointService {
         final int line = location.lineNumber();
         final String threadName = thread.name();
         flp.lastStopReason = reason;
+        // Per stop, not per entry: two threads held at stops of this ID at once can stop for
+        // different reasons (#47 § 1).
+        breakpointTracker.recordStopDetail(thread, BreakpointTracker.EventKind.BREAKPOINT, flp.id, reason);
         breakpointTracker.setLastBreakpointThread(thread, flp.id);
         final Map<String, String> details = new LinkedHashMap<>();
         details.put("breakpointId", String.valueOf(flp.id));
@@ -3087,6 +3477,10 @@ public class FastLogpointService {
      */
     public enum State {
         /**
+         * Set before its class was loaded; becomes {@link #PENDING} when the class loads.
+         */
+        WAITING_FOR_CLASS,
+        /**
          * Registered; waiting for the first hit to arm.
          */
         PENDING,
@@ -3257,6 +3651,11 @@ public class FastLogpointService {
         volatile State state = State.PENDING;
         @Nullable
         volatile String failureReason;
+        /**
+         * While {@link State#REMOVAL_PENDING}: what keeps the class from being restored, in words.
+         */
+        @Nullable
+        volatile String removalBlocker;
         @Nullable
         BreakpointRequest armingRequest;
         /**
@@ -3386,6 +3785,21 @@ public class FastLogpointService {
     /**
      * A target class name within one class loader.
      */
+    /**
+     * A fast logpoint or fast breakpoint whose class is not loaded yet — see {@link #waiting}.
+     *
+     * @param request the {@code ClassPrepareRequest} it waits on
+     * @param failure why it could not be set once the class loaded, or {@code null}
+     */
+    private record WaitingProbe(int id, Kind kind, VirtualMachine vm, String className, int line, String expression,
+                                @Nullable String condition, int bufferSize, int suspendPolicy, boolean stopOnce,
+                                ClassPrepareRequest request, @Nullable String failure) {
+        WaitingProbe failed(String reason) {
+            return new WaitingProbe(id, kind, vm, className, line, expression, condition, bufferSize, suspendPolicy,
+                stopOnce, request, reason);
+        }
+    }
+
     private record TargetKey(String className, @Nullable ClassLoaderReference loader) {
     }
 

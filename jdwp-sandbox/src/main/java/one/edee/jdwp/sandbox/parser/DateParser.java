@@ -3,15 +3,12 @@ package one.edee.jdwp.sandbox.parser;
 import java.time.LocalDate;
 
 /**
- * Parses an ISO-like {@code YYYY-MM-DD} date string into a {@link LocalDate}. Assumes its input is
- * already clean — it does not trim, so any stray whitespace on the ends flows straight into
- * {@link Integer#parseInt}.
+ * Parses an ISO-like {@code YYYY-MM-DD} date string into a {@link LocalDate}.
  */
 public class DateParser {
 
 	/**
-	 * Parses {@code input} as {@code YYYY-MM-DD}. Throws {@link NumberFormatException} if any
-	 * component is not a clean integer — e.g. a trailing space on the day part ("15 ").
+	 * Parses {@code input} as {@code YYYY-MM-DD}.
 	 */
 	public LocalDate parse(String input) {
 		String[] parts = input.split("-");

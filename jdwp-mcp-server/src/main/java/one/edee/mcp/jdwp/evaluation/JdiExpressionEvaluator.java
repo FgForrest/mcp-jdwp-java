@@ -20,8 +20,8 @@ import java.util.stream.Collectors;
  * <p>
  * Pipeline (per call to {@link #evaluate}):
  * 1. Build evaluation context from the frame (locals + `this`).
- * 2. Auto-rewrite bare field identifiers (`field` → `_this.field`) via
- * {@link #rewriteThisFieldReferences} when safe; explicit `this`/`this.field` is handled
+ * 2. Auto-rewrite bare field identifiers and method calls (`field` → `_this.field`, `size()` →
+ * `_this.size()`) via {@link #rewriteThisMemberReferences} when safe; explicit `this`/`this.field` is handled
  * separately by {@link #rewriteThisKeyword}.
  * 3. Cache lookup keyed on `wrapperPackage + "###" + signature + "###" + expression` (the package
  * is part of the key because a define-time fallback may recompile the same expression into a
@@ -143,13 +143,25 @@ public class JdiExpressionEvaluator {
      */
     static String rewriteThisFieldReferences(String expression, Set<String> thisFieldNames,
                                              Set<String> shadowingLocals) {
-        if (thisFieldNames.isEmpty()) {
-            return expression;
-        }
+        return rewriteThisMemberReferences(expression, thisFieldNames, Set.of(), shadowingLocals);
+    }
+
+    /**
+     * {@link #rewriteThisFieldReferences} for methods too: an unqualified call {@code sold()} of a
+     * method of {@code this} becomes {@code _this.sold()}. An identifier followed by {@code (} is a
+     * call — rewritten only when {@code thisMethodNames} holds it, never as a field — and a
+     * constructor call ({@code new Foo(...)}) is left alone. Locals cannot be called, so they shadow
+     * fields only.
+     *
+     * @param thisMethodNames method names declared on {@code this}'s type (already filtered for
+     *                        accessibility)
+     */
+    static String rewriteThisMemberReferences(String expression, Set<String> thisFieldNames,
+                                              Set<String> thisMethodNames, Set<String> shadowingLocals) {
         final Set<String> rewritable = thisFieldNames.stream()
             .filter(name -> !shadowingLocals.contains(name))
             .collect(Collectors.toSet());
-        if (rewritable.isEmpty()) {
+        if (rewritable.isEmpty() && thisMethodNames.isEmpty()) {
             return expression;
         }
 
@@ -174,7 +186,11 @@ public class JdiExpressionEvaluator {
                     end++;
                 }
                 final String identifier = expression.substring(i, end);
-                if (!rewritable.contains(identifier) || isPrecededByDot(expression, i)) {
+                final boolean call = isFollowedByParenthesis(expression, end);
+                final boolean member = call
+                    ? thisMethodNames.contains(identifier) && !isPrecededByNew(expression, i)
+                    : rewritable.contains(identifier);
+                if (!member || isPrecededByDot(expression, i)) {
                     out.append(identifier);
                 } else {
                     out.append("_this.").append(identifier);
@@ -240,6 +256,34 @@ public class JdiExpressionEvaluator {
      * (skipping whitespace) — indicating a qualified reference like {@code obj.field}
      * or {@code obj . field} that should NOT be rewritten.
      */
+    /**
+     * Whether the next non-whitespace character at or after {@code pos} is {@code (}.
+     */
+    private static boolean isFollowedByParenthesis(String s, int pos) {
+        for (int j = pos; j < s.length(); j++) {
+            final char c = s.charAt(j);
+            if (!Character.isWhitespace(c)) {
+                return c == '(';
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the token before {@code pos} is the keyword {@code new}.
+     */
+    private static boolean isPrecededByNew(String s, int pos) {
+        int j = pos - 1;
+        while (j >= 0 && Character.isWhitespace(s.charAt(j))) {
+            j--;
+        }
+        final int end = j + 1;
+        while (j >= 0 && Character.isJavaIdentifierPart(s.charAt(j))) {
+            j--;
+        }
+        return "new".equals(s.substring(j + 1, end));
+    }
+
     private static boolean isPrecededByDot(String s, int pos) {
         for (int j = pos - 1; j >= 0; j--) {
             final char p = s.charAt(j);
@@ -453,7 +497,9 @@ public class JdiExpressionEvaluator {
         return packageDecl +
             "// Automatically generated class for JDI expression evaluation\n" +
             "public class " + simpleClassName + " {\n" +
-            "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
+            // throws Throwable: checked exceptions of the user's code (reflection, I/O) need no
+            // try/catch; whatever escapes is reported like any exception of the invocation.
+            "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") throws Throwable {\n" +
             generateMethodBody(expression) +
             "    }\n" +
             "}\n";
@@ -722,29 +768,31 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Whether {@code field} can be referenced from the generated wrapper class, given the
-     * wrapper's package and whether it shares that package with {@code this}'s declared type.
+     * Whether {@code member} — a field or a method — can be referenced from the generated wrapper
+     * class, given the wrapper's package and whether it shares that package with {@code this}'s
+     * declared type.
      * <ul>
-     *   <li>{@code public} fields are always reachable.</li>
-     *   <li>When the wrapper does NOT share {@code this}'s package, only public fields are
+     *   <li>{@code public} members are always reachable.</li>
+     *   <li>When the wrapper does NOT share {@code this}'s package, only public members are
      *       reachable — the wrapper is in the isolated {@code mcp.jdi.evaluation} and cannot see
      *       package-private or protected members of app code.</li>
-     *   <li>When the wrapper DOES share {@code this}'s package, non-private fields are reachable
-     *       only if their declaring type ALSO lives in that package. A protected field inherited
+     *   <li>When the wrapper DOES share {@code this}'s package, non-private members are reachable
+     *       only if their declaring type ALSO lives in that package. A protected member inherited
      *       from a class in a different package is accessible only via subclassing, and the
-     *       wrapper is not a subclass — so we leave such fields un-rewritten to avoid a
+     *       wrapper is not a subclass — so we leave such members un-rewritten to avoid a
      *       misleading "not visible" compile error.</li>
-     *   <li>Private fields are never rewritten (the wrapper is not the declaring class).</li>
+     *   <li>Private members are never rewritten (the wrapper is not the declaring class).</li>
      * </ul>
      */
-    private static boolean isFieldAccessibleFromWrapper(Field field, String wrapperPackage, boolean sharingPackage) {
-        if (field.isPublic()) {
+    private static boolean isMemberAccessibleFromWrapper(TypeComponent member, String wrapperPackage,
+                                                         boolean sharingPackage) {
+        if (member.isPublic()) {
             return true;
         }
-        if (!sharingPackage || field.isPrivate()) {
+        if (!sharingPackage || member.isPrivate()) {
             return false;
         }
-        return packageOf(field.declaringType().name()).equals(wrapperPackage);
+        return packageOf(member.declaringType().name()).equals(wrapperPackage);
     }
 
     /**
@@ -1202,10 +1250,15 @@ public class JdiExpressionEvaluator {
             return expression;
         }
         final Set<String> rewritableFieldNames = thisClass.allFields().stream()
-            .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
+            .filter(f -> isMemberAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
             .map(Field::name)
             .collect(Collectors.toSet());
-        return rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
+        final Set<String> rewritableMethodNames = thisClass.allMethods().stream()
+            .filter(m -> !m.isConstructor() && !m.isStaticInitializer() && !m.isSynthetic())
+            .filter(m -> isMemberAccessibleFromWrapper(m, wrapperPackage, sharingPackage))
+            .map(Method::name)
+            .collect(Collectors.toSet());
+        return rewriteThisMemberReferences(expression, rewritableFieldNames, rewritableMethodNames, shadowingLocals);
     }
 
     /**

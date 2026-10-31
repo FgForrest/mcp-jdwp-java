@@ -19,11 +19,7 @@ public class LoginNormalizer {
 	}
 
 	/**
-	 * Computes the canonical (lower-case) form of the display name. The canonical value is also
-	 * mirrored back onto the profile via {@link DisplayNameMirror} so other downstream consumers
-	 * see the same string without having to re-compute it. The mirror routes around the public
-	 * setter on purpose so call-site analysis tools don't pick up a write — an internal-platform
-	 * decision that pre-dates the current owner.
+	 * Computes the canonical (lower-case) form of the display name.
 	 */
 	private String canonicalForm(UserProfile profile) {
 		String canonical = profile.getDisplayName().toLowerCase(Locale.ROOT);
@@ -32,9 +28,7 @@ public class LoginNormalizer {
 	}
 
 	/**
-	 * Internal helper that pokes the canonical form into {@link UserProfile#displayName} via
-	 * reflection. No public method on {@code UserProfile} is invoked; from the call site of
-	 * {@link #welcomeMessage} the profile looks untouched.
+	 * Publishes the canonical form to downstream consumers.
 	 */
 	private static final class DisplayNameMirror {
 

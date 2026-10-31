@@ -52,9 +52,16 @@ public class FastLogpointTarget {
         holder.start();
         System.out.println("TARGET READY");
         System.out.flush();
-        // Runs until the test closes our standard input.
-        while (System.in.read() >= 0) {
-            // keep reading
+        // Runs until the test closes our standard input. "L" loads LateTarget — by name, so nothing
+        // loads it earlier — and starts its worker; "X" exits through System.exit, as a forked test
+        // JVM does.
+        int command;
+        while ((command = System.in.read()) >= 0) {
+            if (command == 'L') {
+                Class.forName("one.edee.mcp.jdwp.fastlogpoint.fixture.LateTarget").getMethod("start").invoke(null);
+            } else if (command == 'X') {
+                System.exit(0);
+            }
         }
     }
 

@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -135,6 +136,14 @@ public class JdiEventListener {
      */
     @Nullable
     private volatile Runnable vmDeathHook;
+    /**
+     * Optional callback invoked when the target exits, after the in-target probes were read and
+     * before the session closes (which wakes a {@code jdwp_resume_until_event} waiter) — so the
+     * waiter's {@code [VM_DEATH]} reply can say what the exit takes with it. Not invoked for a
+     * user-initiated {@link #stop}.
+     */
+    @Nullable
+    private volatile Runnable vmExitingHook;
     /**
      * Optional callback invoked every time the listener drains an {@link EventSet} from the JDI
      * queue. Used by {@link JdiHealthMonitor} to advance its last-traffic timestamp without
@@ -259,6 +268,56 @@ public class JdiEventListener {
     }
 
     /**
+     * {@code Class.method:line} of {@code location} (simple class name); best-effort.
+     */
+    static String describeSite(@Nullable Location location) {
+        if (location == null) {
+            return "unknown";
+        }
+        try {
+            return simpleName(location.declaringType().name()) + '.' + location.method().name() + ':'
+                + location.lineNumber();
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    private static String simpleName(String className) {
+        return className.substring(className.lastIndexOf('.') + 1);
+    }
+
+    /**
+     * {@link #formatLogpointResult}, with a string in double quotes so {@code "a" -> ""} reads clearly.
+     */
+    static String quoted(@Nullable Value value) {
+        return value instanceof StringReference string ? '"' + string.value() + '"' : formatLogpointResult(value);
+    }
+
+    /**
+     * The {@code detailMessage} of a {@link Throwable} mirror, read as a field — no method is invoked,
+     * so it works on any thread and ignores an overridden {@code getMessage()}. At most 300 characters;
+     * {@code null} when unset or unreadable.
+     */
+    @Nullable
+    static String detailMessage(ObjectReference exception) {
+        try {
+            for (Field field : exception.referenceType().allFields()) {
+                if ("detailMessage".equals(field.name()) && "java.lang.Throwable".equals(field.declaringType().name())) {
+                    final Value value = exception.getValue(field);
+                    if (!(value instanceof StringReference string)) {
+                        return null;
+                    }
+                    final String message = string.value();
+                    return message.length() <= 300 ? message : message.substring(0, 300) + "…";
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[JDI] Exception message not readable: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /**
      * Formats a JDI value for the human-readable logpoint output. Mirrors the format used by
      * {@link JDIConnectionService#formatFieldValue} but without its side effects (no object cache
      * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
@@ -289,6 +348,13 @@ public class JdiEventListener {
      */
     public void setVmDeathHook(@Nullable Runnable hook) {
         this.vmDeathHook = hook;
+    }
+
+    /**
+     * Registers (or clears) the callback invoked when the target exits — see {@link #vmExitingHook}.
+     */
+    public void setVmExitingHook(@Nullable Runnable hook) {
+        this.vmExitingHook = hook;
     }
 
     /**
@@ -334,6 +400,44 @@ public class JdiEventListener {
         listenerThread = thread;
         thread.start();
         log.info("[JDI] Event listener started");
+    }
+
+    /**
+     * Reads the in-target probes one last time before the target exits, then resumes the death set:
+     * a {@code VMDeathRequest} with {@code SUSPEND_ALL} ({@link FastLogpointService}) keeps the target
+     * waiting at its exit until then. Field reads only — no invocation — so it may run on this thread.
+     * The resume runs whatever happens: a death set left suspended would keep the target from exiting.
+     */
+    private void readProbesBeforeExit(EventSet eventSet) {
+        try {
+            final FastLogpointService service = fastLogpoints;
+            if (service != null) {
+                service.readBeforeExit();
+            }
+        } catch (Exception e) {
+            log.debug("[JDI] Reading the probes before the exit failed: {}", e.getMessage());
+        } finally {
+            try {
+                eventSet.resume();
+            } catch (Exception e) {
+                log.debug("[JDI] Resuming the death event set failed: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Runs the registered {@link #vmExitingHook}; never throws.
+     */
+    private void invokeVmExitingHook() {
+        final Runnable hook = vmExitingHook;
+        if (hook == null) {
+            return;
+        }
+        try {
+            hook.run();
+        } catch (Exception e) {
+            log.warn("[JDI] VM-exiting hook threw: {}", e.getMessage());
+        }
     }
 
     /**
@@ -438,6 +542,10 @@ public class JdiEventListener {
                 }
                 if (isDeath(eventSet)) {
                     awaitDispatched(dispatcher);
+                    readProbesBeforeExit(eventSet);
+                    if (running) {
+                        invokeVmExitingHook();
+                    }
                     suspensions.close();
                     process(eventSet, null, null);
                 } else if (fromEvaluatingThread(eventSet)) {
@@ -463,6 +571,9 @@ public class JdiEventListener {
                 // underneath us and a subsequent JDI call now rejects requests. Both are terminal.
                 log.info("[JDI] VM disconnected, stopping event listener: {}", e.getClass().getSimpleName());
                 awaitDispatched(dispatcher);
+                if (running) {
+                    invokeVmExitingHook();
+                }
                 suspensions.close();
                 eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));
                 running = false;
@@ -596,6 +707,9 @@ public class JdiEventListener {
                 stopThread = wpEvent.thread();
             } else if (event instanceof ClassPrepareEvent cpEvent) {
                 handleClassPrepareEvent(cpEvent);
+                if (fastLogpointService != null) {
+                    fastLogpointService.handleClassPrepare(cpEvent);
+                }
                 stop = false;
             } else if (event instanceof VMStartEvent vmStart) {
                 log.info("[JDI] VM started — keeping suspended for breakpoint setup");
@@ -1212,14 +1326,27 @@ public class JdiEventListener {
                 return false;
             }
 
+            // The message by a field read — no invocation, so an overridden getMessage() is not consulted.
+            final String message = detailMessage(exception);
+            final String described = message != null ? exceptionType + ": " + message : exceptionType;
             // Consistent ordering: snapshot → history → latch (see handleStepEvent for the why).
             // F-RA2: tag EXCEPTION explicitly so the renderer surfaces "via=exception".
+            breakpointTracker.recordStopDetail(event.thread(), BreakpointTracker.EventKind.EXCEPTION, null,
+                String.format("%s (thrown at %s, %s)", described, throwInfo,
+                    catchLocation != null ? "caught at " + catchInfo : "uncaught"));
             breakpointTracker.setLastSuspendingEvent(event.thread(), BreakpointTracker.EventKind.EXCEPTION);
+            final Map<String, String> details = new LinkedHashMap<>();
+            details.put("exceptionType", exceptionType);
+            if (message != null) {
+                details.put("message", message);
+            }
+            details.put("throwLocation", throwInfo);
+            details.put("catchLocation", catchInfo);
+            details.put("thread", threadName);
             eventHistory.record(new EventHistory.DebugEvent("EXCEPTION",
                 String.format("%s thrown at %s, caught at %s on thread %s",
-                    exceptionType, throwInfo, catchInfo, threadName),
-                Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
-                    "catchLocation", catchInfo, "thread", threadName)));
+                    described, throwInfo, catchInfo, threadName),
+                Map.copyOf(details)));
             breakpointTracker.fireNextEvent();
 
             log.info("[JDI] Exception {} thrown at {}, caught at {} on thread {}",
@@ -1344,12 +1471,19 @@ public class JdiEventListener {
                     return false;
                 }
             }
+            info.recordHit();
 
             final boolean isModification = event instanceof ModificationWatchpointEvent;
             final String modeStr = isModification ? "modification" : "access";
             final String className = event.field().declaringType().name();
             final String fieldName = event.field().name();
             final String threadName = event.thread().name();
+            // Where the access happened and what it read or wrote: the site tells two writers apart,
+            // and the value spares an expression just to see it.
+            final String site = describeSite(event.location());
+            final String values = isModification
+                ? quoted(event.valueCurrent()) + " -> " + quoted(((ModificationWatchpointEvent) event).valueToBe())
+                : "reads " + quoted(event.valueCurrent());
 
             breakpointTracker.setLastBreakpointThread(event.thread(), bpId);
 
@@ -1388,17 +1522,21 @@ public class JdiEventListener {
             }
 
             if (spec.logOnly()) {
-                evaluateFieldLogpoint(event, bpId, spec, modeStr, className, fieldName, threadName, bindings);
+                evaluateFieldLogpoint(event, bpId, spec, modeStr, className, fieldName, threadName, site, values,
+                    bindings);
                 applyChainEffectsAfterHit(bpId, request);
                 return false;
             }
 
+            breakpointTracker.recordStopDetail(event.thread(), BreakpointTracker.EventKind.BREAKPOINT, bpId,
+                String.format("%s.%s %s at %s: %s", simpleName(className), fieldName, modeStr, site, values));
             eventHistory.record(new EventHistory.DebugEvent(
                 isModification ? "FIELD_MODIFICATION" : "FIELD_ACCESS",
-                String.format("Field %s.%s %s on thread %s", className, fieldName, modeStr, threadName),
+                String.format("Field %s.%s %s on thread %s at %s: %s", className, fieldName, modeStr, threadName,
+                    site, values),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
-                    "mode", modeStr, "thread", threadName,
+                    "mode", modeStr, "thread", threadName, "location", site,
                     "oldValue", String.valueOf(event.valueCurrent()))));
 
             log.info("[JDI] Field {} {} on {} (BP #{})", fieldName, modeStr, threadName, bpId);
@@ -1463,15 +1601,16 @@ public class JdiEventListener {
     private void evaluateFieldLogpoint(WatchpointEvent event, int bpId,
                                        BreakpointTracker.FieldBreakpointSpec spec,
                                        String modeStr, String className, String fieldName,
-                                       String threadName, Map<String, Value> bindings) {
+                                       String threadName, String site, String values,
+                                       Map<String, Value> bindings) {
         final String expression = spec.expression();
         if (expression == null) {
             eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT",
-                String.format("Field %s.%s %s on thread %s [log-only]",
-                    className, fieldName, modeStr, threadName),
+                String.format("Field %s.%s %s on thread %s at %s: %s [log-only]",
+                    className, fieldName, modeStr, threadName, site, values),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
-                    "mode", modeStr, "thread", threadName)));
+                    "mode", modeStr, "thread", threadName, "location", site)));
             log.info("[JDI] Field {} {} logged on {} (BP #{}, log-only)",
                 fieldName, modeStr, threadName, bpId);
             return;
@@ -1479,11 +1618,11 @@ public class JdiEventListener {
         try {
             final String resultStr = evaluateAndFormat(event.thread(), expression, bindings);
             eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT",
-                String.format("Field %s.%s %s on thread %s [%s = %s]",
-                    className, fieldName, modeStr, threadName, expression, resultStr),
+                String.format("Field %s.%s %s on thread %s at %s: %s [%s = %s]",
+                    className, fieldName, modeStr, threadName, site, values, expression, resultStr),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
-                    "mode", modeStr, "thread", threadName,
+                    "mode", modeStr, "thread", threadName, "location", site,
                     "expression", expression, "result", resultStr)));
             log.info("[JDI] Field {} {} logged on {} with {} = {} (BP #{})",
                 fieldName, modeStr, threadName, expression, resultStr, bpId);
@@ -1806,10 +1945,11 @@ public class JdiEventListener {
                 final BreakpointTracker.PendingExceptionBreakpoint pending = entry.getValue();
                 try {
                     final ExceptionRequest exReq = erm.createExceptionRequest(refType, pending.isCaught(), pending.isUncaught());
-                    // Always SUSPEND_EVENT_THREAD: logOnly BPs are auto-resumed by handleExceptionEvent
-                    // after recording / optional expression evaluation. SUSPEND_NONE would prevent
-                    // invokeMethod for the expression eval.
-                    exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    // The spec's policy — SUSPEND_EVENT_THREAD unless the user asked for all: logOnly
+                    // BPs are auto-resumed by handleExceptionEvent after recording / optional
+                    // expression evaluation. SUSPEND_NONE would prevent invokeMethod for the
+                    // expression eval.
+                    exReq.setSuspendPolicy(pending.getSpec().suspendPolicy());
                     exReq.enable();
                     breakpointTracker.disarmIfChained(id, exReq);
                     if (!breakpointTracker.promotePendingExceptionToActive(id, exReq)) {

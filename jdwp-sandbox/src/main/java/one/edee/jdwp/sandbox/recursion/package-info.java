@@ -1,5 +1,6 @@
 /**
- * Scenario 6: The Echo Chamber — recursive breakpoint hit during expression evaluation.
+ * The Echo Chamber — recursive breakpoint hit during expression evaluation. A server check, not
+ * one of the ten scored test flights.
  *
  * <p>Unlike the other sandbox scenarios, the production code in this package is correct.
  * The "break" is in the debugger interaction: without the reentrancy guard, evaluating an
@@ -14,7 +15,7 @@
  *
  *   # From the MCP client:
  *   jdwp_wait_for_attach()
- *   jdwp_set_breakpoint("io.mcp.jdwp.sandbox.recursion.RecursiveCalculator", 22)
+ *   jdwp_set_breakpoint("one.edee.jdwp.sandbox.recursion.RecursiveCalculator", 22)
  *       # line 22 is "int left = compute(n - 1);" — confirm with jdwp_get_breakpoint_context
  *   jdwp_resume_until_event()
  *       # BP fires once inside compute(5)

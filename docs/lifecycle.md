@@ -134,6 +134,7 @@ The hook fires when the listener loop observes a `VMDeathEvent` or `VMDisconnect
 
 - It **preserves `lastHost` / `lastPort`** — so the next tool call's `ensureConnected()` can auto-reconnect after the target restarts.
 - It **preserves `eventHistory`** — so the `VM_DEATH` entry stays queryable for diagnostics.
+- What the exit dropped — breakpoints, field breakpoints with their hit counts, in-target probes, watchers — was snapshotted just before, by the listener's exiting hook (`captureExit` → `lastExit`), so `[VM_DEATH]`, `jdwp_reset` and `jdwp_disconnect` say that the target exited and what went with it, instead of reporting an empty session. The next attach clears it.
 
 Everything else (object cache, watchers, marks, classpath cache, target version) is cleared. The model is "the VM is gone but the conversation is not over" — keep just enough state to recover gracefully, drop everything that is tied to a specific target-VM lifetime.
 
@@ -189,6 +190,6 @@ Logback is configured in `jdwp-mcp-server/src/main/resources/logback-spring.xml`
 - **STDERR** — `System.err` only (lines 4-9). Never stdout, which carries MCP JSON.
 - **FILE** — path is `${LOG_PATH:-${java.io.tmpdir}/mcp-jdwp-inspector.log}` (line 13). Plain `FileAppender`, `append=true`, **no rotation**.
 
-The `.mcp.json` shipped with the plugin (`/.mcp.json:7`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log` so the log file lives next to the plugin install rather than in the user's working directory. When running the JAR directly without that flag, the log falls back to `${java.io.tmpdir}`. The rationale is documented inline in `application.properties:12-18`.
+The plugin's MCP server entry (`mcpServers` in `.claude-plugin/plugin.json`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log` so the log file lives next to the plugin install rather than in the user's working directory. When running the JAR directly without that flag, the log falls back to `${java.io.tmpdir}`. The rationale is documented inline in `application.properties:12-18`.
 
 The lack of rotation is intentional — sessions are typically short-lived and bounded by the agent's lifetime. For long-running automation, plan to truncate the file externally or wrap the `java` command in a launcher that handles rotation.

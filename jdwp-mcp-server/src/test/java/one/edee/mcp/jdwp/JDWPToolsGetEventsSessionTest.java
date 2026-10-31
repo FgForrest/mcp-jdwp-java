@@ -45,12 +45,13 @@ class JDWPToolsGetEventsSessionTest {
 		final String result = tools.jdwp_get_events(20);
 
 		assertThat(result)
-			.contains("current session s2")
+			.contains("current session s2; 2 from earlier attachments, kept until jdwp_reset or jdwp_clear_events")
+			.contains("── session s1 (an earlier attachment) ──")
 			.contains("[s1] [EXCEPTION]")
 			.contains("[s1] [VM_DEATH]")
-			.contains("── session s2 (new VM attachment) ──")
+			.contains("── session s2 (new VM attachment — the current one) ──")
 			.contains("[s2] [BREAKPOINT]");
-		// the divider appears once, at the boundary — not before the first event
+		// the boundary divider appears once
 		assertThat(result.lines().filter(l -> l.contains("new VM attachment")).count()).isEqualTo(1);
 	}
 

@@ -170,13 +170,43 @@ final class LiveSession implements AutoCloseable {
 	 * The line of the target's source that carries {@code marker}.
 	 */
 	static int lineOf(String marker) throws Exception {
-		final List<String> lines = Files.readAllLines(TARGET_SOURCE);
+		return lineOf(marker, TARGET_SOURCE);
+	}
+
+	/**
+	 * The line of {@code source} that carries {@code marker}.
+	 */
+	static int lineOf(String marker, Path source) throws Exception {
+		final List<String> lines = Files.readAllLines(source);
 		for (int i = 0; i < lines.size(); i++) {
 			if (lines.get(i).contains(marker)) {
 				return i + 1;
 			}
 		}
-		throw new IllegalStateException(marker + " not found in " + TARGET_SOURCE);
+		throw new IllegalStateException(marker + " not found in " + source);
+	}
+
+	/**
+	 * Makes the target load {@code LateTarget} and start its worker.
+	 */
+	void loadLateTarget() throws Exception {
+		process.getOutputStream().write('L');
+		process.getOutputStream().flush();
+	}
+
+	/**
+	 * Lets the target's {@code main} return, so the JVM exits.
+	 */
+	void letTargetExit() throws Exception {
+		process.getOutputStream().close();
+	}
+
+	/**
+	 * Makes the target call {@code System.exit(0)} — how a forked test JVM ends.
+	 */
+	void exitTarget() throws Exception {
+		process.getOutputStream().write('X');
+		process.getOutputStream().flush();
 	}
 
 	/**

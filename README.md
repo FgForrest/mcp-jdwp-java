@@ -15,7 +15,7 @@ An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
 - **Trace without stopping** — line/exception/field logpoints write to an event log, the thread runs on
-- **Catch the writer of a mutating field** — watchpoints suspend at the JVM-level store, including reflective `Field.set` that a line BP can never see
+- **Catch the writer of a mutating field** — watchpoints suspend at every bytecode store to the field, wherever it is; a write through reflection or `Unsafe` is the one they cannot see, and the `[VM_DEATH]` reply's hit count shows when a watchpoint stayed silent
 - **Pure STDIO** — no daemon, no extra port, no GUI
 
 The agent gets the same power as IntelliJ's debugger, with extras that exist specifically because an agent isn't a human staring at a UI (filtering, blocking resume, one-shot context dumps, recursion guards, reconnect after a wedge).
@@ -35,20 +35,20 @@ This MCP server runs **entirely on your local machine**:
 - **JDK 17+** on PATH to **run** the server (must be a JDK, not a JRE — JDI lives in `jdk.jdi`).
 - **JDK 21+ to build from source** — the build toolchain pins to JDK ≥ 21 because Error Prone 2.48 ships Java-21 bytecode. The bytecode target stays at Java 17, so the resulting JAR still runs on a JDK 17 runtime.
 
-No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. The SessionStart hook and every build command in this README use the wrapper.
+No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. Every build command in this README uses the wrapper; the SessionStart hook does too, and falls back to `mvn` on `PATH` when the wrapper cannot set itself up.
 
 ### 1. Install the plugin
 
 **Option A: Plugin marketplace (recommended)**
 
-Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, gotchas), and the `.mcp.json` configuration in one step:
+Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, gotchas), and the MCP server registration in one step:
 
 ```bash
 /plugin marketplace add https://github.com/FgForrest/mcp-jdwp-java.git
 /plugin install jdwp-debugging@mcp-jdwp-java
 ```
 
-The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 17+ on PATH — no Maven install needed). The hook is content-aware: it rebuilds when `git HEAD` moves, not just when the JAR is missing, so `git pull` + restart picks up updates without manual intervention. Restart Claude Code to pick up the plugin.
+The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 21+ — no Maven install needed). The hook is content-aware: it rebuilds when the JAR is missing or, in a git checkout, when `HEAD` moves, so `git pull` + restart picks up updates without manual intervention. When the wrapper cannot set itself up (for example, `~/.m2` is read-only in a sandbox), the hook tries `mvn -o` and then `mvn` from `PATH`. If every attempt fails, a warning at session start names the build log and the exact command to build by hand. A build runs while Claude Code starts the MCP server and the JAR is absent until it finishes, so after a build (first install, update, moved `HEAD`) `jdwp-inspector` may show as failed in `/mcp`; reconnect it there once the build is done. Restart Claude Code to pick up the plugin.
 
 <details>
 <summary><strong>Alternative: manual MCP registration (without plugin)</strong></summary>
@@ -160,8 +160,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `retrieve() returned null` — a session was stored, upgraded, and then... vanished from the map.
 
-**Hint:** The session is still *in* the HashMap. The HashMap just can't *find* it anymore.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -178,8 +176,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 **Difficulty:** Hard | **Test:** `EventBusTest` | **Package:** `events` | **Par:** 4 | **Exercises:** exception breakpoint + trigger gate
 
 **Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
-
-**Hint:** The handler runs on a background thread. Nothing in your code catches its failure — so there's no catch block to break on. Catch the throw itself.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -198,8 +194,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
 
-**Hint:** The value *was* set correctly. Something wrote over it afterward. There's no half-built object to inspect — the damage is in the order of writes.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -217,8 +211,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
 
-**Hint:** The transfer moves money in two steps. The audit snapshot is taken between them.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -232,18 +224,24 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3 | **Exercises:** event history as evidence
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3 | **Exercises:** field watchpoint blind spot + before/after bisect
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
-
-**Hint:** You will not find the write by ripgrep'ing for `setDisplayName` — the public setter is never called. A line BP on the setter never fires. Whatever path the write travels, the field's value still flips. Let the JVM tell you exactly when it changes, regardless of how the write reaches the field.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName` — bypassing the public setter entirely. From the test's perspective the formatter is read-only; from JDI's perspective every reflective write is still a real field modification.
+`LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper, which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName`, bypassing the public setter. From the test's side the formatter looks read-only, and a field watchpoint cannot see the write either: JDI watchpoints fire only on the `putfield`/`getfield` bytecodes (and JNI field access). `Field.set` ends in an `Unsafe` store straight to memory, which trips no watchpoint, in `modification` mode or in `access` mode.
 
-**Debug path:** `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")` — JDI watchpoints fire on every JVM-level field store, including stores issued through `Field.set` and `Unsafe`. The next write suspends the thread inside `DisplayNameMirror.mirror`; `jdwp_get_stack` walks back through `canonicalForm` to `LoginNormalizer.welcomeMessage` and names the culprit. A line BP on `UserProfile.setDisplayName` would never fire — the setter is genuinely unused.
+**Debug path:** The tell is a modification watchpoint that fires once, for the constructor's ordinary assignment, and never again, although the value flips before the assertion: the write does not go through a field store. The par path takes three calls:
+
+1. `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")`. The class is not loaded yet, so the watchpoint waits for it.
+2. `jdwp_resume_until_event`: the watchpoint fires in the `UserProfile` constructor, which stores `"Alice"`.
+3. `jdwp_resume_until_event`: the test fails and its JVM exits. The `[VM_DEATH]` reply lists the watchpoint with one hit. The only store the JVM saw wrote `"Alice"`, yet the test read `"alice"`, so the write is reflective or goes through `Unsafe`. Between the two, the test calls only `welcomeMessage`, on line 24.
+
+Bisecting takes three calls as well and shows where the value flips, though not how: `jdwp_set_breakpoint("one.edee.jdwp.sandbox.userprofile.UserProfileTest", 27)`, just after `welcomeMessage`, then `jdwp_resume_until_event`, then `jdwp_evaluate_expression("profile.getDisplayName()")`, which is already `"alice"`. When the old and new strings could be equal, compare `System.identityHashCode(profile.getDisplayName())` instead.
+
+That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `DisplayNameMirror.mirror` → `Field.set`. To name the writing call from the debugger alone, break at line 24 instead and keep bisecting inside `welcomeMessage` with `jdwp_step_into` / `jdwp_step_over`, comparing the identity after each line: it flips across `DisplayNameMirror.mirror(profile, canonical)` in `canonicalForm`. A line BP on `UserProfile.setDisplayName` never fires — the setter is genuinely unused.
 
 </details>
 
@@ -254,8 +252,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 **Difficulty:** Moderate | **Test:** `CheckoutTest` | **Package:** `cart` | **Par:** 6 | **Exercises:** marked instances (`$label`)
 
 **Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
-
-**Hint:** The object you get back from the pipeline is not the object you passed in. Prove it.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -274,8 +270,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
 
-**Hint:** Two threads, one lost update. Suspending a thread to look changes the timing — watch the reads without stopping anything.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -289,18 +283,16 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #8 The Magic Patch
 
-**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 3 | **Exercises:** runtime mutation (`set_local`)
+**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 4 | **Exercises:** runtime mutation (`set_local`)
 
 **Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
-
-**Hint:** The input looks *almost* right. Rather than rebuild with a fix, patch the value in place and see if the test goes green.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
 `DateParser.parse` splits `YYYY-MM-DD` and `Integer.parseInt`s each part. The feed delivers `"2026-05-15 "` with a trailing space, so `parseInt("15 ")` throws. The parser never trims its input.
 
-**Debug path:** Break at the top of `parse`, observe `input = "2026-05-15 "`, then `jdwp_set_local("input", "2026-05-15")` and resume. The parse now succeeds and the test passes — confirming the trailing space is the whole story, with no rebuild.
+**Debug path:** Four calls. `jdwp_set_breakpoint` at the top of `parse`, `jdwp_resume_until_event` to stop there, `jdwp_set_local("input", "2026-05-15")` to drop the trailing space (or break on the test's line 19 and patch `fromFeed` instead), and `jdwp_resume`. The parse now succeeds and the test passes — confirming the trailing space is the whole story, with no rebuild. The exception message already shows the stray space, so the stop needs no inspection call; the confirming resume counts.
 
 </details>
 
@@ -311,8 +303,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 **Difficulty:** Hard | **Test:** `TransferDeadlockTest` | **Package:** `deadlock` | **Par:** 4 | **Exercises:** multi-thread inspection (no breakpoints)
 
 **Symptom:** The test hangs and then fails its join — both transfers never complete.
-
-**Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -329,18 +319,24 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 4 | **Exercises:** in-target probes (fast logpoint / fast breakpoint, with the user's consent)
 
-**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
+**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — the season ends oversold by a few tickets per performance.
 
-**Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
+**Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`BoxOffice.trySell` checks that the seat is free, prices it (reading the pricing desk's volatile surcharge), and only then records the buyer: a check-then-act race. Two windows that check the same free seat within the pricing step both sell it, and `sold` counts both. About six seats per performance are sold twice.
+`BoxOffice.trySell` checks that the seat is free, prices it (reading the pricing desk's volatile surcharge), and only then records the buyer: a check-then-act race. Two windows that check the same free seat within the pricing step both sell it, and `sold` counts both. About six seats per performance are sold twice. Customer numbers are window numbers, and `owners[]` keeps only the last buyer, so counting seats against `sold()` after the fact shows the overselling but cannot name the window that sold a seat first. Only catching the collision can.
 
-**Debug path:** On the sell line (`seatOwners[seat] = customer`), the condition `seatOwners[seat] != 0` is true exactly when another window sold the seat after this one checked it. Each of these tools needs the user's explicit consent, because it rewrites the class's bytecode: call it once without `userApproved`, relay the briefing, and ask.
-- `jdwp_set_fast_logpoint` with that condition and the expression `seat + " sold to " + seatOwners[seat] + ", resold to " + customer`, then `jdwp_get_events` after the run: every double sale is listed with both windows.
-- `jdwp_set_fast_breakpoint` with that condition, then `jdwp_resume_until_event`: the first double sale stops with every window parked. `jdwp_get_breakpoint_context` shows the seat and its second buyer (`customer`); `seatOwners[seat]` evaluates to the first.
+**Debug path:** On the sell line (`BoxOffice.java:54`, `seatOwners[seat] = customer`), the condition `seatOwners[seat] != 0` is true when another window sold the seat after this one checked it. Both in-target tools rewrite the class's bytecode, so each needs the user's explicit consent: the first call, without `userApproved`, arms nothing and returns a risk briefing to relay word for word. `BoxOffice` is not loaded when the test JVM starts; the approved probe waits for the class to load and arms on its next hit.
+- **Fast logpoint, 4 calls (par):**
+  1. `jdwp_set_fast_logpoint` on `one.edee.jdwp.sandbox.boxoffice.BoxOffice` line 54, with that condition and the expression `seat + " sold to " + seatOwners[seat] + ", resold to " + customer`, without `userApproved`: the risk briefing, relayed to the user.
+  2. The same call with `userApproved=true`, once the user agrees.
+  3. `jdwp_resume_until_event`: the test runs to its end. The reply is `[VM_DEATH]` and says how many `FAST_LOGPOINT` hits were recorded.
+  4. `jdwp_get_events`: the double sales, each with its seat and the first and second window.
+- **Fast breakpoint, 5 calls:** the briefing and the approved `jdwp_set_fast_breakpoint` call with the same condition, then `jdwp_resume_until_event`: the first double sale stops with every window parked. `jdwp_get_breakpoint_context` shows `seat` and its second buyer, `customer`. `jdwp_evaluate_expression("seatOwners[seat]")` gives the first buyer; array elements are not in the context dump.
+
+The logpoint does not catch every double sale. Its condition reads a plain `int[]` without synchronization, so a window that reads the seat before the other window's write is visible logs nothing; one live run caught 1,460 of 2,472 double sales. One is enough to solve the flight. The probe also sits inside the race window, between the check and the write, so it widens the race rather than hiding it: runs with the probe sold more seats twice, not fewer.
 
 An ordinary conditional breakpoint or logpoint on that line goes through the debugger on each of about 60 million passes, at 3–30 ms each. The box office closes first, and the serialized windows stop colliding.
 
@@ -359,7 +355,7 @@ An ordinary conditional breakpoint or logpoint on that line goes through the deb
 | 6-9    | Impressive. You found bugs that would take hours with println.       |
 | 10     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
+**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
 
 ## Features beyond standard JDWP
 
@@ -404,7 +400,7 @@ jdwp_set_fast_logpoint(
 )
 ```
 
-On the next hit of the line the server compiles a small probe class, defines it in the class's own class loader, and redefines the class (`VirtualMachine.redefineClasses`) with a call to the probe at that line. From then on the probe evaluates the condition and expression on the application thread and appends the result to a lock-free ring buffer in the target; `jdwp_get_events` reads that buffer through plain field reads — no thread is ever suspended — and reports entries lost to a buffer overrun as `FAST_LOGPOINT_DROPPED`. Clearing the logpoint, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode.
+On the next hit of the line the server compiles a small probe class, defines it in the class's own class loader, and redefines the class (`VirtualMachine.redefineClasses`) with a call to the probe at that line. From then on the probe evaluates the condition and expression on the application thread and appends the result to a lock-free ring buffer in the target; `jdwp_get_events` reads that buffer through plain field reads — no thread is ever suspended — and reports entries lost to a buffer overrun as `FAST_LOGPOINT_DROPPED`. Hits nobody read before the target exits — a test JVM finishing its run — are read as it exits: the target waits at its exit until the server has drained the buffer, and the `[VM_DEATH]` reply says how many were recorded. A class that is not loaded yet is waited for: the fast logpoint arms once the class loads, so it can be set at VM start (where `forceLoad` cannot load anything). Clearing the logpoint, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode.
 
 Because this **rewrites the running application's bytecode**, the tool requires explicit user consent: called without `userApproved=true` it arms nothing and returns a risk briefing (instrumentation that outlives a crashed server, user code on application threads, interaction with other bytecode agents, breakpoint re-creation, two stop-the-world pauses) for the agent to relay to the user word for word.
 
@@ -427,7 +423,7 @@ jdwp_set_fast_breakpoint(
 
 The first hit of the line goes through the debugger: if the condition holds, that hit is the stop; otherwise the server installs a probe, as for a fast logpoint. The probe calls an empty `stop()` method only when the condition holds, and the debugger's breakpoint sits on `stop()` — so the instrumented method keeps running compiled. In the spike, a method holding a breakpoint that never fired ran at 74 ns per call against 7 ns; with a fast breakpoint the difference stayed within run-to-run noise. Wait for the stop with `jdwp_resume_until_event`; the report reads `fast_breakpoint=N, condition true`. The stack, locals, evaluation, `jdwp_set_local`, watchers and steps all work from the user's frame — the probe frames on top are hidden, and a step lands on the stop line. A condition that throws stops once and is then only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
 
-The consent protocol, the risk briefing and the handling of leftovers after a crashed server are those of fast logpoints. Clearing a fast breakpoint while a thread is stopped in its method switches it off at once and restores the class once that thread is released, so the stopped frame keeps its local variables. The condition runs unsynchronized on every thread that passes the line: it must be thread-safe and free of side effects, and private fields are out of its reach. `jdwp_set_breakpoint` with a condition stays the default; reach for the fast variant only when going through the debugger on every hit would distort what you are looking at — a race, a hot loop, a latency-sensitive path where the condition is rarely true.
+The consent protocol, the risk briefing, waiting for a class that is not loaded yet and the handling of leftovers after a crashed server are those of fast logpoints. Clearing a fast breakpoint while a thread is stopped in its method switches it off at once and restores the class once that thread is released, so the stopped frame keeps its local variables; `jdwp_overview` lists the restore as pending until then. The condition runs unsynchronized on every thread that passes the line: it must be thread-safe and free of side effects, and private fields are out of its reach. `jdwp_set_breakpoint` with a condition stays the default; reach for the fast variant only when going through the debugger on every hit would distort what you are looking at — a race, a hot loop, a latency-sensitive path where the condition is rarely true.
 
 ### Deferred breakpoints
 
@@ -452,7 +448,7 @@ jdwp_set_exception_breakpoint(
 )
 ```
 
-Catch exceptions at the throw site — before the stack unwinds. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_overview(types="exception_breakpoint")` to see active and pending exception breakpoints.
+Catch exceptions at the throw site — before the stack unwinds. The stop names the exception's type and message (`via=exception, java.lang.IllegalStateException: Insufficient stock (thrown at …, caught at …)`). Only the throwing thread stops unless you pass `suspendPolicy="all"` — use it when the throw happens on a pool thread and the test's main thread would otherwise run on to its timeout and end the JVM while you look. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_overview(types="exception_breakpoint")` to see active and pending exception breakpoints.
 
 **Log-only mode** — record the throw without suspending the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
 
@@ -711,7 +707,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?` | **Rare, consent required.** Conditional breakpoint whose condition is evaluated inside the target by injected bytecode — hits that do not meet it never reach the debugger. Without `userApproved=true` it arms nothing and returns a risk briefing |
 | `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints or fast breakpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs, fast logpoints and fast breakpoints (restoring the original bytecode, after the release of a thread stopped in the method; a leftover of an earlier session is only switched off) and removes its watchers |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred and trigger chaining) |
+| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?` | Suspend on exception throw (supports deferred and trigger chaining; `suspendPolicy="all"` parks every thread) |
 | `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
 | `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
 | `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
@@ -730,7 +726,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool                       | Parameters                                          | Description                                                       |
 |----------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
-| `jdwp_evaluate_expression` | `threadId`, `expression`, `frameIndex?`             | Evaluate Java expression at suspended frame (supports `{ block }`) |
+| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java expression at suspended frame (supports `{ block }`; `threadId` defaults to the current stop's thread) |
 | `jdwp_assert_expression`   | `expression`, `expected`, `threadId?`, `frameIndex?` | Evaluate and compare against expected value                       |
 | `jdwp_set_local`           | `threadId`, `frameIndex`, `varName`, `value`        | Set a local variable's value                                      |
 | `jdwp_set_field`           | `objectId`, `fieldName`, `value`                    | Set a field's value on a cached object                            |
@@ -903,12 +899,12 @@ mcp-jdwp-java/
 ├── mvnw / mvnw.cmd                      # Maven wrapper
 ├── README.md
 ├── CHANGELOG.md
-├── .mcp.json                            # MCP server configuration
 ├── .claude-plugin/
-│   ├── plugin.json                      # Claude Code plugin metadata
+│   ├── plugin.json                      # Claude Code plugin metadata + MCP server configuration
 │   └── marketplace.json                 # Plugin marketplace registry
 ├── hooks/
-│   └── hooks.json                       # SessionStart hook: auto-builds JAR if missing or git HEAD moved
+│   ├── hooks.json                       # SessionStart hook registration
+│   └── ensure-server-jar.sh             # Auto-builds the JAR if missing or git HEAD moved
 ├── skills/
 │   ├── java-debug/                      # Debugging skill (workflows, recipes, gotchas)
 │   └── release/                         # Release-cutting skill
@@ -988,6 +984,8 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | `tools.jar not found` / `jdk.jdi not available` | Ensure `JAVA_HOME` points to a JDK, not a JRE. Launch with `--add-modules jdk.jdi`.                                                                                 |
 | Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check port matches `-DJVM_JDWP_PORT`.                                                                     |
 | MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                   |
+| `jdwp-debugging: could not build the MCP server JAR` at session start | The plugin's SessionStart hook tried `./mvnw`, `mvn -o` and `mvn`. Read the build log the message names, run the command it gives (it also writes the `.build-sha` marker), then reconnect `jdwp-inspector` in `/mcp`. |
+| `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`. |
 | MCP server times out on startup                 | JVM startup takes several seconds. Ensure `MCP_TIMEOUT=30000` (or higher) is set in the MCP registration — the default is too short for a Spring Boot Java process. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | Expression evaluation timeout                   | First evaluation is slow (classpath discovery). Increase `MCP_TOOL_TIMEOUT`. Subsequent evaluations use cache.                                                      |

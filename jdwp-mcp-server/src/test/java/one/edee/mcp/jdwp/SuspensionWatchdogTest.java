@@ -137,6 +137,47 @@ class SuspensionWatchdogTest {
 	}
 
 	@Test
+	@DisplayName("host-side work of the lease (thread suspended between invocations) does not age the next invocation (#47 § 2)")
+	void hostWorkDoesNotAgeTheInvocation() throws Exception {
+		// The lease starts with host-side work: the thread is still suspended at its event.
+		model.completeInvocation(t);
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS * 2);
+		watchdog.tick();
+		// Then the invocation starts and blocks at once.
+		model.beginInvocation(t);
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		for (int i = 0; i < 3; i++) {
+			watchdog.tick();
+			advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		}
+
+		assertThat(u.count).as("the invocation is only 1.5 s old").isEqualTo(1);
+		verify(t.ref, never()).currentContendedMonitor();
+	}
+
+	@Test
+	@DisplayName("two consecutive blocked samples on different monitors do not count as one wait (#47 § 2)")
+	void samplesOnAnotherMonitorStartAgain() throws Exception {
+		final ObjectReference first = mock(ObjectReference.class);
+		final ObjectReference second = mock(ObjectReference.class);
+		when(second.owningThread()).thenReturn(u.ref);
+		when(t.ref.currentContendedMonitor()).thenReturn(first, second, second);
+		t.status = ThreadReference.THREAD_STATUS_MONITOR;
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		watchdog.tick();
+		advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		watchdog.tick();
+		assertThat(u.count).as("first and second sample waited for different monitors").isEqualTo(1);
+
+		advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		watchdog.tick();
+		assertThat(u.count).isZero();
+		assertThat(model.invocationRuns(t)).isTrue();
+	}
+
+	@Test
 	@DisplayName("a closed session stops the watchdog")
 	void closedSessionStopsIt() {
 		session.close();

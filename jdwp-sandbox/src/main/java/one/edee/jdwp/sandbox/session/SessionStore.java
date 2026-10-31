@@ -19,7 +19,7 @@ public class SessionStore {
 	}
 
 	/**
-	 * Upgrades the user's role. This mutates the key object while it's in the map.
+	 * Upgrades the user's role.
 	 */
 	public void upgradeUserRole(UserSession session, String newRole) {
 		session.upgradeRole(newRole);

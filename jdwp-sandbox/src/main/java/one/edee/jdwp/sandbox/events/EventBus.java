@@ -8,7 +8,6 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Dispatches order events to registered handlers on a background executor.
- * Handler failures are never observed by any caller, so the bus reports success.
  */
 public class EventBus {
 
@@ -21,10 +20,7 @@ public class EventBus {
 
 	/**
 	 * Dispatches an event to all registered handlers on a single-thread executor and waits
-	 * for completion. Each handler is submitted fire-and-forget — the returned Future is never
-	 * inspected, so any exception a handler throws is captured by the JDK's FutureTask and
-	 * silently discarded. No frame in this class (or any caller) ever catches it, and the
-	 * error list below is never populated.
+	 * for completion.
 	 */
 	public void dispatch(OrderEvent event) {
 		final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
@@ -48,8 +44,7 @@ public class EventBus {
 	}
 
 	/**
-	 * Returns recorded error messages. Always empty — nothing in the dispatch path records a
-	 * failure, because nothing catches one.
+	 * Returns the recorded error messages.
 	 */
 	public List<String> getErrorSummary() {
 		return errors;

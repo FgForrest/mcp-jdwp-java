@@ -103,7 +103,8 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(main.count).as("the seen stop was released").isZero();
 		publish(new BreakpointTracker.LastBreakpoint(main.ref, 12), EventRequest.SUSPEND_EVENT_THREAD);
 
-		assertThat(waiting.get(5, TimeUnit.SECONDS)).contains("breakpoint=12").contains("Resumed: breakpoint 11 on thread main");
+		assertThat(waiting.get(5, TimeUnit.SECONDS)).contains("breakpoint=12")
+			.contains("Released before waiting: breakpoint 11 on thread main");
 	}
 
 	@Test
@@ -166,6 +167,38 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 			BreakpointTracker.EventKind.EXCEPTION));
 		session.finish(context);
 		assertThat(tools.jdwp_resume_until_event(1_000)).contains("via=exception").doesNotContain("breakpoint=");
+	}
+
+	@Test
+	@DisplayName("an exception stop names the exception's type and message; a field-breakpoint stop is labelled as one (#50)")
+	void shouldNameTheExceptionAndTheField() {
+		breakpointTracker.recordStopDetail(main.ref, BreakpointTracker.EventKind.EXCEPTION, null,
+			"java.lang.IllegalStateException: Insufficient stock (thrown at Inventory:12, uncaught)");
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, null, BreakpointTracker.EventKind.EXCEPTION),
+			EventRequest.SUSPEND_EVENT_THREAD);
+		assertThat(tools.jdwp_resume_until_event(1_000))
+			.contains("via=exception, java.lang.IllegalStateException: Insufficient stock (thrown at Inventory:12, "
+				+ "uncaught)");
+	}
+
+	@Test
+	@DisplayName("a stop names the logpoint hits recorded since the last jdwp_get_events (#50)")
+	void shouldNameUnreadLogpointHits() {
+		eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT", "Field X.y modification"));
+		eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT", "Field X.y modification"));
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+
+		assertThat(tools.jdwp_resume_until_event(1_000)).contains("breakpoint=11")
+			.endsWith("Recorded since your last jdwp_get_events: 2 FIELD_LOGPOINT.");
+	}
+
+	@Test
+	@DisplayName("a detail recorded for another stop of the thread is not shown")
+	void staleDetailIsNotShown() {
+		breakpointTracker.recordStopDetail(main.ref, BreakpointTracker.EventKind.BREAKPOINT, 4, "Config.timeout modification");
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, null, BreakpointTracker.EventKind.EXCEPTION),
+			EventRequest.SUSPEND_EVENT_THREAD);
+		assertThat(tools.jdwp_resume_until_event(1_000)).contains("via=exception").doesNotContain("Config.timeout");
 	}
 
 	@Test
