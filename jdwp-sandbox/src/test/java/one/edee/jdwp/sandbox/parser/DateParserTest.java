@@ -12,10 +12,10 @@ class DateParserTest {
 	void shouldParseDateFromFeed() {
 		DateParser parser = new DateParser();
 
-		// The upstream feed delivers the date with a trailing space.
+		// The date as the upstream feed delivers it.
 		String fromFeed = "2026-05-15 ";
 
-		// Fails: Integer.parseInt("15 ") throws NumberFormatException — the day part carries the space.
+		// Fails: NumberFormatException.
 		LocalDate result = parser.parse(fromFeed);
 
 		assertThat(result).isEqualTo(LocalDate.of(2026, 5, 15));

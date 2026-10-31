@@ -3,8 +3,7 @@ package one.edee.jdwp.sandbox.session;
 import java.util.Objects;
 
 /**
- * Represents a user session with a userId and role.
- * Used as a HashMap key — hashCode/equals depend on both fields.
+ * A user session: a user id and a role.
  */
 public class UserSession {
 
@@ -25,7 +24,7 @@ public class UserSession {
 	}
 
 	/**
-	 * Upgrades the user's role. This mutates a field that participates in hashCode/equals.
+	 * Upgrades the user's role.
 	 */
 	public void upgradeRole(String newRole) {
 		this.role = newRole;

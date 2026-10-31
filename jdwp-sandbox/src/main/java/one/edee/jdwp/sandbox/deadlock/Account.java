@@ -1,9 +1,7 @@
 package one.edee.jdwp.sandbox.deadlock;
 
 /**
- * A bank account whose {@code transfer} locks the source account and then the destination account.
- * Two transfers running in opposite directions therefore acquire the two locks in opposite orders
- * — the textbook recipe for deadlock.
+ * A bank account that transfers money to other accounts.
  */
 public class Account {
 
@@ -24,10 +22,7 @@ public class Account {
 	}
 
 	/**
-	 * Transfers {@code amount} from this account to {@code to}. Locks {@code this} first, then
-	 * {@code to}. The brief pause while holding the first lock widens the window so two opposing
-	 * transfers reliably each grab their first lock before either can take the second — and then
-	 * wait on each other forever.
+	 * Transfers {@code amount} from this account to {@code to}.
 	 */
 	public void transfer(Account to, int amount) {
 		synchronized (this) {

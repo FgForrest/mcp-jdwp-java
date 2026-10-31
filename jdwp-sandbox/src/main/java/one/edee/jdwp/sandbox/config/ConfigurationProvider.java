@@ -1,10 +1,8 @@
 package one.edee.jdwp.sandbox.config;
 
 /**
- * Builds and holds the application Configuration, and runs a maintenance sweep that is supposed
- * to clear <em>stale</em> configurations. The sweep misfires on the freshly-initialized instance:
- * it runs on a background thread and resets the timeout back to its default, clobbering the value
- * that {@link #buildConfig()} just set.
+ * Builds and holds the application Configuration, and runs the maintenance sweep that clears
+ * stale configurations.
  */
 public class ConfigurationProvider {
 
@@ -12,7 +10,7 @@ public class ConfigurationProvider {
 
 	public ConfigurationProvider() {
 		this.instance = new Configuration("MyApp");
-		this.instance.init(5000); // correct value is written here…
+		this.instance.init(5000);
 	}
 
 	public Configuration getConfig() {
@@ -20,10 +18,7 @@ public class ConfigurationProvider {
 	}
 
 	/**
-	 * Runs the "stale config" maintenance sweep on a background thread and waits for it. Intended
-	 * to reset configs that have gone stale; here it wrongly treats the live, just-initialized
-	 * instance as stale and zeroes its timeout — a second write that overwrites the 5000 set in
-	 * the constructor. The reader sees only the final value (0) and no surviving trace of the 5000.
+	 * Runs the stale-configuration maintenance sweep on a background thread and waits for it.
 	 */
 	public void runMaintenanceSweep() throws InterruptedException {
 		final Thread reaper = new Thread(instance::resetToDefaults, "config-reaper");

@@ -3,8 +3,7 @@ package one.edee.jdwp.sandbox.userprofile;
 import java.util.List;
 
 /**
- * Mutable user profile. Display name and roles preserve whatever the caller passed; the only
- * publicly visible setter is {@link #setDisplayName(String)}.
+ * A user profile: an email, a display name and roles.
  */
 public class UserProfile {
 

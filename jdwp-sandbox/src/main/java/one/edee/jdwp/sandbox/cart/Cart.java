@@ -4,8 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * A shopping cart. Carries a copy constructor added for a "snapshot" feature — the copy has
- * identical field values to the original, differing only in object identity.
+ * A shopping cart: its items and their total.
  */
 public class Cart {
 
@@ -20,8 +19,7 @@ public class Cart {
 	}
 
 	/**
-	 * Copy constructor — produces a snapshot whose fields equal {@code other}'s. Same values,
-	 * different instance.
+	 * Copies {@code other}.
 	 */
 	public Cart(Cart other) {
 		this.id = other.id;

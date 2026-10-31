@@ -13,7 +13,7 @@ This is the companion sandbox for the [jdwp-debugging Claude Code plugin](https:
 | JDK | 17 or newer |
 | Maven | 3.9 or newer |
 | Claude Code | Latest |
-| Plugin | `jdwp-debugging` 2.0.0+ installed |
+| Plugin | `jdwp-debugging` 2.11.1+ installed |
 
 Verify:
 
@@ -89,15 +89,11 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Symptom:** `retrieve() returned null` — a session was stored, upgraded, and then... vanished from the map.
 
-**Hint:** The session is still *in* the HashMap. The HashMap just can't *find* it anymore.
-
 ### #2 The Swallowed Exception
 
 **Difficulty:** Hard | **Test:** `EventBusTest` | **Package:** `events` | **Par:** 4
 
 **Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
-
-**Hint:** The handler runs on a background thread. Nothing in your code catches its failure — so there's no catch block to break on. Catch the throw itself.
 
 ### #3 The Time Traveler's Config
 
@@ -105,23 +101,17 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
 
-**Hint:** The value *was* set correctly. Something wrote over it afterward. There's no half-built object to inspect — the damage is in the order of writes.
-
 ### #4 The Audit That Lies
 
 **Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank` | **Par:** 4
 
 **Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
 
-**Hint:** The transfer moves money in two steps. The audit snapshot is taken between them.
-
 ### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 5
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
-
-**Hint:** The public setter is never called, so neither ripgrep nor a line BP on `setDisplayName` will find the write. A watch on the field fires once, for the constructor's assignment, and then stays silent, yet the value still flips before the assertion. That silence tells you how the write travels. Where it happens is yours to pin down.
 
 ### #6 The Doppelgänger Cart
 
@@ -129,15 +119,11 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
 
-**Hint:** The object you get back from the pipeline is not the object you passed in. Prove it.
-
 ### #7 The Heisenbug Race
 
 **Difficulty:** Hard | **Test:** `RaceCounterTest` | **Package:** `race` | **Par:** 3
 
 **Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
-
-**Hint:** Two threads, one lost update. Suspending a thread to look changes the timing — watch the reads without stopping anything.
 
 ### #8 The Magic Patch
 
@@ -145,23 +131,17 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 **Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
 
-**Hint:** The input looks *almost* right. Rather than rebuild with a fix, patch the value in place and see if the test goes green.
-
 ### #9 The Polite Standoff
 
 **Difficulty:** Hard | **Test:** `TransferDeadlockTest` | **Package:** `deadlock` | **Par:** 4
 
 **Symptom:** The test hangs and then fails its join — both transfers never complete.
 
-**Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for. (Don't try to evaluate expressions on the stuck threads — the debugger refuses, and that refusal is a clue.)
-
 ### #10 The Oversold House
 
 **Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 4
 
-**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
-
-**Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
+**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — the season ends oversold by a few tickets per performance.
 
 **Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
 

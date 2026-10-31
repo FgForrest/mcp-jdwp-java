@@ -160,8 +160,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `retrieve() returned null` — a session was stored, upgraded, and then... vanished from the map.
 
-**Hint:** The session is still *in* the HashMap. The HashMap just can't *find* it anymore.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -178,8 +176,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 **Difficulty:** Hard | **Test:** `EventBusTest` | **Package:** `events` | **Par:** 4 | **Exercises:** exception breakpoint + trigger gate
 
 **Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
-
-**Hint:** The handler runs on a background thread. Nothing in your code catches its failure — so there's no catch block to break on. Catch the throw itself.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -198,8 +194,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
 
-**Hint:** The value *was* set correctly. Something wrote over it afterward. There's no half-built object to inspect — the damage is in the order of writes.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -217,8 +211,6 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 **Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
 
-**Hint:** The transfer moves money in two steps. The audit snapshot is taken between them.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -232,24 +224,22 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 5 | **Exercises:** field watchpoint blind spot + before/after bisect
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3 | **Exercises:** field watchpoint blind spot + before/after bisect
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
-
-**Hint:** The public setter is never called, so neither ripgrep nor a line BP on `setDisplayName` will find the write. A watch on the field fires once, for the constructor's assignment, and then stays silent, yet the value still flips before the assertion. That silence tells you how the write travels. Where it happens is yours to pin down.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
 `LoginNormalizer.welcomeMessage` calls a private `canonicalForm` helper, which delegates to a static `DisplayNameMirror` nested class. The mirror uses `Field.setAccessible(true)` + `Field.set(profile, canonical)` to write the lower-cased form straight into `UserProfile.displayName`, bypassing the public setter. From the test's side the formatter looks read-only, and a field watchpoint cannot see the write either: JDI watchpoints fire only on the `putfield`/`getfield` bytecodes (and JNI field access). `Field.set` ends in an `Unsafe` store straight to memory, which trips no watchpoint, in `modification` mode or in `access` mode.
 
-**Debug path:** The tell is a modification watchpoint that fires for the constructor's ordinary assignment and then stays silent while the value flips: the write does not go through a field store. So stop waiting for the watchpoint and bisect. Compare `profile.getDisplayName()` before and after each suspect call, or `System.identityHashCode(profile.getDisplayName())` when the old and new strings could be equal. The identity flips across exactly the method doing the hidden write. The test has one suspect call, `welcomeMessage` on line 24, so the par path takes five calls:
+**Debug path:** The tell is a modification watchpoint that fires once, for the constructor's ordinary assignment, and never again, although the value flips before the assertion: the write does not go through a field store. The par path takes three calls:
 
 1. `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.userprofile.UserProfile", fieldName="displayName", mode="modification")`. The class is not loaded yet, so the watchpoint waits for it.
-2. `jdwp_set_breakpoint("one.edee.jdwp.sandbox.userprofile.UserProfileTest", 27)`, just after `welcomeMessage`, so the test cannot end before you look.
-3. `jdwp_resume_until_event`: the watchpoint fires in the `UserProfile` constructor, which stores `"Alice"`.
-4. `jdwp_resume_until_event`: the thread stops at line 27. The watchpoint did not fire in between.
-5. `jdwp_evaluate_expression("profile.getDisplayName()")`: `"alice"`. The value flipped across `welcomeMessage` with no field store the JVM could see, so the write is reflective or goes through `Unsafe`.
+2. `jdwp_resume_until_event`: the watchpoint fires in the `UserProfile` constructor, which stores `"Alice"`.
+3. `jdwp_resume_until_event`: the test fails and its JVM exits. The `[VM_DEATH]` reply lists the watchpoint with one hit. The only store the JVM saw wrote `"Alice"`, yet the test read `"alice"`, so the write is reflective or goes through `Unsafe`. Between the two, the test calls only `welcomeMessage`, on line 24.
+
+Bisecting takes three calls as well and shows where the value flips, though not how: `jdwp_set_breakpoint("one.edee.jdwp.sandbox.userprofile.UserProfileTest", 27)`, just after `welcomeMessage`, then `jdwp_resume_until_event`, then `jdwp_evaluate_expression("profile.getDisplayName()")`, which is already `"alice"`. When the old and new strings could be equal, compare `System.identityHashCode(profile.getDisplayName())` instead.
 
 That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `DisplayNameMirror.mirror` → `Field.set`. To name the writing call from the debugger alone, break at line 24 instead and keep bisecting inside `welcomeMessage` with `jdwp_step_into` / `jdwp_step_over`, comparing the identity after each line: it flips across `DisplayNameMirror.mirror(profile, canonical)` in `canonicalForm`. A line BP on `UserProfile.setDisplayName` never fires — the setter is genuinely unused.
 
@@ -262,8 +252,6 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 **Difficulty:** Moderate | **Test:** `CheckoutTest` | **Package:** `cart` | **Par:** 6 | **Exercises:** marked instances (`$label`)
 
 **Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
-
-**Hint:** The object you get back from the pipeline is not the object you passed in. Prove it.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -282,8 +270,6 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 
 **Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
 
-**Hint:** Two threads, one lost update. Suspending a thread to look changes the timing — watch the reads without stopping anything.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -300,8 +286,6 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 **Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 4 | **Exercises:** runtime mutation (`set_local`)
 
 **Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
-
-**Hint:** The input looks *almost* right. Rather than rebuild with a fix, patch the value in place and see if the test goes green.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -320,8 +304,6 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 
 **Symptom:** The test hangs and then fails its join — both transfers never complete.
 
-**Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for.
-
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
@@ -337,9 +319,7 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 
 **Difficulty:** Hard | **Test:** `BoxOfficeTest` | **Package:** `boxoffice` | **Par:** 4 | **Exercises:** in-target probes (fast logpoint / fast breakpoint, with the user's consent)
 
-**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — every seat is checked before it is sold, yet the season ends oversold by a few tickets per performance.
-
-**Hint:** Eight windows, 480 million sale attempts in a few seconds, a handful of bad ones per performance. Anything that stops a thread on every pass turns the sale into hours, and the extra tickets stop appearing while you watch. The check has to run where the code runs.
+**Symptom:** `[Tickets sold for 300 performances of 200000 seats] expected: 60000000L but was: 60001634L` — the season ends oversold by a few tickets per performance.
 
 **Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
 

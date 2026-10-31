@@ -1,9 +1,7 @@
 package one.edee.jdwp.sandbox.events;
 
 /**
- * Represents an order event with product and quantity information.
- * The quantity field undergoes a byte cast during construction, simulating
- * a deserialization bug that causes overflow for values above 127.
+ * An order event: the order, the product and the ordered quantity.
  */
 public class OrderEvent {
 
@@ -12,13 +10,12 @@ public class OrderEvent {
 	private final int quantity;
 
 	/**
-	 * Creates an order event. The rawQuantity is cast through byte,
-	 * causing overflow for values greater than 127.
+	 * Creates an order event.
 	 */
 	public OrderEvent(String orderId, String productId, int rawQuantity) {
 		this.orderId = orderId;
 		this.productId = productId;
-		this.quantity = (byte) rawQuantity; // Overflow: 200 becomes -56
+		this.quantity = (byte) rawQuantity;
 	}
 
 	public String getOrderId() {

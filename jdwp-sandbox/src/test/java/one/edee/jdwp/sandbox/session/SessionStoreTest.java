@@ -25,6 +25,6 @@ class SessionStoreTest {
 		SessionData retrieved = store.retrieve(session);
 		assertThat(retrieved)
 			.describedAs("Session data should be retrievable after role upgrade")
-			.isNotNull(); // Fails: HashMap can't find it — hashCode changed
+			.isNotNull();
 	}
 }

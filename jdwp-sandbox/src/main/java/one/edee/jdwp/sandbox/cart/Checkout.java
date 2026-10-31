@@ -1,14 +1,12 @@
 package one.edee.jdwp.sandbox.cart;
 
 /**
- * Runs a cart through a multi-stage checkout pipeline. Each stage returns the cart to operate on;
- * {@link #process} threads it through them and returns the result.
+ * Runs a cart through the checkout pipeline.
  */
 public class Checkout {
 
 	/**
-	 * Validates, prices and discounts the cart. Callers that rely on the cart being mutated
-	 * in place (ignoring the return value) will see no change — see {@link #validate}.
+	 * Validates, prices and discounts the cart.
 	 */
 	public Cart process(Cart cart) {
 		cart = validate(cart);
@@ -18,9 +16,7 @@ public class Checkout {
 	}
 
 	/**
-	 * Validates the cart and returns a defensive snapshot so later stages cannot corrupt the
-	 * caller's instance. Because the snapshot is a <em>different</em> object, every later stage
-	 * mutates the copy — the caller's original cart is never touched.
+	 * Rejects an empty cart.
 	 */
 	private Cart validate(Cart cart) {
 		if (cart.getItems().isEmpty()) {

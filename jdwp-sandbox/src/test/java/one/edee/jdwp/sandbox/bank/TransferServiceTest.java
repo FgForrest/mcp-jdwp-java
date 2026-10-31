@@ -26,6 +26,6 @@ class TransferServiceTest {
 		int discrepancy = auditService.reconcile(a, b);
 		assertThat(discrepancy)
 			.describedAs("Total balance should be consistent before and after transfer")
-			.isZero(); // Fails: snapshot captured mid-transfer (1500 instead of 2000)
+			.isZero();
 	}
 }

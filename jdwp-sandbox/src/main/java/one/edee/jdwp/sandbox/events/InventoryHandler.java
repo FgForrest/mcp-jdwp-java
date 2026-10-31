@@ -1,8 +1,7 @@
 package one.edee.jdwp.sandbox.events;
 
 /**
- * Handles order events by reserving inventory. Does not catch anything — a failure in
- * {@link Inventory#reserve} propagates straight out of the dispatch task.
+ * Handles order events by reserving inventory.
  */
 public class InventoryHandler implements EventHandler {
 

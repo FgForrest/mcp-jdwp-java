@@ -1,9 +1,7 @@
 package one.edee.jdwp.sandbox.config;
 
 /**
- * Application configuration. The appName is set in the constructor; the timeout is set by
- * {@link #init(int)} after construction and can be cleared back to its default by
- * {@link #resetToDefaults()}.
+ * Application configuration: the application name and a timeout.
  */
 public class Configuration {
 
