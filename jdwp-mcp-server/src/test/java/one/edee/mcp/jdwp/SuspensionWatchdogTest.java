@@ -106,8 +106,12 @@ class SuspensionWatchdogTest {
 	}
 
 	@Test
-	@DisplayName("a sample that is not blocked on a monitor starts the count again")
+	@DisplayName("a sample that finds the invocation waiting for no monitor starts the count again")
 	void unblockedSampleResetsTheStreak() throws Exception {
+		final ObjectReference monitor = mock(ObjectReference.class);
+		when(monitor.owningThread()).thenReturn(u.ref);
+		// Blocked, then running on (no monitor), then blocked again.
+		when(t.ref.currentContendedMonitor()).thenReturn(monitor, null, monitor);
 		watchdog.tick();
 		advance(SuspensionWatchdog.MIN_AGE_NANOS);
 		t.status = ThreadReference.THREAD_STATUS_MONITOR;
@@ -118,6 +122,36 @@ class SuspensionWatchdogTest {
 		watchdog.tick();
 
 		assertThat(u.count).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("an invocation JDWP shows as running though it waits for a monitor — made from inside its event's handling — is found (#47 § 4)")
+	void monitorWaitShownAsRunningIsFound() throws Exception {
+		t.status = ThreadReference.THREAD_STATUS_RUNNING;
+		watchdog.tick();
+		advance(SuspensionWatchdog.MIN_AGE_NANOS);
+		watchdog.tick();
+		advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+		watchdog.tick();
+
+		assertThat(u.count).isZero();
+		assertThat(model.invocationRuns(t)).as("the brief suspension around the query is undone").isTrue();
+	}
+
+	@Test
+	@DisplayName("a waiting or sleeping invocation is not asked for a monitor owner")
+	void waitingInvocationIsNotAsked() throws Exception {
+		for (int status : new int[]{ThreadReference.THREAD_STATUS_WAIT, ThreadReference.THREAD_STATUS_SLEEPING}) {
+			t.status = status;
+			watchdog.tick();
+			advance(SuspensionWatchdog.MIN_AGE_NANOS);
+			watchdog.tick();
+			advance(TimeUnit.MILLISECONDS.toNanos(SuspensionWatchdog.PERIOD_MS));
+			watchdog.tick();
+		}
+
+		assertThat(u.count).isEqualTo(1);
+		verify(t.ref, never()).currentContendedMonitor();
 	}
 
 	@Test

@@ -79,7 +79,7 @@ class JDWPToolsFrameToolsFreshFramesTest {
 		session = mock(SuspensionSession.class);
 		when(breakpointTracker.suspensionSession()).thenReturn(session);
 		// The stop holding the thread lasts unless a test says otherwise.
-		when(session.holdsOn(thread)).thenReturn(Set.of(STOP));
+		when(session.userHoldsOn(thread)).thenReturn(Set.of(STOP));
 	}
 
 	private static StackFrame staleFrame() {
@@ -137,7 +137,7 @@ class JDWPToolsFrameToolsFreshFramesTest {
 			when(thread.frame(0)).thenReturn(stale, fresh);
 			// Another thread's stop-all (9) was released — the resume that invalidated the frames — while
 			// the thread's own stop lasted.
-			when(session.holdsOn(thread)).thenReturn(Set.of(STOP, 9L), Set.of(STOP));
+			when(session.userHoldsOn(thread)).thenReturn(Set.of(STOP, 9L), Set.of(STOP));
 
 			final String result = tools.jdwp_get_locals(THREAD_ID, 0);
 
@@ -203,7 +203,7 @@ class JDWPToolsFrameToolsFreshFramesTest {
 		@DisplayName("jdwp_set_local writes nothing into a frame that may be another activation, and says so")
 		void setLocalWritesNothing() throws Exception {
 			// The stop that held the thread was released; it ran on and stopped again, under stop 7.
-			when(session.holdsOn(thread)).thenReturn(Set.of(STOP), Set.of(7L));
+			when(session.userHoldsOn(thread)).thenReturn(Set.of(STOP), Set.of(7L));
 			final LocalVariable count = mock(LocalVariable.class);
 			final Type intType = mock(Type.class);
 			final IntegerValue fortyTwo = mock(IntegerValue.class);
@@ -228,7 +228,7 @@ class JDWPToolsFrameToolsFreshFramesTest {
 		@Test
 		@DisplayName("a read tool renders no frames that may be another activation")
 		void readToolAsksToCallAgain() throws Exception {
-			when(session.holdsOn(thread)).thenReturn(Set.of(STOP), Set.of());
+			when(session.userHoldsOn(thread)).thenReturn(Set.of(STOP), Set.of());
 			final StackFrame stale = staleFrame();
 			final StackFrame elsewhere = frameAt("com.example.Elsewhere", "run", 7);
 			when(thread.frames()).thenReturn(List.of(stale), List.of(elsewhere));

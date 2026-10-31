@@ -1255,11 +1255,13 @@ public class JDWPTools {
      * stop's release, the arming's VM-wide suspend: JDI invalidates every frame of a resumed thread
      * though it stays suspended (issue #45 A12). Each attempt rebuilds its whole reply.
      * <p>
-     * It runs again only while a hold the session knows lasted across the attempt, so the fresh
-     * frames are the same activations; otherwise the thread may have run and stopped elsewhere, and
-     * the tool answers with {@code ifRunOn}. A write is retried only on this exception, which JDI
-     * raises before sending it or when the target rejects the frame — either way it did not land.
-     * Meanwhile the thread is reserved: the watchdog does not release it (A2).
+     * It runs again only while a hold only a tool ends — a published stop, a manual hold — lasted
+     * across the attempt: nothing releases it before the next read, so the fresh frames are the same
+     * activations. A set the dispatcher still processes may be released between the check and that
+     * read (#47 § 4). Otherwise the thread may have run and stopped elsewhere, and the tool answers
+     * with {@code ifRunOn}. A write is retried only on this exception, which JDI raises before sending
+     * it or when the target rejects the frame — either way it did not land. Meanwhile the thread is
+     * reserved: the watchdog does not release it (A2), and a lease of it waits until the tool is done.
      */
     private String withFreshFrames(ThreadReference thread, String ifRunOn, Callable<String> work) throws Exception {
         final SuspensionSession session = breakpointTracker.suspensionSession();
@@ -1269,7 +1271,7 @@ public class JDWPTools {
         }
         session.reserve(thread);
         try {
-            Set<Long> holds = session.holdsOn(thread);
+            Set<Long> holds = session.userHoldsOn(thread);
             for (int attempt = 1; ; attempt++) {
                 final String evaluating = evaluationRunningOn(thread);
                 if (evaluating != null) {
@@ -1281,7 +1283,7 @@ public class JDWPTools {
                     if (attempt == FRAME_ATTEMPTS) {
                         throw invalidated;
                     }
-                    final Set<Long> now = session.holdsOn(thread);
+                    final Set<Long> now = session.userHoldsOn(thread);
                     if (Collections.disjoint(holds, now)) {
                         return String.format("Error: thread %s was resumed while its frames were being read, and may "
                             + "have run on since — %s", thread.name(), ifRunOn);

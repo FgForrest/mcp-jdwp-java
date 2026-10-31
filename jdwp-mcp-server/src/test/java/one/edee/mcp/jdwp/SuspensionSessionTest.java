@@ -434,6 +434,26 @@ class SuspensionSessionTest {
 	}
 
 	@Test
+	@DisplayName("the holds only a tool ends: published stops and a manual hold, not a set still queued or processed (#47 § 4)")
+	void userHoldsOnLeavesOutUnpublishedSets() throws Exception {
+		assertThat(session.suspendThread(w.ref)).isNull();
+		final SuspensionSession.Context own = presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final SuspensionSession.Context queued = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL), u.ref,
+			false);
+
+		assertThat(session.holdsOn(t.ref)).containsExactly(own.id(), queued.id());
+		assertThat(session.userHoldsOn(t.ref)).containsExactly(own.id());
+		assertThat(session.userHoldsOn(w.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
+		assertThat(session.userHoldsOn(u.ref)).as("only its own set, not processed yet").isEmpty();
+
+		session.begin(queued);
+		assertThat(session.userHoldsOn(t.ref)).as("processing does not publish it").containsExactly(own.id());
+		assertThat(session.finish(queued)).isFalse();
+		session.releaseAll();
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
+	@Test
 	@DisplayName("the dispatcher may invoke on the thread of the set it processes, though nobody has seen it")
 	void dispatcherLeaseIsAdmittedByConstruction() {
 		final SuspensionSession.Context own = session.route(model.breakpointEvent(t, EventRequest.SUSPEND_ALL),

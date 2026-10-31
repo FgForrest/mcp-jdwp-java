@@ -64,6 +64,10 @@ public final class SuspensionSession {
      */
     public static final long UNKNOWN_HOLD = -2L;
     /**
+     * How long a {@link #lease} waits for a frame tool's {@link #reserve} of its thread to end.
+     */
+    static final long RESERVATION_WAIT_MS = 2_000;
+    /**
      * Request property marking a request whose events need their thread still stopped when the
      * dispatcher handles them even to skip them (a fast breakpoint's stop reads its arguments from
      * the frame): the watchdog never cancels a set with such an event.
@@ -735,15 +739,31 @@ public final class SuspensionSession {
      * {@link #MANUAL_HOLD} for a manual hold. A lease's exemption still counts — its invocation
      * returns to the same frames. While one hold lasts, the thread cannot run past its stop, so a
      * hold present in two snapshots proves its frames belong to the same activations in between
-     * (a frame tool's retry, issue #45 A12). Context ids are never reused.
+     * (an {@link InvocationRunner} job's admission). Context ids are never reused.
      */
     public synchronized Set<Long> holdsOn(ThreadReference thread) {
+        return holdsOn(thread, false);
+    }
+
+    /**
+     * {@link #holdsOn}, limited to the holds only a tool ends: the published stops holding
+     * {@code thread} and a manual hold. Nothing else releases those — the dispatcher releases only
+     * the sets it processes, the watchdog never touches a published stop or a manual hold, and tools
+     * run one at a time — so one of them found by a tool still holds the thread when the tool next
+     * reads its frames. A set still queued or processed does not vouch for that: the dispatcher may
+     * release it at any moment, and the thread run on (a frame tool's retry, #47 § 4).
+     */
+    public synchronized Set<Long> userHoldsOn(ThreadReference thread) {
+        return holdsOn(thread, true);
+    }
+
+    private Set<Long> holdsOn(ThreadReference thread, boolean publishedOnly) {
         if (closed) {
             return Set.of();
         }
         final Set<Long> holds = new LinkedHashSet<>();
         for (Context context : contexts) {
-            if (claims(context, thread)) {
+            if ((!publishedOnly || context.state == State.HELD) && claims(context, thread)) {
                 holds.add(context.id);
             }
         }
@@ -876,11 +896,15 @@ public final class SuspensionSession {
      * The dispatcher may invoke on the event thread of the set it processes. Any other caller needs
      * the thread stopped at an event of its own that a tool has shown, and no set covering it still
      * queued, processed or unseen. A tool's job must also still find one of the holds it was started
-     * under ({@link #admittedUnder}).
+     * under ({@link #admittedUnder}). While a frame tool reads the thread ({@link #reserve}), the
+     * lease waits for it: the invocation would run the thread under the tool, and the frames the tool
+     * reads next would be the invoked code's (#47 § 4).
      *
-     * @throws EvaluationRefusedException when the invocation is not admitted
+     * @throws EvaluationRefusedException when the invocation is not admitted, or a frame tool still
+     *                                    reads the thread after {@link #RESERVATION_WAIT_MS}
      */
     public synchronized void lease(ThreadReference thread) {
+        awaitUnreserved(thread);
         if (closed) {
             return;
         }
@@ -968,8 +992,9 @@ public final class SuspensionSession {
     // ── Watchdog (A1) and reservations (A2) ──
 
     /**
-     * A frame tool starts working on {@code thread}: the watchdog leaves it alone until
-     * {@link #unreserve}.
+     * A frame tool starts working on {@code thread}: the watchdog leaves it alone, and a
+     * {@link #lease} of it waits, until {@link #unreserve}. A frame tool never invokes on the thread
+     * it reserves.
      */
     public synchronized void reserve(ThreadReference thread) {
         reserved.merge(thread, 1, Integer::sum);
@@ -980,6 +1005,29 @@ public final class SuspensionSession {
      */
     public synchronized void unreserve(ThreadReference thread) {
         reserved.computeIfPresent(thread, (key, tools) -> tools == 1 ? null : tools - 1);
+        notifyAll();
+    }
+
+    /**
+     * Waits, releasing the monitor, until no frame tool reserves {@code thread}. A tool's reads are a
+     * few JDWP commands; one still reading after {@link #RESERVATION_WAIT_MS} refuses the lease.
+     */
+    private void awaitUnreserved(ThreadReference thread) {
+        final long deadline = System.nanoTime() + RESERVATION_WAIT_MS * 1_000_000L;
+        while (!closed && reserved.containsKey(thread)) {
+            final long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
+            if (remainingMs <= 0) {
+                throw new EvaluationRefusedException("a tool is reading the frames of thread " + safeName(thread)
+                    + " — evaluate again when it has finished");
+            }
+            try {
+                wait(remainingMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new EvaluationRefusedException("interrupted while a tool read the frames of thread "
+                    + safeName(thread));
+            }
+        }
     }
 
     /**
