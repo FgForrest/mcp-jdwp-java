@@ -83,7 +83,7 @@ class SuspensionOwnershipLiveTest {
 			parkHolder.addThreadFilter(holder);
 			parkHolder.addCountFilter(1);
 			parkHolder.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-			enableSuspended(parkHolder);
+			enableSuspended(parkHolder, holder);
 
 			await("the watchdog to release the holder", () -> eventTypes().contains("EVALUATION_UNBLOCKED"));
 			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).as("the holder's stop was cancelled, not shown")
@@ -143,7 +143,7 @@ class SuspensionOwnershipLiveTest {
 			queuedStop.addThreadFilter(holder);
 			queuedStop.addCountFilter(1);
 			queuedStop.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-			enableSuspended(queuedStop);
+			enableSuspended(queuedStop, holder);
 			await("the holder's stop-all to queue", () -> sessionState().contains("QUEUED"));
 			assertThat(held.suspendCount()).as("its own stop and the queued stop-all").isEqualTo(2);
 
@@ -233,6 +233,103 @@ class SuspensionOwnershipLiveTest {
 
 	@Test
 	@Order(5)
+	@DisplayName("a stop-all whose evaluation outlives its wait is released: the other threads run at once, the evaluating thread once it ends (#47 § 4)")
+	void stopAllAnchorHandedToARunningEvaluation() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final ThreadReference evaluating = thread("worker-0");
+		final ThreadReference other = thread("worker-1");
+		final ThreadReference holder = thread("lock-holder");
+		final Location probe = vm.classesByName(TARGET).get(0).locationsOfLine(lineOf("// MARK: probe")).get(0);
+		final BreakpointRequest stopAll = vm.eventRequestManager().createBreakpointRequest(probe);
+		stopAll.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+		stopAll.addThreadFilter(evaluating);
+		stopAll.addCountFilter(1);
+		final int stopId = session.tracker.registerBreakpoint(stopAll);
+		enableSuspended(stopAll);
+		try {
+			assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis())).contains("Thread: worker-0");
+			assertThat(other.suspendCount()).as("parked by the stop-all").isEqualTo(1);
+
+			final String reply = tools.jdwp_evaluate_expression(evaluating.uniqueID(),
+				"{ java.util.concurrent.locks.LockSupport.parkNanos(25_000_000_000L); return 42; }", 0);
+			assertThat(reply).startsWith("[STILL_RUNNING]").contains("thread worker-0");
+
+			// The user releases the stop-all while the evaluation still runs: worker-0's share of it now
+			// belongs to the evaluation; every other thread runs at once.
+			assertThat(tools.jdwp_resume()).contains("worker-0");
+			assertThat(other.suspendCount()).isZero();
+			assertThat(holder.suspendCount()).isZero();
+			assertThat(sessionState()).as("the evaluation still runs").contains("leases=[worker-0]");
+			final long before = calls();
+			await("worker-1 to make progress meanwhile", () -> {
+				try {
+					return calls() > before;
+				} catch (Exception e) {
+					return false;
+				}
+			});
+
+			await("the late result", () -> history.getRecent(EventHistory.MAX_EVENTS).stream()
+				.anyMatch(event -> event.type().equals("EVALUATION_COMPLETED_LATE") && event.summary().contains("42")));
+			assertApplicationRuns();
+		} finally {
+			tools.jdwp_clear_breakpoint(stopId);
+		}
+	}
+
+	@Test
+	@Order(6)
+	@DisplayName("the watchdog cancels a queued thread stop; the thread's next stop keeps its own suspension (#47 § 4)")
+	void cancelledThreadStopThenANewStop() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final ThreadReference evaluating = thread("worker-0");
+		final ThreadReference holder = thread("lock-holder");
+		// A read of `base` on worker-0 runs an evaluation that waits a second, then takes LOCK.
+		int logpointId = idOf(tools.jdwp_set_field_logpoint(TARGET, "base", "access",
+			"{ java.util.concurrent.locks.LockSupport.parkNanos(1_000_000_000L); synchronized (" + TARGET
+				+ ".LOCK) { return \"got the lock\"; } }",
+			null, evaluating.uniqueID(), null, null, null, null, null));
+		int holdingId = -1;
+		try {
+			await("an evaluation in flight on worker-0", () -> sessionState().contains("leases=[worker-0]"));
+			// Just this one: worker-0 waits at its event until the evaluation ends, so no later read
+			// raises another.
+			tools.jdwp_clear_breakpoint(logpointId);
+			logpointId = -1;
+
+			// The holder stops inside its synchronized block, on every pass: a thread stop Q queued behind
+			// the evaluation, which then waits for LOCK. The watchdog cancels Q; the holder runs on, leaves
+			// LOCK, and stops there again — R.
+			final BreakpointRequest holding = vm.eventRequestManager().createBreakpointRequest(
+				vm.classesByName(TARGET).get(0).locationsOfLine(lineOf("// MARK: holding")).get(0));
+			holding.addThreadFilter(holder);
+			holding.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+			holdingId = session.tracker.registerBreakpoint(holding);
+			enableSuspended(holding, holder);
+
+			await("the watchdog to cancel the holder's stop", () -> history.getRecent(EventHistory.MAX_EVENTS).stream()
+				.anyMatch(event -> event.type().equals("EVENT_CANCELLED") && event.summary().contains("lock-holder")));
+			await("the evaluation to get the lock", () -> history.getRecent(EventHistory.MAX_EVENTS).stream()
+				.anyMatch(event -> event.type().equals("FIELD_LOGPOINT") && event.summary().contains("got the lock")));
+
+			final String shown = tools.jdwp_resume_until_event((int) TIMEOUT.toMillis());
+			assertThat(shown).contains("Thread: lock-holder").contains("suspended=true");
+			assertThat(holder.suspendCount()).as("R's own suspension, not spent by the cancelled Q").isEqualTo(1);
+		} finally {
+			if (holdingId >= 0) {
+				tools.jdwp_clear_breakpoint(holdingId);
+			}
+			if (logpointId >= 0) {
+				tools.jdwp_clear_breakpoint(logpointId);
+			}
+		}
+		tools.jdwp_resume();
+		await("the dispatcher to finish its sets", this::dispatcherIdle);
+		assertApplicationRuns();
+	}
+
+	@Test
+	@Order(7)
 	@DisplayName("an invocation that does not return, then disconnect: the server lets go and the application runs on (#47 § 4)")
 	void disconnectDuringAnInvocation() throws Exception {
 		final ThreadReference evaluating = thread("worker-1");

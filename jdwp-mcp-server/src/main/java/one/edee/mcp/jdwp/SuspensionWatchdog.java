@@ -29,7 +29,9 @@ import java.util.function.LongSupplier;
  * afresh (#47 § 2). One running for more than {@link #MIN_AGE_NANOS} whose thread is blocked on the
  * same monitor in two consecutive samples has the monitor's owner asked for — a balanced suspend of
  * the invoking thread around each query — and {@link SuspensionSession#unblock} releases that owner
- * if, under the session's monitor, it is held by such sets alone. Worker invocations are not watched: their tool's wait is bounded
+ * if, under the session's monitor, it is held by such sets alone. A thread shown running is asked as
+ * well: JDWP shows one that invokes inside its event's handling as running even while it waits for a
+ * monitor (#47 § 4). Worker invocations are not watched: their tool's wait is bounded
  * ({@link InvocationRunner}). Spins, native waits and dependencies on a published stop are not
  * detected: {@code jdwp_resume} or {@code jdwp_reconnect} recover those.
  */
@@ -136,7 +138,10 @@ public final class SuspensionWatchdog {
         if (now - since < MIN_AGE_NANOS) {
             return;
         }
-        if (statusOf(invocation.thread()) != ThreadReference.THREAD_STATUS_MONITOR) {
+        // JDWP shows a thread that invokes from inside its event's handling as RUNNING even while it
+        // waits for a monitor (#47 § 4), so a running one is asked too; it names no monitor if it runs.
+        final int status = statusOf(invocation.thread());
+        if (status != ThreadReference.THREAD_STATUS_MONITOR && status != ThreadReference.THREAD_STATUS_RUNNING) {
             forgetSamples(token);
             return;
         }

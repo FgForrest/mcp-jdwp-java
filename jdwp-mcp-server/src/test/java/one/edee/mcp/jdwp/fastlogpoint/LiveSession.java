@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
 import com.sun.jdi.Method;
+import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.*;
@@ -221,6 +222,21 @@ final class LiveSession implements AutoCloseable {
 			request.enable();
 		} finally {
 			vm.resume();
+		}
+	}
+
+	/**
+	 * {@link #enableSuspended(EventRequest)} for a request filtered to {@code thread}: only that
+	 * thread can raise its event, so only it is suspended. A VM-wide resume while an evaluation runs
+	 * on another thread would invalidate the frame the evaluator reads next ("Thread has been
+	 * resumed").
+	 */
+	static void enableSuspended(EventRequest request, ThreadReference thread) {
+		thread.suspend();
+		try {
+			request.enable();
+		} finally {
+			thread.resume();
 		}
 	}
 }

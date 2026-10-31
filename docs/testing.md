@@ -21,7 +21,7 @@ Live-JVM verification is done **manually** via the sandbox module, not automatic
 
 `fastlogpoint/FastBreakpointLiveTest` does the same for fast breakpoints: stops in both modes and policies, condition errors, inspection and steps at the user's frame, evaluations that overlap a stop-all, a clear while a thread is stopped in the method (the restore waits for its release, also for two entries in one class), and watchers by fast-breakpoint ID. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastBreakpointLiveTest`.
 
-`fastlogpoint/SuspensionOwnershipLiveTest` drives suspension ownership (issue #45) against the same forked target (`LiveSession`, fixture `FastLogpointTarget`): its `lock-holder` thread holds `FastLogpointTarget.LOCK`, so an evaluation can be made to wait on a monitor whose owner a stop-all parks. It checks that the watchdog frees a dispatcher evaluation stuck behind a queued stop-all, and that `jdwp_resume` releases only the stop it holds. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=SuspensionOwnershipLiveTest`.
+`fastlogpoint/SuspensionOwnershipLiveTest` drives suspension ownership (issue #45) against the same forked target (`LiveSession`, fixture `FastLogpointTarget`): its `lock-holder` thread holds `FastLogpointTarget.LOCK`, so an evaluation can be made to wait on a monitor whose owner a stop-all parks. It checks that the watchdog frees a dispatcher evaluation stuck behind a queued stop-all, and that `jdwp_resume` releases only the stop it holds; and, for #47 § 4, `jdwp_reset` during an evaluation, a fast logpoint and a fast breakpoint armed by one hit, a stop-all released while its evaluation outlives the tool's wait, a queued thread stop the watchdog cancels followed by a new stop of that thread, and a disconnect during an evaluation that does not return — each ending with every count at 0 and the workers making progress. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=SuspensionOwnershipLiveTest`.
 
 ## 2. Mocking JDI
 
@@ -68,13 +68,14 @@ Built on it:
 
 - `SuspensionSessionTest` — publication, presentation, releases with compensation, steps, `jdwp_reset`, leases and admission, ownership transfer; every scenario ends on the suspend counts.
 - `SuspensionSessionUnblockTest` — what `SuspensionSession.unblock` may release for the watchdog, how a cancelled set is settled, and what it never touches.
-- `SuspensionWatchdogTest` — sampling driven by hand (`tick()`, an injected clock): the minimum age, two consecutive monitor samples, samples that belong to one invocation, a closed session stopping the watchdog.
+- `SuspensionWatchdogTest` — sampling driven by hand (`tick()`, an injected clock): the minimum age, two consecutive samples on the same monitor, samples that belong to one invocation, a thread JDWP shows as running while it waits for a monitor, a closed session stopping the watchdog.
+- `SuspensionRaceBarrierTest` — the races of #47 § 4, each held at its gap: the competing action runs inside the mocked JDI call that marks it, on the thread the dispatcher, the watchdog or a job would run it on. A job still compiling and a frame tool; a frame tool and the dispatcher's lease (which waits); the hold check and a frame tool's retry (only a published stop or a manual hold vouches for it); the watchdog's owner query and its decision; a job's compilation and a replaced stop.
 
 Mockito only, around the same feature:
 
 - `EvaluationGuardTest` — the depth marker, plus leases: a nested lease, a competing chain refused, a reconnect (`bind`) dropping the earlier connection's holds.
 - `InvocationRunnerTest` — the bounded wait: the result or the rethrown failure, `[STILL_RUNNING]` then exactly one late record, a busy thread refused, no late record in a later connection, a job given up before it started never run, a monitor's owner named with a balanced suspension.
-- `JDWPToolsFrameToolsFreshFramesTest` — the frame tools re-read invalidated frames only while a hold the session knows lasted, and refuse a thread an evaluation runs on.
+- `JDWPToolsFrameToolsFreshFramesTest` — the frame tools re-read invalidated frames only while a hold only a tool ends lasted, and refuse a thread an evaluation runs on.
 
 ### `TestReflectionUtils`
 
