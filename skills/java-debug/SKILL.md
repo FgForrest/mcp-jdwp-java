@@ -111,12 +111,10 @@ Threads hang, the test never completes, or `jdwp_get_threads` shows several thre
 
 Test shows `CompletionException("Async task failed")`, but the real cause is 3 frames deeper.
 
-1. `jdwp_set_exception_breakpoint("java.lang.IllegalStateException", caught=true, uncaught=false)`.
-2. If it returns "deferred" (class not yet loaded), **also set a regular line BP somewhere upstream** of the throw. Both BPs must be in place before resuming.
-3. `jdwp_resume_until_event`.
-4. The line BP hits -> call any inspection tool (e.g. `jdwp_get_locals`) -> this triggers class loading -> exception BP self-promotes from `[PENDING]` to active.
-5. `jdwp_resume_until_event` past the line BP.
-6. The exception BP catches the throw -> `jdwp_get_stack` shows the **real** root frame, not the wrapper.
+1. `jdwp_set_exception_breakpoint("java.lang.IllegalStateException", caught=true, uncaught=false)`. A "deferred" reply (`[PENDING]`) only means the class is not loaded yet — nothing more to do: the BP activates when the JVM loads the class, JDK classes included, which is always before the first throw.
+2. `jdwp_resume_until_event`.
+3. The exception BP catches the throw -> `jdwp_get_stack` shows the **real** root frame, not the wrapper.
+4. Same type thrown many times before the code you care about (framework start-up, earlier tests)? Chain it: set a line BP at the entry of the suspect code and pass its ID as `triggerBreakpointId`, so the exception BP stays disarmed until that line runs — see "Same method runs 1000×" below.
 
 ### "Trace exceptions without stopping the app"
 
@@ -289,11 +287,12 @@ Test ended (VM_DEATH), the surefire JVM was killed for a new run, or the target 
 
 A test fails with an unhelpful `AssertionError` message and tears down before you can inspect state. Pin the JVM at the throw site.
 
-1. `jdwp_set_exception_breakpoint("java.lang.AssertionError", caught=true, uncaught=true, suspendPolicy="all")` — fires on the assertion itself, before JUnit's reporter wraps it and before the VM tears down. With the default `suspendPolicy="thread"` only the throwing thread stops: when it is a pool thread, the test's main thread runs on, may hit its timeout and end the JVM while you look — `"all"` parks every thread.
-2. `jdwp_resume_until_event` — lands at the throw frame with the thread suspended; the reply names the exception's type and message (`via=exception, java.lang.AssertionError: expected … (thrown at …, caught at …)`).
-3. `jdwp_get_breakpoint_context` — full state at the failure point: locals, `this` fields, stack. From here you can `jdwp_evaluate_expression` to test invariants or `jdwp_set_local` / `jdwp_set_field` to try fixes in place.
+1. `jdwp_set_exception_breakpoint("java.lang.AssertionError", caught=true, uncaught=true, suspendPolicy="all")` — fires on the assertion itself, before JUnit's reporter wraps it and before the VM tears down. It also catches subclasses, such as the `org.opentest4j.AssertionFailedError` that JUnit 5's `assertEquals` throws. At VM_START the reply says "deferred": `AssertionError` is not loaded yet, and the BP activates when it loads, before the first assertion can throw — no line BP or `forceLoad` needed. With the default `suspendPolicy="thread"` only the throwing thread stops: when it is a pool thread, the test's main thread runs on, may hit its timeout and end the JVM while you look — `"all"` parks every thread.
+2. `jdwp_resume_until_event` — lands at the throw frame with the thread suspended; the reply names the exception's type and message (`via=exception, org.opentest4j.AssertionFailedError: … ==> expected: <…> but was: <…> (thrown at …, caught at …)`).
+3. `jdwp_get_breakpoint_context` — frame 0 is the assertion library's throw site (e.g. JUnit's `AssertionFailureBuilder`, whose `this` fields show `expected` / `actual` / `message`); the test method is listed a few frames down as `#N`, with the library frames collapsed above it.
+4. `jdwp_get_locals(threadId, frameIndex=N)` — the test's own locals at the failing assertion. From here you can `jdwp_evaluate_expression(..., frameIndex=N)` to test invariants or `jdwp_set_local` / `jdwp_set_field` to try fixes in place.
 
-This is the safest default for "I want to see what the test saw when it gave up." Set it as part of the attach prologue when launching a failing test.
+This is the safest default for "I want to see what the test saw when it gave up." It works from VM_START, so make it part of the attach prologue when launching a failing test: launch suspended (`-Dmaven.surefire.debug`), `jdwp_wait_for_attach`, set this BP plus any line / field BPs, then `jdwp_resume_until_event`.
 
 ### "Same method runs 1000× but I only care about the call after login"
 
@@ -323,8 +322,8 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
   ```
   Block mode (`{ ...; return X; }`) is supported by `jdwp_evaluate_expression` and `jdwp_assert_expression`, and by every condition / logpoint expression field. Checked exceptions need no `try` — the generated method declares `throws Throwable`, and an exception that escapes is reported like any other. Unqualified calls of `this`'s accessible methods are rewritten too (`sold()` → `_this.sold()`); private ones still need reflection.
 - **`set_local` / `set_field` only support** primitives, `String`, and `null`. To mutate a complex object, mutate its individual fields.
-- **Exception breakpoints on bootstrap classes** (`NullPointerException`, `IllegalStateException`, etc.) start as `[PENDING]`. They auto-promote when any tool runs while a thread is suspended at a breakpoint. Pair with a regular line BP upstream — see the "Exception buried under wrappers" recipe.
-- **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but no thread is at a breakpoint yet. `evaluate_expression`, `to_string`, and `set_exception_breakpoint` cannot work until at least one BP has been hit. Set breakpoints first, then resume.
+- **A `[PENDING]` exception breakpoint needs nothing else.** An exception class that is not loaded yet (`IllegalStateException`, `AssertionError`, …) starts as `[PENDING]` and activates when the JVM loads it — JDK classes included, and always before the first instance can be thrown; `jdwp_get_events` then shows a `CLASS_PREPARE` entry for it. Classes the JVM preloads (e.g. `NullPointerException`) bind at once. Neither an upstream line BP nor an inspection tool promotes it — the server never loads a class on its own; only `forceLoad=true` does, and that cannot work at VM_START.
+- **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but none is stopped at an event, so nothing can run code in the target: `jdwp_evaluate_expression`, `jdwp_to_string`, watcher evaluation and `forceLoad=true` (it runs `Class.forName`) need a real stop first — a `forceLoad=true` at VM start just defers, and the reply says `forceLoad=true could not load it`. Setting breakpoints works — line BPs, logpoints, exception and field BPs defer and activate when their class loads (fast probes wait for their class too). Set them all, then resume.
 - **First `evaluate_expression` is slow** (~1-3s) — the expression compiler discovers the target's classpath lazily. Subsequent evals are fast (cached).
 - **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations. If the per-hit pause itself is the problem (a race that disappears under a logpoint), see the fast-logpoint recipe — but only with the user's explicit consent. The same goes for a conditional breakpoint on a hot line whose condition is rarely true: see the fast-breakpoint recipe.
 - **Field watchpoints are expensive.** Each access/modification of a watched field traps into the debugger; on a hot field this can dominate target-VM CPU. Use the narrowest mode that answers your question (`modification` is usually enough), and add `threadFilterId` / `objectFilterId` / `condition` to scope the catches. `jdwp_diagnose` reports `canWatchFieldAccess` / `canWatchFieldModification` plus this warning when connected. Pending field BPs registered before class load promote synchronously on `ClassPrepareEvent`, so `<clinit>` writes are caught.

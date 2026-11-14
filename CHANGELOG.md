@@ -5,6 +5,43 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.11.2] — 2026-11-14
+
+### Fixed — exception breakpoints set at VM start work; the docs said they did not
+
+The `java-debug` skill claimed that an exception breakpoint on a JDK class stays
+`[PENDING]` until a tool runs at a real breakpoint, and that `jdwp_set_exception_breakpoint`
+cannot work at VM start. The same skill told agents to set an `AssertionError` breakpoint
+in the attach prologue, which is exactly VM start. Checked live: the claim was wrong, the
+server was right. Every class loaded after the attach — JDK classes included — reports
+its load, so a pending exception breakpoint activates when its class loads, before the
+first instance can be thrown. An `AssertionError` breakpoint set at VM start stops on
+the first failing JUnit assertion with no other breakpoint. Line breakpoints,
+logpoints and field breakpoints set at VM start defer and fire the same way.
+
+- **Skill, README and developer docs** now say so. The "exception buried under wrappers"
+  recipe no longer asks for an upstream line breakpoint to promote the exception
+  breakpoint (it never did). The "where did the assertion fail" recipe shows where
+  the test's own locals are: a few frames below the assertion library's throw site.
+- **The exception tools' descriptions** no longer send agents to `forceLoad=true` for
+  JDK exception types. `jdwp_set_exception_breakpoint`'s `forceLoad` parameter claimed
+  that the load of a JDK class is never reported and that the deferred path "will never
+  activate"; `jdwp_set_exception_breakpoint` and `jdwp_set_exception_logpoint` told agents
+  to pass `forceLoad=true` for an exception class the application "hasn't referenced yet",
+  and the logpoint's `forceLoad` called itself useful for such classes. Both tools now say
+  that a class not loaded yet — JDK exception types included — is waited for, and that
+  `forceLoad=true` only binds it at once and is not possible at VM start.
+- **README examples** of `jdwp_set_exception_breakpoint` / `jdwp_set_exception_logpoint`
+  passed `exceptionClass=`; the parameter is `className`.
+
+### Fixed — `forceLoad=true` says when it could not load the class
+
+At VM start no thread can run `Class.forName`, so `forceLoad=true` cannot load anything
+and the breakpoint is deferred instead. Line breakpoints, logpoints, exception and field
+breakpoints said only "Class not yet loaded", as if `forceLoad` had not been passed. Their
+reply now carries the same note as the fast probes: `forceLoad=true could not load it`,
+and why.
+
 ## [2.11.1] — 2026-10-31
 
 ### Fixed — fast probes wait for their class and keep their hits at exit

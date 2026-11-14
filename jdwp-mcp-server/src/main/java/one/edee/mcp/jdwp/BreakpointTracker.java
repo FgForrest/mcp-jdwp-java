@@ -1054,14 +1054,15 @@ public class BreakpointTracker {
     /**
      * Re-attempts to promote every pending entry — line BPs, exception BPs, and field watchpoints —
      * by re-querying {@link JDIConnectionService#findLoadedClass} (passive,
-     * side-effect free). This is the safety net for cases where {@link ClassPrepareRequest} does
-     * not fire — most notably bootstrap classes loaded by the JVM before any debugger event is
-     * delivered.
+     * side-effect free). This is the safety net for a class that loaded while no
+     * {@link ClassPrepareRequest} was watching for it — between a tool's lookup and its CPR enable, or
+     * before a reconnect re-registered the pending specs. Bootstrap classes need no safety net: every
+     * class loaded after the attach delivers a {@code ClassPrepareEvent}.
      * <p>
-     * Called from {@link JDIConnectionService#getVM()} (every MCP tool call) and
-     * from {@link JdiEventListener} (after every JDI event), so any user interaction
-     * gives pending items another chance to bind. Best-effort; transient failures are logged at
-     * debug and the item stays pending for the next retry.
+     * Called from {@link JDIConnectionService#getVM()} (every MCP tool call) and once after a
+     * reconnect re-registers the pending specs; the {@link JdiEventListener} loop does not call it.
+     * Any user interaction thus gives pending items another chance to bind. Best-effort; transient
+     * failures are logged at debug and the item stays pending for the next retry.
      * <p>
      * The lookup is intentionally <i>passive</i>: it never invokes {@code Class.forName} in the
      * target VM. The safety net's job is to catch classes that loaded while we weren't looking,

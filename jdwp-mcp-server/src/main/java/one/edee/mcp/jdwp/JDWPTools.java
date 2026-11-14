@@ -2808,8 +2808,9 @@ public class JDWPTools {
     }
 
     /**
-     * Why a fast probe waits although {@code forceLoad=true} was passed: {@code Class.forName} needs a
-     * thread that can run code, and at VM start none can.
+     * Why a breakpoint is deferred, or a fast probe waits, although {@code forceLoad=true} was passed:
+     * {@code Class.forName} needs a thread that can run code, and at VM start none can. Without the
+     * note the reply would read like a plain deferral and hide that the requested load did not happen.
      */
     private static String forceLoadFailedNote(boolean forceLoadRequested) {
         return forceLoadRequested
@@ -2869,8 +2870,8 @@ public class JDWPTools {
 
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             // Passive by default: a debugger should observe class loads, not cause them. Force-load
-            // is opt-in for the rare cases that genuinely need eager binding (bootstrap classes,
-            // tight integration tests). See GH issue #3.
+            // is opt-in for the rare cases that genuinely need eager binding (tight integration
+            // tests); bootstrap classes do not — their load is reported like any other. See GH issue #3.
             final ReferenceType eagerType = effectiveForceLoad
                 ? forceLoad(className)
                 : jdiService.findLoadedClass(className);
@@ -2940,8 +2941,9 @@ public class JDWPTools {
                 }
 
                 return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s%s). " +
-                        "Class not yet loaded — will activate automatically when the JVM loads it.",
-                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo)
+                        "Class not yet loaded%s — will activate automatically when the JVM loads it.",
+                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo,
+                    forceLoadFailedNote(effectiveForceLoad))
                     + deferredClassSuggestion(vm, className);
             }
 
@@ -3074,8 +3076,9 @@ public class JDWPTools {
                 }
 
                 return String.format("Logpoint deferred for %s:%d (ID: %d, expression: %s%s). " +
-                        "Class not yet loaded — will activate when the JVM loads it.",
-                    className, lineNumber, pendingId, expression, conditionInfo)
+                        "Class not yet loaded%s — will activate when the JVM loads it.",
+                    className, lineNumber, pendingId, expression, conditionInfo,
+                    forceLoadFailedNote(effectiveForceLoad))
                     + deferredClassSuggestion(vm, className)
                     + LOGPOINT_READBACK_HINT;
             }
@@ -3825,9 +3828,9 @@ public class JDWPTools {
         "is thrown — caught at the throw site, before the stack unwinds. For non-stopping tracing, use " +
         "jdwp_set_exception_logpoint instead. By default the BP is registered passively: if the exception " +
         "class is not yet loaded the BP is deferred via a ClassPrepareRequest and activates on natural load. " +
-        "Pass forceLoad=true when targeting an exception class the application hasn't referenced yet " +
-        "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
-        "running `<clinit>` in the target VM. The stop names the exception's type and message. Only the " +
+        "A class that is not loaded yet — JDK exception types included — is waited for; forceLoad=true " +
+        "only binds it at once (runs `<clinit>`; not possible at VM start). The stop names the exception's " +
+        "type and message. Only the " +
         "throwing thread is suspended unless suspendPolicy='all': with 'thread', other threads run on — a test's " +
         "main thread may reach its timeout and end the JVM while you inspect the stop.")
     public String jdwp_set_exception_breakpoint(
@@ -3836,7 +3839,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
-        @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced (ClassPrepareEvent is not delivered for bootstrap classes, so the deferred path will never activate).") @Nullable Boolean forceLoad,
+        @McpToolParam(required = false, description = "If true, load the exception class now via Class.forName (runs `<clinit>`; needs a stopped thread, so not at VM start). Default false: a class that is not loaded yet is waited for, JDK classes included.") @Nullable Boolean forceLoad,
         @McpToolParam(required = false, description = "Suspend policy of the stop: 'thread' (default — only the throwing thread) or 'all' (every thread, so nothing runs on while you inspect)") @Nullable String suspendPolicy) {
         final String policyLabel = suspendPolicy == null || suspendPolicy.isBlank()
             ? "thread" : suspendPolicy.toLowerCase(Locale.ROOT);
@@ -3862,9 +3865,8 @@ public class JDWPTools {
         "for multi-statement. Use this for tracing exception flows in long-running " +
         "services without halting traffic. By default the logpoint is registered passively: if the exception " +
         "class is not yet loaded the logpoint is deferred via a ClassPrepareRequest and activates on natural " +
-        "load. Pass forceLoad=true when targeting an exception class the application hasn't referenced yet " +
-        "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
-        "running `<clinit>` in the target VM.")
+        "load. A class that is not loaded yet — JDK exception types included — is waited for; " +
+        "forceLoad=true only binds it at once (runs `<clinit>`; not possible at VM start).")
     public String jdwp_set_exception_logpoint(
         @McpToolParam(description = "Fully-qualified exception class name (e.g., 'java.sql.SQLException')") String className,
         @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object — supports `{ ...; return X; }` block syntax") String expression,
@@ -3873,7 +3875,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
-        @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced.") @Nullable Boolean forceLoad) {
+        @McpToolParam(required = false, description = "If true, load the exception class now via Class.forName (runs `<clinit>`; needs a stopped thread, so not at VM start). Default false: a class that is not loaded yet is waited for, JDK classes included.") @Nullable Boolean forceLoad) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_exception_logpoint. "
                 + "Use jdwp_set_exception_breakpoint for a suspending exception BP without expression evaluation.";
@@ -3943,9 +3945,10 @@ public class JDWPTools {
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
 
-            // Passive lookup by default; only force-load when the caller opts in. The bootstrap-
-            // class problem (ClassPrepareEvent not delivered for java.*/jdk.* exceptions never
-            // referenced by user code) is the primary forceLoad=true use case.
+            // Passive lookup by default; only force-load when the caller opts in. A deferred entry
+            // needs no force-load even for java.*/jdk.* exceptions: every class loaded after the
+            // attach — bootstrap classes included — delivers a ClassPrepareEvent before it can be
+            // thrown, so forceLoad=true only makes the BP bind at once.
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             final ReferenceType eagerType = effectiveForceLoad
                 ? forceLoad(exceptionClass)
@@ -3975,12 +3978,13 @@ public class JDWPTools {
                           Caught: %s
                           Uncaught: %s
                           Mode: %s%s%s%s
-                        Class not yet loaded — will activate automatically when the JVM loads it.""",
+                        Class not yet loaded%s — will activate automatically when the JVM loads it.""",
                     pendingId, exceptionClass, effectiveCaught, effectiveUncaught,
                     modeLabel,
                     expressionLine,
                     conditionLine,
-                    chainInfo)
+                    chainInfo,
+                    forceLoadFailedNote(effectiveForceLoad))
                     + deferredClassSuggestion(vm, exceptionClass)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
@@ -4185,10 +4189,11 @@ public class JDWPTools {
                           Class: %s
                           Field: %s
                           Mode: %s (%s)%s%s%s%s%s%s
-                        Class not yet loaded — will activate automatically when the JVM loads it.""",
+                        Class not yet loaded%s — will activate automatically when the JVM loads it.""",
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
-                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning)
+                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning,
+                    forceLoadFailedNote(effectiveForceLoad))
                     + deferredClassSuggestion(vm, className)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
