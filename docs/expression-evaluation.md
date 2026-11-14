@@ -241,11 +241,11 @@ The error message names the field and suggests the workaround.
 
 ### VMStart suspension is special
 
-When connecting to a JVM started with `suspend=y`, all threads are suspended at `VMStart` but no thread is at a method-invocation event yet. This means `evaluate_expression`, `to_string`, and `set_exception_breakpoint` (which use `invokeMethod`) cannot work until at least one breakpoint has been hit. Set breakpoints first, then resume, then inspect.
+When connecting to a JVM started with `suspend=y`, all threads are suspended at `VMStart` but no thread is at a method-invocation event yet. This means everything that uses `invokeMethod` — `evaluate_expression`, `to_string`, watcher evaluation, and `forceLoad=true` on the set-breakpoint tools (`Class.forName`) — cannot work until at least one breakpoint has been hit. Setting breakpoints needs no invocation: line BPs, logpoints, exception and field BPs on classes that are not loaded yet are deferred and promoted on `ClassPrepareEvent` ([breakpoints.md](breakpoints.md) § 3), and a `forceLoad=true` that cannot load falls back to deferring. Set breakpoints first, then resume, then inspect.
 
-### Bootstrap class exception breakpoints start as PENDING
+### Exception breakpoints on classes not loaded yet start as PENDING
 
-Exception breakpoints on classes like `java.lang.NullPointerException` may return as `[PENDING]` if the class isn't loaded yet. They auto-promote when any tool that calls `getVM()` runs while a thread is suspended at a method-invocation event. Pair with a regular line breakpoint upstream to ensure promotion.
+An exception breakpoint on a class that is not loaded yet — JDK classes such as `java.lang.IllegalStateException` or `java.lang.AssertionError` included — returns as `[PENDING]`. The JVM reports the load of every class loaded after the debugger attached, bootstrap classes too, so the breakpoint is promoted by its `ClassPrepareEvent`, before `<clinit>` and so before the first instance can be thrown. Classes the JVM preloads during start-up (e.g. `java.lang.NullPointerException`) are already visible and bind at once. Tool calls do not promote a pending entry by loading its class: the `tryPromotePending` safety net is passive (`findLoadedClass`). Verified on JDK 21 by setting `java.lang.AssertionError` at VMStart with no other breakpoint: it was promoted on the class's `ClassPrepareEvent` and stopped on JUnit's `AssertionFailedError`.
 
 ## 5. Watcher integration
 

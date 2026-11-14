@@ -78,8 +78,8 @@ A breakpoint is *pending* when the agent set it on a class that hasn't loaded ye
 
 The line-BP path is canonical; the others follow the same shape. `JDWPTools.java:1856-1898`:
 
-1. Tool tries to resolve the class via `findOrForceLoadClass`.
-2. If the class is not loaded and cannot be force-loaded, the tool calls `registerPendingBreakpoint` and attaches condition / logpoint / chain metadata.
+1. Tool looks the class up passively via `findLoadedClass`, or via `findOrForceLoadClass` when the caller passed `forceLoad=true` (a force-load needs a thread stopped at an event, so it cannot load anything at VMStart).
+2. If the class is not loaded (or could not be force-loaded), the tool calls `registerPendingBreakpoint` and attaches condition / logpoint / chain metadata.
 3. The tool creates a `ClassPrepareRequest` filtered by the class name with policy `SUSPEND_EVENT_THREAD`. Only one CPR per class (`hasClassPrepareRequest` check at line 1866; registry on `BreakpointTracker.java:66, 445-462`).
 4. Race guard: re-check `classesByName` after CPR registration, in case the class loaded between the original lookup and the CPR enable.
 
@@ -97,7 +97,9 @@ After promoting, the CPR is deleted if no pending entries still reference the cl
 
 ### Promotion path 2 — `tryPromotePending` safety net
 
-Called from `JDIConnectionService.getVM()` on every MCP tool call (`BreakpointTracker.java:843-955`). Catches bootstrap classes that loaded before any debugger event was delivered — for example, classes preloaded by the JVM during VM-start, where the CPR was set after they were already prepared.
+Called from `JDIConnectionService.getVM()` on every MCP tool call and once after a reconnect re-registers the pending specs (`BreakpointTracker.tryPromotePending`); the listener loop does not call it. Catches a class that loaded while no CPR was watching for it — between the tool's lookup and the CPR enable (the exception-BP path has no step-4 recheck; this net covers that window), or before a reconnect re-registered the pending specs. It is passive (`findLoadedClass`): it never loads a class, so it does not help a class that is never loaded.
+
+Bootstrap classes need no special path. Every class loaded after the debugger attached — `java.lang.*` included — delivers a `ClassPrepareEvent`, so path 1 promotes a pending exception BP on, say, `java.lang.AssertionError` set at VMStart (verified on JDK 21: it activated on the class's prepare and stopped on JUnit's `AssertionFailedError`). Classes loaded before the attach are already visible to the tool's own lookup and bind at once.
 
 Idempotent: a class already promoted via path 1 is a no-op here.
 

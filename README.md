@@ -431,30 +431,34 @@ By default, every line BP, logpoint, exception BP, and field BP is registered **
 
 ```
 jdwp_set_breakpoint(className="com.example.LazyService", lineNumber=15)
-→ "Breakpoint deferred — class com.example.LazyService not yet loaded. Will activate on class load."
+→ "Breakpoint deferred for com.example.LazyService:15 (ID: 1, suspend: all). Class not yet loaded — will activate automatically when the JVM loads it."
 ```
 
-`jdwp_overview()` shows pending breakpoints with their status.
+`jdwp_overview()` shows pending breakpoints with their status; `jdwp_get_events()` records a `CLASS_PREPARE` entry when a load activates them.
 
-Pass `forceLoad=true` only when you need the breakpoint to bind *immediately* — the server will call `Class.forName` in the target VM to load the class up front. That runs the class's `<clinit>` (early static init, eager dependency loads), which can mask lazy-init / classloader-leak diagnostics. Use sparingly.
+This works from VM start, so it is the attach prologue for a failing test: launch the JVM suspended (`-Dmaven.surefire.debug`), `jdwp_wait_for_attach`, set every line BP, logpoint, exception BP and field BP while the JVM is parked, then `jdwp_resume_until_event`. Each one activates when its class loads — JDK classes included, so an exception BP on `java.lang.AssertionError` set at VM start stops on the first failing JUnit assertion.
+
+Pass `forceLoad=true` only when you need the breakpoint to bind *immediately* — the server will call `Class.forName` in the target VM to load the class up front. That runs the class's `<clinit>` (early static init, eager dependency loads), which can mask lazy-init / classloader-leak diagnostics. Use sparingly. It needs a thread stopped at an event to run the load, so at VM start it cannot load anything: the breakpoint is deferred instead, and the reply says `forceLoad=true could not load it`.
 
 ### Exception breakpoints
 
 ```
 jdwp_set_exception_breakpoint(
-  exceptionClass="java.lang.NullPointerException",
+  className="java.lang.NullPointerException",
   caught=true,
   uncaught=true
 )
 ```
 
-Catch exceptions at the throw site — before the stack unwinds. The stop names the exception's type and message (`via=exception, java.lang.IllegalStateException: Insufficient stock (thrown at …, caught at …)`). Only the throwing thread stops unless you pass `suspendPolicy="all"` — use it when the throw happens on a pool thread and the test's main thread would otherwise run on to its timeout and end the JVM while you look. Supports deferred activation (if the exception class isn't loaded yet). Use `jdwp_overview(types="exception_breakpoint")` to see active and pending exception breakpoints.
+Catch exceptions at the throw site — before the stack unwinds. The breakpoint also matches subclasses: one on `java.lang.AssertionError` stops on JUnit's `org.opentest4j.AssertionFailedError`. The stop names the exception's type and message (`via=exception, java.lang.IllegalStateException: Insufficient stock (thrown at …, caught at …)`). Only the throwing thread stops unless you pass `suspendPolicy="all"` — use it when the throw happens on a pool thread and the test's main thread would otherwise run on to its timeout and end the JVM while you look. Use `jdwp_overview(types="exception_breakpoint")` to see active and pending exception breakpoints.
+
+An exception class that is not loaded yet makes the breakpoint `[PENDING]`; it activates by itself when the JVM loads the class — JDK classes such as `IllegalStateException` or `AssertionError` included, and before the first instance can be thrown. It needs no upstream line breakpoint and no `forceLoad`, and it can be set at VM start (see [Deferred breakpoints](#deferred-breakpoints)). Classes the JVM preloads, such as `NullPointerException`, bind at once.
 
 **Log-only mode** — record the throw without suspending the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
 
 ```
 jdwp_set_exception_logpoint(
-  exceptionClass="java.sql.SQLException",
+  className="java.sql.SQLException",
   expression="$exception.getSQLState() + \": \" + $exception.getMessage()"
 )
 ```
@@ -707,8 +711,8 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?` | **Rare, consent required.** Conditional breakpoint whose condition is evaluated inside the target by injected bytecode — hits that do not meet it never reach the debugger. Without `userApproved=true` it arms nothing and returns a risk briefing |
 | `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints or fast breakpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs, fast logpoints and fast breakpoints (restoring the original bytecode, after the release of a thread stopped in the method; a leftover of an earlier session is only switched off) and removes its watchers |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?` | Suspend on exception throw (supports deferred and trigger chaining; `suspendPolicy="all"` parks every thread) |
-| `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
+| `jdwp_set_exception_breakpoint`   | `className`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?` | Suspend on exception throw (supports deferred and trigger chaining; `suspendPolicy="all"` parks every thread) |
+| `jdwp_set_exception_logpoint`     | `className`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
 | `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
 | `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
 

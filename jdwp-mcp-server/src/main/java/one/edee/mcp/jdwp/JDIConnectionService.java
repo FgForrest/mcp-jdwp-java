@@ -1058,9 +1058,11 @@ public class JDIConnectionService {
             ensureConnected();
             current = vm;
         }
-        // Opportunistic pending-breakpoint retry — handles bootstrap classes whose ClassPrepareEvent
-        // is never delivered. Best-effort; failures are swallowed. Runs outside the service monitor
-        // (see class-level Javadoc for the rationale).
+        // Opportunistic pending-breakpoint retry — binds a class that loaded while no
+        // ClassPrepareRequest was watching for it (e.g. between a tool's lookup and its CPR enable).
+        // Every class loaded after the attach, bootstrap classes included, does deliver a
+        // ClassPrepareEvent; this is only the safety net. Best-effort; failures are swallowed. Runs
+        // outside the service monitor (see class-level Javadoc for the rationale).
         try {
             breakpointTracker.tryPromotePending(this);
         } catch (Exception e) {
@@ -1609,9 +1611,9 @@ public class JDIConnectionService {
      * cascade-load dependencies, and cannot park the calling thread inside a target-VM
      * {@code invokeMethod}. This is the default lookup used by every set-breakpoint code path —
      * a debugger should observe class loads, not cause them. Callers that genuinely need to make
-     * a class appear (typically the bootstrap-class case for exception BPs, or expression /
-     * watcher evaluation that needs a specific helper class) must opt in via
-     * {@link #findOrForceLoadClass}.
+     * a class appear (a breakpoint the user wants bound at once, or expression / watcher evaluation
+     * that needs a specific helper class) must opt in via {@link #findOrForceLoadClass}. Exception
+     * breakpoints on JDK classes do not: their class's load is reported like any other.
      */
     @Nullable
     public ReferenceType findLoadedClass(String className) {
@@ -1640,10 +1642,11 @@ public class JDIConnectionService {
 
     /**
      * Locates a class in the target VM, force-loading it via {@code Class.forName(name)} if not yet
-     * visible. Solves the bootstrap-class problem: classes like {@code java.lang.IllegalStateException}
-     * are not visible to {@link VirtualMachine#classesByName} until first referenced, and their
-     * {@link com.sun.jdi.event.ClassPrepareEvent} is not delivered to JDI clients. Returns
-     * {@code null} if the class cannot be found or force-loaded.
+     * visible. Classes like {@code java.lang.IllegalStateException} are not visible to
+     * {@link VirtualMachine#classesByName} until first referenced; a force-load makes them appear at
+     * once. A breakpoint does not need that — their {@link com.sun.jdi.event.ClassPrepareEvent} is
+     * delivered when they load, bootstrap classes included. Returns {@code null} if the class cannot
+     * be found or force-loaded — always at VM start, where no thread can run {@code Class.forName}.
      *
      * <p><b>This method has observable side effects on the target application</b> — running
      * {@code <clinit>} triggers static-field init, cascade-loads dependencies, may register
