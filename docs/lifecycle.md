@@ -190,6 +190,6 @@ Logback is configured in `jdwp-mcp-server/src/main/resources/logback-spring.xml`
 - **STDERR** — `System.err` only (lines 4-9). Never stdout, which carries MCP JSON.
 - **FILE** — path is `${LOG_PATH:-${java.io.tmpdir}/mcp-jdwp-inspector.log}` (line 13). Plain `FileAppender`, `append=true`, **no rotation**.
 
-The plugin's MCP server entry (`mcpServers` in `.claude-plugin/plugin.json`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log` so the log file lives next to the plugin install rather than in the user's working directory. When running the JAR directly without that flag, the log falls back to `${java.io.tmpdir}`. The rationale is documented inline in `application.properties:12-18`.
+The plugin's MCP server entry (`mcpServers` in `.claude-plugin/plugin.json`) sets `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log` so the log file lives next to the plugin install rather than in the user's working directory. Under Codex the launcher `scripts/jdwp-inspector.sh` sets `-DLOG_PATH=$PLUGIN_DATA/logs/mcp-jdwp-inspector.log`, Codex's per-plugin data directory, which survives plugin updates. When running the JAR directly without that flag, the log falls back to `${java.io.tmpdir}`. The rationale is documented inline in `application.properties:12-18`.
 
 The lack of rotation is intentional — sessions are typically short-lived and bounded by the agent's lifetime. For long-running automation, plan to truncate the file externally or wrap the `java` command in a launcher that handles rotation.

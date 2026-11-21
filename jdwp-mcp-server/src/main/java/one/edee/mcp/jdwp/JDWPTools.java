@@ -2131,7 +2131,10 @@ public class JDWPTools {
         try {
             final LocalProjectClasspathProvider.Breakdown breakdown =
                 localClasspathProvider.peekCachedBreakdown();
-            out.append("  CWD: ").append(localClasspathProvider.getWorkingDirectory()).append('\n');
+            out.append("  CWD: ").append(localClasspathProvider.getWorkingDirectory())
+                .append(localClasspathProvider.isWorkingDirectoryReportedByClient()
+                    ? " (session directory reported by the MCP client)" : "")
+                .append('\n');
             out.append("  pom.xml: ").append(localClasspathProvider.hasPomAtRoot() ? "yes" : "no").append('\n');
             final String envState = renderEnvState(breakdown);
             if (breakdown == null) {

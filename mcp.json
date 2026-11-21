@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "jdwp-inspector": {
+      "type": "stdio",
+      "command": "sh",
+      "args": ["${PLUGIN_ROOT}/scripts/jdwp-inspector.sh"]
+    }
+  }
+}

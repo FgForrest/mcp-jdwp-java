@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,13 +32,18 @@ import java.util.stream.Stream;
  * entries with whatever the remote discovery produced — this provider never consults the target VM.
  * <ul>
  *   <li>{@code JDWP_EXTRA_CLASSPATH} env var, parsed by {@link File#pathSeparator}</li>
- *   <li>Filesystem scan of {@code target/classes} / {@code target/test-classes} under the server CWD</li>
+ *   <li>Filesystem scan of {@code target/classes} / {@code target/test-classes} under the project
+ *       directory</li>
  *   <li>Maven {@code dependency:build-classpath} per detected {@code pom.xml}</li>
  * </ul>
  *
+ * <p>The project directory is the one the MCP client reports, when it reports one (Codex, see
+ * {@link ClientWorkspace}), and the server's launch directory otherwise (Claude Code starts the
+ * server in the project).
+ *
  * <p>The first {@link #discoverWithBreakdown()} call is memoised; subsequent calls return the cached
- * result until {@link #reset()} is invoked (typically on JDI reconnect). Discovery is synchronised
- * so concurrent callers see the same memoised snapshot.
+ * result until {@link #reset()} is invoked (typically on JDI reconnect) or the project directory
+ * changes. Discovery is synchronised so concurrent callers see the same memoised snapshot.
  *
  * <p>Registered as a Spring {@code @Service}, but the second constructor takes seams so the env
  * lookup and Maven invocation can be stubbed in tests without touching real environment variables
@@ -94,14 +100,18 @@ public class LocalProjectClasspathProvider {
      */
     public record Breakdown(int envOverride, int filesystem, int maven, Set<String> all) {}
 
-    /** Root the scan is anchored at; usually the MCP server's launch directory. */
-    private final Path workingDirectory;
+    /** Directory the scan is anchored at when no client reports one; the server's launch directory in production. */
+    private final Path launchDirectory;
+    /** Source of the client-reported project directory; {@code null} when the client's is never consulted. */
+    private final @Nullable ClientWorkspace clientWorkspace;
     /** Indirection for {@link System#getenv(String)} so tests can drive the env-override branch. */
     private final Function<String, @Nullable String> envLookup;
     /** Indirection for the Maven shell-out so tests can stub success/failure modes. */
     private final MavenRunner mavenRunner;
     /** Memoised result of the first {@link #discoverWithBreakdown()} call; cleared by {@link #reset()}. */
     private @Nullable Breakdown cachedBreakdown;
+    /** Project directory {@link #cachedBreakdown} was computed for. */
+    private @Nullable Path cachedFor;
 
     /**
      * Test seam: build the provider with explicit working directory, env-lookup function, and Maven
@@ -111,23 +121,37 @@ public class LocalProjectClasspathProvider {
     public LocalProjectClasspathProvider(Path workingDirectory,
                                          Function<String, @Nullable String> envLookup,
                                          MavenRunner mavenRunner) {
-        this.workingDirectory = workingDirectory;
+        this(workingDirectory, null, envLookup, mavenRunner);
+    }
+
+    /**
+     * Test seam that also takes the {@link ClientWorkspace} whose reported directory overrides
+     * {@code launchDirectory}.
+     */
+    public LocalProjectClasspathProvider(Path launchDirectory,
+                                  @Nullable ClientWorkspace clientWorkspace,
+                                  Function<String, @Nullable String> envLookup,
+                                  MavenRunner mavenRunner) {
+        this.launchDirectory = launchDirectory;
+        this.clientWorkspace = clientWorkspace;
         this.envLookup = envLookup;
         this.mavenRunner = mavenRunner;
     }
 
     /**
-     * Default Spring wiring: uses the JVM's launch directory as the working directory and the real
-     * process environment for the env-var lookup. The {@link ProcessBuilderMavenRunner} is injected
-     * so Maven invocations go through the real shell-out path in production.
+     * Default Spring wiring: anchors at the directory the MCP client reports, falling back to the
+     * JVM's launch directory, and uses the real process environment for the env-var lookup. The
+     * {@link ProcessBuilderMavenRunner} is injected so Maven invocations go through the real
+     * shell-out path in production.
      */
     @Autowired
-    public LocalProjectClasspathProvider(ProcessBuilderMavenRunner mavenRunner) {
+    public LocalProjectClasspathProvider(ProcessBuilderMavenRunner mavenRunner, ClientWorkspace clientWorkspace) {
         // `user.dir` is documented as always-present on a normal JVM launch, but a sandboxed
         // / restricted launch can drop it. Defaulting to "." rather than letting Path.of(null)
         // NPE keeps the bean constructible — the scan then runs against the process's effective
         // working directory, which is the same place "." would resolve to anyway.
-        this(Path.of(Objects.toString(System.getProperty("user.dir"), ".")), System::getenv, mavenRunner);
+        this(Path.of(Objects.toString(System.getProperty("user.dir"), ".")), clientWorkspace, System::getenv,
+            mavenRunner);
     }
 
     /**
@@ -141,11 +165,21 @@ public class LocalProjectClasspathProvider {
     }
 
     /**
-     * Working directory the provider is rooted at — exposed for the {@code jdwp_diagnose} report so
-     * operators see the absolute path the scan started from without re-reading {@code user.dir}.
+     * Project directory the next discovery is rooted at: the directory the MCP client reported, or
+     * the launch directory when no client reported one. Exposed for the {@code jdwp_diagnose} report
+     * and the evaluator's "nothing found" hint so they name the directory that was actually scanned.
      */
     public Path getWorkingDirectory() {
-        return workingDirectory;
+        final Path reported = clientWorkspace == null ? null : clientWorkspace.reportedDirectory();
+        return reported != null ? reported : launchDirectory;
+    }
+
+    /**
+     * True when {@link #getWorkingDirectory()} comes from the MCP client rather than from the
+     * server's launch directory.
+     */
+    public boolean isWorkingDirectoryReportedByClient() {
+        return clientWorkspace != null && clientWorkspace.reportedDirectory() != null;
     }
 
     /**
@@ -158,17 +192,18 @@ public class LocalProjectClasspathProvider {
         // pom.xml could redirect Maven discovery at an arbitrary tree on the host filesystem; we
         // treat it as "no pom" so the Maven source is skipped, matching how the filesystem scan
         // treats symlinked target/classes directories.
-        return Files.isRegularFile(workingDirectory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
+        return Files.isRegularFile(getWorkingDirectory().resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
     }
 
     /**
      * Non-blocking peek at the cached breakdown. Returns {@code null} when no discovery has run
-     * yet on this provider instance. Used by the diagnose path so the report never blocks the
-     * caller waiting for a cold-cache Maven invocation; if the cache is cold, the diagnose
-     * renderer prints a one-line "not yet computed" hint and moves on.
+     * yet on this provider instance, or when the cached one was computed for another project
+     * directory. Used by the diagnose path so the report never blocks the caller waiting for a
+     * cold-cache Maven invocation; if the cache is cold, the diagnose renderer prints a one-line
+     * "not yet computed" hint and moves on.
      */
     public synchronized @Nullable Breakdown peekCachedBreakdown() {
-        return cachedBreakdown;
+        return getWorkingDirectory().equals(cachedFor) ? cachedBreakdown : null;
     }
 
     /**
@@ -217,16 +252,21 @@ public class LocalProjectClasspathProvider {
      * @return memoised breakdown — never null; {@link Breakdown#all()} is immutable
      */
     public synchronized Breakdown discoverWithBreakdown() {
+        final Path workingDirectory = getWorkingDirectory();
         final Breakdown cached = cachedBreakdown;
         if (cached != null) {
-            return cached;
+            if (workingDirectory.equals(cachedFor)) {
+                return cached;
+            }
+            log.info("[LocalClasspath] Project directory changed from {} to {} — scanning again",
+                cachedFor, workingDirectory);
         }
         final Set<String> entries = new LinkedHashSet<>();
         addEnvOverride(entries);
         final int afterEnv = entries.size();
-        addFilesystemScan(entries);
+        addFilesystemScan(entries, workingDirectory);
         final int afterFs = entries.size();
-        addMavenDependencies(entries);
+        addMavenDependencies(entries, workingDirectory);
         final int afterMaven = entries.size();
         final Breakdown breakdown = new Breakdown(
             afterEnv,
@@ -238,6 +278,7 @@ public class LocalProjectClasspathProvider {
             Collections.unmodifiableSet(new LinkedHashSet<>(entries))
         );
         cachedBreakdown = breakdown;
+        cachedFor = workingDirectory;
         if (entries.isEmpty()) {
             // Required by the logging policy: ONE INFO line on empty result explaining the why.
             // NOFOLLOW_LINKS on every probe — keep the diagnostic readout consistent with the
@@ -262,6 +303,7 @@ public class LocalProjectClasspathProvider {
      */
     public synchronized void reset() {
         cachedBreakdown = null;
+        cachedFor = null;
         log.debug("[LocalClasspath] Cache reset");
     }
 
@@ -270,7 +312,7 @@ public class LocalProjectClasspathProvider {
      * sits at the working-directory root. Logs at INFO with the count and elapsed time on every
      * outcome (added &gt; 0, added == 0, failure) so operators see one line per discovery.
      */
-    private void addMavenDependencies(Set<String> entries) {
+    private void addMavenDependencies(Set<String> entries, Path workingDirectory) {
         // NOFOLLOW_LINKS: same invariant as hasPomAtRoot — a symlinked pom.xml must not trigger
         // Maven discovery, because Maven would resolve the link and pull dependencies from a tree
         // outside the configured workingDirectory.
@@ -278,7 +320,7 @@ public class LocalProjectClasspathProvider {
             log.debug("[LocalClasspath] No pom.xml under {} — skipping Maven source", workingDirectory);
             return;
         }
-        final List<String> command = buildMavenCommand();
+        final List<String> command = buildMavenCommand(workingDirectory);
         final long startTime = System.currentTimeMillis();
         try {
             final List<String> jars = mavenRunner.run(command, workingDirectory, MAVEN_TIMEOUT_SECONDS);
@@ -308,8 +350,8 @@ public class LocalProjectClasspathProvider {
      * wrapper when available (see {@link #resolveMavenExecutable}). The output file lives under each
      * module's {@code target/}, never at a bare project-root filename.
      */
-    private List<String> buildMavenCommand() {
-        final String executable = resolveMavenExecutable();
+    private static List<String> buildMavenCommand(Path workingDirectory) {
+        final String executable = resolveMavenExecutable(workingDirectory);
         // `-q` keeps Maven CLI noise off the operator's terminal; the runner captures stdout to a
         // size-capped buffer so the WARN path can still surface diagnostic output on failure.
         // `-DincludeScope=runtime` matches what's actually on the app's runtime classpath.
@@ -345,7 +387,7 @@ public class LocalProjectClasspathProvider {
      * NTFS executable bit isn't a thing — {@link Files#isRegularFile(Path, LinkOption...)} is the
      * right gate.
      */
-    private String resolveMavenExecutable() {
+    private static String resolveMavenExecutable(Path workingDirectory) {
         if (isWindows()) {
             final Path mvnwCmd = workingDirectory.resolve("mvnw.cmd");
             // NOFOLLOW_LINKS: a symlinked mvnw.cmd could point at a script outside the working
@@ -376,7 +418,7 @@ public class LocalProjectClasspathProvider {
      * adds each as an entry. Always emits one INFO line summarising the count and elapsed time so
      * operators can see whether the scan contributed or not without enabling DEBUG.
      */
-    private void addFilesystemScan(Set<String> entries) {
+    private static void addFilesystemScan(Set<String> entries, Path workingDirectory) {
         final long startTime = System.currentTimeMillis();
         final int before = entries.size();
         scanForClassDirs(workingDirectory, 0, entries);

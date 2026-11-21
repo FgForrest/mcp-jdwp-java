@@ -1535,9 +1535,12 @@ public class JdiExpressionEvaluator {
                 throw new JdiEvaluationException(
                     "Classpath discovery failed for the current connection: neither the target VM "
                         + "classloader hierarchy nor the local project yielded any classpath entries. "
-                        + "The MCP server was launched from the directory '"
-                        + Objects.toString(System.getProperty("user.dir"), "<unknown>") + "'. "
-                        + "Either (a) restart the server from a directory containing a Maven project "
+                        + "The local project was looked for in '"
+                        + localClasspathProvider.getWorkingDirectory() + "' ("
+                        + (localClasspathProvider.isWorkingDirectoryReportedByClient()
+                            ? "the session directory the MCP client reported"
+                            : "the directory the MCP server was launched from") + "). "
+                        + "Either (a) start the agent session in a directory containing a Maven project "
                         + "(pom.xml + target/classes), or (b) set the JDWP_EXTRA_CLASSPATH environment "
                         + "variable to a colon/semicolon-separated list of jars and class directories. "
                         + "Run jdwp_diagnose to inspect what was scanned, and check the server log for "

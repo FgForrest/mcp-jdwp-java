@@ -76,12 +76,14 @@ Each URL is dereferenced to its path string and added to the deduplicated list. 
 
 ### `LocalProjectClasspathProvider` — local-project classpath fallback
 
-The remote classloader walk above is the source of truth, but it does not see everything. Tomcat's `WebappClassLoaderBase`, Spring Boot's `LaunchedClassLoader` / dev-tools `RestartClassLoader`, and arbitrary user-written `URLClassLoader`s hide their JARs from `getURLs()` or expose them only behind reflection — so JDT can fail to resolve types that are clearly visible to the running application. To plug those gaps, `LocalProjectClasspathProvider` (Spring singleton in the `evaluation/` package) computes a second, additive classpath from the **MCP server's own working directory** and `JdiExpressionEvaluator.configureCompilerClasspath` unions it with the remote-discovered one before handing the result to `InMemoryJavaCompiler.configure`.
+The remote classloader walk above is the source of truth, but it does not see everything. Tomcat's `WebappClassLoaderBase`, Spring Boot's `LaunchedClassLoader` / dev-tools `RestartClassLoader`, and arbitrary user-written `URLClassLoader`s hide their JARs from `getURLs()` or expose them only behind reflection — so JDT can fail to resolve types that are clearly visible to the running application. To plug those gaps, `LocalProjectClasspathProvider` (Spring singleton in the `evaluation/` package) computes a second, additive classpath from the **project directory** and `JdiExpressionEvaluator.configureCompilerClasspath` unions it with the remote-discovered one before handing the result to `InMemoryJavaCompiler.configure`.
+
+The project directory is the directory the agent session runs in. Claude Code starts the MCP server there, so it is `user.dir`. Codex starts plugin servers in the plugin's install directory and reports the session directory with each tool call (`_meta["codex/sandbox-state"].sandboxCwd`, see [diagnostics.md](diagnostics.md) § 8). `ClientWorkspace` records it, and when one was reported the provider scans it instead of `user.dir`. The memoized result belongs to the directory it was computed for, so a report that names another directory triggers a new scan.
 
 **Three sources, composed in order:**
 
 1. **`JDWP_EXTRA_CLASSPATH` env var** — colon/semicolon-separated (parsed with `File.pathSeparator`) list of jars and class directories. Explicit override for cases the other sources can't reach (e.g. a JAR installed outside the project, or a vendor build artefact).
-2. **Filesystem scan** — walks the CWD up to depth 5 looking for `target/classes` and `target/test-classes` directories. Multi-module reactors are covered without the provider needing to parse a `pom.xml`.
+2. **Filesystem scan** — walks the project directory up to depth 5 looking for `target/classes` and `target/test-classes` directories. Multi-module reactors are covered without the provider needing to parse a `pom.xml`.
 3. **Maven `dependency:build-classpath`** — for each detected module, invokes `./mvnw dependency:build-classpath -Dmdep.outputFile=target/.jdwp-mcp-classpath` (preferring `./mvnw` over `mvn`) and harvests the printed list. Synchronous, capped at 180 seconds, output captured into a 64 KB buffer so failures are diagnosable.
 
 **Union order matters.** The merge in `configureCompilerClasspath` is `[remote..., local-only...]` (de-duplicated, host `File.pathSeparator` as the joiner). JDT resolves types left-to-right, so a class present in BOTH a remote entry and a stale local copy binds against the remote definition first — the live target VM always wins on resolution. The local entries are reachable only as a fallback for classes the remote view did not provide.
@@ -95,9 +97,9 @@ The remote classloader walk above is the source of truth, but it does not see ev
 
 **Inspection.** `jdwp_diagnose` shows a `Local project classpath` block listing the CWD, whether a `pom.xml` was found, a per-source breakdown (`env-override=N, filesystem=N, maven=N`), the total entry count, and whether the env-var override is set. The provider also logs every step under the `[LocalClasspath]` prefix — `INFO` for source contributions and timings, `WARN` for Maven non-zero exits / timeouts / malformed env values, `DEBUG` for per-entry tracing and Maven stdout on failure.
 
-**How to disable.** Don't set `JDWP_EXTRA_CLASSPATH` AND launch the MCP server from a directory that has no `pom.xml` and no `target/classes` under it (e.g. `/tmp`). With all three sources silent, the merged classpath is identical to the remote-discovered one.
+**How to disable.** Don't set `JDWP_EXTRA_CLASSPATH` AND run the agent session in a directory that has no `pom.xml` and no `target/classes` under it (e.g. `/tmp`). With all three sources silent, the merged classpath is identical to the remote-discovered one.
 
-If both sides come up empty, `configureCompilerClasspath` throws a `JdiEvaluationException` that names the server's CWD and the two recovery levers (restart from a Maven project, or set `JDWP_EXTRA_CLASSPATH`).
+If both sides come up empty, `configureCompilerClasspath` throws a `JdiEvaluationException` that names the scanned project directory, where it came from (the server's launch directory or the client's report), and the two recovery levers (start the session in a Maven project, or set `JDWP_EXTRA_CLASSPATH`).
 
 ### `JdkDiscoveryService`
 
