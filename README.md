@@ -2,7 +2,7 @@
 
 MCP server that gives AI agents full debugger control over running Java applications — inspect state, set breakpoints, evaluate expressions, and mutate values at runtime via JDWP/JDI.
 
-> **Release notes** — see [`CHANGELOG.md`](CHANGELOG.md). 2.0.0 is a breaking release: several `jdwp_clear_*` tools were unified, and field watchpoints are new.
+> **Release notes** — see [`CHANGELOG.md`](CHANGELOG.md).
 
 **Built on the foundations of [mcp-jdwp-java](https://github.com/NicolasVautrin/mcp-jdwp-java) by [Nicolas Vautrin](https://github.com/NicolasVautrin)** — the original project that provided core JDI connectivity, thread/stack/variable inspection, stepping, and basic breakpoint management. Everything described below as "beyond standard JDWP" was built on top of that base.
 
@@ -14,7 +14,8 @@ An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS
 - **Evaluate arbitrary Java in the suspended frame** — compiled to real bytecode, full classpath, including private/package-private members
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
-- **Trace without stopping** — line/exception/field logpoints write to an event log, the thread runs on
+- **Trace without stopping** — line/exception/field logpoints write to an event log; the hitting thread pauses only while the server evaluates the expression, then runs on
+- **Probe hot code at full speed** — with the user's consent, fast logpoints and fast breakpoints evaluate inside the target JVM: hits that do not match never reach the debugger, and the method stays JIT-compiled
 - **Catch the writer of a mutating field** — watchpoints suspend at every bytecode store to the field, wherever it is; a write through reflection or `Unsafe` is the one they cannot see, and the `[VM_DEATH]` reply's hit count shows when a watchpoint stayed silent
 - **Pure STDIO** — no daemon, no extra port, no GUI
 
@@ -22,24 +23,28 @@ The agent gets the same power as IntelliJ's debugger, with extras that exist spe
 
 ## Security & trust
 
-This MCP server runs **entirely on your local machine**:
+This MCP server runs **on your machine**, as a child process of the agent:
 
-- **No network calls from the server** — the server communicates with the agent over STDIO and with the target JVM over a local JDWP socket. It makes zero outbound HTTP/internet requests. No telemetry, no analytics, no phone-home. The only download is the one described in the next point, made before the server starts.
-- **Built from source, or the release JAR of this repository** — under Claude Code, the plugin's SessionStart hook compiles the JAR on your machine from the sources in this repository (or build it yourself with `./mvnw clean package`). Under Codex, the plugin's launcher downloads `mcp-jdwp-java-<version>.jar` from this repository's GitHub release of the installed version, but only when the installed server sources are the ones tagged for that release; otherwise, or when the download fails, it compiles from source like the hook. Every release attaches that JAR, built from the tagged sources by the release workflow in GitHub Actions.
-- **Auditable** — the full source is here. The server is a standard Spring Boot application with no obfuscation or native code. Try asking Claude Code itself: *"audit these sources for anything that touches network or filesystem beyond the JVM target"*.
+- **No phone-home** — the server talks to the agent over STDIO and to the target JVM over a JDWP socket (local by default; `jdwp_wait_for_attach` accepts another host). It sends no HTTP requests of its own: no telemetry, no analytics. Two things around it can use the network:
+  - **Getting the JAR** — see the next point.
+  - **Maven, for expression evaluation** — when the agent first evaluates an expression and the project directory holds a `pom.xml`, the server runs `mvn dependency:build-classpath` there (`./mvnw` when the project has it) to find JARs the target's class loaders hide. Maven may download the project's dependencies from the repositories the project configures.
+- **Built from source, or the release JAR of this repository** — under Claude Code, the plugin's SessionStart hook compiles the JAR on your machine from the sources in this repository (or build it yourself with `./mvnw clean package`); the build fetches Maven and the dependencies from Maven Central on first use. Under Codex, the plugin's launcher downloads `mcp-jdwp-java-<version>.jar` from this repository's GitHub release of the installed version when the installed server sources are the ones tagged for that release (a copy without git history is trusted by its version number); otherwise, or when the download fails, it compiles from source like the hook. Every release attaches that JAR, built from the tagged sources by the release workflow in GitHub Actions.
+- **What it does to the target** — what any debugger does: it reads and changes the target's state and runs code in it (expression evaluation defines small wrapper classes in the target). Rewriting the application's own bytecode — fast logpoints and fast breakpoints — happens only after the user approves a risk briefing. Clearing them, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode; what a crashed server leaves behind is listed at the next attach (see [Fast logpoints](#fast-logpoints-in-target-consent-required)).
+- **Auditable** — the full source is here. The server is a standard Spring Boot application with no obfuscation or native code. Try asking your agent: *"audit these sources for anything that touches network or filesystem beyond the JVM target"*.
 
 ## Quick start
 
 ### Prerequisites
 
 - **JDK 17+** on PATH to **run** the server (must be a JDK, not a JRE — JDI lives in `jdk.jdi`).
-- **JDK 21+ to build from source** — the build toolchain pins to JDK ≥ 21 because Error Prone 2.48 ships Java-21 bytecode. The bytecode target stays at Java 17, so the resulting JAR still runs on a JDK 17 runtime.
+- **JDK 21+ to build from source** — the build toolchain pins to JDK ≥ 21 because Error Prone 2.48 ships Java-21 bytecode. The bytecode target stays at Java 17, so the resulting JAR still runs on a JDK 17 runtime. A Codex install that downloads the release JAR needs no build, so JDK 17 is enough there.
+- **Codex plugin only:** `bash`, plus `curl` or `wget` for the release download (without them it builds from source).
 
-No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. Every build command in this README uses the wrapper; the SessionStart hook does too, and falls back to `mvn` on `PATH` when the wrapper cannot set itself up.
+No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. Every build command in this README uses the wrapper; so do the SessionStart hook and the Codex launcher, which fall back to `mvn` on `PATH` when the wrapper cannot set itself up.
 
 ### 1. Install the plugin
 
-**Option A: Plugin marketplace (recommended)**
+**Option A: Claude Code plugin (recommended for Claude Code)**
 
 Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, gotchas), and the MCP server registration in one step:
 
@@ -50,7 +55,7 @@ Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, g
 
 The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 21+ — no Maven install needed). The hook is content-aware: it rebuilds when the JAR is missing or, in a git checkout, when `HEAD` moves, so `git pull` + restart picks up updates without manual intervention. When the wrapper cannot set itself up (for example, `~/.m2` is read-only in a sandbox), the hook tries `mvn -o` and then `mvn` from `PATH`. If every attempt fails, a warning at session start names the build log and the exact command to build by hand. A build runs while Claude Code starts the MCP server and the JAR is absent until it finishes, so after a build (first install, update, moved `HEAD`) `jdwp-inspector` may show as failed in `/mcp`; reconnect it there once the build is done. Restart Claude Code to pick up the plugin.
 
-**Option B: Codex**
+**Option B: Codex plugin (recommended for Codex)**
 
 The same repository is a Codex plugin marketplace:
 
@@ -69,9 +74,9 @@ codex plugin add jdwp-debugging@mcp-jdwp-java
 <details>
 <summary><strong>Alternative: manual MCP registration (without plugin)</strong></summary>
 
-If you prefer to register the MCP server directly without the plugin (no skill, no auto-build):
+If you prefer to register the MCP server directly without the plugin (no skill, no auto-build, no updates):
 
-**1. Build the JAR:**
+**1. Build the JAR** (or download `mcp-jdwp-java-<version>.jar` from a [release](https://github.com/FgForrest/mcp-jdwp-java/releases)):
 
 ```bash
 git clone https://github.com/FgForrest/mcp-jdwp-java.git
@@ -79,24 +84,16 @@ cd mcp-jdwp-java
 ./mvnw clean package -DskipTests   # use mvnw.cmd on Windows
 ```
 
-**2. Register with Claude Code:**
+The JAR is `jdwp-mcp-server/target/mcp-jdwp-java.jar`. To change the JDWP port `jdwp_connect` uses (default 5005), add `-DJVM_JDWP_PORT=12345` before `-jar` in the commands below; `jdwp_wait_for_attach` takes any host and port anyway. The server logs to `mcp-jdwp-inspector.log` in the temp directory unless you add `-DLOG_PATH=/path/to/mcp-jdwp-inspector.log` the same way (the Claude Code plugin writes it to `logs/` in the plugin directory, the Codex plugin to `logs/` in its data directory).
+
+**2a. Register with Claude Code:**
 
 ```bash
 claude mcp add jdwp-inspector -s user \
-  -e MCP_TIMEOUT=30000 \
-  -e MCP_TOOL_TIMEOUT=120000 \
   -- java --add-modules jdk.jdi,jdk.attach -jar /path/to/mcp-jdwp-java.jar
 ```
 
-To change the JDWP port (default 5005), add `-DJVM_JDWP_PORT=12345` before `-jar`.
-
-The `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` environment variables are important — JVM startup is not instant (class loading, Spring context initialization), so the default MCP timeouts will cause Claude Code to give up before the server is ready. `MCP_TIMEOUT=30000` gives the server 30 seconds to start, and `MCP_TOOL_TIMEOUT=120000` allows up to 2 minutes for long-running tools like first-time expression evaluation (which discovers the target's classpath and compiles bytecode).
-
-Re-installing requires removing first: `claude mcp remove jdwp-inspector -s user`
-
-Drop `-s user` to scope to the current project only.
-
-**`.mcp.json`:**
+Re-installing requires removing first: `claude mcp remove jdwp-inspector -s user`. Drop `-s user` to scope to the current project only, or put the same entry in the project's `.mcp.json`:
 
 ```json
 {
@@ -106,17 +103,31 @@ Drop `-s user` to scope to the current project only.
       "args": [
         "--add-modules", "jdk.jdi,jdk.attach",
         "-jar", "/path/to/mcp-jdwp-java.jar"
-      ],
-      "env": {
-        "MCP_TIMEOUT": "30000",
-        "MCP_TOOL_TIMEOUT": "120000"
-      }
+      ]
     }
   }
 }
 ```
 
-The plugin-managed install also passes `-DLOG_PATH=${CLAUDE_PLUGIN_ROOT}/logs/mcp-jdwp-inspector.log` so the server's SLF4J log lands inside the plugin directory; add the same flag if you want a fixed log path here.
+The server starts in a few seconds, well within the 30 seconds Claude Code waits by default. On a slow machine, start Claude Code with a longer wait, e.g. `MCP_TIMEOUT=60000 claude`. `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` are read from Claude Code's own environment; an `env` entry in the server registration only reaches the server, which ignores them.
+
+**2b. Register with Codex:**
+
+```bash
+codex mcp add jdwp-inspector -- java --add-modules jdk.jdi,jdk.attach -jar /path/to/mcp-jdwp-java.jar
+```
+
+This writes an entry to `~/.codex/config.toml`. Give that entry timeouts that fit the server: Spring Boot takes a few seconds to start, and `jdwp_resume_until_event` and `jdwp_wait_for_attach` block for as long as the `timeoutMs` the agent passes, so the tool-call timeout should exceed the longest wait you expect:
+
+```toml
+[mcp_servers.jdwp-inspector]
+command = "java"
+args = ["--add-modules", "jdk.jdi,jdk.attach", "-jar", "/path/to/mcp-jdwp-java.jar"]
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+```
+
+Without the plugin, the `java-debug` skill is not installed; copy `skills/java-debug/` into your agent's skills directory if you want it.
 
 </details>
 
@@ -136,9 +147,9 @@ Starts the JVM with JDWP on port 5005, suspended until a debugger connects.
 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
 ```
 
-### 3. Attach from Claude Code
+### 3. Attach from your agent
 
-From there, just tell the agent what to do — *"attach to JDWP, set a breakpoint in `OrderService.createOrder` line 42, run the failing test, dump the context when it hits"*. The bundled `java-debug` skill teaches the agent the right tool sequence; the next section gives you a smoke test that exercises the surface.
+From there, just tell the agent (Claude Code or Codex) what to do — *"attach to JDWP, set a breakpoint in `OrderService.createOrder` line 42, run the failing test, dump the context when it hits"*. The bundled `java-debug` skill teaches the agent the right tool sequence; the next section gives you a smoke test that exercises the surface.
 
 ## Find the Bug — test flights
 
@@ -158,11 +169,11 @@ curl -L -o jdwp-sandbox.zip \
 unzip jdwp-sandbox.zip && cd jdwp-sandbox
 ```
 
-Inside, you get a parentless Maven project with `src/`, a `pom.xml`, a flight-game `README.md`, and a `CLAUDE.md` that briefs the agent on the game's house rules. Open the folder in Claude Code and ask it to play flight #1 — the bundled `CLAUDE.md` keeps it honest (no peeking at source, no spoiler-fetching). Continue with the workflow below.
+Inside, you get a parentless Maven project with `src/`, a `pom.xml`, a flight-game `README.md`, and a `CLAUDE.md` that briefs the agent on the game's house rules. Open the folder in Claude Code and ask it to play flight #1 — the bundled `CLAUDE.md` keeps it honest (no peeking at source, no spoiler-fetching). Codex reads `AGENTS.md`, not `CLAUDE.md`, so under Codex ask it to read `CLAUDE.md` first. Continue with the workflow below.
 
 ### How to launch a test flight
 
-Start Claude Code from the sandbox folder (or this repo's root, if you cloned) and type:
+Start Claude Code or Codex from the sandbox folder (or this repo's root, if you cloned) and type:
 
 ```
 Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing, find the root cause.
@@ -291,7 +302,7 @@ That is the evidence to read `LoginNormalizer` with: `canonicalForm` → `Displa
 
 `RaceCounter.increment` reads the count, waits at a `CyclicBarrier` so both threads have read before either writes, then writes back `read + 1`. Both threads read 0 and both write 1 — one increment is lost. A suspending breakpoint serializes the threads and makes you juggle two parked threads to reconstruct what happened.
 
-**Debug path:** Set a non-suspending `jdwp_set_logpoint` at the read site logging the thread name and `count` (or a field logpoint on `count`). Let the test run, then `jdwp_get_events` — both `racer-1` and `racer-2` are recorded reading 0 before either writes, which is the lost update laid out in order.
+**Debug path:** Set a `jdwp_set_logpoint` (it does not leave the thread stopped) at the read site logging the thread name and `count` (or a field logpoint on `count`). Let the test run, then `jdwp_get_events` — both `racer-1` and `racer-2` are recorded reading 0 before either writes, which is the lost update laid out in order.
 
 </details>
 
@@ -387,7 +398,7 @@ jdwp_set_breakpoint(
 )
 ```
 
-The breakpoint fires on every hit, but the thread is only suspended when the condition evaluates to `true`. False hits are auto-resumed transparently. This is essential for AI agents — without conditions, a breakpoint in a hot loop would generate thousands of useless stops. Conditions (and expressions, and logpoint bodies) all accept **block syntax** — wrap in `{ ...; return X; }` to use intermediate locals, try/catch, or early returns.
+The breakpoint fires on every hit, but the thread only stays stopped when the condition evaluates to `true`: the server evaluates the condition while the hitting thread waits and resumes it at once when the condition is false. This is essential for AI agents — without conditions, a breakpoint in a hot loop would generate thousands of useless stops. Conditions (and expressions, and logpoint bodies) all accept **block syntax** — wrap in `{ ...; return X; }` to use intermediate locals, try/catch, or early returns.
 
 ### Logpoints (non-stopping breakpoints)
 
@@ -400,7 +411,7 @@ jdwp_set_logpoint(
 )
 ```
 
-A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never suspends the thread**. Combined with an optional condition, this gives the agent non-intrusive tracing without stopping execution. View results with `jdwp_get_events()`.
+A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Where even that pause matters — races, hot loops — see fast logpoints below.
 
 ### Fast logpoints (in-target, consent required)
 
@@ -470,7 +481,7 @@ Catch exceptions at the throw site — before the stack unwinds. The breakpoint 
 
 An exception class that is not loaded yet makes the breakpoint `[PENDING]`; it activates by itself when the JVM loads the class — JDK classes such as `IllegalStateException` or `AssertionError` included, and before the first instance can be thrown. It needs no upstream line breakpoint and no `forceLoad`, and it can be set at VM start (see [Deferred breakpoints](#deferred-breakpoints)). Classes the JVM preloads, such as `NullPointerException`, bind at once.
 
-**Log-only mode** — record the throw without suspending the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
+**Log-only mode** — record the throw without stopping the thread, evaluating an expression with `$exception` bound to the thrown object. Use the dedicated `jdwp_set_exception_logpoint` tool:
 
 ```
 jdwp_set_exception_logpoint(
@@ -499,7 +510,7 @@ Suspend whenever a field is read (`access`), written (`modification`), or both (
 - `$fieldName` — the field name as a string
 - `$mode` — `"access"` or `"modification"`, identifying which direction fired
 
-**Log-only mode** — record reads/writes without suspending, evaluating an expression with the same bindings:
+**Log-only mode** — record reads/writes without stopping the thread, evaluating an expression with the same bindings:
 
 ```
 jdwp_set_field_logpoint(
@@ -553,13 +564,13 @@ When the trigger BP is removed, every dependent is automatically armed and a `CH
 ```
 jdwp_evaluate_expression(
   threadId=25,
-  expression="request.getData().get(\"_domain\")",
+  expression="order.getTotal()",
   frameIndex=0
 )
-→ "self.operationTypeSelect = 3"
+→ Result of order.getTotal(): 1250.0
 ```
 
-Compiles arbitrary Java expressions to bytecode using Eclipse JDT, injects them into the target JVM via `ClassLoader.defineClass()`, and executes them in the context of the suspended frame. Full classpath is discovered automatically (including container classloaders like Tomcat). Results are cached for performance. Handles Guice/CGLIB proxies automatically.
+Compiles arbitrary Java expressions to bytecode using Eclipse JDT, injects them into the target JVM via `ClassLoader.defineClass()`, and executes them in the context of the suspended frame. Full classpath is discovered automatically (including container classloaders like Tomcat). Compiled expressions are cached, so repeated evaluations are fast. Handles Guice/CGLIB proxies automatically. Code that does not finish within 20 s (say, it waits for a lock a suspended thread holds) returns `[STILL_RUNNING]` and keeps running in the target; its result lands in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`.
 
 Two input modes:
 
@@ -572,11 +583,15 @@ See [docs/expression-evaluation.md](docs/expression-evaluation.md) for the compi
 
 ```
 jdwp_assert_expression(
-  expression="order.getStatus()",
+  expression="order.getStatus().name()",
   expected="CONFIRMED",
   threadId=25
 )
-→ "OK" or "MISMATCH: actual='PENDING', expected='CONFIRMED'"
+→ OK — order.getStatus().name() = CONFIRMED
+  or
+  MISMATCH — order.getStatus().name()
+    expected: CONFIRMED
+    actual:   PENDING
 ```
 
 Evaluate and compare in one call — useful for agents running verification sequences.
@@ -640,7 +655,7 @@ Replaces the manual "resume → poll events → poll events" pattern. The agent 
 - `Event fired …` — a BP / step / exception suspended a thread; the message includes thread + stop site
 - `[TIMEOUT] …` — the wait expired without an event; the message offers `wait_more` / `reconnect` / `abort` and reports JDI health so the agent never blindly hangs
 - `[VM_DEATH] …` — the target VM died before any event
-- `[NO_EVENT] …` — the wait was released without a stop (e.g., a passive disarm); the message states whether the session is still armed or was cleared
+- `[NO_EVENT] …` — `jdwp_reset` ran while the call waited: every stop was released and every breakpoint cleared, so set breakpoints again
 
 The same soft-wait envelope wraps `jdwp_wait_for_attach`, so bootstrap and resume share one "wait sensibly, decide deliberately" idiom.
 
@@ -728,9 +743,9 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints or fast breakpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs, fast logpoints and fast breakpoints (restoring the original bytecode, after the release of a thread stopped in the method; a leftover of an earlier session is only switched off) and removes its watchers |
 | `jdwp_set_exception_breakpoint`   | `className`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?` | Suspend on exception throw (supports deferred and trigger chaining; `suspendPolicy="all"` parks every thread) |
-| `jdwp_set_exception_logpoint`     | `className`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
-| `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
-| `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
+| `jdwp_set_exception_logpoint`     | `className`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Non-stopping exception breakpoint with `$exception` bound |
+| `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `excludeConstructors?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining; `excludeConstructors=true` ignores writes in the declaring class's constructors and static initializer) |
+| `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `excludeConstructors?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
 
 (For listing or bulk-clearing breakpoints across any combination of kinds, see `jdwp_overview` and `jdwp_clear` in the Debug state section below.)
 
@@ -755,7 +770,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool                | Parameters | Description                                               |
 |---------------------|------------|-----------------------------------------------------------|
-| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, chain events) |
+| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, fast logpoint hits, chain events, late evaluation results) |
 | `jdwp_clear_events` | —          | Clear event history                                       |
 
 ### Diagnostics (1)
@@ -792,7 +807,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool         | Parameters | Description                                                                          |
 |--------------|------------|--------------------------------------------------------------------------------------|
-| `jdwp_reset` | —          | Clear all state (breakpoints, watchers, marks, cache, events) without disconnecting  |
+| `jdwp_reset` | —          | Clear all state (breakpoints, watchers, marks, cache, events) without disconnecting; fast logpoints and fast breakpoints get their original bytecode back |
 
 ## Resources (2)
 
@@ -811,10 +826,10 @@ Note: resource updates are not pushed to the client — re-attach the URI to see
 
 ```
 1. Launch your app with JDWP enabled
-2. In Claude Code:
+2. Ask the agent:
    "Set a breakpoint in OrderService.createOrder line 42 and wait for a hit"
 
-3. Claude:
+3. The agent:
    jdwp_connect()
    jdwp_set_breakpoint("com.example.OrderService", 42)
    jdwp_resume_until_event(timeoutMs=60000)
@@ -829,7 +844,7 @@ Note: resource updates are not pushed to the client — re-attach the URI to see
 ```
 1. "Add a logpoint to trace every order over $1000"
 
-2. Claude:
+2. The agent:
    jdwp_set_logpoint(
      "com.example.OrderService", 42,
      "\"order=\" + order.getId() + \" total=\" + order.getTotal()",
@@ -839,7 +854,7 @@ Note: resource updates are not pushed to the client — re-attach the URI to see
 
 3. Later:
    jdwp_get_events(count=20)
-   → Shows LOGPOINT entries with evaluated expressions, no thread was ever stopped
+   → Shows LOGPOINT entries with evaluated expressions; no thread stayed stopped
 ```
 
 ### Catching exceptions at the throw site
@@ -847,7 +862,7 @@ Note: resource updates are not pushed to the client — re-attach the URI to see
 ```
 1. "I'm getting a NullPointerException somewhere in the order flow"
 
-2. Claude:
+2. The agent:
    jdwp_set_exception_breakpoint("java.lang.NullPointerException", caught=true, uncaught=true)
    jdwp_resume_until_event(timeoutMs=60000)
    jdwp_get_breakpoint_context()
@@ -863,7 +878,7 @@ The `jdwp-sandbox` module includes a deterministic scenario (`one.edee.jdwp.sand
 # Terminal 1 — launch sandbox, suspended on port 5005
 ./mvnw -pl jdwp-sandbox test -Dtest=RecursiveCalculatorTest -DskipTests=false -Dmaven.surefire.debug
 
-# From Claude Code:
+# From the agent:
 jdwp_wait_for_attach()
 jdwp_set_breakpoint("one.edee.jdwp.sandbox.recursion.RecursiveCalculator", 22)
 jdwp_resume_until_event()
@@ -877,7 +892,7 @@ jdwp_get_events()
 ## Architecture
 
 ```
-Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Target JVM (port 5005)
+Claude Code / Codex ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Target JVM (port 5005)
 ```
 
 The server is `SYNC` mode, `web-application-type=none` — JSON over STDIO, no HTTP.
@@ -886,23 +901,28 @@ The server is `SYNC` mode, `web-application-type=none` — JSON over STDIO, no H
 
 | Component                | Role                                                                                                                                               |
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| **JDWPTools**            | 47 `@McpTool` methods — the MCP surface. Thin orchestration over services below.                                                                   |
+| **JDWPTools**            | 50 `@McpTool` methods and 2 `@McpResource` methods — the MCP surface. Thin orchestration over services below.                                      |
 | **JDIConnectionService** | Singleton `VirtualMachine` connection. Object cache (`ConcurrentHashMap<Long, ObjectReference>`), smart collection rendering, classpath discovery. |
 | **BreakpointTracker**    | Breakpoint registry with synthetic IDs. Tracks pending/deferred state, conditions, logpoint expressions, exception breakpoints, and chain dependencies (with cycle detection and trigger-fire memory across pending → active promotion). |
-| **JdiEventListener**     | Daemon thread consuming the JDI event queue. Routes events, evaluates conditions/logpoints, handles recursive suppression.                         |
+| **JdiEventListener**     | Daemon thread that drains the JDI event queue and routes each event set; the sets are processed in order on a `jdi-event-dispatcher` thread, which evaluates conditions and logpoints. Sets raised inside an MCP-driven evaluation are suppressed on the spot, so the listener never calls into the target. |
+| **SuspensionSession**    | One per connection: tracks every routed event set and releases a suspension only through the context that owns it, so tools never resume threads blindly. Also runs steps, `jdwp_reset` and invocation leases. |
+| **SuspensionWatchdog** / **InvocationRunner** | Keep invocations from hanging the server: the watchdog frees a dispatcher evaluation stuck on a lock a parked thread holds; the runner bounds a tool's invocation at 20 s (`[STILL_RUNNING]`, later `EVALUATION_COMPLETED_LATE`). |
 | **EvaluationGuard**      | Per-thread reentrancy guard preventing deadlocks during expression evaluation.                                                                     |
-| **EventHistory**         | Ring buffer of the last 100 JDWP events (including suppressed).                                                                                    |
+| **EventHistory**         | Ring buffer of the last 500 events (including suppressed ones).                                                                                    |
+| **FastLogpointService** (`fastlogpoint/`) | Fast logpoints and fast breakpoints: compiles the probe, redefines the class (**ProbeInstrumenter**, ASM), reads the in-target ring buffers, restores the original bytecode, and recognises probes a crashed server left behind. |
+| **FrameView**            | Numbers a stopped thread's frames as the tools show them, hiding the probe frames above the user's code at a fast-breakpoint stop.               |
 | **JdiHealthMonitor**     | Probes the JDI transport so soft-wait responses can report `wait_more` / `reconnect` / `abort` instead of blindly hanging.                          |
 | **DeadlockAnalyzer**     | Builds the monitor-lock graph and finds lock-ordering cycles for `jdwp_dump_locks`.                                                                |
 | **MarkedInstanceRegistry** (`marks/`) | Registry of named, pinned object references (`$label`) usable from condition / logpoint / watcher / assertion expressions.            |
 | **JvmDiscoveryService** (`discovery/`) | Enumerates local JVMs, parses `-agentlib:jdwp=…` arguments, and confirms JDWP ports via handshake — powers `jdwp_diagnose` and the `jdwp://jvms` resource. |
-| **MultiVersionStdioServerTransportProvider** (`transport/`) | Overrides Spring AI's hardcoded MCP protocol version on the STDIO transport so the server announces whatever Claude Code negotiates. |
+| **MultiVersionStdioServerTransportProvider** (`transport/`) | Overrides Spring AI's hardcoded MCP protocol version on the STDIO transport so the server announces whatever the client negotiates. |
+| **ClientWorkspace** (`transport/`) | Records the session directory Codex sends with every tool call (Codex starts plugin servers in the plugin directory); the local-project classpath fallback scans it. |
 
 ### Expression evaluation pipeline (`evaluation/`)
 
 1. **JdiExpressionEvaluator** — Analyzes the stack frame, generates a wrapper class with a UUID name, delegates compilation, caches results.
 2. **ClasspathDiscoverer** — Walks target JVM classloader hierarchy (including Tomcat/container) to find all JARs. Uses **JdkDiscoveryService** to locate a local JDK matching the target version.
-3. **LocalProjectClasspathProvider** — Additive fallback for when the target's classloader hierarchy hides JARs (Tomcat, Spring Boot dev-tools, custom `URLClassLoader`s). Composes `JDWP_EXTRA_CLASSPATH` (override), a depth-5 scan of `target/classes` / `target/test-classes` under the server's CWD, and `mvn dependency:build-classpath`. Set `JDWP_EXTRA_CLASSPATH=/path/extra.jar:/path/more.jar` (colon/semicolon-separated) to plug specific gaps; `jdwp_diagnose` shows a per-source breakdown. Details in [docs/expression-evaluation.md](docs/expression-evaluation.md#localprojectclasspathprovider--local-project-classpath-fallback).
+3. **LocalProjectClasspathProvider** — Additive fallback for when the target's classloader hierarchy hides JARs (Tomcat, Spring Boot dev-tools, custom `URLClassLoader`s). Composes `JDWP_EXTRA_CLASSPATH` (override), a depth-5 scan of `target/classes` / `target/test-classes` under the project directory, and `mvn dependency:build-classpath` there. The project directory is the server's working directory, or the session directory the client reports (Codex). Set `JDWP_EXTRA_CLASSPATH=/path/extra.jar:/path/more.jar` (colon/semicolon-separated) to plug specific gaps; `jdwp_diagnose` shows a per-source breakdown. Details in [docs/expression-evaluation.md](docs/expression-evaluation.md#localprojectclasspathprovider--local-project-classpath-fallback).
 4. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory.
 5. **RemoteCodeExecutor** — Injects bytecode via `ClassLoader.defineClass()` and invokes it.
 
@@ -930,18 +950,23 @@ mcp-jdwp-java/
 │   ├── hooks.json                       # SessionStart hook registration
 │   └── ensure-server-jar.sh             # Auto-builds the JAR if missing or git HEAD moved (downloads it for the launcher)
 ├── skills/
-│   ├── java-debug/                      # Debugging skill (workflows, recipes, gotchas)
-│   └── release/                         # Release-cutting skill
+│   └── java-debug/                      # Debugging skill (workflows, recipes, gotchas)
+├── .claude/skills/release/              # Release-cutting skill (for maintainers)
+├── release/sandbox/                     # Assembles the standalone jdwp-sandbox.zip of each release
 ├── docs/                                # Developer reference (architecture, lifecycle, …)
 │
 ├── jdwp-mcp-server/                     # The MCP server
 │   ├── pom.xml
 │   └── src/main/java/one/edee/mcp/jdwp/
 │       ├── JDWPMcpServerApplication.java
-│       ├── JDWPTools.java               # 47 @McpTool methods + 2 @McpResource
+│       ├── JDWPTools.java               # 50 @McpTool methods + 2 @McpResource
 │       ├── JDIConnectionService.java    # JDI connection + object cache
 │       ├── BreakpointTracker.java       # Breakpoint registry + deferred state + chains
 │       ├── JdiEventListener.java        # JDI event consumer
+│       ├── SuspensionSession.java       # Who owns which suspension; steps, reset, invocation leases
+│       ├── SuspensionWatchdog.java      # Frees a dispatcher evaluation stuck on a parked thread's lock
+│       ├── InvocationRunner.java        # 20 s bound on a tool's invocation in the target
+│       ├── FrameView.java               # Frame numbering that hides fast-breakpoint probe frames
 │       ├── EvaluationGuard.java         # Recursive breakpoint protection
 │       ├── EventHistory.java            # Event ring buffer
 │       ├── JdiHealthMonitor.java        # Transport liveness for soft-wait
@@ -953,7 +978,17 @@ mcp-jdwp-java/
 │       │   ├── RemoteCodeExecutor.java
 │       │   ├── InMemoryJavaCompiler.java
 │       │   ├── ClasspathDiscoverer.java
-│       │   └── JdkDiscoveryService.java
+│       │   ├── LocalProjectClasspathProvider.java
+│       │   ├── JdkDiscoveryService.java
+│       │   ├── FastLogpointProbeSource.java   # Probe sources of fast logpoints / fast breakpoints
+│       │   ├── FastBreakpointProbeSource.java
+│       │   └── exceptions/
+│       ├── fastlogpoint/                # Fast logpoints + fast breakpoints (in-target probes)
+│       │   ├── FastLogpointService.java
+│       │   ├── ProbeInstrumenter.java   # ASM class rewriting
+│       │   ├── ProbeRing.java           # Reads the in-target ring buffer
+│       │   ├── LeftoverClassifier.java  # Probes a crashed server left behind
+│       │   └── …
 │       ├── marks/                       # Named, pinned heap references ($label)
 │       │   ├── MarkedInstanceRegistry.java
 │       │   ├── MarkInfo.java
@@ -963,11 +998,12 @@ mcp-jdwp-java/
 │       │   ├── DiagnoseReportRenderer.java
 │       │   ├── JdwpAgentArgParser.java
 │       │   ├── JdwpEndpoint.java
-│       │   ├── JvmDescriptor.java
-│       │   └── exceptions/
-│       ├── transport/                   # STDIO transport overrides
+│       │   └── JvmDescriptor.java
+│       ├── transport/                   # STDIO transport overrides + client workspace
 │       │   ├── MultiVersionStdioServerTransportProvider.java
-│       │   └── StdioTransportConfig.java
+│       │   ├── StdioTransportConfig.java
+│       │   ├── ClientWorkspace.java     # Session directory reported by Codex
+│       │   └── ClientWorkspaceConfig.java
 │       └── watchers/                    # Breakpoint-attached expression watchers
 │           ├── WatcherManager.java
 │           └── Watcher.java
@@ -983,6 +1019,7 @@ mcp-jdwp-java/
 - **Spring AI MCP 2.0.0-M4** — MCP protocol integration
 - **JDI** (`jdk.jdi` module) — Java Debug Interface
 - **Eclipse JDT Compiler (ECJ)** — In-memory expression compilation
+- **ASM** — Bytecode rewriting for fast logpoints and fast breakpoints
 - **JSpecify + NullAway** — Compile-time nullness enforcement
 
 ## Technical documentation
@@ -996,7 +1033,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 - [threading-and-safety.md](docs/threading-and-safety.md) — concurrency, MCP SYNC, `INVOKE_SINGLE_THREADED`, the `EvaluationGuard` reentrancy mechanism
 - [memory-and-references.md](docs/memory-and-references.md) — JDI mirrors, the object cache, marks, the compilation cache, byte-array mirroring
 - [event-pipeline.md](docs/event-pipeline.md) — the JDI event listener loop and the suspension decision matrix
-- [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains
+- [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains, fast logpoints and fast breakpoints
 - [expression-evaluation.md](docs/expression-evaluation.md) — the compile-and-inject pipeline (ECJ, `defineClass`, `invokeMethod`)
 - [diagnostics.md](docs/diagnostics.md) — `jdwp_diagnose`, JVM discovery, the handshake probe, transport-loss envelopes, logging
 - [testing.md](docs/testing.md) — test architecture for contributors
@@ -1005,16 +1042,17 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 
 | Problem                                         | Solution                                                                                                                                                            |
 |-------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `tools.jar not found` / `jdk.jdi not available` | Ensure `JAVA_HOME` points to a JDK, not a JRE. Launch with `--add-modules jdk.jdi`.                                                                                 |
-| Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check port matches `-DJVM_JDWP_PORT`.                                                                     |
-| MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                   |
+| `Module jdk.jdi not found` at server start      | The `java` on `PATH` is a JRE, not a JDK. Put a JDK 17+ first on `PATH` (the server is started with `--add-modules jdk.jdi,jdk.attach`).                            |
+| Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check the port matches `-DJVM_JDWP_PORT`, or pass `port` (and `host`) to `jdwp_wait_for_attach`.         |
+| MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart the agent.                                                                                     |
 | `jdwp-debugging: could not build the MCP server JAR` at session start | The plugin's SessionStart hook tried `./mvnw`, `mvn -o` and `mvn`. Read the build log the message names, run the command it gives (it also writes the `.build-sha` marker), then reconnect `jdwp-inspector` in `/mcp`. |
 | `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`. |
 | Codex: no `jdwp-inspector` tools right after install or update | The launcher was still downloading or building the JAR when Codex stopped waiting; it finishes in the background. Start a new session. If the tools stay missing, read `logs/server-jar-setup.log` in the plugin's data directory and `jdwp-mcp-server/target/server-build.log` in the installed plugin. |
-| MCP server times out on startup                 | JVM startup takes several seconds. Ensure `MCP_TIMEOUT=30000` (or higher) is set in the MCP registration — the default is too short for a Spring Boot Java process. |
+| MCP server times out on startup                 | JVM startup takes several seconds. Claude Code: start it with a longer wait, e.g. `MCP_TIMEOUT=60000 claude` (the variable must be in Claude Code's environment, not in the server's `env`). Codex: raise `startup_timeout_sec` of a manual registration; with the plugin, start a new session. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
-| Expression evaluation timeout                   | First evaluation is slow (classpath discovery). Increase `MCP_TOOL_TIMEOUT`. Subsequent evaluations use cache.                                                      |
-| `resume_until_event` returns `[TIMEOUT]` / `[NO_EVENT]` | The wait expired without a stop, or the session was disarmed. The response message says whether the session is still armed (just call again), wedged (try `jdwp_reconnect`), or cleared (re-set BPs). |
+| First expression evaluation returns `[STILL_RUNNING]` | The first evaluation discovers the classpath and may run Maven in the project. An evaluation that takes over 20 s returns `[STILL_RUNNING]` and finishes in the background; its result shows up in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`. Once it has finished, later evaluations use the cached classpath. |
+| A long `jdwp_resume_until_event` / `jdwp_wait_for_attach` is cut off by the client | The client's tool-call timeout is shorter than the `timeoutMs` passed. Codex: raise `tool_timeout_sec` of a manual registration. Claude Code waits long by default; raise `MCP_TOOL_TIMEOUT` in its environment if it is set low. |
+| `resume_until_event` returns `[TIMEOUT]` / `[NO_EVENT]` | `[TIMEOUT]`: the wait expired without a stop; the message reports the transport's health and offers waiting more (just call again), `jdwp_reconnect` when the transport is wedged, or giving up. `[NO_EVENT]`: `jdwp_reset` ran meanwhile and cleared every breakpoint; set them again. |
 | Build fails with Error Prone / toolchain error  | Building from source needs JDK 21+ on the toolchain. The bytecode target stays at Java 17, but the build step itself needs ≥21 because Error Prone 2.48 ships Java-21 bytecode. |
 
 ## License

@@ -170,14 +170,13 @@ The classes checked are `VMDisconnectedException`, `SocketException`, `EOFExcept
 
 `BreakpointTracker.EventKind` is the four-value enum `BREAKPOINT | STEP | EXCEPTION | VM_START` attached to `LastBreakpoint` snapshots (`VM_START` marks the stop of a VM suspended at start). It is the classifier that lets event rendering describe *why* a thread is parked when transport is fine — see [event-pipeline.md](event-pipeline.md) § 10. Not to be confused with the transport-loss envelopes above.
 
-## 6. MCP timeouts — `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT`
+## 6. MCP timeouts — the client's waits
 
-Both are **client-side** Claude Code timeouts, set in the `env` of the plugin's MCP server entry in `.claude-plugin/plugin.json` (`30000` and `120000` ms respectively). They do not appear in the Java code — `grep` returns zero hits across the server source. The reasoning lives at `README.md:79`:
+The server reads no timeout variables; how long a server may take to start and a tool call may run is the client's decision.
 
-- `MCP_TIMEOUT=30000` — Spring Boot context init plus JDI module load takes several seconds. The default Claude Code stdio timeout is too short for a Spring Boot Java process; without this, Claude Code gives up before the server is ready.
-- `MCP_TOOL_TIMEOUT=120000` — first-time `jdwp_evaluate_expression` walks the target classloader hierarchy, calls `JdkDiscoveryService`, and compiles a wrapper class with Eclipse JDT. That first call can run for many seconds; subsequent calls hit the compilation cache and are fast.
-
-If you fork the project, do not lower these without testing on a cold cache against a non-trivial target (Tomcat, Spring Boot, etc.).
+- **Claude Code** waits 30 s for an MCP server to start (`MCP_TIMEOUT`, in ms); Spring Boot context init plus the JDI module load take a few seconds. Its wait for a tool call (`MCP_TOOL_TIMEOUT`, or a per-server `timeout` in ms) is long by default. Both variables are read from Claude Code's own environment (`MCP_TIMEOUT=60000 claude`); an `env` entry in the MCP server registration only reaches the server process. Up to 2.11.2, `.claude-plugin/plugin.json` set both there, to no effect.
+- **Codex** has its own defaults. `mcp.json` cannot change them (a stdio entry allows only `type`, `command`, `args`, `env` and `cwd`), so a plugin install lives with them: the launcher's first start, which downloads or builds the JAR, can outlast the startup wait, and the next session finds the JAR (§ 8). A manual registration sets `startup_timeout_sec` and `tool_timeout_sec` on its `[mcp_servers.jdwp-inspector]` entry in `~/.codex/config.toml`.
+- **Which calls need a long client wait.** A tool's invocation in the target — `jdwp_evaluate_expression`, including the first one, which discovers the classpath and may run `mvn dependency:build-classpath` (bounded at 180 s) — is bounded at 20 s by `InvocationRunner` and then answers `[STILL_RUNNING]` ([threading-and-safety.md](threading-and-safety.md) § 5). What blocks longer are `jdwp_resume_until_event` and `jdwp_wait_for_attach`, for as long as the `timeoutMs` the agent passes (default 30 s). The client's tool-call timeout must exceed that.
 
 ## 7. The MCP resources — `jdwp://diagnose` and `jdwp://jvms`
 

@@ -5,6 +5,51 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.12.0] — 2026-11-21
+
+### New — the plugin installs and works in Codex (#55)
+
+Codex already read the plugin's marketplace, but `jdwp-inspector` could not start
+there: Codex does not expand `${CLAUDE_PLUGIN_ROOT}`. The repository now also carries
+the portable Agent Plugins manifest (`plugin.json` + `mcp.json` at its root), which
+Codex prefers, so `codex plugin marketplace add FgForrest/mcp-jdwp-java` and
+`codex plugin add jdwp-debugging@mcp-jdwp-java` install the same `java-debug` skill
+and server. Claude Code reads neither file; its install is unchanged.
+
+- **A launcher gets the JAR.** Codex runs no hook before it starts a plugin's server,
+  so `scripts/jdwp-inspector.sh` prepares the JAR first: it downloads this release's
+  `mcp-jdwp-java-<version>.jar` when the installed server sources are the ones tagged
+  for the release, and builds it with Maven otherwise. The preparation runs in a
+  session of its own, so a download or build that outlasts Codex's startup wait still
+  finishes, and the next session finds the JAR.
+- **The project directory comes from Codex.** Codex starts plugin servers in the
+  plugin's directory. The server now asks Codex for its sandbox state, receives the
+  session directory with every tool call, and scans that directory for the local
+  project classpath; `jdwp_diagnose` shows it. Under Claude Code the server's working
+  directory is used, as before.
+
+### Docs — the README tells the truth again
+
+- **Security & trust** no longer claims that no pre-built binaries are distributed or
+  that nothing touches the network: releases ship the server JAR, the build fetches
+  Maven and dependencies, and the first expression evaluation can run Maven in the
+  project. It also says that only fast logpoints and fast breakpoints rewrite the
+  application's bytecode, and only after the user agrees.
+- **Install** names the Claude Code and the Codex plugin, and the manual registration
+  covers Codex (`codex mcp add`, `startup_timeout_sec`, `tool_timeout_sec`).
+- **Timeouts.** The README told users to put `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` into
+  the server's `env`. Claude Code reads both from its own environment only, so that
+  did nothing; the plugin's own `env` entry is gone for the same reason. Claude Code
+  waits 30 s for the server to start by default, enough for this server.
+- **Logpoints** no longer claim they never suspend: each hit pauses the hitting thread
+  while the server evaluates, which is why fast logpoints exist. The TL;DR now lists
+  fast logpoints and fast breakpoints.
+- **Reference fixes:** missing `forceLoad` and `excludeConstructors` parameters in the
+  tool table, 50 tools instead of 47, `jdwp_evaluate_expression` / `jdwp_assert_expression`
+  reply formats, a 500-entry event history instead of 100, and an architecture section
+  and project tree that include suspension ownership, the fast-probe package and the
+  client workspace.
+
 ## [2.11.2] — 2026-11-14
 
 ### Fixed — exception breakpoints set at VM start work; the docs said they did not
