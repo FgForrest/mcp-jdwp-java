@@ -11,6 +11,11 @@
 # it, under the hook's lock, so a concurrent session waits instead of starting
 # a half-written JAR.
 #
+# The JAR lives in <data>/server, <data> being $PLUGIN_DATA (Codex sets it): Codex
+# replaces the plugin's own files when it reinstalls the plugin, even at the
+# same version, and a JAR kept among them would go with them. Without
+# PLUGIN_DATA it stays in the plugin's jdwp-mcp-server/target.
+#
 # The preparation runs in a session of its own (setsid). Codex kills the
 # server's process group when it gives up on a slow start or ends the session;
 # a download or build in a new session still finishes, and the next session
@@ -25,7 +30,12 @@
 ROOT=${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 LOGS="${PLUGIN_DATA:-$ROOT}/logs"
 mkdir -p "$LOGS" 2> /dev/null || LOGS=${TMPDIR:-/tmp}
-JAR="$ROOT/jdwp-mcp-server/target/mcp-jdwp-java.jar"
+JAR_DIR="$ROOT/jdwp-mcp-server/target"
+if [ -n "${PLUGIN_DATA:-}" ] && mkdir -p "$PLUGIN_DATA/server" 2> /dev/null; then
+  JAR_DIR="$PLUGIN_DATA/server"
+  export JDWP_JAR_DIR="$JAR_DIR"
+fi
+JAR="$JAR_DIR/mcp-jdwp-java.jar"
 SETUP_LOG="$LOGS/server-jar-setup.log"
 
 # Runs "$@" in a new session where the platform offers a way to, and returns
@@ -54,7 +64,7 @@ detached bash "$ROOT/hooks/ensure-server-jar.sh" --download < /dev/null >> "$SET
 wait $!
 
 if [ ! -s "$JAR" ]; then
-  echo "jdwp-inspector: the server JAR $JAR is not available. See $SETUP_LOG and $ROOT/jdwp-mcp-server/target/server-build.log." >&2
+  echo "jdwp-inspector: the server JAR $JAR is not available. See $SETUP_LOG and $JAR_DIR/server-build.log." >&2
   exit 1
 fi
 

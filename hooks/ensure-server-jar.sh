@@ -17,24 +17,44 @@
 # hand: the server sources equal tag v<version>, or there is no git history to
 # compare with. It builds when the download is skipped or fails.
 #
-# Maven output goes to jdwp-mcp-server/target/server-build.log. Stdout carries
-# at most one JSON object: its systemMessage is shown to the user, its
+# When JDWP_JAR_DIR is set (the launcher sets it to a directory in the plugin's
+# data directory), the JAR the server runs, its marker, the lock and the log
+# live there instead of in jdwp-mcp-server/target: Codex replaces the plugin's
+# files when it reinstalls the plugin but keeps its data directory. A download
+# goes straight there; Maven still builds in jdwp-mcp-server/target, and the
+# built JAR is copied over. The marker then also carries the plugin version, as
+# the data directory outlives versions and "no-git" alone would not tell them
+# apart.
+#
+# Maven output goes to server-build.log next to the JAR. Stdout carries at most
+# one JSON object: its systemMessage is shown to the user, its
 # additionalContext reaches Claude. Nothing is printed when no build was needed.
 # The script always exits 0 so that Claude Code applies that JSON.
 #
 # Plain bash 3.2 (macOS) and Linux; no jq.
 
 PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-TARGET="$PLUGIN/jdwp-mcp-server/target"
+BUILT="$PLUGIN/jdwp-mcp-server/target/mcp-jdwp-java.jar"
+TARGET="${JDWP_JAR_DIR:-$PLUGIN/jdwp-mcp-server/target}"
 JAR="$TARGET/mcp-jdwp-java.jar"
 PREV="$JAR.prev"
 MARKER="$TARGET/.build-sha"
 LOCK="$TARGET/.build-lock"
 LOG="$TARGET/server-build.log"
-EXPECTED=$(git -C "$PLUGIN" rev-parse HEAD 2>/dev/null || echo no-git)
+# true when the JAR lives outside the build directory (JDWP_JAR_DIR is set)
+JAR_ELSEWHERE=false
+[ "$JAR" != "$BUILT" ] && JAR_ELSEWHERE=true
 DOWNLOAD=false
 [ "${1:-}" = "--download" ] && DOWNLOAD=true
 RELEASES="https://github.com/FgForrest/mcp-jdwp-java/releases/download"
+
+# The plugin version from the root plugin.json; empty when there is none.
+plugin_version() {
+  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN/plugin.json" 2>/dev/null | head -n 1
+}
+
+EXPECTED=$(git -C "$PLUGIN" rev-parse HEAD 2>/dev/null || echo no-git)
+[ "$JAR_ELSEWHERE" = true ] && EXPECTED="v$(plugin_version) $EXPECTED"
 
 needs_build() {
   [ ! -f "$JAR" ] || [ "$EXPECTED" != "$(cat "$MARKER" 2>/dev/null)" ]
@@ -52,7 +72,11 @@ emit() {
     "$(json_escape "$1")" "$(json_escape "$2")"
 }
 
-MANUAL="cd '$PLUGIN' && ./mvnw -pl jdwp-mcp-server -am package -DskipTests && printf %s $EXPECTED > jdwp-mcp-server/target/.build-sha"
+if [ "$JAR_ELSEWHERE" = true ]; then
+  MANUAL="cd '$PLUGIN' && ./mvnw -pl jdwp-mcp-server -am package -DskipTests && cp jdwp-mcp-server/target/mcp-jdwp-java.jar '$JAR' && printf %s '$EXPECTED' > '$MARKER'"
+else
+  MANUAL="cd '$PLUGIN' && ./mvnw -pl jdwp-mcp-server -am package -DskipTests && printf %s $EXPECTED > jdwp-mcp-server/target/.build-sha"
+fi
 RECONNECT="If jdwp-inspector failed to connect at startup, run /mcp and reconnect it."
 
 fail() {
@@ -101,17 +125,17 @@ fi
 [ -f "$JAR" ] && mv -f "$JAR" "$PREV"
 
 : > "$LOG"
-# $1 = label for the log, the rest = the Maven command
+# $1 = label for the log, the rest = the Maven command. Maven writes $BUILT;
+# with JDWP_JAR_DIR set, the JAR is then copied to $JAR. A leftover $BUILT is
+# removed first so that a failed build cannot pass for a successful one.
 build() {
   label=$1
   shift
   printf '\n=== %s: %s\n' "$label" "$(date)" >> "$LOG"
-  (cd "$PLUGIN" && "$@" -pl jdwp-mcp-server -am package -DskipTests -B) >> "$LOG" 2>&1 < /dev/null && [ -s "$JAR" ]
-}
-
-# The plugin version from the root plugin.json; empty when there is none.
-plugin_version() {
-  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN/plugin.json" 2>/dev/null | head -n 1
+  [ "$JAR_ELSEWHERE" = true ] && rm -f "$BUILT"
+  (cd "$PLUGIN" && "$@" -pl jdwp-mcp-server -am package -DskipTests -B) >> "$LOG" 2>&1 < /dev/null && [ -s "$BUILT" ] || return 1
+  [ "$JAR_ELSEWHERE" = true ] || return 0
+  cp "$BUILT" "$JAR.copy" && mv -f "$JAR.copy" "$JAR"
 }
 
 # True when release v$1 was built from the server sources at hand. Without git

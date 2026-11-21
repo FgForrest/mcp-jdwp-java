@@ -5,6 +5,34 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.12.1] — 2026-11-21
+
+### Fixed — under Codex, the server JAR survives Codex reinstalling the plugin (#58)
+
+The Codex launcher prepared the server JAR inside the installed plugin, in
+`jdwp-mcp-server/target`. Codex replaces those files when it reinstalls the plugin,
+even at the same version: right after `codex plugin add`, the first session's
+marketplace sync did so, and the JAR the launcher had just downloaded was gone. A
+fresh install took three sessions to get the tools. The launcher now keeps the JAR in
+`server/` in the plugin's data directory, which Codex leaves alone. A download goes
+straight there, and a Maven build is copied there. A reinstall of the same revision
+finds the JAR in place; only a new version or changed sources prepare a new one.
+Claude Code is unchanged.
+
+### Docs — help when `jdwp-inspector` does not connect; `AGENTS.md` in the sandbox zip
+
+- **README** has a new section, "When `jdwp-inspector` does not connect". After an
+  install or update it can take more than one reconnect: `/mcp` in Claude Code, a new
+  session in Codex. You can also ask the agent to find out why.
+- **The `java-debug` skill** explains what to do when the `jdwp_*` tools are
+  missing: where the JAR and the logs are, how to check Java, how to rerun the JAR
+  preparation by hand, and when to ask the user to reconnect. The skill is installed
+  even when the server is not connected, so it can help exactly then.
+- **The sandbox zip** carries the house rules in `AGENTS.md`, which Codex reads.
+  `CLAUDE.md` imports it, so Claude Code loads the same rules. The sandbox README
+  covers Codex. The rules now say that `jdwp_assert_expression` returns `OK`, not
+  `MATCH`.
+
 ## [2.12.0] — 2026-11-21
 
 ### New — the plugin installs and works in Codex (#55)

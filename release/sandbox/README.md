@@ -1,10 +1,10 @@
 # JDWP Test Flights — Sandbox Edition
 
-Ten deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
+Ten deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach your agent — Claude Code or Codex — via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
 
 Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the ten, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
 
-This is the companion sandbox for the [jdwp-debugging Claude Code plugin](https://github.com/FgForrest/mcp-jdwp-java). Install the plugin first, then come back here.
+This is the companion sandbox for the [jdwp-debugging plugin](https://github.com/FgForrest/mcp-jdwp-java) for Claude Code and Codex. Install the plugin first, then come back here.
 
 ## Prerequisites
 
@@ -12,18 +12,18 @@ This is the companion sandbox for the [jdwp-debugging Claude Code plugin](https:
 |---|---|
 | JDK | 17 or newer |
 | Maven | 3.9 or newer |
-| Claude Code | Latest |
-| Plugin | `jdwp-debugging` 2.11.1+ installed |
+| Claude Code or Codex | Latest |
+| Plugin | `jdwp-debugging` installed: 2.11.1+ in Claude Code, 2.12.0+ in Codex |
 
 Verify:
 
 ```bash
 java -version       # 17+
 mvn -version        # 3.9+
-claude --version    # any recent
+claude --version    # or: codex --version
 ```
 
-In Claude Code, the `jdwp-debugging` plugin must be listed and active. The plugin ships a `java-debug` skill the agent will pick up automatically when you ask it to debug.
+The `jdwp-debugging` plugin must be installed and enabled: check `/plugin` in Claude Code, `/plugins` in Codex. The plugin ships a `java-debug` skill the agent will pick up automatically when you ask it to debug.
 
 ## How to play one flight
 
@@ -37,21 +37,21 @@ mvn test -Dtest=SessionStoreTest -DskipTests=false -Dmaven.surefire.debug
 
 The test process **hangs** at "Listening for transport dt_socket at address: 5005" — that's correct. It's waiting for a debugger.
 
-**Terminal 2** — open Claude Code in this folder and paste the assignment prompt below.
+**Terminal 2** — open Claude Code or Codex in this folder and paste the assignment prompt below.
 
-Claude will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it's solved, kill the test (or let it finish) and move on to the next flight.
+The agent will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it's solved, kill the test (or let it finish) and move on to the next flight.
 
-Between flights, ask Claude to run `jdwp_reset()` — it clears breakpoints and cached state without dropping the connection.
+Between flights, ask the agent to run `jdwp_reset()` — it clears breakpoints and cached state without dropping the connection.
 
 ## The assignment prompt
 
-Paste this into Claude Code to start a flight. Replace `#N (TestClass)` with the flight you want.
+Paste this into your agent to start a flight. Replace `#N (TestClass)` with the flight you want.
 
 ```
 You are about to play JDWP test flight #1 (SessionStoreTest) on port 5005.
 
 The rules:
-1. The /java-debug skill is your playbook. Use it.
+1. The java-debug skill is your playbook. Use it.
 2. Sandbox source under src/main/java/.../ is OFF LIMITS until you can finish this
    sentence at a breakpoint: "My evidence is X, my hypothesis is Y, the source I'd
    like to read to confirm is Z." The failing test class itself is fair game — it's
@@ -75,11 +75,11 @@ for, and tell me:
 Good hunting.
 ```
 
-If you'd rather Claude pick the flight: replace the first line with `You are about to play one JDWP test flight — pick one from README.md and tell me which.`
+If you'd rather the agent pick the flight: replace the first line with `You are about to play one JDWP test flight — pick one from README.md and tell me which.`
 
 ## House rules
 
-`CLAUDE.md` in this folder briefs the agent on the game's rules: don't read source files first, debug-driven hypothesis only. **Do not edit `CLAUDE.md`** if you want a fair flight — its rules exist so the experience exercises the debugger rather than static analysis.
+`AGENTS.md` in this folder briefs the agent on the game's rules: don't read source files first, debug-driven hypothesis only. Codex reads it directly; Claude Code reads `CLAUDE.md`, which imports it. **Do not edit `AGENTS.md`** if you want a fair flight — its rules exist so the experience exercises the debugger rather than static analysis.
 
 ## The flights
 
@@ -166,10 +166,11 @@ The reveals are deliberately not in this zip so the agent that you ask to play c
 
 ## Troubleshooting
 
-- **`Listening for transport dt_socket at address: 5005` then nothing happens.** Correct — that's the JVM waiting. Go to the other terminal and tell Claude to attach.
-- **Claude reports "port 5005 not listening".** Did the test start? In terminal 1, do you see the "Listening for transport" line? If not, the test hasn't reached the suspend point — likely a compile failure earlier in the log.
+- **`Listening for transport dt_socket at address: 5005` then nothing happens.** Correct — that's the JVM waiting. Go to the other terminal and tell the agent to attach.
+- **The agent reports "port 5005 not listening".** Did the test start? In terminal 1, do you see the "Listening for transport" line? If not, the test hasn't reached the suspend point — likely a compile failure earlier in the log.
 - **Port 5005 already taken.** Another debugger is using it. Either kill the other process or change ports: `-Dmaven.surefire.debug="-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5006"`, then attach with `port=5006`.
-- **Plugin doesn't seem active.** In Claude Code, `/plugins list` — `jdwp-debugging` must be present and enabled. If not, `/plugins install` it from the marketplace.
+- **Plugin doesn't seem active.** In Claude Code, open `/plugin`; in Codex, `/plugins` (or `codex plugin list`). `jdwp-debugging` must be installed and enabled.
+- **The `jdwp_*` tools are missing right after installing or updating the plugin.** The server JAR was still being built or downloaded when the agent started the server. In Claude Code, reconnect `jdwp-inspector` in `/mcp`; in Codex, start a new session. It can take more than one try. If the tools stay missing, ask the agent to find out why — the plugin's `java-debug` skill tells it where to look.
 
 ## Have fun
 
