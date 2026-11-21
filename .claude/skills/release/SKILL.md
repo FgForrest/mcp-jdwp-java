@@ -14,6 +14,7 @@ End-to-end workflow for releasing the `jdwp-debugging` plugin from this repo.
 | User-facing artifact                            | Bump on release?                |
 |-------------------------------------------------|---------------------------------|
 | `.claude-plugin/marketplace.json` `version`     | **YES** — both occurrences      |
+| `plugin.json` (repo root) `version`             | **YES** — the Codex manifest    |
 | `CHANGELOG.md` new section at top               | **YES**                         |
 | Annotated git tag `vX.Y.Z`                      | **YES**                         |
 | `pom.xml` `<version>` (Maven artifact)          | NO — internal build id only     |
@@ -45,9 +46,11 @@ Run all of these before touching anything.
 
 ## Procedure
 
-### 1. Bump `.claude-plugin/marketplace.json`
+### 1. Bump `.claude-plugin/marketplace.json` and `plugin.json`
 
-Two `"version"` strings to change — top-level marketplace version AND the inner `plugins[0].version`. Both must move to the new `X.Y.Z` together.
+Three `"version"` strings to change — the top-level marketplace version, the inner `plugins[0].version`, and the `version` of the root `plugin.json` (the Agent Plugins manifest Codex reads). All three must move to the new `X.Y.Z` together; `PluginManifestConsistencyTest` fails the build when they disagree.
+
+The root `plugin.json` version also decides which release JAR Codex installs download: `scripts/jdwp-inspector.sh` fetches `mcp-jdwp-java-X.Y.Z.jar` from release `vX.Y.Z` when the installed server sources equal that tag. So the tag must sit on the commit whose sources `release.yml` builds — the release commit, as below.
 
 ### 2. Write the `CHANGELOG.md` entry
 
@@ -77,7 +80,7 @@ Section headings to choose from (use the ones that fit): `### New`, `### Fixed`,
 ### 3. The release commit
 
 ```bash
-git add .claude-plugin/marketplace.json CHANGELOG.md
+git add .claude-plugin/marketplace.json plugin.json CHANGELOG.md
 git commit -m "chore: release X.Y.Z — <short headline>"
 ```
 
@@ -86,7 +89,7 @@ Use a HEREDOC for the body. Three paragraphs is the established length (see `7b9
 2. Concurrency / behavior fixes that ship alongside.
 3. Review polish summary.
 
-Stage only those two files. Never include untracked files or unrelated edits.
+Stage only those three files. Never include untracked files or unrelated edits.
 
 ### 4. Annotated tag
 
@@ -132,7 +135,7 @@ Tag the release commit itself (the one with `chore: release X.Y.Z` in the subjec
 
 ## Red flags
 
-- `marketplace.json` and `CHANGELOG.md` show different versions after your edits → you forgot one of the two `version` strings in JSON, or skipped the changelog.
+- `marketplace.json`, `plugin.json` and `CHANGELOG.md` show different versions after your edits → you forgot one of the three `version` strings in JSON, or skipped the changelog.
 - `git log <last-tag>..HEAD` lists merge commits but no feature commits → you're tagging from the wrong baseline; find the actual last release commit.
 - The release commit's parent is not the current `origin/main` tip → either rebase or cherry-pick before pushing.
 - `git for-each-ref refs/tags/vX.Y.Z` shows `objecttype commit` not `tag` → lightweight tag by accident, redo with `-a`.

@@ -8,7 +8,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 
 ## What you get (TL;DR)
 
-An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code as **50 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
+An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code and Codex as **50 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
 
 - **See runtime state, not stack traces** — read locals, fields, threads, the entire object graph
 - **Evaluate arbitrary Java in the suspended frame** — compiled to real bytecode, full classpath, including private/package-private members
@@ -24,8 +24,8 @@ The agent gets the same power as IntelliJ's debugger, with extras that exist spe
 
 This MCP server runs **entirely on your local machine**:
 
-- **No network calls** — the server communicates with Claude Code over STDIO and with the target JVM over a local JDWP socket. It makes zero outbound HTTP/internet requests. No telemetry, no analytics, no phone-home.
-- **Built from source** — the JAR is compiled locally on your machine from the source code in this repository (either via the plugin auto-build hook or manually with `./mvnw clean package`). No pre-built binaries are downloaded or distributed.
+- **No network calls from the server** — the server communicates with the agent over STDIO and with the target JVM over a local JDWP socket. It makes zero outbound HTTP/internet requests. No telemetry, no analytics, no phone-home. The only download is the one described in the next point, made before the server starts.
+- **Built from source, or the release JAR of this repository** — under Claude Code, the plugin's SessionStart hook compiles the JAR on your machine from the sources in this repository (or build it yourself with `./mvnw clean package`). Under Codex, the plugin's launcher downloads `mcp-jdwp-java-<version>.jar` from this repository's GitHub release of the installed version, but only when the installed server sources are the ones tagged for that release; otherwise, or when the download fails, it compiles from source like the hook. Every release attaches that JAR, built from the tagged sources by the release workflow in GitHub Actions.
 - **Auditable** — the full source is here. The server is a standard Spring Boot application with no obfuscation or native code. Try asking Claude Code itself: *"audit these sources for anything that touches network or filesystem beyond the JVM target"*.
 
 ## Quick start
@@ -49,6 +49,22 @@ Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, g
 ```
 
 The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 21+ — no Maven install needed). The hook is content-aware: it rebuilds when the JAR is missing or, in a git checkout, when `HEAD` moves, so `git pull` + restart picks up updates without manual intervention. When the wrapper cannot set itself up (for example, `~/.m2` is read-only in a sandbox), the hook tries `mvn -o` and then `mvn` from `PATH`. If every attempt fails, a warning at session start names the build log and the exact command to build by hand. A build runs while Claude Code starts the MCP server and the JAR is absent until it finishes, so after a build (first install, update, moved `HEAD`) `jdwp-inspector` may show as failed in `/mcp`; reconnect it there once the build is done. Restart Claude Code to pick up the plugin.
+
+**Option B: Codex**
+
+The same repository is a Codex plugin marketplace:
+
+```bash
+codex plugin marketplace add FgForrest/mcp-jdwp-java
+codex plugin add jdwp-debugging@mcp-jdwp-java
+```
+
+(or `/plugins` in the Codex TUI). Codex reads the plugin's root `plugin.json` and `mcp.json` (the portable [Agent Plugins](https://agent-plugins.org) format) and installs the same `java-debug` skill and `jdwp-inspector` server. It runs no hook before starting a plugin's server, so the server is started through `scripts/jdwp-inspector.sh`, which gets the JAR first: it downloads the release JAR when the installed sources are the ones tagged for that release, and builds it otherwise (`./mvnw`, `mvn -o`, `mvn`, as the hook does). After that it starts the server at once.
+
+- **First session after install or update:** Codex does not wait long for a server to start. If the `jdwp-inspector` tools are missing, start a new session: the download or build carries on in the background and the next session finds the JAR. Its log is `logs/server-jar-setup.log` in the plugin's data directory (`~/.codex/plugins/data/…`), next to the server log `logs/mcp-jdwp-inspector.log`.
+- **Project directory:** Codex starts plugin servers in the plugin's own directory and tells the server the session's directory with each tool call. `jdwp_diagnose` shows that directory, and the local-project classpath fallback scans it, so start Codex in your project as you would Claude Code.
+- **Codex's sandbox:** commands Codex runs in its `workspace-write` sandbox have no network access by default. A JVM started there may not be able to offer its JDWP port to the server, which runs outside the sandbox. If attaching fails, give the sandbox network access (`[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml`) or start the JVM outside it.
+- **Windows:** the launcher is a POSIX shell script, so the plugin's server does not start under Codex on native Windows; register the JAR by hand as below.
 
 <details>
 <summary><strong>Alternative: manual MCP registration (without plugin)</strong></summary>
@@ -905,10 +921,14 @@ mcp-jdwp-java/
 ├── CHANGELOG.md
 ├── .claude-plugin/
 │   ├── plugin.json                      # Claude Code plugin metadata + MCP server configuration
-│   └── marketplace.json                 # Plugin marketplace registry
+│   └── marketplace.json                 # Plugin marketplace registry (Claude Code and Codex)
+├── plugin.json                          # Agent Plugins manifest (Codex): metadata + Codex listing
+├── mcp.json                             # Agent Plugins MCP server registration (Codex)
+├── scripts/
+│   └── jdwp-inspector.sh                # Codex launcher: gets the JAR, then starts the server
 ├── hooks/
 │   ├── hooks.json                       # SessionStart hook registration
-│   └── ensure-server-jar.sh             # Auto-builds the JAR if missing or git HEAD moved
+│   └── ensure-server-jar.sh             # Auto-builds the JAR if missing or git HEAD moved (downloads it for the launcher)
 ├── skills/
 │   ├── java-debug/                      # Debugging skill (workflows, recipes, gotchas)
 │   └── release/                         # Release-cutting skill
@@ -990,6 +1010,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                   |
 | `jdwp-debugging: could not build the MCP server JAR` at session start | The plugin's SessionStart hook tried `./mvnw`, `mvn -o` and `mvn`. Read the build log the message names, run the command it gives (it also writes the `.build-sha` marker), then reconnect `jdwp-inspector` in `/mcp`. |
 | `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`. |
+| Codex: no `jdwp-inspector` tools right after install or update | The launcher was still downloading or building the JAR when Codex stopped waiting; it finishes in the background. Start a new session. If the tools stay missing, read `logs/server-jar-setup.log` in the plugin's data directory and `jdwp-mcp-server/target/server-build.log` in the installed plugin. |
 | MCP server times out on startup                 | JVM startup takes several seconds. Ensure `MCP_TIMEOUT=30000` (or higher) is set in the MCP registration — the default is too short for a Spring Boot Java process. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | Expression evaluation timeout                   | First evaluation is slow (classpath discovery). Increase `MCP_TOOL_TIMEOUT`. Subsequent evaluations use cache.                                                      |

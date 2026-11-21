@@ -190,7 +190,7 @@ The annotation is `org.springframework.ai.mcp.annotation.McpResource` (`JDWPTool
 
 ## 8. The MCP server entry and the SessionStart hook
 
-Two files configure the plugin lifecycle.
+Claude Code reads `.claude-plugin/` (the MCP server entry and the SessionStart hook below). Codex reads the root Agent Plugins manifest instead (last subsection).
 
 ### `mcpServers` in `.claude-plugin/plugin.json`
 
@@ -210,6 +210,18 @@ One `SessionStart` hook runs `hooks/ensure-server-jar.sh`, which **rebuilds the 
 Maven output goes to `jdwp-mcp-server/target/server-build.log`. When the hook built something or failed, it prints one JSON object: `systemMessage` is shown to the user (on failure: what failed, the log path and the exact command to build by hand) and `additionalContext` tells Claude the same. Claude Code starts plugin MCP servers while SessionStart hooks still run, and the launch path is empty for the whole build, so in a session that builds `jdwp-inspector` may have failed to start; the message says to reconnect it in `/mcp`. A server started from the old JAR keeps running from `.prev` (moved, never overwritten); the hook deletes `.prev` once the new JAR is in place.
 
 The hook needs a JDK 21+ for the build (`JAVA_HOME` or `java` on `PATH`), but not a Maven install — `./mvnw` is the bundled wrapper.
+
+With `--download`, which only the Codex launcher passes, the hook first tries the release asset `mcp-jdwp-java-<version>.jar` of release `v<version>`, `<version>` read from the root `plugin.json`. It does so only when that release was built from the sources at hand: `git diff v<version> -- pom.xml jdwp-mcp-server` is empty, or there is no git history to compare with. The download lands in `mcp-jdwp-java.jar.download` and becomes the JAR only once it starts with a ZIP header. When the download is skipped or fails, the Maven chain runs as usual. Without the flag the hook behaves exactly as described above.
+
+### Root `plugin.json`, `mcp.json` and `scripts/jdwp-inspector.sh` (Codex)
+
+Codex reads the portable [Agent Plugins](https://agent-plugins.org) manifest at the repository root and prefers it over `.claude-plugin/plugin.json`. `mcp.json` must carry `$schema`, and a stdio entry may use only `type`, `command`, `args`, `env` and `cwd`; Codex skips the file or entry otherwise, without telling the user. `PluginManifestConsistencyTest` pins both rules, the shared server name and the version. Claude Code reads neither file; its project-level config is the dotted `.mcp.json`.
+
+Codex differs from Claude Code in three ways that shape the entry point:
+
+- **No hook before the server starts.** With the root manifest Codex did not run `hooks/hooks.json`, and plugin hooks would need the user's trust review anyway. So `mcp.json` starts `sh ${PLUGIN_ROOT}/scripts/jdwp-inspector.sh`, which runs `hooks/ensure-server-jar.sh --download`, waits for it and then `exec`s `java`. When the JAR is current the hook returns at once; otherwise a concurrent session waits on the hook's lock instead of starting a half-written JAR.
+- **A short start window, then a group kill.** `codex exec` does not wait for a slow server, and when Codex gives up on a server or ends the session it kills the server's process group. The launcher therefore runs the hook in a new session (`setsid -w`, or `perl -MPOSIX` where there is no `setsid`), so a download or build outlives the session that started it and the next session finds the JAR. All of the preparation's output goes to `$PLUGIN_DATA/logs/server-jar-setup.log`, because stdout is the MCP channel. The server log is `$PLUGIN_DATA/logs/mcp-jdwp-inspector.log`.
+- **The server runs in the plugin directory.** Codex starts plugin servers with `cwd` = the plugin root and supports no MCP `roots`. The server declares the experimental capability `codex/sandbox-state-meta`, and Codex then sends the session directory with every tool call as `_meta["codex/sandbox-state"].sandboxCwd`. `ClientWorkspaceConfig` wraps every tool's handler so `ClientWorkspace` records it before the tool runs, and `LocalProjectClasspathProvider` scans that directory instead of `user.dir` (§ local project classpath in `jdwp_diagnose`).
 
 ## 9. The diagnostic mental model
 

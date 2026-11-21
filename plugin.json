@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "jdwp-debugging",
+  "version": "2.11.2",
+  "description": "Java JDWP debugger via MCP — set breakpoints, inspect runtime state, evaluate expressions, mutate variables, catch exceptions at throw site, trace execution with logpoints.",
+  "author": {
+    "name": "Jan (Novoj) Novotný"
+  },
+  "homepage": "https://github.com/FgForrest/mcp-jdwp-java",
+  "repository": "https://github.com/FgForrest/mcp-jdwp-java",
+  "license": "MIT",
+  "keywords": ["java", "debugging", "jdwp", "jdi", "breakpoints", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "JDWP Debugging",
+        "shortDescription": "Debug running Java applications over JDWP",
+        "longDescription": "Attach to a JVM over JDWP and debug it from the agent: breakpoints, conditional and exception breakpoints, logpoints, field watchpoints, stepping, locals, fields and object graphs, Java expression evaluation in the suspended frame, and changing values at runtime. Needs a JDK 17+ on PATH.",
+        "developerName": "FG Forrest",
+        "category": "Developer Tools",
+        "capabilities": ["Interactive", "Read", "Write"],
+        "websiteURL": "https://github.com/FgForrest/mcp-jdwp-java",
+        "defaultPrompt": [
+          "This test fails — attach the debugger and find out why",
+          "Find which code writes this field",
+          "Catch this exception where it is thrown"
+        ]
+      }
+    }
+  }
+}

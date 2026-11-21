@@ -4,15 +4,18 @@ import com.sun.jdi.ThreadReference;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 
 import java.io.File;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -170,6 +173,33 @@ class JdiExpressionEvaluatorLocalClasspathUnionTest {
 				System.setProperty("user.dir", savedUserDir);
 			}
 		}
+	}
+
+	/**
+	 * Under Codex the server runs in the plugin's install directory; the "nothing found" error must
+	 * name the session directory the client reported, which is the one that was scanned, rather
+	 * than the server's launch directory.
+	 */
+	@Test
+	@DisplayName("the empty-classpath error names the session directory the MCP client reported")
+	void shouldNameClientReportedDirectoryInExceptionMessage(@TempDir Path session) throws Exception {
+		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, "/opt/jdk");
+		when(jdiService.discoverClasspath(thread)).thenReturn(null);
+		when(jdiService.getTargetMajorVersion()).thenReturn(21);
+		final ClientWorkspace workspace = new ClientWorkspace();
+		workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", session.toUri().toString())));
+		final LocalProjectClasspathProvider local = new LocalProjectClasspathProvider(
+			Path.of(System.getProperty("java.io.tmpdir"), "jdwp-mcp-plugin-root-" + java.util.UUID.randomUUID()),
+			workspace, name -> null, (c, d, t) -> List.of());
+
+		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), local);
+
+		assertThatCode(() -> evaluator.configureCompilerClasspath(thread))
+			.isInstanceOf(JdiEvaluationException.class)
+			.satisfies(e -> assertThat(e.getMessage())
+				.contains("'" + session.normalize() + "' (the session directory the MCP client reported)")
+				.doesNotContain("jdwp-mcp-plugin-root-"));
 	}
 
 	/**

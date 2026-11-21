@@ -5,16 +5,19 @@ import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -297,12 +300,39 @@ class JDWPToolsDiagnoseTest {
 
 		assertThat(result).contains("Local project classpath");
 		assertThat(result).contains("(read from cache; populated on first expression evaluation)");
-		assertThat(result).contains("CWD: " + cwd);
+		assertThat(result).contains("CWD: " + cwd + "\n");
 		// The stub forces Maven to contribute 3 jars; filesystem and env may legitimately add
 		// entries from the running build's tree but the maven count must be exactly 3.
 		assertThat(result).containsPattern("Sources: env-override=0, filesystem=\\d+, maven=3");
 		assertThat(result).containsPattern("Total local entries: \\d+");
 		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (unset)");
+	}
+
+	/**
+	 * Codex starts the server in the plugin's install directory and reports the session directory
+	 * with each tool call. The local-classpath block must show that directory, say where it came
+	 * from, and not show the launch directory.
+	 */
+	@Test
+	@DisplayName("local-classpath section shows the session directory the MCP client reported")
+	void shouldShowClientReportedDirectory(@TempDir Path tmp) {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path launch = tmp.resolve("plugin-root");
+		final ClientWorkspace workspace = new ClientWorkspace();
+		workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", tmp.toUri().toString())));
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			launch, workspace, name -> null, (command, workingDirectory, timeoutSeconds) -> List.of());
+		final JDWPTools toolsWithProvider = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, provider);
+
+		final String result = toolsWithProvider.jdwp_diagnose(null);
+
+		assertThat(result).contains("CWD: " + tmp.normalize() + " (session directory reported by the MCP client)\n");
+		assertThat(result).doesNotContain("CWD: " + launch);
 	}
 
 	/**

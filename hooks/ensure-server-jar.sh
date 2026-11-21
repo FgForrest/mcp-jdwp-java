@@ -10,6 +10,13 @@
 # goes first because it needs no network and fails fast when the local
 # repository lacks something.
 #
+# With --download (passed only by scripts/jdwp-inspector.sh, the launcher for
+# hosts that read the root plugin.json, such as Codex), it first tries to
+# download the release asset mcp-jdwp-java-<version>.jar, <version> taken from
+# the root plugin.json. It does so only when that release was built from the sources at
+# hand: the server sources equal tag v<version>, or there is no git history to
+# compare with. It builds when the download is skipped or fails.
+#
 # Maven output goes to jdwp-mcp-server/target/server-build.log. Stdout carries
 # at most one JSON object: its systemMessage is shown to the user, its
 # additionalContext reaches Claude. Nothing is printed when no build was needed.
@@ -25,6 +32,9 @@ MARKER="$TARGET/.build-sha"
 LOCK="$TARGET/.build-lock"
 LOG="$TARGET/server-build.log"
 EXPECTED=$(git -C "$PLUGIN" rev-parse HEAD 2>/dev/null || echo no-git)
+DOWNLOAD=false
+[ "${1:-}" = "--download" ] && DOWNLOAD=true
+RELEASES="https://github.com/FgForrest/mcp-jdwp-java/releases/download"
 
 needs_build() {
   [ ! -f "$JAR" ] || [ "$EXPECTED" != "$(cat "$MARKER" 2>/dev/null)" ]
@@ -99,25 +109,82 @@ build() {
   (cd "$PLUGIN" && "$@" -pl jdwp-mcp-server -am package -DskipTests -B) >> "$LOG" 2>&1 < /dev/null && [ -s "$JAR" ]
 }
 
-built=""
-tried="./mvnw"
-if build "./mvnw" sh ./mvnw; then
-  built="./mvnw"
-elif ! command -v mvn > /dev/null 2>&1; then
-  tried="./mvnw (no mvn on PATH)"
-else
-  tried="./mvnw, mvn -o, mvn"
-  if build "mvn -o" mvn -o; then
-    built="mvn -o"
-  elif build "mvn" mvn; then
-    built="mvn"
+# The plugin version from the root plugin.json; empty when there is none.
+plugin_version() {
+  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN/plugin.json" 2>/dev/null | head -n 1
+}
+
+# True when release v$1 was built from the server sources at hand. Without git
+# history (an installed copy) the plugin version is all there is to go by.
+release_matches_sources() {
+  git -C "$PLUGIN" rev-parse --git-dir > /dev/null 2>&1 || return 0
+  git -C "$PLUGIN" rev-parse -q --verify "refs/tags/v$1^{commit}" > /dev/null 2>&1 &&
+    git -C "$PLUGIN" diff --quiet "v$1" -- pom.xml jdwp-mcp-server > /dev/null 2>&1
+}
+
+# $1 = URL, $2 = file; exit status of the transfer.
+fetch() {
+  if command -v curl > /dev/null 2>&1; then
+    curl -fsSL --connect-timeout 20 --max-time 600 -o "$2" "$1" >> "$LOG" 2>&1 < /dev/null
+  elif command -v wget > /dev/null 2>&1; then
+    wget -q -T 20 -O "$2" "$1" >> "$LOG" 2>&1 < /dev/null
+  else
+    echo "neither curl nor wget is on PATH" >> "$LOG"
+    return 1
+  fi
+}
+
+# Downloads the release JAR of version $1 into place; a partial download never
+# becomes the JAR.
+download() {
+  url="$RELEASES/v$1/mcp-jdwp-java-$1.jar"
+  part="$JAR.download"
+  printf '\n=== download %s: %s\n' "$url" "$(date)" >> "$LOG"
+  rm -f "$part"
+  # A failed or cut-off transfer fails fetch (curl -f, wget); the "PK" ZIP
+  # header check additionally rejects anything that is not a JAR, such as an
+  # HTML page served with a success status.
+  if fetch "$url" "$part" && [ "$(head -c 2 "$part" 2>/dev/null)" = "PK" ] && mv -f "$part" "$JAR"; then
+    return 0
+  fi
+  rm -f "$part"
+  return 1
+}
+
+done_what=""
+tried=""
+version=$(plugin_version)
+if [ "$DOWNLOAD" = true ] && [ -n "$version" ]; then
+  if release_matches_sources "$version"; then
+    tried="the v$version release download, "
+    download "$version" && done_what="downloaded the jdwp-inspector MCP server JAR of release v$version"
+  else
+    printf '\n=== no download: the server sources differ from tag v%s\n' "$version" >> "$LOG"
   fi
 fi
 
-if [ -n "$built" ]; then
+if [ -z "$done_what" ]; then
+  built=""
+  tried="${tried}./mvnw"
+  if build "./mvnw" sh ./mvnw; then
+    built="./mvnw"
+  elif ! command -v mvn > /dev/null 2>&1; then
+    tried="$tried (no mvn on PATH)"
+  else
+    tried="$tried, mvn -o, mvn"
+    if build "mvn -o" mvn -o; then
+      built="mvn -o"
+    elif build "mvn" mvn; then
+      built="mvn"
+    fi
+  fi
+  [ -n "$built" ] && done_what="built the jdwp-inspector MCP server JAR with $built"
+fi
+
+if [ -n "$done_what" ]; then
   rm -f "$PREV"
   printf '%s' "$EXPECTED" > "$MARKER.tmp" && mv -f "$MARKER.tmp" "$MARKER"
-  emit "jdwp-debugging: built the jdwp-inspector MCP server JAR with $built. $RECONNECT" \
+  emit "jdwp-debugging: $done_what. $RECONNECT" \
     "The jdwp-inspector MCP server JAR was built at session start. If its tools are missing, ask the user to reconnect jdwp-inspector in /mcp."
   exit 0
 fi

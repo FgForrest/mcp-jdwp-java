@@ -164,7 +164,9 @@ Routing in step 3 happens on the listener thread, processing on the event dispat
 mcp-jdwp-java/
 ├── pom.xml                    Maven reactor
 ├── mvnw / mvnw.cmd            Maven wrapper (pinned 3.9.x)
-├── .claude-plugin/plugin.json plugin manifest + MCP server registration
+├── .claude-plugin/plugin.json plugin manifest + MCP server registration (Claude Code)
+├── plugin.json, mcp.json      Agent Plugins manifest + MCP server registration (Codex)
+├── scripts/jdwp-inspector.sh  Codex launcher: gets the JAR via the hook script, then starts it
 ├── hooks/                     SessionStart auto-build hook (hooks.json → ensure-server-jar.sh)
 ├── docs/                      ← you are here
 ├── jdwp-mcp-server/           the real MCP server
