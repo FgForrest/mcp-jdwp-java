@@ -66,7 +66,7 @@ codex plugin add jdwp-debugging@mcp-jdwp-java
 
 (or `/plugins` in the Codex TUI). Codex reads the plugin's root `plugin.json` and `mcp.json` (the portable [Agent Plugins](https://agent-plugins.org) format) and installs the same `java-debug` skill and `jdwp-inspector` server. It runs no hook before starting a plugin's server, so the server is started through `scripts/jdwp-inspector.sh`, which gets the JAR first: it downloads the release JAR when the installed sources are the ones tagged for that release, and builds it otherwise (`./mvnw`, `mvn -o`, `mvn`, as the hook does). After that it starts the server at once.
 
-- **First session after install or update:** Codex does not wait long for a server to start. If the `jdwp-inspector` tools are missing, start a new session: the download or build carries on in the background and the next session finds the JAR. Its log is `logs/server-jar-setup.log` in the plugin's data directory (`~/.codex/plugins/data/…`), next to the server log `logs/mcp-jdwp-inspector.log`.
+- **First session after install or update:** Codex does not wait long for a server to start. If the `jdwp-inspector` tools are missing, start a new session: the download or build carries on in the background, and a later session finds the JAR (see [When `jdwp-inspector` does not connect](#when-jdwp-inspector-does-not-connect)). Its log is `logs/server-jar-setup.log` in the plugin's data directory (`~/.codex/plugins/data/…`), next to the server log `logs/mcp-jdwp-inspector.log`.
 - **Project directory:** Codex starts plugin servers in the plugin's own directory and tells the server the session's directory with each tool call. `jdwp_diagnose` shows that directory, and the local-project classpath fallback scans it, so start Codex in your project as you would Claude Code.
 - **Codex's sandbox:** commands Codex runs in its `workspace-write` sandbox have no network access by default. A JVM started there may not be able to offer its JDWP port to the server, which runs outside the sandbox. If attaching fails, give the sandbox network access (`[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml`) or start the JVM outside it.
 - **Windows:** the launcher is a POSIX shell script, so the plugin's server does not start under Codex on native Windows; register the JAR by hand as below.
@@ -131,6 +131,14 @@ Without the plugin, the `java-debug` skill is not installed; copy `skills/java-d
 
 </details>
 
+#### When `jdwp-inspector` does not connect
+
+After an install or an update the server often does not come up on the first try: the agent starts it while its JAR is still being built or downloaded, or gives up waiting for it. That is expected, and it usually takes one or two more tries:
+
+- **Claude Code:** run `/mcp`, select `jdwp-inspector` and reconnect. If it fails again, the build is still running — wait for the session-start message that reports it and reconnect once more.
+- **Codex:** start a new session. It can take two: right after the first start, Codex may refresh its copy of the plugin, and the JAR is fetched again.
+- **Ask the agent.** The `java-debug` skill is installed even when the server is not connected, and it tells the agent where to look. Ask something like *"the jdwp-inspector MCP server does not connect — find out why"*: the agent checks the JAR, reads the build and server logs, checks `java -version`, can rerun the build, and tells you when to reconnect.
+
 ### 2. Launch your Java application with JDWP
 
 **Maven Surefire (test debugging):**
@@ -169,7 +177,7 @@ curl -L -o jdwp-sandbox.zip \
 unzip jdwp-sandbox.zip && cd jdwp-sandbox
 ```
 
-Inside, you get a parentless Maven project with `src/`, a `pom.xml`, a flight-game `README.md`, and a `CLAUDE.md` that briefs the agent on the game's house rules. Open the folder in Claude Code and ask it to play flight #1 — the bundled `CLAUDE.md` keeps it honest (no peeking at source, no spoiler-fetching). Codex reads `AGENTS.md`, not `CLAUDE.md`, so under Codex ask it to read `CLAUDE.md` first. Continue with the workflow below.
+Inside, you get a parentless Maven project with `src/`, a `pom.xml`, a flight-game `README.md`, and an `AGENTS.md` that briefs the agent on the game's house rules — Codex reads it directly, and the bundled `CLAUDE.md` imports it for Claude Code. Open the folder in your agent and ask it to play flight #1 — the house rules keep it honest (no peeking at source, no spoiler-fetching). Continue with the workflow below.
 
 ### How to launch a test flight
 
@@ -1046,8 +1054,8 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check the port matches `-DJVM_JDWP_PORT`, or pass `port` (and `host`) to `jdwp_wait_for_attach`.         |
 | MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart the agent.                                                                                     |
 | `jdwp-debugging: could not build the MCP server JAR` at session start | The plugin's SessionStart hook tried `./mvnw`, `mvn -o` and `mvn`. Read the build log the message names, run the command it gives (it also writes the `.build-sha` marker), then reconnect `jdwp-inspector` in `/mcp`. |
-| `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`. |
-| Codex: no `jdwp-inspector` tools right after install or update | The launcher was still downloading or building the JAR when Codex stopped waiting; it finishes in the background. Start a new session. If the tools stay missing, read `logs/server-jar-setup.log` in the plugin's data directory and `jdwp-mcp-server/target/server-build.log` in the installed plugin. |
+| `jdwp-inspector` failed right after install, update or `git pull` | The SessionStart hook was still building the JAR when Claude Code started the server, and Claude Code skips a failed plugin server for 15 minutes. Reconnect it in `/mcp`, more than once if the build is still running. See [When `jdwp-inspector` does not connect](#when-jdwp-inspector-does-not-connect). |
+| Codex: no `jdwp-inspector` tools right after install or update | The launcher was still downloading or building the JAR when Codex stopped waiting; it finishes in the background. Start a new session, or two. If the tools stay missing, ask the agent to find out why, or read `logs/server-jar-setup.log` in the plugin's data directory and `jdwp-mcp-server/target/server-build.log` in the installed plugin. |
 | MCP server times out on startup                 | JVM startup takes several seconds. Claude Code: start it with a longer wait, e.g. `MCP_TIMEOUT=60000 claude` (the variable must be in Claude Code's environment, not in the server's `env`). Codex: raise `startup_timeout_sec` of a manual registration; with the plugin, start a new session. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | First expression evaluation returns `[STILL_RUNNING]` | The first evaluation discovers the classpath and may run Maven in the project. An evaluation that takes over 20 s returns `[STILL_RUNNING]` and finishes in the background; its result shows up in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`. Once it has finished, later evaluations use the cached classpath. |

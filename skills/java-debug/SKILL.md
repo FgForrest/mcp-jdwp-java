@@ -30,6 +30,8 @@ Live debugging of a running JVM via JDWP. Replaces "add a println, re-run, repea
 
 ## Prerequisites
 
+The `jdwp_*` tools come from the plugin's `jdwp-inspector` MCP server. **If they are missing**, the server is not connected — usually right after an install or update, while its JAR is still being prepared. Do not fall back to println debugging: follow [references/troubleshooting.md](references/troubleshooting.md#the-jdwp_-tools-are-missing-the-mcp-server-is-not-connected) to find out why, and ask the user to reconnect.
+
 The target JVM must be running with the JDWP agent. **The port is whatever the developer (or their deployment) chose** — port 5005 is only the convention for build-system test shortcuts. Long-running services very often expose JDWP on a different port (8003, 8000, 9009, …).
 
 ```

@@ -52,6 +52,7 @@ cp -R "$SOURCE_DIR" "$STAGING_DIR/src"
 cp "$SANDBOX_TEMPLATE_DIR/pom.xml"    "$STAGING_DIR/pom.xml"
 cp "$SANDBOX_TEMPLATE_DIR/README.md"  "$STAGING_DIR/README.md"
 cp "$SANDBOX_TEMPLATE_DIR/CLAUDE.md"  "$STAGING_DIR/CLAUDE.md"
+cp "$SANDBOX_TEMPLATE_DIR/AGENTS.md"  "$STAGING_DIR/AGENTS.md"
 
 # Patch the pom version to match the release version.
 # Portable sed: write to a temp file then move into place (works on both GNU and BSD sed).

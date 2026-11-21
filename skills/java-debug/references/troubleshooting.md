@@ -1,5 +1,19 @@
 # Troubleshooting the JDWP MCP Server
 
+## The `jdwp_*` tools are missing: the MCP server is not connected
+
+Without the server there is no `jdwp_diagnose`. This is common right after the plugin is installed or updated: the server JAR was still being built (or, under Codex, downloaded) when the agent started the server. Find out what is wrong and tell the user what to do — you cannot reconnect the server yourself.
+
+1. **Find the plugin directory.** It is the directory that holds this skill (`skills/java-debug/`): under Claude Code `~/.claude/plugins/cache/<marketplace>/jdwp-debugging/<version>/`, under Codex `~/.codex/plugins/cache/<marketplace>/jdwp-debugging/<version>/`, or the root of a checkout used as the plugin.
+2. **Is the JAR there?** `jdwp-mcp-server/target/mcp-jdwp-java.jar`. Next to it, `.build-sha` names the commit it was built for (`no-git` in a copy without git history).
+3. **Read the logs.**
+   - `jdwp-mcp-server/target/server-build.log` — the Maven build, and under Codex the release download.
+   - Codex only: `logs/server-jar-setup.log` in the plugin's data directory (`~/.codex/plugins/data/…`) — what the launcher did.
+   - The server's own log, `logs/mcp-jdwp-inspector.log` — in the plugin directory under Claude Code, in the data directory under Codex. A JAR that exists but does not start shows its error here.
+4. **Check Java.** `java -version` must report a JDK 17 or newer; a JRE fails with `Module jdk.jdi not found`. Building needs JDK 21+.
+5. **Prepare the JAR by hand** when the build or download failed or is not finished: `bash <plugin dir>/hooks/ensure-server-jar.sh` (under Codex add `--download` to try the release JAR first). It does nothing when the JAR is current; otherwise it builds (`./mvnw`, `mvn -o`, `mvn`), writes `.build-sha`, and prints one JSON line saying what it did or why it failed. Another session's build in progress makes it wait.
+6. **Ask the user to reconnect.** Claude Code: `/mcp`, select `jdwp-inspector`, reconnect — again if a build was still running; Claude Code skips a failed plugin server for 15 minutes unless it is reconnected by hand. Codex: start a new session.
+
 ## Start here: `jdwp_diagnose`
 
 When something isn't working — can't connect, breakpoint won't fire, target JVM seems to be gone — run `jdwp_diagnose` first. It returns a three-block "state of the world" snapshot in one call:
