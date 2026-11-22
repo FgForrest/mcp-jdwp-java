@@ -51,6 +51,9 @@ public final class InvocationRunner {
      */
     private static final long BLOCKER_TIMEOUT_MS = 2_000;
 
+    /** The worker can annotate the job while it is waiting on host-side classpath discovery. */
+    private static final ThreadLocal<Job<?>> CURRENT_JOB = new ThreadLocal<>();
+
     private static final int PENDING = 0;
     private static final int RUNNING = 1;
     private static final int DONE = 2;
@@ -125,6 +128,9 @@ public final class InvocationRunner {
                 other = running.replace(key, other, job) ? null : running.putIfAbsent(key, job);
             }
             if (other != null) {
+                if (other.waitingForLocalClasspath) {
+                    throw new StillRunning(classpathWaitReport(other));
+                }
                 throw new StillRunning(String.format("[STILL_RUNNING] %s on thread %s has been running in the target for "
                     + "%d s — wait for EVALUATION_COMPLETED_LATE in jdwp_get_events before starting another "
                     + "invocation on that thread.", other.what, nameOf(thread), other.elapsedMs() / 1000));
@@ -150,6 +156,21 @@ public final class InvocationRunner {
             return unwrap(job);
         } catch (ExecutionException e) {
             throw rethrow(e);
+        }
+    }
+
+    /** Marks a bounded host-side wait so a tool deadline can explain what its job is doing. */
+    public static void duringLocalClasspathWait(Runnable wait) {
+        final Job<?> job = CURRENT_JOB.get();
+        if (job == null) {
+            wait.run();
+            return;
+        }
+        job.waitingForLocalClasspath = true;
+        try {
+            wait.run();
+        } finally {
+            job.waitingForLocalClasspath = false;
         }
     }
 
@@ -181,7 +202,11 @@ public final class InvocationRunner {
         return e;
     }
 
+    /** Builds the tool thread's timeout reply using the worker's current wait phase. */
     private String stillRunningReport(Job<?> job) {
+        if (job.waitingForLocalClasspath) {
+            return classpathWaitReport(job);
+        }
         final ThreadReference thread = job.thread;
         final String on = thread != null ? " on thread " + nameOf(thread) : "";
         final String blocker = thread != null ? "; " + boundedBlockerOf(thread) : "";
@@ -191,6 +216,16 @@ public final class InvocationRunner {
                 + "evaluating thread stays suspended until the evaluation ends); jdwp_reconnect ends everything.",
             job.what, on, timeoutMs / 1000, blocker,
             thread != null ? " and the thread can be evaluated on again" : "");
+    }
+
+    /**
+     * Returns the tool thread's reply when the job is waiting for local discovery at the
+     * deadline or when another invocation is refused. The reply requires no target VM query.
+     */
+    private static String classpathWaitReport(Job<?> job) {
+        return "[STILL_RUNNING] " + job.what + " is waiting for local classpath discovery. "
+            + "Run jdwp_diagnose for progress. The result will be recorded as "
+            + "EVALUATION_COMPLETED_LATE (jdwp_get_events) when the evaluation finishes.";
     }
 
     /**
@@ -276,6 +311,8 @@ public final class InvocationRunner {
         private final long startedNanos = System.nanoTime();
         private final AtomicInteger state = new AtomicInteger(PENDING);
         private final CompletableFuture<T> outcome = new CompletableFuture<>();
+        /** Set by the worker during local discovery so the tool thread can explain the wait. */
+        private volatile boolean waitingForLocalClasspath;
 
         private Job(String what, @Nullable ThreadReference thread, Callable<T> work,
                     @Nullable SuspensionSession session, Set<Long> holds) {
@@ -297,11 +334,13 @@ public final class InvocationRunner {
             }
             T value = null;
             Throwable failure = null;
+            CURRENT_JOB.set(this);
             try {
                 value = thread != null ? SuspensionSession.admittedUnder(thread, holds, work) : work.call();
             } catch (Throwable t) {
                 failure = t;
             } finally {
+                CURRENT_JOB.remove();
                 running.remove(key, this);
             }
             if (state.compareAndSet(RUNNING, DONE)) {

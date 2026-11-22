@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import org.eclipse.jdt.core.compiler.IProblem;
 import org.eclipse.jdt.internal.compiler.tool.EclipseCompiler;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -36,20 +37,51 @@ import java.util.stream.Collectors;
 public class InMemoryJavaCompiler {
     private static final Logger log = LoggerFactory.getLogger(InMemoryJavaCompiler.class);
 
+    /** A volatile reference publishes the complete configuration in one write. */
+    private volatile @Nullable Configuration configuration;
+
     /**
-     * Filesystem path to the target-matching JDK; used as `--system` so JDT can resolve system classes.
+     * Immutable options for one compiler configuration.
+     *
+     * @param jdkPath root of the target-matching JDK, passed as {@code --system} so ECJ can
+     *     resolve system classes
+     * @param classpath target classpath and any local fallback entries, joined with the host
+     *     {@link File#pathSeparator} for ECJ's {@code -classpath} argument
+     * @param targetMajorVersion target JVM's major version, used for ECJ's source and target
+     *     options and clamped to 8 when the target version is unknown
      */
-    @Nullable
-    private String jdkPath;
+    record Configuration(String jdkPath, String classpath, int targetMajorVersion) {}
+
     /**
-     * Path-separator-delimited classpath of the target VM, populated lazily by {@link #configure}.
+     * Returns the immutable options, or {@code null} when unconfigured. The evaluator reads this
+     * after publishing options on a tool worker or dispatcher to pair them with its cache.
      */
-    @Nullable
-    private String classpath;
+    @Nullable Configuration currentConfiguration() {
+        return configuration;
+    }
+
+    /** ECJ could resolve these names or type references with additional classpath entries. */
+    private static final Set<String> MISSING_TYPE_CODES = Set.of(
+        Integer.toString(IProblem.UndefinedType), Integer.toString(IProblem.UndefinedName),
+        Integer.toString(IProblem.UnresolvedVariable), Integer.toString(IProblem.ImportNotFound),
+        Integer.toString(IProblem.IsClassPathCorrect), Integer.toString(IProblem.IsClassPathCorrectWithReferencingType),
+        Integer.toString(IProblem.MissingTypeInMethod),
+        Integer.toString(IProblem.MissingTypeInConstructor), Integer.toString(IProblem.MissingTypeInLambda));
+
     /**
-     * Target JVM major version (8, 11, 17, ...); defaults to 8 until {@link #configure} is called.
+     * Compilation failed on a reference that additional classpath entries might resolve.
+     * The evaluator uses this signal to defer a fast probe while local discovery is pending.
      */
-    private int targetMajorVersion = 8;
+    static final class MissingClasspathTypes extends JdiEvaluationException {
+        /** Serialization version for this compiler exception. */
+        @java.io.Serial
+        private static final long serialVersionUID = 1L;
+
+        /** Captures the ECJ error text that led the compiler to identify missing types. */
+        MissingClasspathTypes(String message) {
+            super(message);
+        }
+    }
 
     /**
      * Materialises the source for {@code className} under {@code tempDir}, creating any required
@@ -96,19 +128,18 @@ public class InMemoryJavaCompiler {
     }
 
     /**
-     * Configures the compiler with a JDK path, classpath, and target version. Synchronized so that a
-     * concurrent {@link #compile} sees a fully populated state. A non-positive `targetMajorVersion`
-     * silently clamps to 8 (the lowest version JDT can target).
+     * Configures the compiler with a JDK path, classpath, and target version. A non-positive
+     * {@code targetMajorVersion} silently clamps to 8 (the lowest version JDT can target).
+     * Publishing the immutable options through the volatile reference lets {@link #compile}
+     * capture a consistent snapshot without synchronizing with this method.
      *
      * @param jdkPath            file path to the root of a JDK matching the target VM's major version
-     * @param classpath          target VM classpath (colon- or semicolon-separated, depending on target OS)
-     * @param targetMajorVersion target JVM major version (e.g., 8, 11, 17, 21); 0 or negative falls back to 8
+     * @param classpath          merged classpath joined with the host path separator
+     * @param targetMajorVersion target JVM major version (e.g., 8, 11, 17, 21). Values below 1 fall back to 8.
      */
-    public synchronized void configure(String jdkPath, String classpath, int targetMajorVersion) {
+    public void configure(String jdkPath, String classpath, int targetMajorVersion) {
         final long startTime = System.currentTimeMillis();
-        this.jdkPath = jdkPath;
-        this.classpath = classpath;
-        this.targetMajorVersion = targetMajorVersion > 0 ? targetMajorVersion : 8;
+        configuration = new Configuration(jdkPath, classpath, targetMajorVersion > 0 ? targetMajorVersion : 8);
 
         if (classpath.isEmpty()) {
             log.warn("[Compiler] Classpath is empty, application classes may not be resolved.");
@@ -121,23 +152,21 @@ public class InMemoryJavaCompiler {
     }
 
     /**
-     * Returns the compiler to its unconfigured state, dropping the JDK path and classpath set by
-     * {@link #configure} and restoring the default target version. Called on disconnect/reconnect:
-     * the discovered classpath belongs to one specific target VM, so leftover config from a previous
-     * connection must not survive. Without this, a post-reconnect discovery failure would leave
-     * {@link #jdkPath} non-null and {@link #compile} would silently emit bytecode resolved against
-     * the previous target's classpath; after a reset, {@link #compile} instead throws the
-     * "not configured" error until {@link #configure} runs again for the new connection.
+     * Returns the compiler to its unconfigured state. The evaluator calls this before remote
+     * discovery when the JDK path is absent, including on first use after reconnect. Clearing the
+     * snapshot prevents bytecode from being resolved against the previous target's classpath if
+     * discovery fails. {@link #compile} throws the "not configured" error until {@link #configure}
+     * publishes options for the current connection.
      */
-    public synchronized void reset() {
-        this.jdkPath = null;
-        this.classpath = null;
-        this.targetMajorVersion = 8;
+    public void reset() {
+        configuration = null;
     }
 
     /**
      * Compiles `sourceCode` into bytecode for `className`. The returned map is keyed by fully qualified
-     * class name and includes any inner/anonymous classes JDT emits.
+     * class name and includes any inner/anonymous classes JDT emits. Reads the immutable config
+     * snapshot once, so a concurrent local classpath merge can publish new options without a
+     * lock and this compilation still uses one consistent set of options.
      *
      * @param className  fully qualified name of the primary class declared in `sourceCode`
      * @param sourceCode complete `.java` source text (must declare a package matching `className`)
@@ -146,7 +175,17 @@ public class InMemoryJavaCompiler {
      *                                or if JDT reports any `Diagnostic.Kind.ERROR` diagnostic
      */
     public Map<String, byte[]> compile(String className, String sourceCode) throws JdiEvaluationException {
-        if (jdkPath == null) {
+        return compile(className, sourceCode, configuration);
+    }
+
+    /**
+     * Compiles on the evaluator's tool worker or dispatcher using options captured with its wrapper
+     * cache. Returns the generated bytecode by class name. Throws {@link JdiEvaluationException}
+     * if options are missing, compiler I/O fails, or ECJ rejects the source.
+     */
+    Map<String, byte[]> compile(String className, String sourceCode, @Nullable Configuration config)
+        throws JdiEvaluationException {
+        if (config == null) {
             throw new JdiEvaluationException(
                 "Compiler is not configured. Please call configure() with a valid JDK path and classpath."
             );
@@ -169,7 +208,7 @@ public class InMemoryJavaCompiler {
             final Iterable<? extends JavaFileObject> compilationUnits = standardFileManager.getJavaFileObjects(sourceFile.toFile());
 
             // 3. Build compiler options and run the compilation task
-            final List<String> options = buildCompilerOptions();
+            final List<String> options = buildCompilerOptions(config);
             final JavaCompiler.CompilationTask task = compiler.getTask(
                 null, fileManager, diagnostics, options, null, compilationUnits
             );
@@ -187,7 +226,10 @@ public class InMemoryJavaCompiler {
                     .collect(Collectors.joining("\n"));
                 final long elapsed = System.currentTimeMillis() - startTime;
                 log.error("[Compiler] Compilation failed after {}ms:\n{}", elapsed, errors);
-                throw new JdiEvaluationException("Compilation failed:\n" + errors);
+                final String message = "Compilation failed:\n" + errors;
+                final boolean missingTypes = diagnostics.getDiagnostics().stream().anyMatch(d ->
+                    d.getKind() == Diagnostic.Kind.ERROR && MISSING_TYPE_CODES.contains(d.getCode()));
+                throw missingTypes ? new MissingClasspathTypes(message) : new JdiEvaluationException(message);
             }
 
             final Map<String, byte[]> compiledBytecode = fileManager.getCompiledBytecode();
@@ -216,13 +258,14 @@ public class InMemoryJavaCompiler {
     /**
      * Builds the JDT compiler option list from the configured target version, JDK path, and classpath.
      */
-    private List<String> buildCompilerOptions() {
+    private static List<String> buildCompilerOptions(Configuration config) {
+        final int targetMajorVersion = config.targetMajorVersion();
         final String versionStr = targetMajorVersion <= 8 ? "1." + targetMajorVersion : String.valueOf(targetMajorVersion);
         final List<String> options = new ArrayList<>(Arrays.asList("-source", versionStr, "-target", versionStr));
         options.add("-g"); // Preserve local variable names
-        options.addAll(Arrays.asList("--system", jdkPath));
-        if (classpath != null && !classpath.isEmpty()) {
-            options.addAll(Arrays.asList("-classpath", classpath));
+        options.addAll(Arrays.asList("--system", config.jdkPath()));
+        if (!config.classpath().isEmpty()) {
+            options.addAll(Arrays.asList("-classpath", config.classpath()));
         }
         return options;
     }

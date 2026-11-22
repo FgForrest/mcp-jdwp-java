@@ -304,7 +304,7 @@ class InterpreterHarnessLiveTest {
     }
 
     private static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
-        return new JDIConnectionService(mock(JdiEventListener.class),
+        final JDIConnectionService connection = new JDIConnectionService(mock(JdiEventListener.class),
             new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
             new MarkedInstanceRegistry(), new JdiHealthMonitor(), mock(JvmDiscoveryService.class)) {
             @Override
@@ -312,6 +312,16 @@ class InterpreterHarnessLiveTest {
                 return vm;
             }
         };
+        // Classpath discovery publishes its result only for the VM the connection holds, so the
+        // fixture's VM is planted as the connection's own, as a real attach would do.
+        try {
+            final java.lang.reflect.Field field = JDIConnectionService.class.getDeclaredField("vm");
+            field.setAccessible(true);
+            field.set(connection, vm);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("Could not plant the fixture VM into the connection", e);
+        }
+        return connection;
     }
 
     /** Replay an engine on a freshly attached fixture. Pass no pre-replay check or goldens for a candidate. */
@@ -513,7 +523,9 @@ class InterpreterHarnessLiveTest {
                 return Outcome.targetException(invoked.exception().referenceType().name());
             }
             if (e.getMessage().startsWith("Compilation failed:")) {
-                final String name = e.getClass().getSimpleName();
+                // A compile error that more classpath entries might fix is a JdiEvaluationException
+                // subclass the evaluator uses internally; the oracle records the public type.
+                final String name = JdiEvaluationException.class.getSimpleName();
                 return new Outcome("compile error", name, "compile error: " + name, null);
             }
             throw e;

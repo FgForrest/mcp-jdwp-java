@@ -5,15 +5,20 @@ import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.evaluation.ProcessBuilderMavenRunner;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -287,9 +292,7 @@ class JDWPToolsDiagnoseTest {
 				"/tmp/dep-a.jar", "/tmp/dep-b.jar", "/tmp/dep-c.jar"
 			)
 		);
-		// Warm the breakdown cache so the diagnose path's non-blocking peek has something to render.
-		// Production warming happens on the first expression-evaluation flow, not on the diagnose
-		// path itself — see renderLocalClasspathBlock for why the diagnose call never blocks.
+		// Populate the breakdown so diagnose can report the finished discovery.
 		stub.discoverWithBreakdown();
 		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
 			jdiService, new BreakpointTracker(), new WatcherManager(),
@@ -299,7 +302,7 @@ class JDWPToolsDiagnoseTest {
 		final String result = toolsWithStub.jdwp_diagnose(null);
 
 		assertThat(result).contains("Local project classpath");
-		assertThat(result).contains("(read from cache; populated on first expression evaluation)");
+		assertThat(result).doesNotContain("not yet computed", "discovery is still running");
 		assertThat(result).contains("CWD: " + cwd + "\n");
 		// The stub forces Maven to contribute 3 jars; filesystem and env may legitimately add
 		// entries from the running build's tree but the maven count must be exactly 3.
@@ -371,11 +374,56 @@ class JDWPToolsDiagnoseTest {
 		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set)");
 	}
 
+	@Test
+	@DisplayName("reports a Maven failure alongside the entries discovered from other sources")
+	void shouldReportMavenFailure(@TempDir Path cwd) throws Exception {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null));
+		Files.createDirectories(cwd.resolve("target/classes"));
+		Files.writeString(cwd.resolve("pom.xml"), "<project/>");
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			cwd, name -> null, (command, directory, timeout) -> {
+				throw new IllegalStateException("dependency resolution failed");
+			});
+		provider.discover();
+		final JDWPTools toolsWithProvider = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, provider);
+
+		assertThat(toolsWithProvider.jdwp_diagnose(false))
+			.contains("Sources: env-override=0, filesystem=1, maven=0")
+			.contains("dependency resolution failed");
+	}
+
+	/** Reports the cleanup limitation when the real Maven runner uses descendant polling. */
+	@Test
+	@EnabledOnOs({OS.LINUX, OS.MAC})
+	void shouldReportMavenPollingCleanupLimit(@TempDir Path cwd) throws Exception {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null));
+		Files.writeString(cwd.resolve("pom.xml"), "<project/>");
+		final Path wrapper = Files.writeString(cwd.resolve("mvnw"), "#!/bin/sh\nexit 0\n");
+		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
+		final ProcessBuilderMavenRunner runner;
+		try (MockedStatic<Files> files = Mockito.mockStatic(Files.class, Mockito.CALLS_REAL_METHODS)) {
+			files.when(() -> Files.isExecutable(Path.of("/usr/bin/setsid"))).thenReturn(false);
+			runner = new ProcessBuilderMavenRunner();
+		}
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(cwd, name -> null, runner);
+		assertThat(provider.discoverWithBreakdown().failure()).isNull();
+		final JDWPTools toolsWithProvider = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, provider);
+
+		assertThat(toolsWithProvider.jdwp_diagnose(false))
+			.contains("Helper processes of a cancelled or timed-out Maven run may outlive it.");
+	}
+
 	/**
 	 * The diagnose path must never block on a cold local-classpath cache. When the provider has
-	 * never run discovery the renderer must call {@code peekCachedBreakdown()} (non-blocking),
-	 * print a "not yet computed; will populate after first expression evaluation" hint, and return.
-	 * Discovery happens organically when expression evaluation needs it.
+	 * never started discovery, the renderer should show "not yet computed" and return.
 	 */
 	@Test
 	@DisplayName("does not block on a cold local-classpath cache — renders a 'not yet computed' hint instead")
@@ -470,7 +518,7 @@ class JDWPToolsDiagnoseTest {
 				: null,
 			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);
-		// Cache intentionally NOT warmed — peekCachedBreakdown() returns null in the renderer.
+		// Leave the cache cold so the renderer reads the env override directly.
 		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
 			jdiService, new BreakpointTracker(), new WatcherManager(),
 			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),

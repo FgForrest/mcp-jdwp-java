@@ -1,15 +1,26 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import com.sun.jdi.VirtualMachine;
+import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.channels.spi.AbstractInterruptibleChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+import static org.mockito.Mockito.mock;
 
 /**
  * Tests for the memoisation, reset semantics, per-source breakdown shape, immutability of the
@@ -17,6 +28,128 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("LocalProjectClasspathProvider — caching and breakdown")
 class LocalProjectClasspathProviderCacheTest {
+
+	/** Safety bound for positive test signals. Progress is asserted while the old scan is gated. */
+	private static final long SIGNAL_TIMEOUT_SECONDS = 30;
+
+	/** Keeps the old worker blocked while a replacement scan completes, then releases its late result. */
+	@Test
+	void replacementCompletesWhileCancelledWorkerIsStillUnwinding(@TempDir Path project) throws Exception {
+		final Path next = Files.createDirectory(project.resolve("next"));
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		Files.writeString(next.resolve("pom.xml"), "<project/>");
+		final ClientWorkspace workspace = new ClientWorkspace();
+		final CountDownLatch started = new CountDownLatch(1);
+		final CountDownLatch cancelled = new CountDownLatch(1);
+		final CountDownLatch release = new CountDownLatch(1);
+		final CountDownLatch replacement = new CountDownLatch(1);
+		final CountDownLatch oldScanReturned = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, workspace,
+			name -> null, (command, directory, timeout) -> {
+				if (directory.equals(next)) {
+					replacement.countDown();
+					return List.of("/new.jar");
+				}
+				started.countDown();
+				try {
+					release.await();
+				} catch (InterruptedException e) {
+					cancelled.countDown();
+					release.await();
+				}
+				oldScanReturned.countDown();
+				return List.of("/old.jar");
+			});
+
+		try {
+			provider.startForConnection(mock(VirtualMachine.class));
+			assertThat(started.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", next.toString())));
+			provider.startForConnection(mock(VirtualMachine.class));
+			assertThat(cancelled.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			assertThat(replacement.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			awaitCachedEntry(provider, "/new.jar");
+			release.countDown();
+			assertThat(oldScanReturned.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			assertThat(provider.peekCachedBreakdown()).isNotNull()
+				.extracting(LocalProjectClasspathProvider.Breakdown::all).isEqualTo(Set.of("/new.jar"));
+		} finally {
+			release.countDown();
+			provider.reset();
+		}
+	}
+
+	/** Checks that attach can complete while the old worker's interrupt handler blocks in I/O cleanup. */
+	@Test
+	void replacementDoesNotWaitForCancelledIoToClose(@TempDir Path project) throws Exception {
+		final Path next = Files.createDirectory(project.resolve("next"));
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		Files.writeString(next.resolve("pom.xml"), "<project/>");
+		final ClientWorkspace workspace = new ClientWorkspace();
+		final CountDownLatch workerStarted = new CountDownLatch(1);
+		final Semaphore releaseWorker = new Semaphore(0);
+		final CountDownLatch closeEntered = new CountDownLatch(1);
+		final Semaphore releaseClose = new Semaphore(0);
+		final CountDownLatch closeFinished = new CountDownLatch(1);
+
+		/** Test channel whose close hook can block the thread requesting interruption. */
+		final class StalledChannel extends AbstractInterruptibleChannel {
+			/** Registers the interrupt hook and parks the discovery worker until released. */
+			void blockInRead() throws java.io.IOException {
+				begin();
+				try {
+					workerStarted.countDown();
+					// An interruptible wait could unwind to end(false) and unregister the
+					// channel hook before Thread.interrupt() gets to invoke it.
+					releaseWorker.acquireUninterruptibly();
+				} finally {
+					end(false);
+				}
+			}
+
+			/** Signals that the interrupt handler entered, then waits for the test to release it. */
+			@Override
+			protected void implCloseChannel() {
+				closeEntered.countDown();
+				releaseClose.acquireUninterruptibly();
+				closeFinished.countDown();
+			}
+		}
+
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, workspace,
+			name -> null, (command, directory, timeout) -> {
+				if (directory.equals(project)) {
+					// Model an I/O implementation whose interruption hook blocks its caller.
+					new StalledChannel().blockInRead();
+				}
+				return List.of(directory.resolve("dependency.jar").toString());
+			});
+		provider.startForConnection(mock(VirtualMachine.class));
+		try {
+			assertThat(workerStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+				.as("the old worker registered its channel interrupt hook").isTrue();
+			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", next.toString())));
+			final VirtualMachine replacement = mock(VirtualMachine.class);
+			final CompletableFuture<Void> attachment =
+				CompletableFuture.runAsync(() -> provider.startForConnection(replacement));
+			assertThat(closeEntered.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+				.as("cancellation entered the old channel's close hook").isTrue();
+			attachment.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			awaitCachedEntry(provider, next.resolve("dependency.jar").toString());
+			assertThat(closeFinished.getCount()).as("attach and discovery completed while close was blocked").isEqualTo(1);
+		} finally {
+			releaseClose.release();
+			releaseWorker.release();
+			provider.reset();
+		}
+	}
+
+	/** Observes the cached result of the scan started by attach. */
+	private static void awaitCachedEntry(LocalProjectClasspathProvider provider, String entry) {
+		await().atMost(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS).untilAsserted(() ->
+			assertThat(provider.peekCachedBreakdown()).isNotNull()
+				.extracting(LocalProjectClasspathProvider.Breakdown::all).isEqualTo(Set.of(entry)));
+	}
 
 	@Test
 	@DisplayName("subsequent discover() and discoverWithBreakdown() calls reuse the cached result")

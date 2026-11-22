@@ -1,5 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import com.sun.jdi.VirtualMachine;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -8,16 +10,23 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -34,16 +43,16 @@ import java.util.stream.Stream;
  *   <li>{@code JDWP_EXTRA_CLASSPATH} env var, parsed by {@link File#pathSeparator}</li>
  *   <li>Filesystem scan of {@code target/classes} / {@code target/test-classes} under the project
  *       directory</li>
- *   <li>Maven {@code dependency:build-classpath} per detected {@code pom.xml}</li>
+ *   <li>Maven {@code dependency:build-classpath} when the project root has a {@code pom.xml}</li>
  * </ul>
  *
  * <p>The project directory is the one the MCP client reports, when it reports one (Codex, see
  * {@link ClientWorkspace}), and the server's launch directory otherwise (Claude Code starts the
  * server in the project).
  *
- * <p>The first {@link #discoverWithBreakdown()} call is memoised; subsequent calls return the cached
- * result until {@link #reset()} is invoked (typically on JDI reconnect) or the project directory
- * changes. Discovery is synchronised so concurrent callers see the same memoised snapshot.
+ * <p>Discovery runs on a daemon executor. A new JDI connection starts a fresh discovery with
+ * the directory captured at attach. A subsequent evaluation can start a replacement when the
+ * client reports a different directory.
  *
  * <p>Registered as a Spring {@code @Service}, but the second constructor takes seams so the env
  * lookup and Maven invocation can be stubbed in tests without touching real environment variables
@@ -97,8 +106,108 @@ public class LocalProjectClasspathProvider {
      * @param maven       number of entries Maven's {@code dependency:build-classpath} added on top
      *                    of env + filesystem (dedup'd against earlier sources)
      * @param all         insertion-ordered union of all contributing entries; never null
+     * @param failure     diagnostic when a source failed, if any
      */
-    public record Breakdown(int envOverride, int filesystem, int maven, Set<String> all) {}
+    public record Breakdown(int envOverride, int filesystem, int maven, Set<String> all,
+                            @Nullable String failure) {}
+
+    /**
+     * Snapshot for the dispatcher, tool evaluations, and {@code jdwp_diagnose}. Reading the status
+     * returns immediately, so a slow Maven run cannot stall event processing or diagnostics.
+     * A null breakdown means discovery is pending when {@code running} is true, or that there is
+     * no discovery for this directory yet. A completed breakdown may contain partial results
+     * alongside a failure.
+     */
+    public record DiscoveryStatus(Path directory, boolean reportedByClient, boolean running,
+                                  @Nullable Breakdown breakdown) {
+        /** The diagnose tool can check the captured directory with a single filesystem probe. */
+        public boolean hasPomAtRoot() {
+            return hasPom(directory);
+        }
+
+        /** Returns a pending or failed discovery message, or {@code null} when neither applies. */
+        public @Nullable String problem() {
+            if (running) {
+                return "Local classpath discovery is still running.";
+            }
+            return breakdown == null ? null : breakdown.failure();
+        }
+    }
+
+    private record ProjectDirectory(Path path, boolean reportedByClient) {}
+
+    /**
+     * The directory, scan identity, and result observed together during compiler configuration.
+     * The evaluator uses this snapshot to check publication and decide whether to reuse options.
+     */
+    record Snapshot(ProjectDirectory project, @Nullable Discovery scan, DiscoveryStatus status) {
+        /**
+         * Returns whether the snapshots refer to the same directory and scan. When local entries
+         * are in use, also checks the result's identity to detect completion of a pending scan.
+         */
+        boolean sameInput(Snapshot other, boolean includeLocal) {
+            return scan == other.scan && project.equals(other.project)
+                && (!includeLocal || status.breakdown() == other.status.breakdown());
+        }
+    }
+
+    /**
+     * One background scan for a directory captured when the task was submitted. The daemon
+     * publishes its completed breakdown through {@code ready} so the dispatcher and diagnose can
+     * read it without waiting on the future. Tool evaluations and tests can wait on the future
+     * for up to the Maven timeout. Replacing a discovery interrupts the old task and isolates its
+     * result, even if that task finishes after the replacement is installed.
+     */
+    private final class Discovery {
+        /** Root captured by the thread that requested the scan. */
+        private final Path directory;
+        /** Background computation that MCP workers can wait for. */
+        private final FutureTask<Breakdown> task;
+        /** Dedicated daemon that runs the scan and can be interrupted independently. */
+        private final Thread worker;
+        /** Completed result for non-waiting readers, written under the compiler publication gate. */
+        private volatile @Nullable Breakdown ready;
+
+        /** Prepares a discovery and its daemon. The caller starts it after publishing the scan. */
+        private Discovery(Path directory) {
+            this.directory = directory;
+            this.task = new FutureTask<>(() -> {
+                Breakdown breakdown;
+                try {
+                    breakdown = scan(directory);
+                } catch (RuntimeException e) {
+                    log.warn("[LocalClasspath] Discovery failed (cwd={})", directory, e);
+                    breakdown = new Breakdown(0, 0, 0, Set.of(), "Local classpath discovery failed: " + e);
+                }
+                synchronized (LocalProjectClasspathProvider.this) {
+                    ready = breakdown;
+                }
+                return breakdown;
+            });
+            // A filesystem read may still be blocked in the OS after cancellation. A separate
+            // worker lets a replacement scan run while this one unwinds.
+            this.worker = new Thread(task, "jdi-local-classpath");
+            this.worker.setDaemon(true);
+        }
+
+        /**
+         * Waits on a tool worker or test thread up to the Maven budget. Returns the breakdown,
+         * or {@code null} on timeout, cancellation, or interruption. Wraps unexpected task
+         * failure in {@link IllegalStateException}.
+         */
+        private @Nullable Breakdown await() {
+            try {
+                return task.get(MAVEN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (TimeoutException | CancellationException e) {
+                return null;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (ExecutionException e) {
+                throw new IllegalStateException("Local classpath discovery failed", e.getCause());
+            }
+        }
+    }
 
     /** Directory the scan is anchored at when no client reports one; the server's launch directory in production. */
     private final Path launchDirectory;
@@ -108,10 +217,12 @@ public class LocalProjectClasspathProvider {
     private final Function<String, @Nullable String> envLookup;
     /** Indirection for the Maven shell-out so tests can stub success/failure modes. */
     private final MavenRunner mavenRunner;
-    /** Memoised result of the first {@link #discoverWithBreakdown()} call; cleared by {@link #reset()}. */
-    private @Nullable Breakdown cachedBreakdown;
-    /** Project directory {@link #cachedBreakdown} was computed for. */
-    private @Nullable Path cachedFor;
+    /** Replaced on attach or directory change. The executor completes only its own task. */
+    private volatile @Nullable Discovery discovery;
+    /** Once bound, only a thread of the active VM can request or publish a scan. Guarded by this. */
+    private boolean connectionScoped;
+    /** Active VM identity, or {@code null} after teardown. Guarded by the provider monitor. */
+    private @Nullable VirtualMachine owner;
 
     /**
      * Test seam: build the provider with explicit working directory, env-lookup function, and Maven
@@ -155,8 +266,9 @@ public class LocalProjectClasspathProvider {
     }
 
     /**
-     * Returns the union of all contributing entries from the memoised breakdown. Convenience
-     * wrapper around {@link #discoverWithBreakdown()} for callers that only need the merged set.
+     * Returns the local entries for tests that only need the merged set. Waits up to the Maven
+     * budget through {@link #discoverWithBreakdown()}. Production callers use the status snapshot
+     * or the tool evaluation wait instead.
      *
      * @return insertion-ordered, immutable set of local classpath entries
      */
@@ -166,44 +278,63 @@ public class LocalProjectClasspathProvider {
 
     /**
      * Project directory the next discovery is rooted at: the directory the MCP client reported, or
-     * the launch directory when no client reported one. Exposed for the {@code jdwp_diagnose} report
-     * and the evaluator's "nothing found" hint so they name the directory that was actually scanned.
+     * the launch directory when no client reported one. The dispatcher and diagnostics use
+     * {@link #discoveryStatus()} to keep the displayed directory and discovery result together.
      */
     public Path getWorkingDirectory() {
+        return projectDirectory().path();
+    }
+
+    private ProjectDirectory projectDirectory() {
         final Path reported = clientWorkspace == null ? null : clientWorkspace.reportedDirectory();
-        return reported != null ? reported : launchDirectory;
+        return reported == null ? new ProjectDirectory(launchDirectory, false) : new ProjectDirectory(reported, true);
     }
 
-    /**
-     * True when {@link #getWorkingDirectory()} comes from the MCP client rather than from the
-     * server's launch directory.
-     */
+    /** True when the MCP client reported the project directory. */
     public boolean isWorkingDirectoryReportedByClient() {
-        return clientWorkspace != null && clientWorkspace.reportedDirectory() != null;
+        return projectDirectory().reportedByClient();
     }
 
     /**
-     * True when a {@code pom.xml} sits at the working-directory root. Cheap I/O; called only from
-     * the diagnose path (once per call). Surfaced so the report can say "pom.xml: yes/no" without
-     * duplicating the path logic.
+     * True when a regular, non-symlinked {@code pom.xml} sits at the working-directory root.
+     * Uses the same check as Maven discovery and the diagnose snapshot so they agree on whether
+     * the Maven source applies.
      */
     public boolean hasPomAtRoot() {
-        // NOFOLLOW_LINKS: the provider's invariant is "symlinks are never followed". A symlinked
-        // pom.xml could redirect Maven discovery at an arbitrary tree on the host filesystem; we
-        // treat it as "no pom" so the Maven source is skipped, matching how the filesystem scan
-        // treats symlinked target/classes directories.
-        return Files.isRegularFile(getWorkingDirectory().resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
+        return hasPom(getWorkingDirectory());
+    }
+
+    private static boolean hasPom(Path directory) {
+        // NOFOLLOW_LINKS keeps a symlinked pom.xml from redirecting Maven discovery into an
+        // arbitrary tree on the host. The filesystem scan also skips symlinked class directories.
+        return Files.isRegularFile(directory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
+    }
+
+    /** Reads the current project's discovery state without starting discovery or waiting for it. */
+    public DiscoveryStatus discoveryStatus() {
+        return statusFor(projectDirectory(), discovery);
+    }
+
+    /** Lets diagnose report the runner's cleanup capability without waiting for discovery. */
+    public boolean mavenUsesDescendantPolling() {
+        return mavenRunner.usesDescendantPolling();
     }
 
     /**
-     * Non-blocking peek at the cached breakdown. Returns {@code null} when no discovery has run
-     * yet on this provider instance, or when the cached one was computed for another project
-     * directory. Used by the diagnose path so the report never blocks the caller waiting for a
-     * cold-cache Maven invocation; if the cache is cold, the diagnose renderer prints a one-line
-     * "not yet computed" hint and moves on.
+     * Returns status for the requested directory from the scan's published result. A scan for
+     * another directory is treated as absent. This read never waits on the discovery task.
      */
-    public synchronized @Nullable Breakdown peekCachedBreakdown() {
-        return getWorkingDirectory().equals(cachedFor) ? cachedBreakdown : null;
+    private static DiscoveryStatus statusFor(ProjectDirectory directory, @Nullable Discovery current) {
+        if (current == null || !directory.path().equals(current.directory)) {
+            return new DiscoveryStatus(directory.path(), directory.reportedByClient(), false, null);
+        }
+        final Breakdown breakdown = current.ready;
+        return new DiscoveryStatus(directory.path(), directory.reportedByClient(), breakdown == null, breakdown);
+    }
+
+    /** Returns the completed breakdown for the current directory, if available. */
+    public @Nullable Breakdown peekCachedBreakdown() {
+        return discoveryStatus().breakdown();
     }
 
     /**
@@ -241,32 +372,121 @@ public class LocalProjectClasspathProvider {
     }
 
     /**
-     * Runs (or returns the memoised result of) the three-source discovery. Synchronised so two
-     * concurrent callers cannot both pay the Maven invocation cost; the second caller blocks and
-     * receives the first caller's cached breakdown.
-     *
-     * <p>On an empty result, emits one INFO log line that explains which sources had what state
-     * (env unset vs blank, {@code target/} present, {@code pom.xml} present) so operators can
-     * diagnose "why is nothing being added" without enabling DEBUG.
-     *
-     * @return memoised breakdown — never null; {@link Breakdown#all()} is immutable
+     * Starts or joins discovery for the current directory and returns the completed breakdown.
+     * Tests use this to inspect the results directly and can block for up to the Maven timeout.
+     * Production diagnostics read {@link #discoveryStatus()} so the report stays responsive.
      */
-    public synchronized Breakdown discoverWithBreakdown() {
-        final Path workingDirectory = getWorkingDirectory();
-        final Breakdown cached = cachedBreakdown;
-        if (cached != null) {
-            if (workingDirectory.equals(cachedFor)) {
-                return cached;
-            }
-            log.info("[LocalClasspath] Project directory changed from {} to {} — scanning again",
-                cachedFor, workingDirectory);
+    public Breakdown discoverWithBreakdown() {
+        final Discovery current;
+        synchronized (this) {
+            current = currentDiscovery(getWorkingDirectory());
         }
+        final Breakdown breakdown = current.await();
+        if (breakdown == null) {
+            throw new IllegalStateException("Local classpath discovery did not complete within the wait");
+        }
+        return breakdown;
+    }
+
+    /**
+     * The thread establishing a JDI connection calls this before starting its event listener
+     * and dispatcher. Captures the directory reported at attach and queues a fresh scan so a
+     * reconnect sees the current project layout. Requests cancellation of any prior discovery
+     * and returns without waiting for either scan to finish.
+     */
+    synchronized void startForConnection(VirtualMachine vm) {
+        connectionScoped = true;
+        owner = vm;
+        replaceDiscovery(getWorkingDirectory());
+    }
+
+    /** Clears a stopped connection's scan immediately and interrupts its worker without joining it. */
+    synchronized void stopForConnection(VirtualMachine vm) {
+        if (owner == vm) {
+            owner = null;
+            reset();
+        }
+    }
+
+    /**
+     * The event dispatcher reads a snapshot without waiting. When the client reports a different
+     * directory, an evaluation starts the replacement scan. Remote-only prewarming just reads.
+     */
+    synchronized @Nullable Snapshot snapshotFor(@Nullable VirtualMachine vm, boolean start) {
+        if (connectionScoped && (owner == null || owner != vm)) {
+            return null;
+        }
+        final ProjectDirectory project = projectDirectory();
+        final Discovery current = start ? currentDiscovery(project.path()) : discovery;
+        return new Snapshot(project, current, statusFor(project, current));
+    }
+
+    /**
+     * An MCP invocation worker waits outside the evaluator and session monitors. Cancellation
+     * wakes the wait, and the evaluator checks the connection again before publishing anything.
+     */
+    void awaitDiscovery(@Nullable VirtualMachine vm) {
+        final Snapshot snapshot = snapshotFor(vm, true);
+        final Discovery current = snapshot == null ? null : snapshot.scan();
+        if (current != null && current.ready == null) {
+            InvocationRunner.duringLocalClasspathWait(current::await);
+        }
+    }
+
+    /**
+     * Publishes compiler options on the dispatcher or an evaluation worker only while the
+     * connection, directory, and any observed local result are current. Returns false to retry.
+     */
+    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, boolean includeLocal,
+                                          Runnable publish) {
+        if ((connectionScoped && (owner == null || owner != vm)) || discovery != snapshot.scan()) {
+            return false;
+        }
+        final ProjectDirectory project = snapshot.project();
+        if (includeLocal && statusFor(project, discovery).breakdown() != snapshot.status().breakdown()) {
+            return false;
+        }
+        final ClientWorkspace workspace = clientWorkspace;
+        if (workspace == null) {
+            publish.run();
+            return true;
+        }
+        return workspace.publishIfCurrent(project.reportedByClient() ? project.path() : null, publish);
+    }
+
+    /**
+     * Gets the current scan for the directory or starts a replacement without waiting.
+     * Called under the provider monitor by evaluation or test threads.
+     */
+    private Discovery currentDiscovery(Path directory) {
+        final Discovery current = discovery;
+        if (current != null && directory.equals(current.directory)) {
+            return current;
+        }
+        return replaceDiscovery(directory);
+    }
+
+    /**
+     * Installs and returns a fresh scan under the provider monitor. The attach or evaluation
+     * caller starts the dedicated worker and requests cancellation of the prior scan.
+     */
+    private Discovery replaceDiscovery(Path directory) {
+        final Discovery previous = discovery;
+        final Discovery next = new Discovery(directory);
+        discovery = next;
+        cancel(previous);
+        next.worker.start();
+        return next;
+    }
+
+    /** Runs on the discovery daemon and returns the combined entries and per-source counts. */
+    private Breakdown scan(Path workingDirectory) {
         final Set<String> entries = new LinkedHashSet<>();
         addEnvOverride(entries);
         final int afterEnv = entries.size();
         addFilesystemScan(entries, workingDirectory);
         final int afterFs = entries.size();
-        addMavenDependencies(entries, workingDirectory);
+        final String mavenFailure = addMavenDependencies(entries, workingDirectory);
         final int afterMaven = entries.size();
         final Breakdown breakdown = new Breakdown(
             afterEnv,
@@ -275,11 +495,10 @@ public class LocalProjectClasspathProvider {
             // Wrap a defensive LinkedHashSet copy so the cached view is immutable but still
             // preserves insertion order — callers rely on containsExactly-style assertions and
             // Set.copyOf would drop order (it returns a hash-based immutable set).
-            Collections.unmodifiableSet(new LinkedHashSet<>(entries))
+            Collections.unmodifiableSet(new LinkedHashSet<>(entries)),
+            mavenFailure
         );
-        cachedBreakdown = breakdown;
-        cachedFor = workingDirectory;
-        if (entries.isEmpty()) {
+        if (entries.isEmpty() && !Thread.currentThread().isInterrupted()) {
             // Required by the logging policy: ONE INFO line on empty result explaining the why.
             // NOFOLLOW_LINKS on every probe — keep the diagnostic readout consistent with the
             // "symlinks not followed" invariant used by every other filesystem probe in this class.
@@ -297,28 +516,42 @@ public class LocalProjectClasspathProvider {
     }
 
     /**
-     * Clears the memoised breakdown so the next {@link #discoverWithBreakdown()} call re-scans.
-     * Called by {@link JdiExpressionEvaluator#configureCompilerClasspath} on a JDI reconnect because
-     * the new connection may target a different project layout — a stale breakdown would mismatch.
+     * Tests use this to discard the current result without queuing a replacement. It interrupts
+     * an active daemon task and returns without waiting for cleanup. Production teardown uses
+     * {@link #stopForConnection(VirtualMachine)} to cancel work for the departing VM.
      */
     public synchronized void reset() {
-        cachedBreakdown = null;
-        cachedFor = null;
-        log.debug("[LocalClasspath] Cache reset");
+        final Discovery previous = discovery;
+        discovery = null;
+        cancel(previous);
+    }
+
+    /**
+     * Cancels the future immediately to wake waiters. A separate daemon interrupts the old
+     * worker so an I/O close hook cannot block the replacement or teardown caller.
+     */
+    private static void cancel(@Nullable Discovery previous) {
+        if (previous != null && previous.task.cancel(false)) {
+            // Wake anyone awaiting the result now. Thread.interrupt() may run an I/O close hook
+            // on its caller, so signal the worker from a daemon outside the discovery monitor.
+            final Thread interrupter = new Thread(previous.worker::interrupt, "jdi-local-classpath-cancel");
+            interrupter.setDaemon(true);
+            interrupter.start();
+        }
     }
 
     /**
      * Adds Maven-resolved dependency jars to {@code entries}. No-ops cleanly when no {@code pom.xml}
-     * sits at the working-directory root. Logs at INFO with the count and elapsed time on every
-     * outcome (added &gt; 0, added == 0, failure) so operators see one line per discovery.
+     * sits at the working-directory root. Logs successful contributions at INFO, including why
+     * a successful run can contribute zero entries. Returns failures in the breakdown for diagnose.
      */
-    private void addMavenDependencies(Set<String> entries, Path workingDirectory) {
-        // NOFOLLOW_LINKS: same invariant as hasPomAtRoot — a symlinked pom.xml must not trigger
-        // Maven discovery, because Maven would resolve the link and pull dependencies from a tree
-        // outside the configured workingDirectory.
-        if (!Files.isRegularFile(workingDirectory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS)) {
+    private @Nullable String addMavenDependencies(Set<String> entries, Path workingDirectory) {
+        if (Thread.currentThread().isInterrupted()) {
+            return "Maven classpath discovery was interrupted.";
+        }
+        if (!hasPom(workingDirectory)) {
             log.debug("[LocalClasspath] No pom.xml under {} — skipping Maven source", workingDirectory);
-            return;
+            return null;
         }
         final List<String> command = buildMavenCommand(workingDirectory);
         final long startTime = System.currentTimeMillis();
@@ -328,37 +561,39 @@ public class LocalProjectClasspathProvider {
             entries.addAll(jars);
             final int added = entries.size() - before;
             final long elapsed = System.currentTimeMillis() - startTime;
-            if (added > 0) {
-                log.info("[LocalClasspath] Maven contributed {} dependency jars in {}ms", added, elapsed);
+            if (added == 0) {
+                // A successful Maven run can have no runtime dependencies in scope or return only
+                // entries already found by another source. Give operators that context for zero.
+                log.info("[LocalClasspath] Maven contributed 0 dependency jars in {}ms "
+                    + "(no runtime dependencies in scope or entries already present)", elapsed);
             } else {
-                // "Reason-out on empty" — required by the logging policy. 0 jars is NOT necessarily a
-                // failure: a project with no runtime dependencies (or a filtered classpath) legitimately
-                // yields nothing. The runner already logs a WARN on a genuine shell-level failure, so
-                // point operators there for the failure case without implying one happened.
-                log.info("[LocalClasspath] Maven contributed 0 jars in {}ms (no runtime deps, or Maven "
-                    + "failed — check earlier WARN lines for timeout / non-zero exit / missing output)", elapsed);
+                log.info("[LocalClasspath] Maven contributed {} dependency jars in {}ms", added, elapsed);
             }
+            return null;
+        } catch (ProcessBuilderMavenRunner.OutputReadException e) {
+            entries.addAll(e.entries());
+            log.warn("[LocalClasspath] Maven classpath output read failed (cwd={})", workingDirectory, e);
+            return "Maven classpath discovery failed: " + e.getMessage();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Maven classpath discovery was interrupted.";
         } catch (Exception e) {
-            log.warn("[LocalClasspath] Maven dependency:build-classpath failed after {}ms: {}: {} (cwd={})",
-                System.currentTimeMillis() - startTime, e.getClass().getSimpleName(), e.getMessage(),
-                workingDirectory);
+            log.warn("[LocalClasspath] Maven dependency:build-classpath failed after {}ms (cwd={})",
+                System.currentTimeMillis() - startTime, workingDirectory, e);
+            return "Maven classpath discovery failed: " + e;
         }
     }
 
     /**
      * Builds the {@code dependency:build-classpath} command line, picking up the project's Maven
-     * wrapper when available (see {@link #resolveMavenExecutable}). The output file lives under each
-     * module's {@code target/}, never at a bare project-root filename.
+     * wrapper when available (see {@link #resolveMavenExecutable}). The production runner adds
+     * the run-specific output path.
      */
     private static List<String> buildMavenCommand(Path workingDirectory) {
         final String executable = resolveMavenExecutable(workingDirectory);
         // `-q` keeps Maven CLI noise off the operator's terminal; the runner captures stdout to a
         // size-capped buffer so the WARN path can still surface diagnostic output on failure.
         // `-DincludeScope=runtime` matches what's actually on the app's runtime classpath.
-        // The output file lives under each module's `target/` — Maven-owned build output, gitignored
-        // everywhere, wiped by `mvn clean`. NEVER use a bare filename here (`.jdwp-mcp-classpath`):
-        // that would land in project source directories which we must not write to. See the
-        // file-safety policy.
         // We do NOT pass `-Dmdep.pathSeparator=:` — that flag forces a Unix separator on Windows and
         // would corrupt drive letters in jar paths. Letting Maven use the platform default and
         // splitting on File.pathSeparator on the read side keeps things consistent.
@@ -366,8 +601,7 @@ public class LocalProjectClasspathProvider {
             executable,
             "-q",
             "dependency:build-classpath",
-            "-DincludeScope=runtime",
-            "-Dmdep.outputFile=target/.jdwp-mcp-classpath"
+            "-DincludeScope=runtime"
         );
     }
 
@@ -443,7 +677,8 @@ public class LocalProjectClasspathProvider {
         // NOFOLLOW_LINKS everywhere: a symlink to another tree on the same filesystem could create
         // walk cycles or pull in jars from outside the project. The documented invariant is that
         // this scan never follows links — enforce it at every probe.
-        if (depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+        if (Thread.currentThread().isInterrupted()
+            || depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
         // At each directory, probe for target/classes and target/test-classes BEFORE recursing — we
@@ -469,16 +704,16 @@ public class LocalProjectClasspathProvider {
             return;
         }
         try (Stream<Path> children = Files.list(dir)) {
-            children
-                // `Files::isDirectory` (the method reference) FOLLOWS links — use the explicit
-                // overload with NOFOLLOW_LINKS so a symlinked directory is treated as "not a
-                // directory" and skipped.
-                .filter(p -> Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS))
-                .filter(p -> {
-                    final String name = p.getFileName().toString();
-                    return !name.startsWith(".") && !SKIP_DIRS.contains(name);
-                })
-                .forEach(child -> scanForClassDirs(child, depth + 1, entries));
+            final Iterator<Path> paths = children.iterator();
+            // Check before advancing the directory iterator, which may itself block on I/O.
+            while (!Thread.currentThread().isInterrupted() && paths.hasNext()) {
+                final Path child = paths.next();
+                final String name = child.getFileName().toString();
+                if (!name.startsWith(".") && !SKIP_DIRS.contains(name)) {
+                    // scanForClassDirs checks the type without following symlinked directories.
+                    scanForClassDirs(child, depth + 1, entries);
+                }
+            }
         } catch (AccessDeniedException e) {
             // Permission denied on a single directory is expected (CI agents, restricted dev envs).
             // Log at WARN so an operator sees it once, but never abort the whole scan.
@@ -532,10 +767,7 @@ public class LocalProjectClasspathProvider {
      * Seam for executing a Maven command and harvesting its output. The production implementation
      * is {@link ProcessBuilderMavenRunner}; tests provide in-memory stubs.
      *
-     * <p>Implementations MUST follow the empty-list-on-failure contract: any non-zero exit,
-     * timeout, exception, or interruption is reflected by returning an empty list (after logging
-     * the cause). This keeps the provider's outer flow declarative — it can union the result with
-     * other sources without per-source null/error handling.
+     * Failures propagate to the provider so it can report them alongside the other sources.
      */
     @FunctionalInterface
     public interface MavenRunner {
@@ -544,12 +776,18 @@ public class LocalProjectClasspathProvider {
          * {@code timeoutSeconds}, and returns the classpath entries the command's output files
          * contributed.
          *
-         * @param command          full argv (executable + arguments) to invoke
+         * @param command          Maven executable and discovery arguments; the runner supplies its output path
          * @param workingDirectory CWD for the spawned process; output files are harvested under it
          * @param timeoutSeconds   wall-clock budget; on timeout the implementation MUST kill the
-         *                         process and return an empty list
-         * @return harvested classpath entries; empty on any failure (never null)
+         *                         process before reporting the failure
+         * @return harvested classpath entries
          */
-        List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds);
+        List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds)
+            throws IOException, InterruptedException;
+
+        /** Whether cleanup on this host uses descendant polling and may miss reparented helpers. */
+        default boolean usesDescendantPolling() {
+            return false;
+        }
     }
 }

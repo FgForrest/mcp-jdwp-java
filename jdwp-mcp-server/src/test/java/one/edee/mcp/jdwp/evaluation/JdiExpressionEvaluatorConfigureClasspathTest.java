@@ -1,13 +1,25 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,6 +56,99 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
+	}
+
+	/** Finishes local discovery during the remote walk and checks one publication with both results. */
+	@Test
+	void eventMergesLocalClasspathThatBecomesReadyDuringRemoteWalk(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path local = project.resolve("local.jar");
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				if (!releaseMaven.await(30, TimeUnit.SECONDS)) {
+					throw new AssertionError("Remote walk did not release Maven");
+				}
+				return List.of(local.toString());
+			});
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(thread.virtualMachine()).thenReturn(vm);
+		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
+		when(jdiService.getTargetMajorVersion()).thenReturn(21);
+		when(jdiService.discoverClasspath(thread)).thenAnswer(call -> {
+			releaseMaven.countDown();
+			assertThat(provider.discover()).containsExactly(local.toString());
+			return "/remote";
+		});
+		final JdiExpressionEvaluator withLocal = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), provider);
+		withLocal.startLocalClasspathDiscovery(vm);
+		try {
+			withLocal.configureCompilerClasspathForEvent(thread);
+			verify(compiler).configure("/opt/jdk", "/remote" + File.pathSeparator + local, 21);
+			verify(compiler, never()).configure("/opt/jdk", "/remote", 21);
+			verify(jdiService).discoverClasspath(thread);
+		} finally {
+			releaseMaven.countDown();
+			withLocal.stopLocalClasspathDiscovery(vm);
+		}
+	}
+
+	/** Changes the reported workspace between reading discovery and publishing compiler options. */
+	@Test
+	void workspaceChangeBeforePublicationDiscardsOldClasspath(@TempDir Path project) throws Exception {
+		final Path next = Files.createDirectory(project.resolve("next"));
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		Files.writeString(next.resolve("pom.xml"), "<project/>");
+		final ClientWorkspace workspace = new ClientWorkspace();
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, workspace,
+			name -> null, (command, directory, timeout) -> List.of(directory.resolve("local.jar").toString()));
+		final JdiExpressionEvaluator withWorkspace = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), provider);
+		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
+		when(jdiService.discoverClasspath(thread)).thenReturn("/app");
+		when(jdiService.getTargetMajorVersion()).thenAnswer(call -> {
+			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", next.toString())));
+			provider.snapshotFor(null, true);
+			return 21;
+		});
+		assertThatCode(() -> {
+			provider.discover();
+			withWorkspace.configureCompilerClasspathForEvent(thread);
+		}).doesNotThrowAnyException();
+
+		verify(compiler, never()).configure("/opt/jdk", "/app" + File.pathSeparator + project.resolve("local.jar"), 21);
+		provider.discover();
+		withWorkspace.configureCompilerClasspathForEvent(thread);
+		verify(compiler).configure("/opt/jdk", "/app" + File.pathSeparator + next.resolve("local.jar"), 21);
+	}
+
+	/** Replaces the VM during configuration and checks that late work cannot publish for it. */
+	@Test
+	void reconnectBeforePublicationRefusesOldConnection() throws Exception {
+		final VirtualMachine previous = mock(VirtualMachine.class);
+		final VirtualMachine next = mock(VirtualMachine.class);
+		when(thread.virtualMachine()).thenReturn(previous);
+		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
+		when(jdiService.discoverClasspath(thread)).thenReturn("/old");
+		when(jdiService.getTargetMajorVersion()).thenAnswer(call -> {
+			evaluator.stopLocalClasspathDiscovery(previous);
+			evaluator.startLocalClasspathDiscovery(next);
+			// A delayed teardown from the previous listener must leave the replacement alive.
+			evaluator.stopLocalClasspathDiscovery(previous);
+			return 21;
+		});
+
+		evaluator.startLocalClasspathDiscovery(previous);
+		assertThatThrownBy(() -> evaluator.configureCompilerClasspathForEvent(thread))
+			.isInstanceOf(JdiEvaluationException.class).hasMessageContaining("target connection ended");
+		verify(compiler, never()).configure(any(), any(), org.mockito.ArgumentMatchers.anyInt());
+
+		when(thread.virtualMachine()).thenReturn(next);
+		when(jdiService.discoverClasspath(thread)).thenReturn("/new");
+		org.mockito.Mockito.doReturn(21).when(jdiService).getTargetMajorVersion();
+		evaluator.configureCompilerClasspath(thread);
+		verify(compiler).configure("/opt/jdk", "/new", 21);
 	}
 
 	@Test
@@ -96,30 +201,23 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 	@Test
 	@DisplayName("prewarm warms remote+JDK but defers local merge; first real eval completes it")
 	void prewarmDefersLocalMergeUntilFirstEvaluation() throws Exception {
-		// prewarm runs on the JDI event-listener thread and must never invoke the local provider
-		// (which can shell out to Maven for minutes). It warms only remote discovery + JDK detection;
-		// the first real configureCompilerClasspath then completes the local merge.
-		final LocalProjectClasspathProvider local = mock(LocalProjectClasspathProvider.class);
-		when(local.discover()).thenReturn(java.util.Set.of("/local/a"));
+		final LocalProjectClasspathProvider local = new LocalProjectClasspathProvider(
+			java.nio.file.Path.of("missing-classpath-fixture"), name -> "/local/a", (c, d, t) -> java.util.List.of());
 		final JdiExpressionEvaluator deferEvaluator = new JdiExpressionEvaluator(
 			compiler, jdiService, new EvaluationGuard(), local);
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(thread.virtualMachine()).thenReturn(vm);
+		deferEvaluator.startLocalClasspathDiscovery(vm);
+		local.discover();
 
-		// prewarm reads the JDK path twice before discovery (outer guard + inner gate); both see
-		// null, then discovery sets it for every subsequent read.
 		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, null, "/opt/jdk");
 		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
 		when(jdiService.getTargetMajorVersion()).thenReturn(21);
 
 		deferEvaluator.prewarmClasspath(thread);
-
-		// Remote discovery happened; the (potentially Maven-shelling) local discover() was NOT run
-		// during prewarm. The cheap cache reset() may still fire on the fresh-connection edge.
-		verify(jdiService).discoverClasspath(thread);
-		verify(local, never()).discover();
-
-		// First real evaluation falls through the JDK-path short-circuit and merges the local fallback.
+		verify(compiler).configure("/opt/jdk", "/app/classes", 21);
 		deferEvaluator.configureCompilerClasspath(thread);
-		verify(local).discover();
+		verify(compiler).configure("/opt/jdk", "/app/classes" + java.io.File.pathSeparator + "/local/a", 21);
 	}
 
 	@Test

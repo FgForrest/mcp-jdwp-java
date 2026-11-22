@@ -26,6 +26,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * Drains the JDI event queue on a dedicated daemon thread named `jdi-event-listener`. The MCP
@@ -71,7 +72,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} directly — promotion happens
  * lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call. Logpoint and
  * conditional-BP handlers DO end up calling it indirectly the first time after connect (via
- * {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}); the safety-net
+ * {@code configureCompilerClasspathForEvent} → {@code discoverClasspath} → {@code getVM}); the safety-net
  * promoter is strictly passive (it never calls {@code invokeMethod} on the target VM), so it is
  * safe to invoke from any event-processing context.
  * <p>
@@ -135,7 +136,7 @@ public class JdiEventListener {
      * Left null by tests that drive the listener directly — death becomes a silent loop exit.
      */
     @Nullable
-    private volatile Runnable vmDeathHook;
+    private volatile Consumer<VirtualMachine> vmDeathHook;
     /**
      * Optional callback invoked when the target exits, after the in-target probes were read and
      * before the session closes (which wakes a {@code jdwp_resume_until_event} waiter) — so the
@@ -162,7 +163,10 @@ public class JdiEventListener {
      * Idempotence gate so concurrent death observers (graceful in-loop event, disconnect exception,
      * external {@code stop()}) collapse into at most one {@link #vmDeathHook} invocation per session.
      */
-    private final AtomicBoolean vmDeathHookInvoked = new AtomicBoolean(false);
+    private record ListenerConnection(VirtualMachine vm, AtomicBoolean deathHookInvoked) {}
+
+    /** Identity and death-hook gate for the active listener, cleared by {@link #stop()}. */
+    private volatile @Nullable ListenerConnection listenerConnection;
 
     public JdiEventListener(BreakpointTracker breakpointTracker, EventHistory eventHistory,
                             @Lazy JdiExpressionEvaluator expressionEvaluator,
@@ -349,7 +353,7 @@ public class JdiEventListener {
      * after {@link #start} is best-effort — a concurrent death observation may still invoke the
      * previously-set value.
      */
-    public void setVmDeathHook(@Nullable Runnable hook) {
+    public void setVmDeathHook(@Nullable Consumer<VirtualMachine> hook) {
         this.vmDeathHook = hook;
     }
 
@@ -383,10 +387,10 @@ public class JdiEventListener {
      */
     public void start(VirtualMachine vm) {
         stop();
+        final ListenerConnection connection = new ListenerConnection(vm, new AtomicBoolean());
+        listenerConnection = connection;
+        expressionEvaluator.startLocalClasspathDiscovery(vm);
 
-        // Re-arm the death-hook gate so a reconnect after a clean disconnect still fires the hook
-        // on the second disconnect.
-        vmDeathHookInvoked.set(false);
         running = true;
         final ExecutorService sessionDispatcher = Executors.newSingleThreadExecutor(r -> {
             final Thread worker = new Thread(r, "jdi-event-dispatcher");
@@ -398,7 +402,7 @@ public class JdiEventListener {
         session = suspensions;
         evaluationGuard.bind(suspensions);
         watchdog = SuspensionWatchdog.start(suspensions);
-        final Thread thread = new Thread(() -> listen(vm, sessionDispatcher, suspensions), "jdi-event-listener");
+        final Thread thread = new Thread(() -> listen(connection, sessionDispatcher, suspensions), "jdi-event-listener");
         thread.setDaemon(true);
         listenerThread = thread;
         thread.start();
@@ -447,16 +451,16 @@ public class JdiEventListener {
      * Runs the registered {@link #vmDeathHook} at most once per session under a swallow-on-failure
      * guard. Never throws — a hook failure must not mask the death itself.
      */
-    private void invokeVmDeathHook() {
-        if (!vmDeathHookInvoked.compareAndSet(false, true)) {
+    private void invokeVmDeathHook(ListenerConnection connection) {
+        if (!connection.deathHookInvoked().compareAndSet(false, true)) {
             return;
         }
-        final Runnable hook = vmDeathHook;
+        final Consumer<VirtualMachine> hook = vmDeathHook;
         if (hook == null) {
             return;
         }
         try {
-            hook.run();
+            hook.accept(connection.vm());
         } catch (Exception e) {
             log.warn("[JDI] VM-death hook threw: {}", e.getMessage());
         }
@@ -474,6 +478,11 @@ public class JdiEventListener {
      */
     public void stop() {
         running = false;
+        final ListenerConnection connection = listenerConnection;
+        listenerConnection = null;
+        if (connection != null) {
+            cancelLocalClasspathDiscovery(connection.vm());
+        }
         final SuspensionSession suspensions = session;
         session = null;
         if (suspensions != null) {
@@ -507,7 +516,17 @@ public class JdiEventListener {
         // path; the CAS gate inside invokeVmDeathHook() collapses the race with the listener's own
         // call so the hook still fires at most once.
         breakpointTracker.fireNextEvent();
-        invokeVmDeathHook();
+        if (connection != null) {
+            invokeVmDeathHook(connection);
+        }
+    }
+
+    /**
+     * Requests cancellation for the departing VM. The listener thread and connection teardown
+     * can both call this without waiting for the discovery worker or its Maven process.
+     */
+    void cancelLocalClasspathDiscovery(VirtualMachine vm) {
+        expressionEvaluator.stopLocalClasspathDiscovery(vm);
     }
 
     /**
@@ -526,7 +545,8 @@ public class JdiEventListener {
      * {@link #vmDeathHook} before exiting. An {@code InterruptedException} from an external
      * {@link #stop} closes the session, clears {@link #running} and invokes the hook.
      */
-    private void listen(VirtualMachine vm, ExecutorService dispatcher, SuspensionSession suspensions) {
+    private void listen(ListenerConnection connection, ExecutorService dispatcher, SuspensionSession suspensions) {
+        final VirtualMachine vm = connection.vm();
         final EventQueue queue = vm.eventQueue();
 
         while (running) {
@@ -544,6 +564,7 @@ public class JdiEventListener {
                     }
                 }
                 if (isDeath(eventSet)) {
+                    cancelLocalClasspathDiscovery(vm);
                     awaitDispatched(dispatcher);
                     readProbesBeforeExit(eventSet);
                     if (running) {
@@ -551,6 +572,7 @@ public class JdiEventListener {
                     }
                     suspensions.close();
                     process(eventSet, null, null);
+                    invokeVmDeathHook(connection);
                 } else if (fromEvaluatingThread(eventSet)) {
                     suppress(eventSet, suspensions);
                 } else {
@@ -566,13 +588,14 @@ public class JdiEventListener {
                 suspensions.close();
                 running = false;
                 breakpointTracker.fireNextEvent();
-                invokeVmDeathHook();
+                invokeVmDeathHook(connection);
                 break;
             } catch (VMDisconnectedException | IllegalStateException e) {
                 // VMDisconnectedException: queue raised before any in-loop death event came through
                 // (typical for abrupt target exit). IllegalStateException: the VM was disposed
                 // underneath us and a subsequent JDI call now rejects requests. Both are terminal.
                 log.info("[JDI] VM disconnected, stopping event listener: {}", e.getClass().getSimpleName());
+                cancelLocalClasspathDiscovery(vm);
                 awaitDispatched(dispatcher);
                 if (running) {
                     invokeVmExitingHook();
@@ -581,7 +604,7 @@ public class JdiEventListener {
                 eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));
                 running = false;
                 breakpointTracker.fireNextEvent();
-                invokeVmDeathHook();
+                invokeVmDeathHook(connection);
                 break;
             } catch (Exception e) {
                 if (running) {
@@ -647,8 +670,8 @@ public class JdiEventListener {
      * false conditional breakpoints reach the bottom with `shouldSuspend == false` and the set is to
      * be resumed. Note that the set is resumed only when NO event in it demanded suspension — even one
      * suspending event keeps every thread in the set parked for user inspection. A death event records
-     * {@code VM_DEATH}, clears {@link #running}, fires the resume-until-event latch and invokes the
-     * {@link #vmDeathHook}; the rest of its set is not processed.
+     * {@code VM_DEATH}, clears {@link #running}, and fires the resume-until-event latch before the
+     * listener invokes the {@link #vmDeathHook}. The rest of its set is not processed.
      *
      * @return whether the caller should resume the set
      */
@@ -684,7 +707,6 @@ public class JdiEventListener {
                 // observe running=true and re-park before the loop has actually exited.
                 running = false;
                 breakpointTracker.fireNextEvent();
-                invokeVmDeathHook();
                 return false;
             }
             // A handler that decides not to stop withdraws the stop candidates it added (a
@@ -1681,7 +1703,7 @@ public class JdiEventListener {
      */
     private String evaluateAndFormat(ThreadReference thread, String expression,
                                      Map<String, Value> extraBindings) throws Exception {
-        expressionEvaluator.configureCompilerClasspath(thread);
+        expressionEvaluator.configureCompilerClasspathForEvent(thread);
         final StackFrame frame = thread.frame(0);
         final Value result = expressionEvaluator.evaluate(frame, expression,
             mergeMarkedBindings(extraBindings));
@@ -1739,7 +1761,7 @@ public class JdiEventListener {
                                                   Map<String, Value> extraBindings,
                                                   int breakpointId, String location) {
         try {
-            expressionEvaluator.configureCompilerClasspath(thread);
+            expressionEvaluator.configureCompilerClasspathForEvent(thread);
             final StackFrame frame = thread.frame(0);
             final Value result = expressionEvaluator.evaluate(frame, condition,
                 mergeMarkedBindings(extraBindings));

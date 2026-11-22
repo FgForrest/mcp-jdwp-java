@@ -2,22 +2,31 @@ package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ThreadReference;
+import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
+import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.InOrder;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -47,6 +56,49 @@ class InvocationRunnerTest {
 
 	private InvocationRunner runner(long timeoutMs) {
 		return new InvocationRunner(pool, timeoutMs, history, () -> session);
+	}
+
+	/** Checks that a tool timeout and a competing invocation report the host-side wait. */
+	@Test
+	void pendingClasspathWaitHasAHostSideTimeoutReport(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final CountDownLatch release = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> { release.await(); return List.of(); });
+		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(mock(InMemoryJavaCompiler.class),
+			mock(JDIConnectionService.class), new EvaluationGuard(), provider);
+		final AtomicReference<Thread> worker = new AtomicReference<>();
+		final InvocationRunner runner = new InvocationRunner(command -> {
+			pool.execute(() -> {
+				worker.set(Thread.currentThread());
+				command.run();
+			});
+			// The runner starts its deadline after Executor.execute returns. Wait for the
+			// actual classpath wait so this test exercises the deadline in that phase.
+			await().atMost(30, TimeUnit.SECONDS).until(() -> {
+				final Thread thread = worker.get();
+				return thread != null && Arrays.stream(thread.getStackTrace()).anyMatch(frame ->
+					frame.getClassName().equals("java.util.concurrent.FutureTask") && frame.getMethodName().equals("get"));
+			});
+		}, 100, history, () -> session);
+		final ThreadReference target = thread("main", 1);
+		try {
+			assertThatThrownBy(() -> runner.run(target, "evaluating a.MissingType.VALUE", () -> {
+				evaluator.configureCompilerClasspath(target);
+				return null;
+			})).isInstanceOf(InvocationRunner.StillRunning.class)
+				.hasMessageContaining("waiting for local classpath discovery")
+				.hasMessageContaining("jdwp_diagnose")
+				.hasMessageNotContaining("running in the target")
+				.hasMessageNotContaining("jdwp_resume");
+			assertThatThrownBy(() -> runner.run(target, "another evaluation", () -> null))
+				.isInstanceOf(InvocationRunner.StillRunning.class)
+				.hasMessageContaining("waiting for local classpath discovery")
+				.hasMessageNotContaining("running in the target");
+		} finally {
+			release.countDown();
+			provider.reset();
+		}
 	}
 
 	@Test

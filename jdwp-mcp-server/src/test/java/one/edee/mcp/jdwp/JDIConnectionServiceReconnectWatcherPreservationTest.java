@@ -178,6 +178,6 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		final var ordered = inOrder(listener);
 		ordered.verify(listener).setVmDeathHook(isNull());
 		ordered.verify(listener).stop();
-		ordered.verify(listener).setVmDeathHook(any(Runnable.class));
+		ordered.verify(listener).setVmDeathHook(org.mockito.ArgumentMatchers.notNull());
 	}
 }

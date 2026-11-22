@@ -28,7 +28,7 @@ import static org.mockito.Mockito.when;
  *       of hanging to timeout;</li>
  *   <li>record a {@code VM_DEATH} entry in {@link EventHistory} so {@code jdwp_resume_until_event}
  *       can detect the dead-VM wakeup;</li>
- *   <li>invoke the registered {@link JdiEventListener#setVmDeathHook(Runnable) vm-death hook}
+ *   <li>invoke the registered {@link JdiEventListener#setVmDeathHook(java.util.function.Consumer) vm-death hook}
  *       exactly once so {@link JDIConnectionService#notifyVmDied()} can drop the stale VM
  *       reference without waiting for the next MCP tool call.</li>
  * </ul>
@@ -74,6 +74,7 @@ class JdiEventListenerDisconnectTest {
 		assertThat(released).isTrue();
 	}
 
+	/** Checks post-mortem notification when queue removal throws a transport disconnect. */
 	@Test
 	@DisplayName("VMDisconnectedException path: invokes vm-death hook exactly once and records VM_DEATH")
 	void shouldInvokeVmDeathHookAndRecordVmDeathOnDisconnectException() throws Exception {
@@ -84,7 +85,7 @@ class JdiEventListenerDisconnectTest {
 
 		CountDownLatch hookFired = new CountDownLatch(1);
 		AtomicInteger hookCalls = new AtomicInteger();
-		listener.setVmDeathHook(() -> {
+		listener.setVmDeathHook(deadVm -> {
 			hookCalls.incrementAndGet();
 			hookFired.countDown();
 		});
@@ -100,12 +101,13 @@ class JdiEventListenerDisconnectTest {
 			.isEqualTo("VM_DEATH");
 	}
 
+	/** Checks notification and event history on an explicit VM death event. */
 	@Test
 	@DisplayName("Graceful VMDeathEvent path: invokes vm-death hook exactly once and records VM_DEATH")
 	void shouldInvokeVmDeathHookAndRecordVmDeathOnGracefulVmDeathEvent() throws Exception {
 		CountDownLatch hookFired = new CountDownLatch(1);
 		AtomicInteger hookCalls = new AtomicInteger();
-		listener.setVmDeathHook(() -> {
+		listener.setVmDeathHook(deadVm -> {
 			hookCalls.incrementAndGet();
 			hookFired.countDown();
 		});
@@ -120,12 +122,13 @@ class JdiEventListenerDisconnectTest {
 			.isEqualTo("VM_DEATH");
 	}
 
+	/** Checks notification and event history on an explicit disconnect event. */
 	@Test
 	@DisplayName("Graceful VMDisconnectEvent path: invokes vm-death hook exactly once and records VM_DEATH")
 	void shouldInvokeVmDeathHookAndRecordVmDeathOnGracefulVmDisconnectEvent() throws Exception {
 		CountDownLatch hookFired = new CountDownLatch(1);
 		AtomicInteger hookCalls = new AtomicInteger();
-		listener.setVmDeathHook(() -> {
+		listener.setVmDeathHook(deadVm -> {
 			hookCalls.incrementAndGet();
 			hookFired.countDown();
 		});
@@ -151,12 +154,13 @@ class JdiEventListenerDisconnectTest {
 		assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
 	}
 
+	/** Checks that a failing death callback leaves the listener able to finish teardown. */
 	@Test
 	@DisplayName("Hook that throws does not break VM_DEATH recording or listener termination")
 	void shouldNotThrowWhenVmDeathHookItselfThrows() throws Exception {
 		// Covers the swallow-on-failure contract in invokeVmDeathHook: a buggy hook implementation
 		// must not stop VM_DEATH from being recorded or break the listener's normal exit path.
-		listener.setVmDeathHook(() -> {
+		listener.setVmDeathHook(deadVm -> {
 			throw new RuntimeException("hook failure");
 		});
 
@@ -197,6 +201,7 @@ class JdiEventListenerDisconnectTest {
 			.isEqualTo("VM_DEATH");
 	}
 
+	/** Checks that explicit stop wakes waiters and invokes the death hook once. */
 	@Test
 	@DisplayName("stop() on a parked listener fires the latch and invokes the death hook exactly once")
 	void shouldFireLatchAndInvokeHookWhenStopInterruptsParkedListener() throws Exception {
@@ -217,7 +222,7 @@ class JdiEventListenerDisconnectTest {
 		});
 
 		AtomicInteger hookCalls = new AtomicInteger();
-		listener.setVmDeathHook(hookCalls::incrementAndGet);
+		listener.setVmDeathHook(deadVm -> hookCalls.incrementAndGet());
 		CountDownLatch waiter = tracker.armNextEventLatch();
 
 		listener.start(vm);

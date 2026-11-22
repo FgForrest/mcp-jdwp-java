@@ -1,8 +1,13 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,13 +20,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Tests for the Maven {@code dependency:build-classpath} source of
- * {@link LocalProjectClasspathProvider}. Pins the command-line shape (quiet mode, runtime scope,
- * output file under {@code target/}), the {@code mvnw} preference rule, the silent-skip when no
+ * {@link LocalProjectClasspathProvider}. Pins quiet mode and runtime scope, the
+ * {@code mvnw} preference rule, the silent-skip when no
  * {@code pom.xml} is present, and the timeout the runner is invoked with.
  */
 @DisplayName("LocalProjectClasspathProvider — Maven dependency:build-classpath")
 class LocalProjectClasspathProviderMavenTest {
 
+	/** Runs dependency discovery from a Maven project's root and includes the runner's entries. */
 	@Test
 	@DisplayName("invokes Maven dependency:build-classpath when pom.xml is at the working directory")
 	void shouldInvokeMavenWhenPomXmlExists(@TempDir Path tmp) throws Exception {
@@ -43,16 +49,33 @@ class LocalProjectClasspathProviderMavenTest {
 		final Set<String> entries = provider.discover();
 
 		assertThat(capturedCmd.get()).anyMatch(s -> s.contains("dependency:build-classpath"));
-		// SAFETY: the output file MUST land under target/ (Maven-owned) — never bare in module root.
-		// This assertion enforces the file-safety policy at the design level: if anyone changes
-		// the flag to land elsewhere, this test fails.
-		assertThat(capturedCmd.get())
-			.as("mdep.outputFile must point under target/ — file-safety policy")
-			.anyMatch(s -> s.equals("-Dmdep.outputFile=target/.jdwp-mcp-classpath"));
 		assertThat(entries).contains(
 			"/home/user/.m2/repository/org/foo/foo-1.0.jar",
 			"/home/user/.m2/repository/org/bar/bar-2.0.jar"
 		);
+	}
+
+	@Test
+	@DisplayName("explains a successful Maven run that contributes no dependency jars")
+	void shouldExplainSuccessfulEmptyMavenResult(@TempDir Path tmp) throws Exception {
+		Files.writeString(tmp.resolve("pom.xml"), "<project/>");
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			tmp, envName -> null, (cmd, cwd, t) -> List.of());
+		final Logger logger = (Logger) LoggerFactory.getLogger(LocalProjectClasspathProvider.class);
+		final ListAppender<ILoggingEvent> captured = new ListAppender<>();
+		captured.start();
+		logger.addAppender(captured);
+		try {
+			assertThat(provider.discoverWithBreakdown().failure()).isNull();
+		} finally {
+			logger.detachAppender(captured);
+			captured.stop();
+		}
+
+		assertThat(captured.list).anySatisfy(event -> {
+			assertThat(event.getLevel()).isEqualTo(Level.INFO);
+			assertThat(event.getFormattedMessage()).contains("Maven contributed 0 dependency jars", "no runtime dependencies");
+		});
 	}
 
 	/**

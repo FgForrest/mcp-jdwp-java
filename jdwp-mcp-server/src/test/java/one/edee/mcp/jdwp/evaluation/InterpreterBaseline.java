@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.evaluation.CountingJdwpConnection.Command;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import org.jspecify.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -44,11 +45,13 @@ final class InterpreterBaseline {
         int bytes;
         int compilations;
 
+        /** Counts every compilation: the public overload and the evaluator's captured-options path both end here. */
         @Override
-        public Map<String, byte[]> compile(String className, String sourceCode) throws JdiEvaluationException {
+        Map<String, byte[]> compile(String className, String sourceCode, @Nullable Configuration config)
+            throws JdiEvaluationException {
             final long start = System.nanoTime();
             try {
-                final Map<String, byte[]> result = super.compile(className, sourceCode);
+                final Map<String, byte[]> result = super.compile(className, sourceCode, config);
                 bytes += result.values().stream().mapToInt(bytecode -> bytecode.length).sum();
                 return result;
             } finally {
