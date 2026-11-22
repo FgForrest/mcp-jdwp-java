@@ -1,8 +1,13 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,6 +58,29 @@ class LocalProjectClasspathProviderMavenTest {
 			"/home/user/.m2/repository/org/foo/foo-1.0.jar",
 			"/home/user/.m2/repository/org/bar/bar-2.0.jar"
 		);
+	}
+
+	@Test
+	@DisplayName("explains a successful Maven run that contributes no dependency jars")
+	void shouldExplainSuccessfulEmptyMavenResult(@TempDir Path tmp) throws Exception {
+		Files.writeString(tmp.resolve("pom.xml"), "<project/>");
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			tmp, envName -> null, (cmd, cwd, t) -> List.of());
+		final Logger logger = (Logger) LoggerFactory.getLogger(LocalProjectClasspathProvider.class);
+		final ListAppender<ILoggingEvent> captured = new ListAppender<>();
+		captured.start();
+		logger.addAppender(captured);
+		try {
+			assertThat(provider.discoverWithBreakdown().failure()).isNull();
+		} finally {
+			logger.detachAppender(captured);
+			captured.stop();
+		}
+
+		assertThat(captured.list).anySatisfy(event -> {
+			assertThat(event.getLevel()).isEqualTo(Level.INFO);
+			assertThat(event.getFormattedMessage()).contains("Maven contributed 0 dependency jars", "no runtime dependencies");
+		});
 	}
 
 	/**

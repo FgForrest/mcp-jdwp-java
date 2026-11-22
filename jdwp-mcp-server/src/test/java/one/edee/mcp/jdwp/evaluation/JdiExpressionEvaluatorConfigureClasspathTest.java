@@ -96,30 +96,21 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 	@Test
 	@DisplayName("prewarm warms remote+JDK but defers local merge; first real eval completes it")
 	void prewarmDefersLocalMergeUntilFirstEvaluation() throws Exception {
-		// prewarm runs on the JDI event-listener thread and must never invoke the local provider
-		// (which can shell out to Maven for minutes). It warms only remote discovery + JDK detection;
-		// the first real configureCompilerClasspath then completes the local merge.
-		final LocalProjectClasspathProvider local = mock(LocalProjectClasspathProvider.class);
-		when(local.discover()).thenReturn(java.util.Set.of("/local/a"));
+		final LocalProjectClasspathProvider local = new LocalProjectClasspathProvider(
+			java.nio.file.Path.of("missing-classpath-fixture"), name -> "/local/a", (c, d, t) -> java.util.List.of());
 		final JdiExpressionEvaluator deferEvaluator = new JdiExpressionEvaluator(
 			compiler, jdiService, new EvaluationGuard(), local);
+		deferEvaluator.startLocalClasspathDiscovery();
+		local.discover();
 
-		// prewarm reads the JDK path twice before discovery (outer guard + inner gate); both see
-		// null, then discovery sets it for every subsequent read.
 		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, null, "/opt/jdk");
 		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
 		when(jdiService.getTargetMajorVersion()).thenReturn(21);
 
 		deferEvaluator.prewarmClasspath(thread);
-
-		// Remote discovery happened; the (potentially Maven-shelling) local discover() was NOT run
-		// during prewarm. The cheap cache reset() may still fire on the fresh-connection edge.
-		verify(jdiService).discoverClasspath(thread);
-		verify(local, never()).discover();
-
-		// First real evaluation falls through the JDK-path short-circuit and merges the local fallback.
+		verify(compiler).configure("/opt/jdk", "/app/classes", 21);
 		deferEvaluator.configureCompilerClasspath(thread);
-		verify(local).discover();
+		verify(compiler).configure("/opt/jdk", "/app/classes" + java.io.File.pathSeparator + "/local/a", 21);
 	}
 
 	@Test

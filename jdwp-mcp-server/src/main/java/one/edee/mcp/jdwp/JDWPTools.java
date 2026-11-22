@@ -133,13 +133,9 @@ public class JDWPTools {
      */
     private final JdiHealthMonitor healthMonitor;
     /**
-     * Local-project classpath fallback. Surfaced through {@code jdwp_diagnose} so operators can
-     * see which sources (env override / filesystem / Maven) contributed to the additive classpath
-     * fed into expression evaluation. Memoised per JDI connection; the diagnose path reads the
-     * cached breakdown via {@link LocalProjectClasspathProvider#peekCachedBreakdown()} and never
-     * triggers discovery itself — discovery happens organically on the first expression
-     * evaluation. When the cache is cold the diagnose section prints a "not yet computed" hint
-     * instead of blocking.
+     * Supplies the local project entries used by the evaluator to fill gaps in the remote
+     * classpath. Diagnose reads the background discovery's status, source counts, and failures
+     * without waiting for Maven, which can take up to three minutes on a cold cache.
      */
     private final LocalProjectClasspathProvider localClasspathProvider;
     /**
@@ -2124,11 +2120,8 @@ public class JDWPTools {
             out.append('\n').append(buildDiagnosticReport(false, null));
         }
 
-        // Local project classpath section: shows which entries the additive fallback contributed
-        // to expression evaluation. Independent of connection state so operators can sanity-check
-        // their CWD even before attaching. NON-BLOCKING: reads only the cached breakdown via
-        // peekCachedBreakdown(); never triggers a Maven invocation. When the cache is cold the
-        // block prints a "not yet computed" hint and discovery happens on the first eval.
+        // Show the project directory even before attach. The report remains available while
+        // Maven runs because this block reads the background discovery's current status.
         out.append(renderLocalClasspathBlock());
 
         out.append(renderLocalJvmsBlock(status, inspectAll));
@@ -2136,11 +2129,10 @@ public class JDWPTools {
     }
 
     /**
-     * Renders the "Local project classpath" diagnose section. NON-BLOCKING by design — calls into
-     * {@link LocalProjectClasspathProvider#peekCachedBreakdown()} so the report never waits on a
-     * cold-cache Maven invocation (which can take up to ~3 min). When the cache is cold the block
-     * prints a "not yet computed" hint; the breakdown populates organically the next time
-     * expression evaluation runs.
+     * Renders the background discovery's current status on the diagnose tool's thread.
+     * Reading the snapshot leaves diagnose available during a Maven run of up to three minutes.
+     * It reports whether discovery is pending, then reports the counts by source and any failure
+     * once the breakdown is ready. The root POM check and env-var lookup are independent of the scan.
      *
      * <p>The env-state line is three-way:
      * {@code (unset)} when the variable is absent, {@code (set, no entries)} when present but
@@ -2149,26 +2141,26 @@ public class JDWPTools {
      */
     private String renderLocalClasspathBlock() {
         final StringBuilder out = new StringBuilder("\n▸ Local project classpath\n");
-        out.append("  (read from cache; populated on first expression evaluation)\n");
         try {
-            final LocalProjectClasspathProvider.Breakdown breakdown =
-                localClasspathProvider.peekCachedBreakdown();
-            out.append("  CWD: ").append(localClasspathProvider.getWorkingDirectory())
-                .append(localClasspathProvider.isWorkingDirectoryReportedByClient()
-                    ? " (session directory reported by the MCP client)" : "")
+            final LocalProjectClasspathProvider.DiscoveryStatus status = localClasspathProvider.discoveryStatus();
+            final LocalProjectClasspathProvider.Breakdown breakdown = status.breakdown();
+            out.append("  CWD: ").append(status.directory())
+                .append(status.reportedByClient() ? " (session directory reported by the MCP client)" : "")
                 .append('\n');
-            out.append("  pom.xml: ").append(localClasspathProvider.hasPomAtRoot() ? "yes" : "no").append('\n');
-            final String envState = renderEnvState(breakdown);
-            if (breakdown == null) {
-                out.append("  (not yet computed; will populate on first expression evaluation)\n");
-                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
-            } else {
+            out.append("  pom.xml: ").append(status.hasPomAtRoot() ? "yes" : "no").append('\n');
+            final String problem = status.problem();
+            if (problem != null) {
+                out.append("  ").append(problem).append('\n');
+            }
+            if (breakdown != null) {
                 out.append("  Sources: env-override=").append(breakdown.envOverride())
                     .append(", filesystem=").append(breakdown.filesystem())
                     .append(", maven=").append(breakdown.maven()).append('\n');
                 out.append("  Total local entries: ").append(breakdown.all().size()).append('\n');
-                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
+            } else if (!status.running()) {
+                out.append("  (not yet computed for this directory)\n");
             }
+            out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(renderEnvState(breakdown)).append('\n');
         } catch (Exception e) {
             log.warn("Local classpath discovery failed during diagnose", e);
             out.append("  (local classpath discovery failed: ").append(e.getMessage()).append(")\n");

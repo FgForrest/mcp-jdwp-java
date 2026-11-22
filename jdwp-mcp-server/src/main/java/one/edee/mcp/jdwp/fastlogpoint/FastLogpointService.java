@@ -1579,7 +1579,7 @@ public class FastLogpointService {
         // In a constructor `this` may still be uninitialized at the line; passing it would not verify.
         final boolean includeThis = !method.isStatic() && !method.isConstructor();
 
-        expressionEvaluator.configureCompilerClasspath(thread);
+        expressionEvaluator.configureCompilerClasspathForEvent(thread);
         if (flp.kind == Kind.LOGPOINT) {
             logArmingHit(flp, thread, location);
         } else if (evaluateArmingHit(flp, thread, location)) {

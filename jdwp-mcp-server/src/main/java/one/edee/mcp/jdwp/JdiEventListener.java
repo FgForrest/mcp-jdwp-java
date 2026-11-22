@@ -71,7 +71,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} directly — promotion happens
  * lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call. Logpoint and
  * conditional-BP handlers DO end up calling it indirectly the first time after connect (via
- * {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}); the safety-net
+ * {@code configureCompilerClasspathForEvent} → {@code discoverClasspath} → {@code getVM}); the safety-net
  * promoter is strictly passive (it never calls {@code invokeMethod} on the target VM), so it is
  * safe to invoke from any event-processing context.
  * <p>
@@ -383,6 +383,7 @@ public class JdiEventListener {
      */
     public void start(VirtualMachine vm) {
         stop();
+        expressionEvaluator.startLocalClasspathDiscovery();
 
         // Re-arm the death-hook gate so a reconnect after a clean disconnect still fires the hook
         // on the second disconnect.
@@ -1681,7 +1682,7 @@ public class JdiEventListener {
      */
     private String evaluateAndFormat(ThreadReference thread, String expression,
                                      Map<String, Value> extraBindings) throws Exception {
-        expressionEvaluator.configureCompilerClasspath(thread);
+        expressionEvaluator.configureCompilerClasspathForEvent(thread);
         final StackFrame frame = thread.frame(0);
         final Value result = expressionEvaluator.evaluate(frame, expression,
             mergeMarkedBindings(extraBindings));
@@ -1739,7 +1740,7 @@ public class JdiEventListener {
                                                   Map<String, Value> extraBindings,
                                                   int breakpointId, String location) {
         try {
-            expressionEvaluator.configureCompilerClasspath(thread);
+            expressionEvaluator.configureCompilerClasspathForEvent(thread);
             final StackFrame frame = thread.frame(0);
             final Value result = expressionEvaluator.evaluate(frame, condition,
                 mergeMarkedBindings(extraBindings));

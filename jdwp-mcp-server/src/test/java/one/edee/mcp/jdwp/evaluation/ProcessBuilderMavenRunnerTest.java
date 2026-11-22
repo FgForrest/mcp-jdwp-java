@@ -6,12 +6,14 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for {@link ProcessBuilderMavenRunner}: the {@code .jdwp-mcp-classpath} harvester (parent
@@ -67,15 +69,14 @@ class ProcessBuilderMavenRunnerTest {
 	}
 
 	@Test
-	@DisplayName("returns empty list when the command executor reports a non-zero exit code")
-	void shouldReturnEmptyListWhenMavenExitsNonzero(@TempDir Path tmp) throws Exception {
+	@DisplayName("reports a non-zero Maven exit code")
+	void shouldReportNonzeroMavenExit(@TempDir Path tmp) throws Exception {
 		Files.createDirectories(tmp.resolve("target"));
 		Files.writeString(tmp.resolve("target/.jdwp-mcp-classpath"), "/m2/foo.jar");
 		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> 1);
 
-		final List<String> result = runner.run(List.of("false"), tmp, 10);
-
-		assertThat(result).isEmpty();
+		assertThatThrownBy(() -> runner.run(List.of("false"), tmp, 10))
+			.isInstanceOf(IOException.class).hasMessageContaining("Maven exited with code 1");
 	}
 
 	/**
@@ -108,15 +109,10 @@ class ProcessBuilderMavenRunnerTest {
 				throw new InterruptedException("simulated interrupt; stub does not spawn anything");
 			});
 
-			final List<String> result = runner.run(List.of("anything"), tmp, 10);
-
-			assertThat(result).isEmpty();
+			assertThatThrownBy(() -> runner.run(List.of("anything"), tmp, 10))
+				.isInstanceOf(InterruptedException.class);
 			assertThat(sibling.isAlive())
 				.as("Sibling subprocess must NOT be destroyed by run() — process ownership is scoped to the executor")
-				.isTrue();
-			// Interrupt flag must be restored so the caller can observe the cancellation.
-			assertThat(Thread.interrupted())
-				.as("run() must restore the interrupt flag")
 				.isTrue();
 		} finally {
 			sibling.destroyForcibly();
@@ -148,10 +144,10 @@ class ProcessBuilderMavenRunnerTest {
 		final long startTime = System.currentTimeMillis();
 		// 1s timeout against a 30s sleep — the runner must terminate the child within a few
 		// seconds of the budget, not 30s later.
-		final List<String> result = runner.run(List.of("sleep", "30"), tmp, 1);
+		assertThatThrownBy(() -> runner.run(List.of("sleep", "30"), tmp, 1))
+			.isInstanceOf(IOException.class).hasMessageContaining("Maven timed out");
 		final long elapsed = System.currentTimeMillis() - startTime;
 
-		assertThat(result).isEmpty();
 		assertThat(elapsed)
 			.as("Runner must enforce timeout — should return within ~5s, not wait the full 30")
 			.isLessThan(8_000);

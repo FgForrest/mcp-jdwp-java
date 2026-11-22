@@ -27,6 +27,10 @@ This block answers "what process is the agent talking to?". Useful when a sessio
 
 When connected, an inline breakpoint-and-events sub-report is appended (`JDWPTools.java:1239-1241`, via `buildDiagnosticReport(false, null)` at line 1307+). That gives the agent the breakpoint registry state and the recent event timeline without having to fan out across multiple tool calls.
 
+### Local project classpath
+
+This section shows the current project directory, whether the client reported it, the presence of a root `pom.xml`, and the state of `JDWP_EXTRA_CLASSPATH`. It reports progress while discovery runs and shows the per-source counts, total entries, and any Maven failure when it finishes. Diagnose reads the available snapshot immediately.
+
 ### Block 3 — Local JVMs
 
 `renderLocalJvmsBlock` (`JDWPTools.java:1252-1283`) lists every same-user Java process the server could detect, with its JDWP port (when known) and reachability state. The MCP server's own PID is filtered out (`DiagnoseReportRenderer.java:120-127`) to avoid noisy self-entries.
@@ -180,7 +184,7 @@ The server reads no timeout variables; how long a server may take to start and a
 
 - **Claude Code** waits 30 s for an MCP server to start (`MCP_TIMEOUT`, in ms); Spring Boot context init plus the JDI module load take a few seconds. Its wait for a tool call (`MCP_TOOL_TIMEOUT`, or a per-server `timeout` in ms) is long by default. Both variables are read from Claude Code's own environment (`MCP_TIMEOUT=60000 claude`); an `env` entry in the MCP server registration only reaches the server process. Up to 2.11.2, `.claude-plugin/plugin.json` set both there, to no effect.
 - **Codex** has its own defaults. `mcp.json` cannot change them (a stdio entry allows only `type`, `command`, `args`, `env` and `cwd`), so a plugin install lives with them: the launcher's first start, which downloads or builds the JAR, can outlast the startup wait, and the next session finds the JAR (§ 8). A manual registration sets `startup_timeout_sec` and `tool_timeout_sec` on its `[mcp_servers.jdwp-inspector]` entry in `~/.codex/config.toml`.
-- **Which calls need a long client wait.** A tool's invocation in the target — `jdwp_evaluate_expression`, including the first one, which discovers the classpath and may run `mvn dependency:build-classpath` (bounded at 180 s) — is bounded at 20 s by `InvocationRunner` and then answers `[STILL_RUNNING]` ([threading-and-safety.md](threading-and-safety.md) § 5). What blocks longer are `jdwp_resume_until_event` and `jdwp_wait_for_attach`, for as long as the `timeoutMs` the agent passes (default 30 s). The client's tool-call timeout must exceed that.
+- **Which calls need a long client wait.** A tool's invocation in the target — `jdwp_evaluate_expression`, including an evaluation still waiting for background classpath discovery — is bounded at 20 s by `InvocationRunner` and then answers `[STILL_RUNNING]` ([threading-and-safety.md](threading-and-safety.md) § 5). What blocks longer are `jdwp_resume_until_event` and `jdwp_wait_for_attach`, for as long as the `timeoutMs` the agent passes (default 30 s). The client's tool-call timeout must exceed that. Maven discovery starts at attach and has a 180 s process budget.
 
 ## 7. The MCP resources — `jdwp://diagnose` and `jdwp://jvms`
 

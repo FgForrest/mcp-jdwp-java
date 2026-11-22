@@ -31,8 +31,7 @@ import java.util.regex.Pattern;
  * <p>Responsibility boundary: this class owns the process invocation, timeout enforcement, stdout
  * draining, and output-file collection. It NEVER deletes files — {@code target/} is Maven-owned
  * and gets wiped by {@code mvn clean}; arbitrary deletion in the project tree is prohibited by the
- * file-safety policy. Honours the {@link LocalProjectClasspathProvider.MavenRunner} empty-list-on-failure
- * contract: every error path returns {@link List#of()} after logging.
+ * file-safety policy. Callers receive the failure so they can diagnose a partial classpath.
  *
  * <p>Thread model: each {@link #run} invocation spawns ONE daemon platform thread named
  * {@code jdwp-mcp-maven-stdout-drainer} to drain the child process's merged stdout/stderr stream.
@@ -71,29 +70,16 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     @Override
-    public List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds) {
-        try {
-            final int exitCode = commandExecutor.execute(new CommandRequest(command, workingDirectory, timeoutSeconds));
-            // executeRealCommand already logs WARN with the captured stdout on non-zero/timeout;
-            // no second log line here.
-            if (exitCode != 0) {
-                return List.of();
-            }
-            return harvestOutputFiles(workingDirectory);
-        } catch (InterruptedException ie) {
-            // executeRealCommand kills its own child process and its descendants before throwing —
-            // process ownership is scoped to whoever spawned it. Restore the interrupt flag and
-            // return so the caller higher up the stack can observe the cancellation. We deliberately
-            // do NOT consult `ProcessHandle.current().descendants()` here: that would forcibly kill
-            // any unrelated subprocess another server component happened to start in the same window.
-            Thread.currentThread().interrupt();
-            log.warn("[LocalClasspath] Maven invocation interrupted (cwd={})", workingDirectory);
-            return List.of();
-        } catch (Exception e) {
-            log.warn("[LocalClasspath] Maven invocation failed: {}: {} (cwd={})",
-                e.getClass().getSimpleName(), e.getMessage(), workingDirectory);
-            return List.of();
+    public List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds)
+        throws IOException, InterruptedException {
+        final int exitCode = commandExecutor.execute(new CommandRequest(command, workingDirectory, timeoutSeconds));
+        if (exitCode == -1) {
+            throw new IOException("Maven timed out after " + timeoutSeconds + " seconds");
         }
+        if (exitCode != 0) {
+            throw new IOException("Maven exited with code " + exitCode);
+        }
+        return harvestOutputFiles(workingDirectory);
     }
 
     /**
@@ -261,10 +247,11 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
                 return -1;
             }
         } catch (InterruptedException ie) {
-            // waitFor was interrupted — kill the child AND its descendants (Maven can fork helpers),
-            // restore the interrupt flag, propagate so the outer run() returns empty and surfaces
-            // the cancellation. Only THIS Maven process and its descendants are touched — never
-            // unrelated subprocesses owned by other server components.
+            // waitFor was interrupted. Kill the Maven child and its descendants, since Maven
+            // can fork helpers. Restore the interrupt flag and propagate the interruption so the
+            // caller can observe the cancellation. A ProcessHandle.current().descendants() sweep
+            // could also kill subprocesses owned by other server components, so scope cleanup
+            // to the process this invocation started.
             destroyProcessTree(process);
             Thread.currentThread().interrupt();
             throw ie;
@@ -349,7 +336,7 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     /** Seam for the actual process execution; returns the child's exit code (or {@code -1} on timeout). */
     @FunctionalInterface
     interface CommandExecutor {
-        int execute(CommandRequest request) throws Exception;
+        int execute(CommandRequest request) throws IOException, InterruptedException;
     }
 
     /** Bundles the inputs the {@link CommandExecutor} needs so the seam stays a single-arg lambda. */

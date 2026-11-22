@@ -6,7 +6,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,7 +36,7 @@ class InMemoryJavaCompilerConfigureTest {
 			String jdkHome = System.getProperty("java.home");
 			compiler.configure(jdkHome, "", -1);
 
-			assertThat(readTargetMajorVersion()).isEqualTo(8);
+			assertThat(compiledClassVersion()).isEqualTo(52);
 		}
 
 		@Test
@@ -45,7 +45,7 @@ class InMemoryJavaCompilerConfigureTest {
 			String jdkHome = System.getProperty("java.home");
 			compiler.configure(jdkHome, "", 0);
 
-			assertThat(readTargetMajorVersion()).isEqualTo(8);
+			assertThat(compiledClassVersion()).isEqualTo(52);
 		}
 
 		@Test
@@ -54,14 +54,9 @@ class InMemoryJavaCompilerConfigureTest {
 			String jdkHome = System.getProperty("java.home");
 			compiler.configure(jdkHome, "", 17);
 
-			assertThat(readTargetMajorVersion()).isEqualTo(17);
+			assertThat(compiledClassVersion()).isEqualTo(61);
 		}
 
-		private int readTargetMajorVersion() throws Exception {
-			Field field = InMemoryJavaCompiler.class.getDeclaredField("targetMajorVersion");
-			field.setAccessible(true);
-			return (int) field.get(compiler);
-		}
 	}
 
 	@Nested
@@ -108,28 +103,24 @@ class InMemoryJavaCompilerConfigureTest {
 		}
 
 		@Test
-		@DisplayName("Reset clears jdkPath, classpath, and restores the default target version")
-		void shouldClearConfiguredState() throws Exception {
+		@DisplayName("After reset, compilation uses the new target version")
+		void shouldUseNewConfigurationAfterReset() throws Exception {
 			final String jdkHome = System.getProperty("java.home");
-			compiler.configure(jdkHome, "/some/app.jar", 21);
+			compiler.configure(jdkHome, "", 17);
+			assertThat(compiledClassVersion()).isEqualTo(61);
 
 			compiler.reset();
+			compiler.configure(jdkHome, "", 8);
 
-			assertThat(readField("jdkPath")).isNull();
-			assertThat(readField("classpath")).isNull();
-			assertThat(readTargetMajorVersion()).isEqualTo(8);
+			assertThat(compiledClassVersion()).isEqualTo(52);
 		}
 
-		private Object readField(String name) throws Exception {
-			final Field field = InMemoryJavaCompiler.class.getDeclaredField(name);
-			field.setAccessible(true);
-			return field.get(compiler);
-		}
-
-		private int readTargetMajorVersion() throws Exception {
-			final Field field = InMemoryJavaCompiler.class.getDeclaredField("targetMajorVersion");
-			field.setAccessible(true);
-			return (int) field.get(compiler);
-		}
 	}
+
+	private int compiledClassVersion() throws JdiEvaluationException {
+		final byte[] bytecode = compiler.compile("VersionProbe", "public class VersionProbe {}").get("VersionProbe");
+		// Classfile header: four-byte magic, two-byte minor version, then major version.
+		return ByteBuffer.wrap(bytecode).getShort(6);
+	}
+
 }

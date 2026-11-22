@@ -56,11 +56,11 @@ The target type is visible to the running JVM but invisible to the wrapper compi
 
 Work through these in order:
 
-1. **Run `jdwp_diagnose` and read the `Local project classpath` block.** Its `CWD` line names the project directory that was scanned (marked `session directory reported by the MCP client` under Codex), whether `pom.xml` was found, and a per-source breakdown — `Sources: env-override=N, filesystem=N, maven=N`. All zeros means the fallback contributed nothing; that's the gap to fill.
+1. **Run `jdwp_diagnose` and read the `Local project classpath` block.** Its `CWD` line names the project directory that was scanned (marked `session directory reported by the MCP client` under Codex), whether `pom.xml` was found, and a per-source breakdown — `Sources: env-override=N, filesystem=N, maven=N`. While discovery runs, this block shows its status. After discovery, check the counts and any Maven failure.
 
 2. **Set `JDWP_EXTRA_CLASSPATH` to add specific jars or class directories.** Colon-separated on Linux/macOS, semicolon-separated on Windows (parsed with `File.pathSeparator`). Restart the MCP server after setting the variable — the provider memoizes for the JDI connection's lifetime. This is the right lever when a single JAR is missing or the project is Gradle (Gradle is not auto-detected in v1).
 
-3. **Start the agent session in a directory containing a Maven `pom.xml`.** The filesystem scan walks depth-5 looking for `target/classes` / `target/test-classes`, and `dependency:build-classpath` runs per detected module. First call on a cold Maven cache can take up to 3 minutes — that's expected, not a hang. `jdwp_diagnose` warns about the latency in the section header.
+3. **Start the agent session in a directory containing a Maven `pom.xml`.** The filesystem scan walks depth-5 looking for `target/classes` / `target/test-classes`, and the server runs `dependency:build-classpath` from the project root on attach. Cold Maven caches can take up to 3 minutes. Conditions and logpoints use the available remote classpath while discovery runs.
 
 4. **Check the server log for `[LocalClasspath]` lines.** Every source emits at least one entry: `INFO` for successful contributions and timings, `WARN` for Maven non-zero exits / timeouts / malformed env values (with the captured stdout). The same prefix covers `LocalProjectClasspathProvider`, `ProcessBuilderMavenRunner`, and the union step in `JdiExpressionEvaluator`. Remote-side failures use the `[Discoverer]` / `[JDI]` prefixes — both worth grepping when eval breaks.
 

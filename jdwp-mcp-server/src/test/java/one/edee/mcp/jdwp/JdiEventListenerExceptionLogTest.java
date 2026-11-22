@@ -120,7 +120,7 @@ class JdiEventListenerExceptionLogTest {
 		runListenerWith(listener, eventSet);
 
 		verify(eventSet).resume();
-		verify(evaluator).configureCompilerClasspath(thread);
+		verify(evaluator).configureCompilerClasspathForEvent(thread);
 		verify(evaluator).evaluate(eq(frame), eq("$exception.getMessage()"),
 			eq(Map.of("$exception", exception)));
 

@@ -49,16 +49,13 @@ final class LiveSession implements AutoCloseable {
 	final FastLogpointService fastLogpoints;
 	final JDWPTools tools;
 
-	private LiveSession(Process process, int port) {
+	private LiveSession(Process process, int port, LocalProjectClasspathProvider localClasspath) {
 		this.process = process;
 		this.port = port;
 		final EvaluationGuard guard = new EvaluationGuard();
 		final MarkedInstanceRegistry marks = new MarkedInstanceRegistry();
 		final WatcherManager watchers = new WatcherManager();
 		final JdiHealthMonitor health = new JdiHealthMonitor();
-		final LocalProjectClasspathProvider noLocalClasspath = new LocalProjectClasspathProvider(
-			Path.of(System.getProperty("java.io.tmpdir"), "fast-logpoint-live-" + UUID.randomUUID()),
-			name -> null, (command, workingDirectory, timeoutSeconds) -> List.of());
 		// The listener and the evaluator depend on each other through the connection service;
 		// Spring breaks the cycle with @Lazy, the test with a delegating stand-in.
 		final AtomicReference<JdiExpressionEvaluator> evaluatorRef = new AtomicReference<>();
@@ -72,14 +69,20 @@ final class LiveSession implements AutoCloseable {
 		final JdiEventListener listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks);
 		connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health, new JvmDiscoveryService());
 		final JdiExpressionEvaluator evaluator =
-			new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, noLocalClasspath);
+			new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, localClasspath);
 		evaluatorRef.set(evaluator);
 		fastLogpoints = new FastLogpointService(tracker, history, guard, evaluator, listener, connection);
 		tools = new JDWPTools(connection, tracker, watchers, evaluator, history, guard,
-			mock(JvmDiscoveryService.class), marks, health, noLocalClasspath, fastLogpoints);
+			mock(JvmDiscoveryService.class), marks, health, localClasspath, fastLogpoints);
 	}
 
 	static LiveSession start(List<String> extraJvmArgs) throws Exception {
+		return start(extraJvmArgs, new LocalProjectClasspathProvider(
+			Path.of(System.getProperty("java.io.tmpdir"), "fast-logpoint-live-" + UUID.randomUUID()),
+			name -> null, (command, workingDirectory, timeoutSeconds) -> List.of()));
+	}
+
+	static LiveSession start(List<String> extraJvmArgs, LocalProjectClasspathProvider localClasspath) throws Exception {
 		final String classpath = Path.of(FastLogpointTarget.class.getProtectionDomain().getCodeSource()
 			.getLocation().toURI()).toString();
 		// A fixed port, not :0 — after a detach the agent listens again on the same address, and the
@@ -95,7 +98,7 @@ final class LiveSession implements AutoCloseable {
 		command.addAll(List.of("-cp", classpath, TARGET, "2"));
 		final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 		awaitReady(process);
-		final LiveSession session = new LiveSession(process, port);
+		final LiveSession session = new LiveSession(process, port, localClasspath);
 		session.connection.connect("127.0.0.1", port);
 		return session;
 	}

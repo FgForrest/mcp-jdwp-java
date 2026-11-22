@@ -152,7 +152,7 @@ A full ECJ compile against a fully-loaded classpath plus the JDWP-side `defineCl
 
 ### Other clear paths
 
-The cache is also cleared proactively on every `configureCompilerClasspath()` call (`JdiExpressionEvaluator.java:656`). The reasoning: reconnecting to a different target VM (or even the same one after a class-load event) may invalidate previously-compiled bytecode because the target's class set has shifted.
+The evaluator replaces the compilation cache when the compiler is reset for a new connection or reconfigured after merging local classpath entries. An in-flight compilation keeps its original cache reference, so its result cannot repopulate the replacement cache.
 
 ## 7. Byte-array mirroring — the O(n) cost
 
