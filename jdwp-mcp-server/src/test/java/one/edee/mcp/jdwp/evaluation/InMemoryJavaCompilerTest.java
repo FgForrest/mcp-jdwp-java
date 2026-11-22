@@ -120,6 +120,17 @@ class InMemoryJavaCompilerTest {
 			assertThatThrownBy(() -> compiler.compile("Probe", source)).isExactlyInstanceOf(expected);
 		}
 
+		/**
+		 * U+1C90 became an identifier letter after Java 8. The classifier scans at the compile's source level, so a
+		 * misspelled local that contains it stays a permanent error instead of a missing classpath type.
+		 */
+		@Test
+		void classifiesAnIdentifierOfTheCompileSourceLevelAsAnUnresolvedValue() {
+			compiler.configure(System.getProperty("java.home"), "", Runtime.version().feature());
+			final String source = "public class Probe { Object read() { return missᲐngLocal; } }";
+			assertThatThrownBy(() -> compiler.compile("Probe", source)).isExactlyInstanceOf(JdiEvaluationException.class);
+		}
+
 		@Test
 		void shouldCompileSimpleClass() throws JdiEvaluationException {
 			String jdkHome = System.getProperty("java.home");
