@@ -5,6 +5,7 @@ import com.sun.jdi.event.*;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.*;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -305,7 +306,7 @@ class InterpreterHarnessLiveTest {
     private static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
         return new JDIConnectionService(mock(JdiEventListener.class),
             new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
-            new MarkedInstanceRegistry(), new JdiHealthMonitor()) {
+            new MarkedInstanceRegistry(), new JdiHealthMonitor(), mock(JvmDiscoveryService.class)) {
             @Override
             public VirtualMachine getVM() {
                 return vm;
