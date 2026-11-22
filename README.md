@@ -385,7 +385,7 @@ An ordinary conditional breakpoint or logpoint on that line goes through the deb
 
 ### #11 The Missing Pickup
 
-**Difficulty:** Moderate | **Test:** `PickupDeskTest` | **Package:** `pickup` | **Par:** 3 | **Exercises:** read-only expression evaluation across package boundaries
+**Difficulty:** Moderate | **Test:** `PickupDeskTest` | **Package:** `pickup` | **Par:** 3 | **Exercises:** expression eval
 
 **Symptom:** `Pickup unavailable for the selected location ==> expected: <true> but was: <false>` — a listed pickup point is reported as unavailable.
 
