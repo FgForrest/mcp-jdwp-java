@@ -114,6 +114,11 @@ public class InterpreterTarget extends InterpreterTargetBase {
         return step("M", first + second);
     }
 
+    public int inspectInner() {
+        new Inner().inspect();
+        return step("I", 1);
+    }
+
     /** javac oracle for expressions the separately compiled evaluation wrapper cannot see. */
     public Object golden(String id) {
         return switch (id) {

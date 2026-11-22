@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
 import com.sun.jdi.event.*;
+import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
@@ -34,31 +35,31 @@ class InterpreterHarnessLiveTest {
         TARGET, "main", PACKAGE_STOP, "package", TARGET + "$Inner", "inner");
     private static final Set<String> STOPS = Set.of("main", "package", "inner", "exception", "field");
     private static final String BASELINE_ID = "local-arithmetic";
+    private static final int COLD_TRIALS = 5;
+    private static final int HITS_PER_TRIAL = 5;
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final Set<String> FIXTURE_GOLDENS = Set.of("private-field", "private-map", "private-map-call",
         "private-session", "private-method", "super-call", "generic-receiver", "outer-this", "exception-detail");
-    private static final Map<String, String> PRIMITIVES = Map.of(
-        "java.lang.Boolean", "boolean", "java.lang.Byte", "byte", "java.lang.Character", "char",
-        "java.lang.Short", "short", "java.lang.Integer", "int", "java.lang.Long", "long",
-        "java.lang.Float", "float", "java.lang.Double", "double");
+    private static final String COLD_CLASS = TARGET + "$Cold";
 
     /** A candidate engine can read a fresh frame and use the same bindings the oracle saw. */
     record EvaluationContext(Entry entry, ThreadReference thread, Map<String, Value> bindings,
-                             JDIConnectionService connection) {
+                             JDIConnectionService connection, Map<String, ObjectReference> fixtureReferences) {
         StackFrame frame() throws IncompatibleThreadStateException {
             return thread.frame(0);
         }
 
         Outcome render(@Nullable Value value) {
-            final String type = value == null ? "null" : value.type().name();
             String rendered = connection.formatFieldValue(value);
             if (value instanceof ObjectReference && !(value instanceof StringReference)) {
                 rendered = rendered.replaceFirst("^(Object|Array)#\\d+ ", "$1#<id> ");
             }
-            if ("char-array-string".equals(entry.id())) {
+            final boolean normalizeCharArrayString = "char-array-string".equals(entry.id());
+            if (normalizeCharArrayString) {
                 rendered = rendered.replaceFirst("^\"\\[C@[0-9a-f]+\"$", "\"[C@<hash>\"");
             }
-            return new Outcome("value", PRIMITIVES.getOrDefault(type, type), rendered);
+            final var facts = InterpreterValueFacts.capture(value, fixtureReferences, normalizeCharArrayString);
+            return new Outcome("value", facts.javaClass(), rendered, facts);
         }
     }
 
@@ -67,9 +68,9 @@ class InterpreterHarnessLiveTest {
         Outcome evaluate(EvaluationContext context) throws Exception;
     }
 
-    record Outcome(String kind, String javaClass, String rendered) {
+    record Outcome(String kind, String javaClass, String rendered, @Nullable InterpreterValueFacts facts) {
         static Outcome targetException(String javaClass) {
-            return new Outcome("exception", javaClass, javaClass);
+            return new Outcome("exception", javaClass, javaClass, null);
         }
 
         String expectedClass() {
@@ -80,7 +81,7 @@ class InterpreterHarnessLiveTest {
     record Calls(int count, String order) {
     }
 
-    record Observation(Outcome outcome, Calls calls) {
+    record Observation(Outcome outcome, Calls calls, Map<String, Boolean> initializedClasses) {
     }
 
     record Row(String id, @Nullable String stop, @Nullable Observation compiled,
@@ -89,13 +90,163 @@ class InterpreterHarnessLiveTest {
 
     @FunctionalInterface
     interface BeforeMain {
-        void measure(EvaluationContext context) throws Exception;
+        void run(ThreadReference thread) throws Exception;
+    }
+
+    private record AttachedFixture(VirtualMachine vm, CountingJdwpConnection wire, EvaluationGuard guard,
+                                   JDIConnectionService connection) {
+        JdiExpressionEvaluator evaluator(InMemoryJavaCompiler compiler) {
+            return new JdiExpressionEvaluator(compiler, connection, guard, noLocalClasspath());
+        }
+    }
+
+    @FunctionalInterface
+    private interface FixtureAction<T> {
+        T run(AttachedFixture fixture) throws Exception;
+    }
+
+    private record Trial(String version, InterpreterBaseline.Sample cold, List<InterpreterBaseline.Sample> hits) {
+    }
+
+    private record TargetSamples(Path javaHome, String version, List<InterpreterBaseline.Sample> cold,
+                                 List<InterpreterBaseline.Sample> hits) {
+    }
+
+    @Test
+    void distinguishesReferenceMeaningAcrossReplays() throws Exception {
+        final var distinct = List.of(mainRow("class-literal", "int[].class"), mainRow("array-value", "items"),
+            mainRow("array-identity", "items"), mainRow("private-map", "store.map"));
+        final var entries = new ArrayList<>(distinct);
+        entries.addAll(List.of(mainRow("boxed", "boxed"), mainRow("string", "text"),
+            mainRow("bounded-array", "new int[20]")));
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            final var oracle = replayTestEngine(javaHome, entries, context -> testReference(context, false));
+            final var wrong = replayTestEngine(javaHome, entries, context -> testReference(context, true));
+            for (Entry entry : distinct) {
+                assertThat(wrong.get(entry.id()).outcome().rendered())
+                    .as(entry.id()).isEqualTo(oracle.get(entry.id()).outcome().rendered());
+                assertThat(wrong.get(entry.id())).as(entry.id()).isNotEqualTo(oracle.get(entry.id()));
+            }
+            assertThat(wrong.get("boxed")).isEqualTo(oracle.get("boxed"));
+            assertThat(facts(oracle, "boxed").scalar()).isEqualTo("1000");
+            assertThat(wrong.get("string")).isEqualTo(oracle.get("string"));
+            assertThat(facts(oracle, "string").scalar()).isEqualTo("abc");
+            final var array = Objects.requireNonNull(facts(oracle, "bounded-array").array());
+            assertThat(array.length()).isEqualTo(20);
+            assertThat(array.elements()).hasSize(16).allSatisfy(element -> assertThat(element.scalar()).isEqualTo("0"));
+        }
+    }
+
+    @Test
+    void distinguishesPrematureInitializationEvenWhenValuesAgree() throws Exception {
+        final var entries = List.of(mainRow("cold-constant", TARGET + ".Cold.CONSTANT"),
+            mainRow("cold-static", TARGET + ".Cold.initialized"), mainRow("cold-static-counter", "initializations"));
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            final var oracle = replayTestEngine(javaHome, entries, coldTestEngine(false));
+            final var wrong = replayTestEngine(javaHome, entries, coldTestEngine(true));
+            for (Entry entry : entries) {
+                assertThat(wrong.get(entry.id()).outcome()).as(entry.id()).isEqualTo(oracle.get(entry.id()).outcome());
+            }
+            assertThat(wrong.get("cold-constant")).isNotEqualTo(oracle.get("cold-constant"));
+            assertThat(oracle.get("cold-constant").initializedClasses()).containsEntry(COLD_CLASS, false);
+            assertThat(wrong.get("cold-constant").initializedClasses()).containsEntry(COLD_CLASS, true);
+            assertThat(wrong.get("cold-static")).isEqualTo(oracle.get("cold-static"));
+            assertThat(wrong.get("cold-static-counter")).isEqualTo(oracle.get("cold-static-counter"));
+        }
+    }
+
+    @Test
+    void evaluatingAStopHasNoSuspendingRequestForAFutureStop() throws Exception {
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            replayTestEngine(javaHome, List.of(mainRow("main-probe", "1")), context -> {
+                final var requests = context.thread().virtualMachine().eventRequestManager();
+                assertThat(requests.breakpointRequests()).isEmpty();
+                assertThat(requests.classPrepareRequests()).noneMatch(EventRequest::isEnabled);
+                return context.render(context.thread().virtualMachine().mirrorOf(1));
+            });
+        }
+    }
+
+    private static Entry mainRow(String id, String expression) {
+        return new Entry(id, "jdwp_evaluate_expression", "expression", expression, "main", null, null);
+    }
+
+    private static InterpreterValueFacts facts(Map<String, Observation> observations, String id) {
+        return Objects.requireNonNull(observations.get(id).outcome().facts());
+    }
+
+    private static Outcome testReference(EvaluationContext context, boolean wrong) throws Exception {
+        final VirtualMachine vm = context.thread().virtualMachine();
+        final StackFrame frame = context.frame();
+        final var items = (ArrayReference) frame.getValue(frame.visibleVariableByName("items"));
+        return switch (context.entry().id()) {
+            case "class-literal" -> context.render(wrong
+                ? vm.classesByName("java.lang.String").get(0).classObject() : items.referenceType().classObject());
+            case "array-value", "array-identity" -> {
+                if (!wrong && context.entry().id().equals("array-identity")) {
+                    yield context.render(items);
+                }
+                final var copy = ((ArrayType) items.referenceType()).newInstance(items.length());
+                copy.setValues(!wrong || context.entry().id().equals("array-identity") ? items.getValues()
+                    : List.of(vm.mirrorOf(-1), vm.mirrorOf(-1), vm.mirrorOf(-1)));
+                yield context.render(copy);
+            }
+            case "private-map" -> {
+                final ObjectReference receiver = Objects.requireNonNull(frame.thisObject());
+                final var store = (ObjectReference) receiver.getValue(receiver.referenceType().fieldByName("store"));
+                final var map = (ObjectReference) store.getValue(store.referenceType().fieldByName("map"));
+                final var type = (ClassType) map.referenceType();
+                yield context.render(wrong ? type.newInstance(context.thread(),
+                    type.methodsByName("<init>", "(Ljava/util/Map;)V").get(0),
+                    List.of(map), ClassType.INVOKE_SINGLE_THREADED) : map);
+            }
+            case "boxed" -> context.render(wrong ? vm.mirrorOf(1000)
+                : frame.getValue(frame.visibleVariableByName("boxed")));
+            case "string" -> context.render(wrong ? vm.mirrorOf("abc")
+                : frame.getValue(frame.visibleVariableByName("text")));
+            case "bounded-array" -> context.render(((ArrayType) items.referenceType()).newInstance(20));
+            default -> throw new AssertionError(context.entry().id());
+        };
+    }
+
+    private static Engine coldTestEngine(boolean initializeEarly) {
+        return context -> {
+            final var evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), context.connection(),
+                new EvaluationGuard(), noLocalClasspath());
+            evaluator.configureCompilerClasspath(context.thread());
+            if (initializeEarly && "cold-constant".equals(context.entry().id())) {
+                evaluator.evaluate(context.frame(), TARGET + ".Cold.initialized", context.bindings());
+            }
+            return compiledResult(evaluator, context);
+        };
+    }
+
+    private static Map<String, Observation> replayTestEngine(Path javaHome, List<Entry> entries, Engine engine)
+        throws Exception {
+        return withFixture(javaHome, fixture -> replay(fixture.vm(), entries, fixture.connection(), engine, null,
+            new StringBuilder(), null));
+    }
+
+    private static <T> T withFixture(Path javaHome, FixtureAction<T> action) throws Exception {
+        try (var target = InterpreterTargetVm.start(javaHome);
+             var wire = CountingJdwpConnection.attach(target.port())) {
+            final var vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
+            try {
+                final var guard = new EvaluationGuard();
+                return action.run(new AttachedFixture(vm, wire, guard, connectionFor(vm, guard)));
+            } finally {
+                try {
+                    vm.dispose();
+                } catch (VMDisconnectedException ignored) {
+                    // The fixture may have exited before the replay completed.
+                }
+            }
+        }
     }
 
     @Test
     void recordsCompiledOracleAndBaseline() throws Exception {
         Files.createDirectories(REPORTS);
-        final var rows = new StringBuilder();
         final var vmStart = new StringBuilder();
         final List<Entry> synthetic;
         try (var reader = new InputStreamReader(
@@ -114,47 +265,24 @@ class InterpreterHarnessLiveTest {
             assertThat(entries).extracting(Entry::id).doesNotHaveDuplicates();
         }
 
-        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
-            try (var target = InterpreterTargetVm.start(javaHome);
-                 var wire = CountingJdwpConnection.attach(target.port())) {
-                final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
-                try {
-                    run(vm, wire, entries, rows, vmStart);
-                } finally {
-                    try {
-                        vm.dispose();
-                    } catch (VMDisconnectedException ignored) {
-                        // The fixture may have exited before the replay completed.
-                    }
-                }
-            }
+        final List<Path> javaHomes = InterpreterTargetVm.javaHomes();
+        final Entry probe = synthetic.stream().filter(e -> BASELINE_ID.equals(e.id())).findFirst().orElseThrow();
+        final String baselineRows = baseline(javaHomes, probe);
+        for (Path javaHome : javaHomes) {
+            final Path report = withFixture(javaHome, fixture -> writeOracle(fixture, entries, vmStart));
+            assertThat(report).isRegularFile();
         }
-        InterpreterBaseline.write(REPORTS.resolve("interp-baseline.md"), rows.toString(), vmStart.toString());
+        InterpreterBaseline.write(REPORTS.resolve("interp-baseline.md"), baselineRows, vmStart.toString());
     }
 
-    private static void run(VirtualMachine vm, CountingJdwpConnection wire, List<Entry> entries,
-                            StringBuilder rows, StringBuilder vmStart) throws Exception {
-        final var guard = new EvaluationGuard();
-        final var connection = new JDIConnectionService(mock(JdiEventListener.class),
-            new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
-            new MarkedInstanceRegistry(), new JdiHealthMonitor()) {
-            @Override
-            public VirtualMachine getVM() {
-                return vm;
-            }
-        };
-        final var compiler = new InterpreterBaseline.Compiler();
-        final var evaluator = new JdiExpressionEvaluator(compiler, connection, guard, noLocalClasspath());
-        final Engine compiled = context -> {
-            evaluator.configureCompilerClasspath(context.thread());
-            return compiledResult(evaluator, context);
-        };
-
-        final String version = vm.version();
+    private static Path writeOracle(AttachedFixture fixture, List<Entry> entries, StringBuilder vmStart)
+        throws Exception {
+        final String version = fixture.vm().version();
         final int major = Integer.parseInt(version.split("\\.")[0]);
         final var golden = new LinkedHashMap<String, Observation>();
-        final var observations = replay(vm, entries, connection, compiled,
-            context -> measure(evaluator, compiler, context, wire, version, rows), vmStart, golden);
+        final var observations = replay(fixture.vm(), entries, fixture.connection(),
+            compiledEngine(fixture.evaluator(new InMemoryJavaCompiler())), InterpreterHarnessLiveTest::checkPrivateAccess,
+            vmStart, golden);
 
         final var jsonl = new StringBuilder();
         for (Entry entry : entries) {
@@ -164,22 +292,38 @@ class InterpreterHarnessLiveTest {
             jsonl.append(JSON.writeValueAsString(
                 new Row(entry.id(), entry.stop(), observation, golden.get(entry.id()), skip))).append('\n');
         }
-        Files.writeString(REPORTS.resolve("interp-oracle-jdk" + major + ".jsonl"), jsonl);
+        return Files.writeString(REPORTS.resolve("interp-oracle-jdk" + major + ".jsonl"), jsonl);
     }
 
-    /** Replay an engine on a freshly attached fixture. Pass no baseline or goldens for a candidate. */
+    private static Engine compiledEngine(JdiExpressionEvaluator evaluator) {
+        return context -> {
+            evaluator.configureCompilerClasspath(context.thread());
+            return compiledResult(evaluator, context);
+        };
+    }
+
+    private static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
+        return new JDIConnectionService(mock(JdiEventListener.class),
+            new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
+            new MarkedInstanceRegistry(), new JdiHealthMonitor()) {
+            @Override
+            public VirtualMachine getVM() {
+                return vm;
+            }
+        };
+    }
+
+    /** Replay an engine on a freshly attached fixture. Pass no pre-replay check or goldens for a candidate. */
     static Map<String, Observation> replay(VirtualMachine vm, List<Entry> entries, JDIConnectionService connection,
-                                          Engine engine, @Nullable BeforeMain baseline, StringBuilder vmStart,
+                                          Engine engine, @Nullable BeforeMain beforeMain, StringBuilder vmStart,
                                           @Nullable Map<String, Observation> goldens) throws Exception {
         final var marks = new MarkedInstanceRegistry();
         final var observations = new LinkedHashMap<String, Observation>();
         final var requests = vm.eventRequestManager();
-        for (String className : INSPECT_STOPS.keySet()) {
-            final var request = requests.createClassPrepareRequest();
-            request.addClassFilter(className);
-            request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-            request.enable();
-        }
+        final var prepareMain = requests.createClassPrepareRequest();
+        prepareMain.addClassFilter(TARGET);
+        prepareMain.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        prepareMain.enable();
 
         final Set<String> seen = new HashSet<>();
         while (!seen.equals(STOPS)) {
@@ -191,10 +335,7 @@ class InterpreterHarnessLiveTest {
                         checkVmStart(vm, start, vmStart);
                     } else if (event instanceof ClassPrepareEvent prepare) {
                         requests.deleteEventRequest(prepare.request());
-                        final var location = prepare.referenceType().methodsByName("inspect").get(0).location();
-                        final var request = requests.createBreakpointRequest(location);
-                        request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-                        request.enable();
+                        armInspect(requests, prepare.referenceType());
                     } else if (event instanceof BreakpointEvent breakpoint) {
                         requests.deleteEventRequest(breakpoint.request());
                         final String stop = Objects.requireNonNull(
@@ -202,21 +343,25 @@ class InterpreterHarnessLiveTest {
                         final ThreadReference thread = breakpoint.thread();
                         final ClassType fixture = fixture(vm);
                         if ("main".equals(stop)) {
-                            if (baseline != null) {
-                                final Entry probe = entries.stream().filter(e -> BASELINE_ID.equals(e.id()))
-                                    .findFirst().orElseThrow();
-                                baseline.measure(new EvaluationContext(probe, thread, Map.of(), connection));
-                                checkPrivateAccess(thread);
+                            if (beforeMain != null) {
+                                beforeMain.run(thread);
                             }
                             marks.mark("target", Objects.requireNonNull(thread.frame(0).thisObject()), true);
                         }
                         evaluateStop(entries, stop, thread, marks.buildBindings(), fixture, connection,
                             engine, observations, goldens);
-                        if ("inner".equals(stop)) {
-                            final var exception = requests.createExceptionRequest(null, true, false);
-                            exception.addClassFilter(TARGET);
-                            exception.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-                            exception.enable();
+                        // The main method preloads the other fixture classes. Arm the next stop only
+                        // after all evaluations at this one return, so they can call its methods.
+                        switch (stop) {
+                            case "main" -> armInspect(requests, vm.classesByName(PACKAGE_STOP).get(0));
+                            case "package" -> armInspect(requests, vm.classesByName(TARGET + "$Inner").get(0));
+                            case "inner" -> {
+                                final var exception = requests.createExceptionRequest(null, true, false);
+                                exception.addClassFilter(TARGET);
+                                exception.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                                exception.enable();
+                            }
+                            default -> throw new AssertionError(stop);
                         }
                         assertThat(seen.add(stop)).as(stop).isTrue();
                     } else if (event instanceof ExceptionEvent exception) {
@@ -257,6 +402,12 @@ class InterpreterHarnessLiveTest {
         return observations;
     }
 
+    private static void armInspect(EventRequestManager requests, ReferenceType type) {
+        final var request = requests.createBreakpointRequest(type.methodsByName("inspect").get(0).location());
+        request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        request.enable();
+    }
+
     private static void checkVmStart(VirtualMachine vm, VMStartEvent start, StringBuilder report)
         throws Exception {
         assertThat(start.thread().isSuspended()).isTrue();
@@ -280,9 +431,45 @@ class InterpreterHarnessLiveTest {
             ObjectReference.INVOKE_SINGLE_THREADED)).value()).isEqualTo(22);
     }
 
-    private static void measure(JdiExpressionEvaluator evaluator, InterpreterBaseline.Compiler compiler,
-                                EvaluationContext context, CountingJdwpConnection wire, String version,
-                                StringBuilder rows) throws Exception {
+    private static String baseline(List<Path> javaHomes, Entry probe) throws Exception {
+        final var targets = new ArrayList<TargetSamples>();
+        // Finish warming ECJ and both target JDK images before collecting any sample.
+        for (Path javaHome : javaHomes) {
+            final Trial warmup = withFixture(javaHome, fixture -> measureTrial(fixture, probe));
+            targets.add(new TargetSamples(javaHome, warmup.version(), new ArrayList<>(), new ArrayList<>()));
+        }
+        for (int i = 0; i < COLD_TRIALS; i++) {
+            for (TargetSamples target : targets) {
+                final Trial trial = withFixture(target.javaHome(), fixture -> measureTrial(fixture, probe));
+                assertThat(trial.version()).isEqualTo(target.version());
+                target.cold().add(trial.cold());
+                target.hits().addAll(trial.hits());
+            }
+        }
+        final var rows = new StringBuilder();
+        for (TargetSamples target : targets) {
+            rows.append(InterpreterBaseline.row(target.version(), "first use", target.cold()));
+            rows.append(InterpreterBaseline.row(target.version(), "hit", target.hits()));
+        }
+        return rows.toString();
+    }
+
+    private static Trial measureTrial(AttachedFixture fixture, Entry probe) throws Exception {
+        final var compiler = new InterpreterBaseline.Compiler();
+        final var evaluator = fixture.evaluator(compiler);
+        final var samples = new ArrayList<InterpreterBaseline.Sample>();
+        replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator),
+            thread -> samples.addAll(measure(evaluator, compiler,
+                new EvaluationContext(probe, thread, Map.of(), fixture.connection(), Map.of()), fixture.wire())),
+            new StringBuilder(), null);
+        assertThat(samples).hasSize(1 + HITS_PER_TRIAL);
+        return new Trial(fixture.vm().version(), samples.get(0), List.copyOf(samples.subList(1, samples.size())));
+    }
+
+    private static List<InterpreterBaseline.Sample> measure(JdiExpressionEvaluator evaluator,
+                                                           InterpreterBaseline.Compiler compiler,
+                                                           EvaluationContext context, CountingJdwpConnection wire)
+        throws Exception {
         assertThat(context.connection().getDiscoveredJdkPath()).isNull();
         final VirtualMachine vm = context.thread().virtualMachine();
         final var beforeMirrors = wire.snapshot();
@@ -291,7 +478,9 @@ class InterpreterHarnessLiveTest {
         }
         assertThat(wire.snapshot()).as("primitive byte mirrors are host-side objects").isEqualTo(beforeMirrors);
 
-        for (boolean cold : List.of(true, false)) {
+        final var samples = new ArrayList<InterpreterBaseline.Sample>();
+        for (int i = 0; i <= HITS_PER_TRIAL; i++) {
+            final boolean cold = i == 0;
             final var before = wire.snapshot();
             final int compilations = compiler.compilations;
             final int bytes = compiler.bytes;
@@ -300,15 +489,17 @@ class InterpreterHarnessLiveTest {
             evaluator.configureCompilerClasspath(context.thread());
             final long classpathNanos = System.nanoTime() - start;
             final var configured = wire.snapshot();
-            final Outcome result = compiledResult(evaluator, context);
+            final String rendered = context.connection().formatFieldValue(
+                evaluator.evaluate(context.frame(), context.entry().expression(), context.bindings()));
             final long totalNanos = System.nanoTime() - start;
             final var sample = new InterpreterBaseline.Sample(before, configured, wire.snapshot(),
                 classpathNanos, compiler.nanos - compileNanos, totalNanos, compiler.bytes - bytes);
-            assertThat(result).isEqualTo(new Outcome("value", "int", "3"));
+            assertThat(rendered).isEqualTo("3");
             assertThat(compiler.compilations - compilations).isEqualTo(cold ? 1 : 0);
             sample.verify(cold);
-            rows.append(sample.row(version, cold ? "first use" : "hit"));
+            samples.add(sample);
         }
+        return samples;
     }
 
     private static Outcome compiledResult(JdiExpressionEvaluator evaluator, EvaluationContext context)
@@ -322,7 +513,7 @@ class InterpreterHarnessLiveTest {
             }
             if (e.getMessage().startsWith("Compilation failed:")) {
                 final String name = e.getClass().getSimpleName();
-                return new Outcome("compile error", name, "compile error: " + name);
+                return new Outcome("compile error", name, "compile error: " + name, null);
             }
             throw e;
         }
@@ -332,11 +523,13 @@ class InterpreterHarnessLiveTest {
                                      Map<String, Value> bindings, ClassType fixture, JDIConnectionService connection,
                                      Engine engine, Map<String, Observation> observations,
                                      @Nullable Map<String, Observation> goldens) throws Exception {
-        for (Entry entry : entries) {
-            if (!stop.equals(entry.stop())) {
-                continue;
-            }
-            final var context = new EvaluationContext(entry, thread, bindings, connection);
+        final var stopEntries = entries.stream().filter(entry -> stop.equals(entry.stop())).toList();
+        if (stopEntries.isEmpty()) {
+            return;
+        }
+        final var fixtureReferences = fixtureReferences(thread.frame(0), bindings);
+        for (Entry entry : stopEntries) {
+            final var context = new EvaluationContext(entry, thread, bindings, connection, fixtureReferences);
             final Observation result = observe(context, fixture, engine);
             observations.put(entry.id(), result);
             if (goldens != null) {
@@ -344,7 +537,7 @@ class InterpreterHarnessLiveTest {
                 if (expectedClass != null) {
                     assertThat(result.outcome().expectedClass()).as(entry.id()).isEqualTo(expectedClass);
                 }
-                verifyFixtureSemantics(entry.id(), fixture, result);
+                verifyFixtureSemantics(entry.id(), result);
                 if (FIXTURE_GOLDENS.contains(entry.id())) {
                     final Observation golden = observe(context, fixture, InterpreterHarnessLiveTest::golden);
                     assertThat(golden.outcome().kind()).as(entry.id()).isEqualTo("value");
@@ -354,6 +547,31 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    private static Map<String, ObjectReference> fixtureReferences(StackFrame frame, Map<String, Value> bindings)
+        throws AbsentInformationException {
+        final var references = new HashMap<String, ObjectReference>();
+        bindings.forEach((name, value) -> {
+            if (value instanceof ObjectReference object) {
+                references.put(name, object);
+            }
+        });
+        final @Nullable ObjectReference receiver = frame.thisObject();
+        if (receiver != null) {
+            references.put("this", receiver);
+        }
+        if (bindings.get("$target") instanceof ObjectReference target) {
+            final var store = (ObjectReference) target.getValue(target.referenceType().fieldByName("store"));
+            final var map = (ObjectReference) store.getValue(store.referenceType().fieldByName("map"));
+            references.put("$target.store.map", map);
+        }
+        frame.getValues(frame.visibleVariables()).forEach((local, value) -> {
+            if (value instanceof ObjectReference object) {
+                references.put(local.name(), object);
+            }
+        });
+        return Map.copyOf(references);
+    }
+
     static Observation observe(EvaluationContext context, ClassType fixture, Engine engine) throws Exception {
         final var vm = fixture.virtualMachine();
         final Field calls = fixture.fieldByName("calls");
@@ -361,25 +579,28 @@ class InterpreterHarnessLiveTest {
         fixture.setValue(calls, vm.mirrorOf(0));
         fixture.setValue(trace, vm.mirrorOf(""));
         final Outcome outcome = engine.evaluate(context);
+        final boolean coldInitialized = vm.classesByName(COLD_CLASS).stream().anyMatch(ReferenceType::isInitialized);
         return new Observation(outcome, new Calls(((IntegerValue) fixture.getValue(calls)).value(),
-            ((StringReference) fixture.getValue(trace)).value()));
+            ((StringReference) fixture.getValue(trace)).value()), Map.of(COLD_CLASS, coldInitialized));
     }
 
-    private static void verifyFixtureSemantics(String id, ClassType fixture, Observation observation) {
+    private static void verifyFixtureSemantics(String id, Observation observation) {
         switch (id) {
             case "short-circuit-and", "short-circuit-or" ->
                 assertThat(observation.calls()).as(id).isEqualTo(new Calls(0, ""));
             case "lazy-ternary" -> assertThat(observation.calls()).isEqualTo(new Calls(1, "T"));
             case "receiver-and-arguments" -> assertThat(observation.calls()).isEqualTo(new Calls(4, "RABM"));
+            case "call-future-stop" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo("1");
+                assertThat(observation.calls()).isEqualTo(new Calls(1, "I"));
+            }
             case "block-assign-frame-local" -> assertThat(observation.outcome().rendered()).isEqualTo("7");
             case "block-keeps-frame-local" -> assertThat(observation.outcome().rendered()).isEqualTo("2");
             case "cold-static-counter" -> assertThat(observation.outcome().rendered()).isEqualTo("1");
             case "field-values" -> assertThat(observation.outcome().rendered()).isEqualTo("16");
             case "field-metadata" -> assertThat(observation.outcome().rendered()).isEqualTo("\"hidden:modification\"");
-            case "cold-constant", "cold-static" -> {
-                final boolean initialized = fixture.virtualMachine().classesByName(TARGET + "$Cold").get(0).isInitialized();
-                assertThat(initialized).as(id).isEqualTo(id.equals("cold-static"));
-            }
+            case "cold-constant", "cold-static" ->
+                assertThat(observation.initializedClasses()).containsEntry(COLD_CLASS, id.equals("cold-static"));
             default -> {
                 // Other rows are recorded for later engine comparisons.
             }

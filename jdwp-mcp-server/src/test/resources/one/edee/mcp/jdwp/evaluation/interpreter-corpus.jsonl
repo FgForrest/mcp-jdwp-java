@@ -72,3 +72,4 @@
 {"id":"null-value","tool":"jdwp_evaluate_expression","param":"expression","expression":"null","stop":"main","expected_class":"null","notes":"Phase 1, null literal result"}
 {"id":"array-value","tool":"jdwp_evaluate_expression","param":"expression","expression":"items","stop":"main","expected_class":"int[]","notes":"Phase 1, array result with a process-specific object ID"}
 {"id":"package-field","tool":"jdwp_evaluate_expression","param":"expression","expression":"peer.code","stop":"package","expected_class":"int","notes":"Phase 1, invocation-free access on a package-private declared type"}
+{"id":"call-future-stop","tool":"jdwp_evaluate_expression","param":"expression","expression":"this.inspectInner()","stop":"main","expected_class":"int","notes":"Calls Inner.inspect before its fixture stop is armed"}
