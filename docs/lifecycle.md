@@ -49,7 +49,7 @@ The Spring context boots without any JDI activity. No `VirtualMachine`, no event
 >
 > The JVM accepts a `-agentlib:jdwp=` command-line option that loads the bundled JDWP agent (a shared library shipped with the JDK). The agent parses its options and either listens on a socket (`server=y`) or attaches outbound to a debugger (`server=n`). The full option string the README documents — `transport=dt_socket,server=y,suspend=n,address=*:5005` — tells the agent to use TCP, listen, not suspend on start, and bind to all interfaces on port 5005. The agent is what implements the JDWP server side; the JVM itself does not know JDWP, it provides a JVMTI (Java Virtual Machine Tool Interface) surface that the agent uses to install breakpoints, read frames, etc. Anything the debugger can do is something the JVMTI can do.
 >
-> The `suspend=y` variant pauses every thread at VMStart before the application's `main` runs. This is what you want when you need to set a breakpoint before the first interesting line executes; combined with `jdwp_wait_for_attach`, it is how the test-flight scenarios stay reproducible.
+> The `suspend=y` variant pauses every thread at VMStart before the application's `main` runs. This is what you want when you need to set a breakpoint before the first interesting line executes; use `jdwp_wait_for_attach(requireVmStart=true)` to verify a test launch is still at startup.
 
 ## 2. Attaching to the target — `jdwp_connect` and `jdwp_wait_for_attach`
 
@@ -89,7 +89,11 @@ The "exactly one attempt" behaviour matters: a `getVM()` call cannot spiral into
 
 Polls `connect()` every 200 ms up to a timeout (default 30 s) — `JDWPTools.java:296-359`. `IllegalConnectorArgumentsException` fails fast (a bad host or port — no point retrying). `IOException` and other exceptions are retried (the target is simply not listening yet). On timeout, the tool runs JVM discovery (see [diagnostics.md](diagnostics.md)) so the agent can see "what JVMs did come up but on a different port".
 
-On success — as after `jdwp_connect` — the tool waits, outside the connection service's monitor, up to 500 ms for the VMStart event (`SuspensionSession.acknowledgeStart`). A VM suspended at start has that stop marked as seen, and the reply says it is suspended at `VM_START`; a VM started with `suspend=n` is reported as running. Either way the hint is the same: set breakpoints, then `jdwp_resume_until_event`, whose first call releases the start stop.
+After a new connection, the tool waits up to 500 ms for VMStart outside the connection service monitor (`SuspensionSession.acknowledgeStart`). A VM suspended at start has that stop marked as seen. Set breakpoints, then call `jdwp_resume_until_event` to release the start stop. A running VM may have launched with `suspend=n` or resumed in an earlier debugger session. In permissive mode, if VMStart has yet to arrive and a thread is suspended, the reply reports the uncertainty and the next wait can present a late start stop.
+
+With `requireVmStart=true`, an existing session is refused with `[NOT_FRESH]` and remains attached. A new attachment must observe a suspending `VM_START` within the handshake window. A JVM already running or suspended at an ordinary event, such as a launch configured with `onthrow`, is detached with `[NOT_FRESH]`. For a local target, the reply names the process when available. Each new test run starts after disconnecting and confirming the previous JVM has ended. The option defaults to false.
+
+`jdwp_connect`, `jdwp_wait_for_attach` and `jdwp_reconnect` report the local target PID, start time in the server’s time zone, uptime and launch selector when available. A discovery-only match is labelled `probably PID`. See [diagnostics.md](diagnostics.md) for the lookup.
 
 ## 3. The event listener — started here, stopped on disconnect
 
@@ -118,7 +122,7 @@ There are two cleanup paths, and the difference matters.
 4. Calls `vm.dispose()` for a clean JDWP teardown (lines 451-456). Best-effort: any exception is swallowed because the VM may already be gone.
 5. **Resets `lastHost` / `lastPort` to 0 / null** (lines 459-460).
 
-That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly.
+That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly. The disconnect reply includes the local process identity when available. When the socket owner is a live JVM configured to serve JDWP on that port, the reply reports that it listens there again and gives the PID for cleanup. For a local TCP peer, discovery-only match, or missing PID, the reply gives commands to verify the port owner.
 
 ### VM-death: `notifyVmDied()`
 

@@ -1188,13 +1188,7 @@ public class BreakpointTracker {
                         continue;
                     }
 
-                    final ExceptionRequest exReq = erm.createExceptionRequest(
-                        refType, pending.isCaught(), pending.isUncaught());
-                    // The spec's policy — SUSPEND_EVENT_THREAD unless the user asked for all: even
-                    // logOnly BPs need a brief suspend so the listener can read the exception object /
-                    // evaluate the optional expression. Auto-resume happens in
-                    // JdiEventListener.handleExceptionEvent.
-                    exReq.setSuspendPolicy(pending.getSpec().suspendPolicy());
+                    final ExceptionRequest exReq = pending.getSpec().createRequest(erm, refType);
                     exReq.enable();
                     disarmIfChained(id, exReq);
                     if (!promotePendingExceptionToActive(id, exReq)) {
@@ -2313,8 +2307,48 @@ public class BreakpointTracker {
         boolean uncaught,
         boolean logOnly,
         @Nullable String expression,
-        int suspendPolicy
+        int suspendPolicy,
+        @Nullable String thrownIn,
+        List<String> notThrownIn
     ) {
+        public ExceptionBreakpointSpec {
+            notThrownIn = List.copyOf(notThrownIn);
+        }
+
+        /**
+         * A spec without throw-site filters.
+         */
+        public ExceptionBreakpointSpec(String exceptionClass, boolean caught, boolean uncaught, boolean logOnly,
+                                       @Nullable String expression, int suspendPolicy) {
+            this(exceptionClass, caught, uncaught, logOnly, expression, suspendPolicy, null, List.of());
+        }
+
+        /** Configure the disabled request identically for an immediate set, promotion and reconnect. */
+        ExceptionRequest createRequest(EventRequestManager manager, ReferenceType type) {
+            final ExceptionRequest request = manager.createExceptionRequest(type, caught, uncaught);
+            try {
+                request.setSuspendPolicy(suspendPolicy);
+                if (thrownIn != null) {
+                    request.addClassFilter(thrownIn);
+                }
+                notThrownIn.forEach(request::addClassExclusionFilter);
+                return request;
+            } catch (RuntimeException e) {
+                deleteQuietly(manager, request);
+                throw e;
+            }
+        }
+
+        /**
+         * The throw-site filters for replies and {@code jdwp_overview}, e.g.
+         * {@code "  thrownIn=com.acme.*  notThrownIn=java.*,jdk.*"}; {@code ""} without filters.
+         */
+        String throwSiteFilterSummary() {
+            final String include = thrownIn == null ? "" : "  thrownIn=" + thrownIn;
+            final String exclude = notThrownIn.isEmpty() ? "" : "  notThrownIn=" + String.join(",", notThrownIn);
+            return include + exclude;
+        }
+
         /**
          * A spec whose request suspends only the throwing thread — what every log-only one needs
          * (it is resumed right after the record) and the default of a suspending one.

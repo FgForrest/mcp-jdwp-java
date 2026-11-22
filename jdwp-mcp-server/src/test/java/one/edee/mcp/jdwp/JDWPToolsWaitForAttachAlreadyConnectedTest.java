@@ -44,7 +44,7 @@ class JDWPToolsWaitForAttachAlreadyConnectedTest {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenReturn("Already connected to OpenJDK 64-Bit Server VM");
 
-		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000);
+		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000, null);
 
 		assertThat(result)
 			.contains("Already connected")
@@ -61,7 +61,7 @@ class JDWPToolsWaitForAttachAlreadyConnectedTest {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenReturn("Connected to OpenJDK 64-Bit Server VM (version 21)");
 
-		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000);
+		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000, null);
 
 		assertThat(result).contains("VM_START");
 		verify(discovery, never()).discover();

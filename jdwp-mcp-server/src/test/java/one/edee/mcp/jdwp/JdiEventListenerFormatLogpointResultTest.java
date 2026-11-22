@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.Field;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.PrimitiveValue;
 import com.sun.jdi.ReferenceType;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 /**
  * Tests {@link JdiEventListener}'s private static {@code formatLogpointResult(Value)} via
@@ -47,16 +49,34 @@ class JdiEventListenerFormatLogpointResultTest {
 	}
 
 	@Test
-	@DisplayName("ObjectReference returns Object#N (type)")
-	void shouldReturnObjectHashFormatForObjectReference() throws Exception {
+	@DisplayName("ObjectReference shows its type without an uncached ID")
+	void shouldShowObjectTypeWithoutAnId() throws Exception {
 		ObjectReference objRef = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
-		when(objRef.uniqueID()).thenReturn(77L);
 		when(objRef.referenceType()).thenReturn(refType);
 		when(refType.name()).thenReturn("com.example.Foo");
 
 		String result = invokeFormatLogpointResult(objRef);
-		assertThat(result).isEqualTo("Object#77 (com.example.Foo)");
+		assertThat(result).isEqualTo("Object (com.example.Foo)");
+	}
+
+	@Test
+	@DisplayName("A boxed primitive is read directly from its value field")
+	void shouldUnboxPrimitiveWithoutInvokingTargetCode() throws Exception {
+		ObjectReference boxed = mock(ObjectReference.class);
+		ReferenceType type = mock(ReferenceType.class);
+		Field field = mock(Field.class);
+		PrimitiveValue value = mock(PrimitiveValue.class);
+		when(boxed.referenceType()).thenReturn(type);
+		when(type.name()).thenReturn("java.lang.Integer");
+		when(type.fieldByName("value")).thenReturn(field);
+		when(boxed.getValue(field)).thenReturn(value);
+		when(value.toString()).thenReturn("-204723185");
+
+		assertThat(invokeFormatLogpointResult(boxed)).isEqualTo("-204723185");
+		org.mockito.Mockito.verify(boxed).referenceType();
+		org.mockito.Mockito.verify(boxed).getValue(field);
+		verifyNoMoreInteractions(boxed);
 	}
 
 	@Test

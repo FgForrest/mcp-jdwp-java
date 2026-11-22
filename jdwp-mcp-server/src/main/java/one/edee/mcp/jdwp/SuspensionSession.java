@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.function.Supplier;
 
 /**
  * Who owns each suspension of one JDI connection (issue #45; {@code PROPOSAL-suspension-ownership.md}).
@@ -697,23 +698,39 @@ public final class SuspensionSession {
     }
 
     /**
+     * Outcome of {@link #step}.
+     *
+     * @param refusal          why the step was not started, or {@code null} when it was
+     * @param remainingHolders the other thread-specific holds, grouped by holder kind
+     * @param remainingStopAlls summaries of stop-alls still in effect, grouped and counted
+     *                          even if JDI lists no other threads
+     */
+    public record StepResult(@Nullable String refusal, List<String> remainingHolders, List<String> remainingStopAlls) {
+        private static StepResult refused(String reason) {
+            return new StepResult(reason, List.of(), List.of());
+        }
+    }
+
+    /**
      * A step on {@code thread}, atomically: admission, installing the request, then releasing the
      * thread. A refused or failed step leaves no request behind.
-     *
-     * @return {@code null} when the step was started, otherwise why not
      */
-    @Nullable
-    public synchronized String step(ThreadReference thread, StepInstaller installer) throws Exception {
+    public synchronized StepResult step(ThreadReference thread, Supplier<List<ThreadReference>> allThreads,
+                                        StepInstaller installer) throws Exception {
         if (closed) {
-            return "the debugging session is closed";
+            return StepResult.refused("the debugging session is closed");
         }
         final String refusal = releaseRefusal(thread);
         if (refusal != null) {
-            return refusal;
+            return StepResult.refused(refusal);
         }
         if (!holds(thread)) {
-            return "nothing holds thread " + safeName(thread) + " — step from a stop or a jdwp_suspend_thread hold";
+            return StepResult.refused("nothing holds thread " + safeName(thread)
+                + " — step from a stop or a jdwp_suspend_thread hold");
         }
+        // Enumerate only for stop-all ownership; the other holders name their threads directly.
+        final List<ThreadReference> vmThreads = contexts.stream().anyMatch(c -> c.policy == EventRequest.SUSPEND_ALL)
+            ? allThreads.get() : List.of();
         final StepRequest request = installer.install();
         stamp(request);
         try {
@@ -724,7 +741,125 @@ public final class SuspensionSession {
             deleteQuietly(request);
             throw e;
         }
-        return null;
+        return describeRemainingHolders(vmThreads);
+    }
+
+    /**
+     * Summarizes the remaining holds under the session monitor. Equivalent stop-alls share their
+     * state and origin. The displayed sample covers the union of JDI-enumerated threads they hold.
+     *
+     * @param vmThreads threads enumerated by JDI, which can omit virtual threads
+     * @return the grouped stop-all and thread-specific holds, with one display budget
+     */
+    private StepResult describeRemainingHolders(List<ThreadReference> vmThreads) {
+        final Map<String, Set<ThreadReference>> groups = new LinkedHashMap<>();
+        final Map<StopAllGroup, StopAllSummary> stopAlls = new LinkedHashMap<>();
+        for (Context context : contexts) {
+            final ThreadReference eventThread = context.thread;
+            if (context.policy == EventRequest.SUSPEND_ALL) {
+                final String state = context.state == State.HELD ? seenWord(context) : "in-progress";
+                stopAlls.computeIfAbsent(new StopAllGroup(state, eventThread), ignored -> new StopAllSummary())
+                    .add(context, vmThreads);
+            } else if (context.policy == EventRequest.SUSPEND_EVENT_THREAD
+                && eventThread != null && covers(context, eventThread)) {
+                final String label = context.state == State.HELD
+                    ? seenWord(context) + " thread stops" : "events still being processed";
+                groups.computeIfAbsent(label, ignored -> new LinkedHashSet<>()).add(eventThread);
+            }
+        }
+        groups.put("jdwp_suspend_thread holds", manual);
+        final StepThreadNames names = new StepThreadNames();
+        final List<String> stopAllDescriptions = describeStopAlls(stopAlls, names);
+        final List<String> threadHolds = groups.entrySet().stream()
+            .filter(entry -> !entry.getValue().isEmpty())
+            .map(entry -> entry.getKey() + ": " + names.describeGroup(entry.getValue()))
+            .toList();
+        return new StepResult(null, threadHolds, stopAllDescriptions);
+    }
+
+    /** Combines stop-alls with the same presentation state and originating thread. */
+    private record StopAllGroup(String state, @Nullable ThreadReference origin) {}
+
+    /** Counts the contexts in one group and keeps the distinct threads JDI lists for that group. */
+    private static final class StopAllSummary {
+        /** Number of stop-all contexts in the group. */
+        private int count;
+        /** Enumerated threads held by at least one context in this group. */
+        private final Set<ThreadReference> listed = new LinkedHashSet<>();
+
+        /** Adds one context and its share of the enumerated threads. */
+        private void add(Context context, List<ThreadReference> vmThreads) {
+            count++;
+            for (ThreadReference thread : vmThreads) {
+                if (covers(context, thread)) {
+                    listed.add(thread);
+                }
+            }
+        }
+    }
+
+    /** Reports named stop-all groups and combines origins beyond the name budget by state. */
+    private static List<String> describeStopAlls(Map<StopAllGroup, StopAllSummary> stopAlls, StepThreadNames names) {
+        final List<String> descriptions = new ArrayList<>();
+        final Map<String, Integer> additional = new LinkedHashMap<>();
+        for (Map.Entry<StopAllGroup, StopAllSummary> entry : stopAlls.entrySet()) {
+            final StopAllGroup key = entry.getKey();
+            final StopAllSummary group = entry.getValue();
+            final ThreadReference thread = key.origin();
+            if (thread != null && names.exhausted()) {
+                additional.merge(key.state(), group.count, Integer::sum);
+                continue;
+            }
+            final String origin = thread == null ? "" : " from thread " + names.take(thread);
+            final String sample = group.listed.isEmpty() ? "" : " (JDI lists " + names.describeGroup(group.listed) + ')';
+            if (group.count == 1) {
+                descriptions.add("The " + key.state() + " stop-all" + origin + " still covers other threads" + sample + '.');
+            } else {
+                descriptions.add(group.count + " " + key.state() + " stop-alls" + origin + " still cover other threads" + sample + '.');
+            }
+        }
+        additional.forEach((state, count) -> {
+            if (count == 1) {
+                descriptions.add("One additional " + state + " stop-all still covers other threads.");
+            } else {
+                descriptions.add(count + " additional " + state + " stop-alls still cover other threads.");
+            }
+        });
+        return List.copyOf(descriptions);
+    }
+
+    /**
+     * Whether a held context's stop has been presented by a tool, in the words the step reply uses.
+     */
+    private static String seenWord(Context context) {
+        return context.reported ? "presented" : "unseen";
+    }
+
+    /** Tracks the shared name budget for the entire step reply. */
+    private static final class StepThreadNames {
+        /** The reply header already spends one of the five names on the stepping thread. */
+        private int remaining = 4;
+
+        /** Whether subsequent groups must be described by count alone. */
+        private boolean exhausted() {
+            return remaining == 0;
+        }
+
+        /** Spends one slot on a known thread when room remains. */
+        private String take(ThreadReference thread) {
+            remaining--;
+            return safeName(thread);
+        }
+
+        /** Shows a sample of the group, or just its size when the name budget is exhausted. */
+        private String describeGroup(Set<ThreadReference> threads) {
+            if (exhausted()) {
+                return threads.size() == 1 ? "1 thread" : threads.size() + " threads";
+            }
+            final int shown = Math.min(remaining, threads.size());
+            final String names = String.join(", ", threads.stream().limit(shown).map(this::take).toList());
+            return threads.size() > shown ? names + " and " + (threads.size() - shown) + " more" : names;
+        }
     }
 
     /**
@@ -849,7 +984,7 @@ public final class SuspensionSession {
          */
         SUSPENDED,
         /**
-         * The VM started without suspending (VMStart with policy NONE).
+         * The start event does not currently hold the VM.
          */
         RUNNING,
         /**

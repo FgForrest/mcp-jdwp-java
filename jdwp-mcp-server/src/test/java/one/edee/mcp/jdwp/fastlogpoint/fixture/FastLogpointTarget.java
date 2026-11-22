@@ -14,6 +14,7 @@ public class FastLogpointTarget {
      * Total {@link #compute} calls — read by the test over JDWP to measure throughput.
      */
     static final AtomicLong CALLS = new AtomicLong();
+    static volatile Thread virtualWorker;
     /**
      * Held by the {@code lock-holder} thread, which sleeps while holding it: a monitor an evaluation
      * can wait for.
@@ -59,6 +60,14 @@ public class FastLogpointTarget {
         while ((command = System.in.read()) >= 0) {
             if (command == 'L') {
                 Class.forName("one.edee.mcp.jdwp.fastlogpoint.fixture.LateTarget").getMethod("start").invoke(null);
+            } else if (command == 'V') {
+                virtualWorker = (Thread) Thread.class.getMethod("startVirtualThread", Runnable.class)
+                    .invoke(null, (Runnable) () -> {
+                        Thread.currentThread().setName("unlisted-virtual-worker");
+                        for (;;) {
+                            LockSupport.park();
+                        }
+                    });
             } else if (command == 'X') {
                 System.exit(0);
             }

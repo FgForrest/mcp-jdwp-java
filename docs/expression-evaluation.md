@@ -266,6 +266,8 @@ Logpoints (`jdwp_set_logpoint`), exception logpoints (`jdwp_set_exception_logpoi
 - **Logpoints** — evaluate the expression on every hit, record the result to event history, and auto-resume. Support an optional condition expression that gates whether the log fires.
 - **Conditional breakpoints** — evaluate the condition expression on every hit; the thread stays suspended only if the condition evaluates to `true`.
 
+Both exception tools bind `$exception` for their conditions. Optional throw-site class filters run in the target before an event reaches the expression evaluator. Regular logpoint history shows boxed primitives as values and prints the type for other object results.
+
 Both are subject to the same constraints: the expression must compile against the frame's visible types, and each evaluation incurs the `invokeMethod` cost. Placing a logpoint inside a tight loop with millions of iterations will be expensive. The listener-side dispatch is documented in [event-pipeline.md](event-pipeline.md) and [breakpoints.md](breakpoints.md).
 
 ### Synthetic bindings

@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp;
 
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -49,7 +50,7 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		// invoked because we never reach a successful attach.
 		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, marks);
 		final JDIConnectionService service = new JDIConnectionService(
-			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor(), new JvmDiscoveryService());
 
 		// Seed a watcher that the reconnect must preserve.
 		watchers.createWatcher("trace.id", 1, "entity.id");
@@ -81,7 +82,7 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		final JdiEventListener listener = new JdiEventListener(tracker, new EventHistory(),
 			mock(JdiExpressionEvaluator.class), new EvaluationGuard(), null, new MarkedInstanceRegistry());
 		final JDIConnectionService service = new JDIConnectionService(listener, tracker, new EventHistory(), watchers,
-			new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor());
+			new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor(), new JvmDiscoveryService());
 		final FastLogpointService fastLogpoints = mock(FastLogpointService.class);
 		when(fastLogpoints.breakpointIdsByLocation()).thenReturn(Map.of("com.example.Cart:42", List.of(5)));
 		service.setFastLogpointService(fastLogpoints);
@@ -114,7 +115,7 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, marks);
 		final JDIConnectionService service = new JDIConnectionService(
-			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor(), new JvmDiscoveryService());
 
 		// Seed one PENDING line BP into the tracker so the snapshot has something to round-trip.
 		// Using a pending entry avoids needing a mock BreakpointRequest with a live JDI handle.
@@ -165,7 +166,7 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		// covers the sequencing already.
 		doAnswer(inv -> null).when(listener).stop();
 		final JDIConnectionService service = new JDIConnectionService(
-			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor(), new JvmDiscoveryService());
 
 		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 

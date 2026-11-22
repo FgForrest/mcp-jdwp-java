@@ -13,7 +13,7 @@ This is the companion sandbox for the [jdwp-debugging plugin](https://github.com
 | JDK | 17 or newer |
 | Maven | 3.9 or newer |
 | Claude Code or Codex | Latest |
-| Plugin | `jdwp-debugging` installed: 2.11.1+ in Claude Code, 2.12.0+ in Codex |
+| Plugin | `jdwp-debugging` 2.13.0 or later in Claude Code and Codex |
 
 Verify:
 
@@ -39,9 +39,7 @@ The test process **hangs** at "Listening for transport dt_socket at address: 500
 
 **Terminal 2** — open Claude Code or Codex in this folder and paste the assignment prompt below.
 
-The agent will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it's solved, kill the test (or let it finish) and move on to the next flight.
-
-Between flights, ask the agent to run `jdwp_reset()` — it clears breakpoints and cached state without dropping the connection.
+The agent will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it is solved, end the flight with `jdwp_disconnect()`. If the verified socket owner is your still-running test JVM, use `kill <pid>` with that PID. For a TCP peer or an unverified or missing PID, check the listener with `ss -ltnp 'sport = :<port>'` or `lsof -nP -iTCP:<port> -sTCP:LISTEN` first. Stop the background `mvn test` shell if needed and confirm both have exited. Stopping the shell alone can leave the forked Surefire JVM running. Then launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
 ## The assignment prompt
 
@@ -64,7 +62,7 @@ The rules:
    Hitting par = ⭐⭐⭐. Within 2× par = ⭐⭐. Solved at all = ⭐. Report the count when
    you finish.
 
-Now attach via jdwp_wait_for_attach(port=5005), set the breakpoints the flight calls
+Now attach via jdwp_wait_for_attach(port=5005, requireVmStart=true), set the breakpoints the flight calls
 for, and tell me:
   - What the bug actually is (root cause in one sentence)
   - Which JVM observation revealed it (the tool call + the value that contradicted
@@ -168,7 +166,7 @@ The reveals are deliberately not in this zip so the agent that you ask to play c
 
 - **`Listening for transport dt_socket at address: 5005` then nothing happens.** Correct — that's the JVM waiting. Go to the other terminal and tell the agent to attach.
 - **The agent reports "port 5005 not listening".** Did the test start? In terminal 1, do you see the "Listening for transport" line? If not, the test hasn't reached the suspend point — likely a compile failure earlier in the log.
-- **Port 5005 already taken.** Another debugger is using it. Either kill the other process or change ports: `-Dmaven.surefire.debug="-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5006"`, then attach with `port=5006`.
+- **Port 5005 already taken.** If still attached, call `jdwp_disconnect()`. Use `kill <pid>` if the reply verifies your previous test JVM as the live socket owner. Otherwise check the listener with `ss -ltnp 'sport = :5005'` or `lsof -nP -iTCP:5005 -sTCP:LISTEN` before stopping it. Confirm the test JVM has exited. Stopping the Maven shell alone can leave the forked Surefire JVM holding the port. If you need a different port, launch with `-Dmaven.surefire.debug="-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5006"` and attach with `port=5006, requireVmStart=true`.
 - **Plugin doesn't seem active.** In Claude Code, open `/plugin`; in Codex, `/plugins` (or `codex plugin list`). `jdwp-debugging` must be installed and enabled.
 - **The `jdwp_*` tools are missing right after installing or updating the plugin.** The server JAR was still being built or downloaded when the agent started the server. In Claude Code, reconnect `jdwp-inspector` in `/mcp`; in Codex, start a new session. It can take more than one try. If the tools stay missing, ask the agent to find out why — the plugin's `java-debug` skill tells it where to look.
 

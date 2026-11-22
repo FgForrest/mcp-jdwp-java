@@ -187,6 +187,8 @@ Start Claude Code or Codex from the sandbox folder (or this repo's root, if you 
 Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing, find the root cause.
 ```
 
+For each new test JVM, attach with `jdwp_wait_for_attach(port=5005, requireVmStart=true)`. Between runs, disconnect and confirm the previous test JVM and background Maven shell have ended.
+
 ---
 
 ### #1 The Phantom Session
@@ -419,7 +421,7 @@ jdwp_set_logpoint(
 )
 ```
 
-A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Where even that pause matters — races, hot loops — see fast logpoints below.
+A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Boxed primitives appear as values, and other objects appear as `Object (type)`. Where even that pause matters — races, hot loops — see fast logpoints below.
 
 ### Fast logpoints (in-target, consent required)
 
@@ -471,7 +473,7 @@ jdwp_set_breakpoint(className="com.example.LazyService", lineNumber=15)
 
 `jdwp_overview()` shows pending breakpoints with their status; `jdwp_get_events()` records a `CLASS_PREPARE` entry when a load activates them.
 
-This works from VM start, so it is the attach prologue for a failing test: launch the JVM suspended (`-Dmaven.surefire.debug`), `jdwp_wait_for_attach`, set every line BP, logpoint, exception BP and field BP while the JVM is parked, then `jdwp_resume_until_event`. Each one activates when its class loads — JDK classes included, so an exception BP on `java.lang.AssertionError` set at VM start stops on the first failing JUnit assertion.
+This works from VM start, so it is the attach prologue for a failing test: launch the JVM suspended (`-Dmaven.surefire.debug`), call `jdwp_wait_for_attach(requireVmStart=true)`, set every line BP, logpoint, exception BP and field BP while the JVM is parked, then `jdwp_resume_until_event`. Each one activates when its class loads — JDK classes included, so an exception BP on `java.lang.AssertionError` set at VM start stops on the first failing JUnit assertion.
 
 Pass `forceLoad=true` only when you need the breakpoint to bind *immediately* — the server will call `Class.forName` in the target VM to load the class up front. That runs the class's `<clinit>` (early static init, eager dependency loads), which can mask lazy-init / classloader-leak diagnostics. Use sparingly. It needs a thread stopped at an event to run the load, so at VM start it cannot load anything: the breakpoint is deferred instead, and the reply says `forceLoad=true could not load it`.
 
@@ -499,6 +501,8 @@ jdwp_set_exception_logpoint(
 ```
 
 Each hit records an `EXCEPTION_LOG` entry to `jdwp_get_events`; failures during evaluation surface as `EXCEPTION_LOG_ERROR` so the listener never throws. Use this to trace exception flows in long-running services without stopping them.
+
+Both exception tools support a Java `condition` with `$exception` bound to the thrown object. To scope broad exception types, pass one throw-site class pattern in `thrownIn` (for example, `thrownIn="com.example.*"`) or comma-separated exclusion patterns in `notThrownIn` (for example, `notThrownIn="jdk.*,org.junit.*"`). Use exact class names or one `*` at either end. The VM drops throws that match any exclusion. Every throw site is eligible by default. The filters appear in `jdwp_overview` and survive deferral and `jdwp_reconnect`.
 
 ### Field breakpoints (watchpoints)
 
@@ -695,7 +699,7 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 ### Stepping: when it's worth it
 
-`jdwp_step_over` / `jdwp_step_into` / `jdwp_step_out` go through the same stop pipeline as breakpoints — the step releases the stepping thread, the next `STEP` event stops that thread alone again, and `jdwp_resume_until_event` waits for it without resuming anything else; other threads parked by the original stop stay parked until `jdwp_resume`. `threadId` is optional; omitted, the step targets the thread of the current stop.
+`jdwp_step_over`, `jdwp_step_into` and `jdwp_step_out` release the selected thread and report remaining stops and manual holds. A stop-all still covers threads JDI omits from the list, including virtual threads on some JVMs. Call `jdwp_resume_until_event` to wait for the landing. Omit `threadId` to step the thread of the current stop.
 
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
@@ -712,7 +716,9 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_connect`         | —                              | Connect to JDWP on configured host:port                                                              |
 | `jdwp_disconnect`      | —                              | Disconnect (sends JDWP Dispose) and clears session state                                             |
 | `jdwp_reconnect`       | —                              | Re-attach to the last target; BP IDs, conditions, logpoints, chains, watchers replay onto the new VM |
-| `jdwp_wait_for_attach` | `host?`, `port?`, `timeoutMs?` | Poll until JVM is listening, then attach (soft-wait envelope at the ceiling)                         |
+| `jdwp_wait_for_attach` | `host?`, `port?`, `timeoutMs?`, `requireVmStart?` | Poll for a listening JVM and attach. `requireVmStart=true` requires a fresh start suspension. |
+
+Attach and disconnect replies show the local PID, start time, and launch selector when available. For an unverified local JVM, disconnect gives commands to check the port owner. A forwarder may appear as the TCP peer. A live `server=y` process listens again after disconnect. `[NOT_FRESH]` means a session already exists or the new attachment had no suspending `VM_START` during its startup check.
 
 ### Inspection (9)
 
@@ -750,8 +756,8 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?` | **Rare, consent required.** Conditional breakpoint whose condition is evaluated inside the target by injected bytecode — hits that do not meet it never reach the debugger. Without `userApproved=true` it arms nothing and returns a risk briefing |
 | `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints or fast breakpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs, fast logpoints and fast breakpoints (restoring the original bytecode, after the release of a thread stopped in the method; a leftover of an earlier session is only switched off) and removes its watchers |
-| `jdwp_set_exception_breakpoint`   | `className`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?` | Suspend on exception throw (supports deferred and trigger chaining; `suspendPolicy="all"` parks every thread) |
-| `jdwp_set_exception_logpoint`     | `className`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Non-stopping exception breakpoint with `$exception` bound |
+| `jdwp_set_exception_breakpoint`   | `className`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?`, `condition?`, `thrownIn?`, `notThrownIn?` | Suspend on exception throw with optional condition and throw-site filters. Supports deferral, trigger chaining and `suspendPolicy="all"`. |
+| `jdwp_set_exception_logpoint`     | `className`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `thrownIn?`, `notThrownIn?` | Non-stopping exception breakpoint with `$exception` bound and optional throw-site filters. |
 | `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `excludeConstructors?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining; `excludeConstructors=true` ignores writes in the declaring class's constructors and static initializer) |
 | `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `excludeConstructors?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
 
@@ -887,7 +893,7 @@ The `jdwp-sandbox` module includes a deterministic scenario (`one.edee.jdwp.sand
 ./mvnw -pl jdwp-sandbox test -Dtest=RecursiveCalculatorTest -DskipTests=false -Dmaven.surefire.debug
 
 # From the agent:
-jdwp_wait_for_attach()
+jdwp_wait_for_attach(requireVmStart=true)
 jdwp_set_breakpoint("one.edee.jdwp.sandbox.recursion.RecursiveCalculator", 22)
 jdwp_resume_until_event()
 # → BP fires inside compute(5)

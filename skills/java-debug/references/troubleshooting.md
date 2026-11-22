@@ -33,19 +33,20 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 
 Applies to any JDWP port — 5005 for build-system shortcuts, but also non-default ports (8003, 8000, 9009, …) used by already-running services.
 
-Find what holds the port:
+Check the local target PID and start time in the attach or disconnect reply. A live `server=y` target listens again after detach. `jdwp_wait_for_attach(requireVmStart=true)` reports `[NOT_FRESH]` for an existing session or if a new attachment fails to receive a suspending `VM_START` event. Disconnect and confirm the previous test process has ended before relaunching. A TCP peer may be a port forwarder. For a TCP peer, `probably PID`, ambiguous match, or missing PID, verify the port owner before stopping the process.
+
+To look up a listener from the shell, use one of these commands.
 
 ```bash
-ps -ef | grep "jdwp=transport"     # all JDWP-enabled JVMs
-ss -tnlp | grep <port>             # what's listening on a specific port (Linux)
-lsof -i :<port>                    # same, macOS / BSD
+ss -ltnp 'sport = :5005'        # listening TCP port and owner on Linux
+lsof -nP -iTCP:5005 -sTCP:LISTEN # listening TCP port and owner on macOS / BSD
 ```
 
 Only kill a process you launched yourself in this session. If the process is unrecognized or was not started by you, **ask the user before killing it** — it may be a long-running service the user *intends* you to attach to, or another developer's debug session. When in doubt, ask "is this the JVM I should attach to?" before doing anything destructive.
 
-## Both processes gone after a crash
+## Reattaching after a crash
 
-The test JVM exits when its debugger detaches; the MCP server may also have crashed. Reconnect the MCP server first (`/mcp` in Claude Code, a new session in Codex), then relaunch the test JVM from scratch.
+Reconnect the MCP server first (`/mcp` in Claude Code, a new session in Codex). Check whether the test JVM is still alive, confirm it has ended, then relaunch the test and attach with `requireVmStart=true`.
 
 ## Expression evaluation fails with "X cannot be resolved"
 

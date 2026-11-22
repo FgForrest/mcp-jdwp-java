@@ -70,7 +70,7 @@ final class LiveSession implements AutoCloseable {
 			}
 		});
 		final JdiEventListener listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks);
-		connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health);
+		connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health, new JvmDiscoveryService());
 		final JdiExpressionEvaluator evaluator =
 			new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, noLocalClasspath);
 		evaluatorRef.set(evaluator);

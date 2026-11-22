@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -84,7 +85,7 @@ class SuspensionSessionHeldThreadsTest {
 		session.presentCurrent();
 		final StepRequest step = mock(StepRequest.class);
 		when(step.virtualMachine()).thenReturn(model.vm);
-		assertThat(session.step(t.ref, () -> step)).isNull();
+		assertThat(session.step(t.ref, List::of, () -> step).refusal()).isNull();
 
 		assertThat(held(false, 0)).containsOnly(Map.entry(u.ref, Set.of(SuspensionSession.MANUAL_HOLD)),
 			Map.entry(t.ref, Set.of(SuspensionSession.STEP_HOLD)));

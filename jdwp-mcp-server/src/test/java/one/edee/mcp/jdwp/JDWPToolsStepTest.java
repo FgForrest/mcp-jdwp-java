@@ -75,14 +75,20 @@ class JDWPToolsStepTest {
 	 * {@code jdwp_resume_until_event} leaves it: a step releases its thread through that stop.
 	 */
 	private void holdStop(ThreadReference thread, int breakpointId) throws Exception {
+		holdStop(thread, breakpointId, EventRequest.SUSPEND_EVENT_THREAD, true);
+	}
+
+	private void holdStop(ThreadReference thread, int breakpointId, int policy, boolean present) throws Exception {
 		final EventSet set = mock(EventSet.class);
-		when(set.suspendPolicy()).thenReturn(EventRequest.SUSPEND_EVENT_THREAD);
+		when(set.suspendPolicy()).thenReturn(policy);
 		when(set.iterator()).thenAnswer(invocation -> Collections.emptyIterator());
 		final SuspensionSession.Context context = session.route(set, thread, false);
 		session.begin(context);
 		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread, breakpointId));
 		session.finish(context);
-		session.nextStop(0);
+		if (present) {
+			session.nextStop(0);
+		}
 		stops.put(thread, set);
 	}
 
@@ -103,6 +109,119 @@ class JDWPToolsStepTest {
 		final StepRequest req = mock(StepRequest.class);
 		when(erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth)).thenReturn(req);
 		return req;
+	}
+
+	@Test
+	@DisplayName("Step reports the remaining holders, including unseen stops and manual holds")
+	void shouldReportRemainingHolders() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		final ThreadReference seen = suspendedThread(2L);
+		final ThreadReference unseen = mock(ThreadReference.class);
+		when(unseen.uniqueID()).thenReturn(3L);
+		when(unseen.name()).thenReturn("unseen-worker");
+		holdStop(unseen, 3, EventRequest.SUSPEND_EVENT_THREAD, false);
+		final ThreadReference manual = mock(ThreadReference.class);
+		when(manual.uniqueID()).thenReturn(4L);
+		when(manual.name()).thenReturn("manual-worker");
+		session.suspendThread(manual);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping, seen, unseen, manual));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L)).contains("released", "presented thread stops: thread-2",
+			"unseen thread stops: unseen-worker", "jdwp_suspend_thread holds: manual-worker",
+			"All remaining threads run.");
+	}
+
+	/** Reserves space for the stepping thread and stop-all origin in the shared name cap. */
+	@Test
+	@DisplayName("Step from stop-all shows the remaining threads with a capped list")
+	void shouldCapStopAllThreadNames() throws Exception {
+		final List<ThreadReference> threads = new java.util.ArrayList<>();
+		for (int i = 1; i <= 8; i++) {
+			final ThreadReference thread = mock(ThreadReference.class);
+			when(thread.uniqueID()).thenReturn((long) i);
+			when(thread.name()).thenReturn("worker-" + i);
+			threads.add(thread);
+		}
+		final ThreadReference stepping = threads.get(0);
+		when(stepping.isSuspended()).thenReturn(true);
+		holdStop(stepping, 1, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(threads);
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L)).contains("presented stop-all from thread worker-1",
+			"still covers other threads (JDI lists worker-2", "and 4 more")
+			.doesNotContain("worker-5", "worker-6", "worker-7", "worker-8");
+	}
+
+	@Test
+	@DisplayName("A stop-all is reported even if JDI only lists the stepping thread")
+	void shouldDescribeStopAllScopeWithNoOtherEnumeratedThreads() throws Exception {
+		final ThreadReference stepping = mock(ThreadReference.class);
+		when(stepping.uniqueID()).thenReturn(1L);
+		when(stepping.name()).thenReturn("main");
+		when(stepping.isSuspended()).thenReturn(true);
+		holdStop(stepping, 1, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L))
+			.contains("presented stop-all from thread main", "still covers other threads")
+			.doesNotContain("All other threads run.", "All remaining threads run.");
+	}
+
+	/** Exercises several presented stop-alls still held after repeatedly releasing only their origin. */
+	@Test
+	void shouldCountRepeatedStopAllsFromTheSameThread() throws Exception {
+		final ThreadReference stepping = mock(ThreadReference.class);
+		when(stepping.uniqueID()).thenReturn(1L);
+		when(stepping.name()).thenReturn("main");
+		when(stepping.isSuspended()).thenReturn(true);
+		final ThreadReference bystander = mock(ThreadReference.class);
+		when(bystander.uniqueID()).thenReturn(2L);
+		when(bystander.name()).thenReturn("bystander");
+		for (int hit = 1; hit <= 8; hit++) {
+			holdStop(stepping, hit, EventRequest.SUSPEND_ALL, true);
+			if (hit < 8) {
+				assertThat(session.releaseThread(stepping).refusal()).isNull();
+			}
+		}
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping, bystander));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L))
+			.contains("8 presented stop-alls from thread main")
+			.containsOnlyOnce("JDI lists bystander");
+	}
+
+	/** Shares one thread-name budget across stop-all scopes and manual-hold groups. */
+	@Test
+	void shouldCapThreadNamesAcrossDifferentHolders() throws Exception {
+		final List<ThreadReference> threads = new java.util.ArrayList<>();
+		for (int i = 1; i <= 8; i++) {
+			final ThreadReference thread = mock(ThreadReference.class);
+			when(thread.uniqueID()).thenReturn((long) i);
+			when(thread.name()).thenReturn("sample-" + i);
+			threads.add(thread);
+		}
+		final ThreadReference stepping = threads.get(0);
+		when(stepping.isSuspended()).thenReturn(true);
+		assertThat(session.suspendThread(threads.get(7))).isNull();
+		holdStop(stepping, 1, EventRequest.SUSPEND_ALL, true);
+		holdStop(threads.get(1), 2, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(threads);
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		final String reply = tools.jdwp_step_over(1L);
+		assertThat(reply).contains("jdwp_suspend_thread holds", "stop-all")
+			.doesNotContain("All remaining threads run.");
+		assertThat(java.util.regex.Pattern.compile("sample-\\d+").matcher(reply).results().count())
+			.isLessThanOrEqualTo(5);
 	}
 
 	@Nested
@@ -173,7 +292,8 @@ class JDWPToolsStepTest {
 			verify(erm).createStepRequest(threadCaptor.capture(), anyInt(), anyInt());
 			assertThat(threadCaptor.getValue()).isSameAs(thread);
 			assertThat(out).contains("42").contains("thread-42")
-				.contains("Call jdwp_resume_until_event to wait for the STEP event");
+				.contains("Call jdwp_resume_until_event to wait for the STEP event")
+				.contains("All other threads run.");
 		}
 
 		@Test

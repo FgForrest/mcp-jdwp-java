@@ -15,6 +15,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -238,28 +240,19 @@ class JdiEventListenerExceptionLogTest {
 		assertThat(last.details()).containsEntry("catchLocation", "com.example.Handler:73");
 	}
 
-	/**
-	 * Pins the condition gate on log-only exception BPs: when a condition is attached to the
-	 * exception logpoint and evaluates to {@code false}, the listener must auto-resume the event
-	 * set WITHOUT recording an {@code EXCEPTION_LOG} entry, WITHOUT evaluating the log expression,
-	 * and WITHOUT propagating chain effects to dependents. Mirrors the line-BP condition-false
-	 * carve-out: a skipped condition is not a meaningful trigger, so dependents must remain
-	 * disabled.
-	 */
-	@Test
-	@DisplayName("Log-only exception BP with condition false: auto-resume, no log, no chain effects")
-	void shouldSkipExceptionLogAndChainWhenConditionFalse() throws Exception {
+	@ParameterizedTest(name = "logOnly={0}")
+	@ValueSource(booleans = {true, false})
+	@DisplayName("A false exception condition releases the event and skips chain effects")
+	void shouldSkipExceptionHitAndChainWhenConditionFalse(boolean logOnly) throws Exception {
 		ThreadReference thread = mockThread("worker-cond-false", 700L);
 		ExceptionRequest request = mock(ExceptionRequest.class);
 		ObjectReference exception = mockException("java.lang.RuntimeException");
 		StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
 
-		// Register the log-only exception BP WITH an expression — so we can also assert the
-		// expression is NOT evaluated when the condition is false (only the condition itself runs).
-		int exId = tracker.registerExceptionBreakpoint(
-			request, ExceptionBreakpointSpec.logOnly("java.lang.RuntimeException", true, true,
-				"$exception.getMessage()"));
+		int exId = tracker.registerExceptionBreakpoint(request, logOnly
+			? ExceptionBreakpointSpec.logOnly("java.lang.RuntimeException", true, true, "$exception.getMessage()")
+			: ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
 
 		// Wire a disabled line-BP dependent on the exception BP so we can assert no chain arming.
 		BreakpointRequest dependentBp = mock(BreakpointRequest.class);
@@ -280,12 +273,10 @@ class JdiEventListenerExceptionLogTest {
 
 		runListenerWith(listener, eventSet);
 
-		// Thread auto-resumes — a condition-false exception logpoint must not park the thread.
 		verify(eventSet).resume();
-		// No EXCEPTION_LOG (or EXCEPTION_LOG_ERROR) entry was recorded.
 		assertThat(eventHistory.getRecent(20))
 			.extracting(EventHistory.DebugEvent::type)
-			.doesNotContain("EXCEPTION_LOG", "EXCEPTION_LOG_ERROR");
+			.doesNotContain("EXCEPTION", "EXCEPTION_LOG", "EXCEPTION_LOG_ERROR");
 		// Chain effects must be skipped — dependent stays disabled, no CHAIN_ARMED entry.
 		verify(dependentBp, never()).setEnabled(true);
 		assertThat(eventHistory.getRecent(20))
@@ -296,6 +287,29 @@ class JdiEventListenerExceptionLogTest {
 			eq(Map.of("$exception", exception)));
 		verify(evaluator, org.mockito.Mockito.times(1))
 			.evaluate(any(), anyString(), any());
+	}
+
+	@Test
+	@DisplayName("A broken exception breakpoint condition reports the error and keeps the stop")
+	void shouldKeepExceptionStopWhenConditionFails() throws Exception {
+		final ThreadReference thread = mockThread("worker", 725L);
+		final ExceptionRequest request = mock(ExceptionRequest.class);
+		final ObjectReference exception = mockException("java.lang.RuntimeException");
+		final StackFrame frame = mock(StackFrame.class);
+		final String condition = "$exception.invalidMethod()";
+		when(thread.frame(0)).thenReturn(frame);
+		when(evaluator.evaluate(frame, condition, Map.of("$exception", exception)))
+			.thenThrow(new JdiEvaluationException("unknown method"));
+		final int id = tracker.registerExceptionBreakpoint(request,
+			ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
+		tracker.setCondition(id, condition);
+		final EventSet set = mockEventSet(mockExceptionEvent(request, thread, exception, "example.Worker", 42));
+
+		runListenerWith(listener, set);
+
+		verify(set, never()).resume();
+		assertThat(eventHistory.getRecent(20)).extracting(EventHistory.DebugEvent::type)
+			.containsSubsequence("CONDITION_ERROR", "EXCEPTION");
 	}
 
 	/**

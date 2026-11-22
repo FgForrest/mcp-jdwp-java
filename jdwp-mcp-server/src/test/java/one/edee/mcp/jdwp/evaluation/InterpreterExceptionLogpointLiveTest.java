@@ -49,7 +49,8 @@ class InterpreterExceptionLogpointLiveTest {
             }
         });
         final var listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks);
-        final var connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health);
+        final var connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health,
+            mock(JvmDiscoveryService.class));
         final var evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, noLocalClasspath);
         delegate.set(evaluator);
         final var fast = new FastLogpointService(tracker, history, guard, evaluator, listener, connection);
@@ -59,7 +60,7 @@ class InterpreterExceptionLogpointLiveTest {
             assertThat(connection.connect("127.0.0.1", port)).startsWith("Connected");
             assertThat(tools.jdwp_resume_until_event(10_000)).contains("via=vm_start");
             assertThat(tools.jdwp_set_exception_logpoint("java.lang.IllegalArgumentException", "$exception.getMessage()",
-                null, true, false, null, null, false)).contains("ID:").doesNotContain("Error");
+                null, true, false, null, null, false, null, null)).contains("ID:").doesNotContain("Error");
             assertThat(tools.jdwp_resume()).startsWith("Resumed:");
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
                 assertThat(history.getRecent(20)).anySatisfy(event -> {
