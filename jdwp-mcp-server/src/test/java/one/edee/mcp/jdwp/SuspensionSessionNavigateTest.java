@@ -9,6 +9,7 @@ import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -19,6 +20,15 @@ import static org.mockito.Mockito.*;
 
 /** Tests navigation on holds managed by the suspension session. */
 class SuspensionSessionNavigateTest {
+
+    /**
+     * A test marks the test thread as processing an event set. Clear that mark, or later tests on the
+     * same JVM thread would buffer their history entries into this test's session.
+     */
+    @AfterEach
+    void endProcessing() {
+        SuspensionSession.endProcessing();
+    }
 
     @Test
     void toolsNavigateManualBystanderMonitorAndWaitHoldsWithoutBorrowingCounts() throws Exception {
