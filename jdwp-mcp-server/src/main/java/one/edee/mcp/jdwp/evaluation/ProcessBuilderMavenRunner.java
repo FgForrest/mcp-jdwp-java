@@ -55,6 +55,8 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     private static final String MODULE_OUTPUT = "${project.groupId}@${project.artifactId}@${project.version}.cp";
     /** Passes the private path outside argv so platform launchers cannot reinterpret it. */
     private static final String OUTPUT_DIRECTORY_ENV = "JDWP_MCP_CLASSPATH_DIR";
+    /** Maven's output-directory expression, also the literal directory name if expansion fails. */
+    private static final String OUTPUT_DIRECTORY_EXPRESSION = "${env." + OUTPUT_DIRECTORY_ENV + "}";
     /** Upper bound on captured child stdout/stderr included in the WARN log on failure. */
     private static final int STDOUT_CAPTURE_BYTES = 64 * 1024;
     /**
@@ -109,15 +111,15 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             final List<String> argv = new ArrayList<>(command);
             // Maven expands the environment reference and reactor coordinates for each module.
             // Keep the absolute path out of argv, especially when launching mvnw.cmd on Windows.
-            argv.add("-Dmdep.outputFile=${env." + OUTPUT_DIRECTORY_ENV + "}/" + MODULE_OUTPUT);
+            argv.add("-Dmdep.outputFile=" + OUTPUT_DIRECTORY_EXPRESSION + "/" + MODULE_OUTPUT);
             final int exitCode = commandExecutor.execute(new CommandRequest(List.copyOf(argv), workingDirectory,
                 timeoutSeconds, outputDirectory));
             switch (exitCode) {
                 case -1 -> throw new IOException("Maven timed out after " + timeoutSeconds + " seconds");
                 case 126, 127 -> throw new IOException("Maven executable could not be started: " + command.get(0)
-                    + " (exit code " + exitCode + "). Check for a missing interpreter, CRLF line endings,"
-                    + " or a missing inner command.");
-                case 0 -> { return harvestOutputFiles(outputDirectory); }
+                    + " (exit code " + exitCode + "). Check for a command not on PATH, a missing interpreter,"
+                    + " CRLF line endings, or a missing inner command.");
+                case 0 -> { return harvestOutputFiles(outputDirectory, workingDirectory); }
                 default -> throw new IOException("Maven exited with code " + exitCode);
             }
         } catch (InterruptedException e) {
@@ -132,8 +134,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
      * Reads regular files recursively without following links, including paths nested by a version.
      * Returns the union of entries, reports read failures with partial results, and treats an
      * interrupted read as cancellation. A successful Maven run must produce at least one file.
+     * With no private output, a literal directory in the project identifies a dropped environment.
      */
-    private static List<String> harvestOutputFiles(Path directory) throws IOException, InterruptedException {
+    private static List<String> harvestOutputFiles(Path directory, Path workingDirectory)
+        throws IOException, InterruptedException {
         checkDiscoveryInterrupted();
         final Set<String> entries = new LinkedHashSet<>();
         final List<IOException> failures = new ArrayList<>();
@@ -172,6 +176,14 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             throw new OutputReadException(List.copyOf(entries), failures);
         }
         if (!foundOutput) {
+            final Path literalDirectory = workingDirectory.resolve(OUTPUT_DIRECTORY_EXPRESSION);
+            if (Files.isDirectory(literalDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Maven succeeded but wrote no private classpath output. "
+                    + "The Maven launcher did not pass the " + OUTPUT_DIRECTORY_ENV
+                    + " environment variable through, so Maven wrote into directories named "
+                    + OUTPUT_DIRECTORY_EXPRESSION + " inside the project's modules, such as " + literalDirectory
+                    + ". Delete them.");
+            }
             throw new IOException("Maven succeeded but wrote no classpath output. "
                 + "Check whether the POM configures the dependency plugin's outputFile.");
         }

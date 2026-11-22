@@ -94,14 +94,17 @@ public class JdiExpressionEvaluator {
      * Flushes the whole map at {@link #MAX_CACHE_SIZE}. Compiler reconfiguration replaces the map
      * so a concurrent compilation can only populate the cache it started with.
      */
-    private volatile CompilerState compilerState = new CompilerState(null, null, null, null, new ConcurrentHashMap<>());
+    private volatile CompilerState compilerState =
+        new CompilerState(null, null, null, false, null, new ConcurrentHashMap<>());
 
     /**
      * Binds the VM and discovery snapshot to the options and wrapper cache. A tool worker or
      * dispatcher captures one state so each compilation uses the options that own its cache.
+     * {@code localEntriesAdded} records whether the merge changed the remote-only classpath.
      */
     private record CompilerState(@Nullable VirtualMachine vm, @Nullable Snapshot snapshot,
                                  LocalProjectClasspathProvider.@Nullable Breakdown mergedLocal,
+                                 boolean localEntriesAdded,
                                  InMemoryJavaCompiler.@Nullable Configuration options,
                                  Map<String, CachedCompilation> cache) {}
 
@@ -1512,7 +1515,7 @@ public class JdiExpressionEvaluator {
             // updating the local options. Successful reconfiguration replaces the wrapper cache.
             if (!jdkReady) {
                 compiler.reset();
-                compilerState = new CompilerState(null, null, null, null, new ConcurrentHashMap<>());
+                compilerState = new CompilerState(null, null, null, false, null, new ConcurrentHashMap<>());
             }
 
             final String remoteClasspath = jdiConnectionService.discoverClasspath(suspendedThread);
@@ -1529,13 +1532,15 @@ public class JdiExpressionEvaluator {
                 // win over stale local copies. Append local-only entries to fill classloader gaps.
                 final Set<String> localEntries = local == null ? Set.of() : local.all();
                 final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
+                final boolean localEntriesAdded = !localEntries.isEmpty()
+                    && !mergedClasspath.equals(mergeClasspaths(remoteClasspath, Set.of()));
                 final int version = jdiConnectionService.getTargetMajorVersion();
                 final Snapshot candidate = snapshot;
                 if (localClasspathProvider.publishIfCurrent(vm, candidate, includeLocal, () -> {
                     if (jdkPath != null && !mergedClasspath.isEmpty()) {
                         compiler.configure(jdkPath, mergedClasspath, version);
-                        compilerState = new CompilerState(vm, candidate, local, compiler.currentConfiguration(),
-                            new ConcurrentHashMap<>());
+                        compilerState = new CompilerState(vm, candidate, local, localEntriesAdded,
+                            compiler.currentConfiguration(), new ConcurrentHashMap<>());
                     }
                 })) {
                     // Remote discovery signals unavailable inputs by leaving the JDK or classpath
@@ -1621,7 +1626,7 @@ public class JdiExpressionEvaluator {
             if (captured == null) {
                 throw failure;
             }
-            final boolean missingFromRemote = state.mergedLocal() == null
+            final boolean missingFromRemote = !state.localEntriesAdded()
                 && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes;
             // A workspace reported during ECJ may not have a scan yet. Starting it here
             // lets this evaluation defer against the replacement without waiting for Maven.

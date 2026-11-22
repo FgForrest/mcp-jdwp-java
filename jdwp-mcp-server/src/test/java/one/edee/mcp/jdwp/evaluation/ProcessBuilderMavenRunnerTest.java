@@ -281,6 +281,10 @@ class ProcessBuilderMavenRunnerTest {
 		assertThatThrownBy(() -> runner.run(List.of(inner.toString(), nonExecutable.toString()), project, 30))
 			.isInstanceOf(IOException.class).hasMessageContaining("could not be started", inner.toString(),
 				"126", "missing interpreter", "CRLF", "missing inner command");
+		final String missingCommand = "mvn-jdwp-test-command-not-installed";
+		assertThatThrownBy(() -> runner.run(List.of(missingCommand), project, 30))
+			.isInstanceOf(IOException.class).hasMessageContaining(missingCommand)
+			.hasMessageContaining("127").hasMessageContaining("not on PATH");
 	}
 
 	/** Treats cancellation between Maven exit and classpath harvest as an interrupt. */
@@ -423,13 +427,34 @@ class ProcessBuilderMavenRunnerTest {
 	void shouldRequireOutputFileEvenForEmptyClasspath(@TempDir Path project) throws Exception {
 		final ProcessBuilderMavenRunner missing = new ProcessBuilderMavenRunner(req -> 0);
 		assertThatThrownBy(() -> missing.run(List.of("mvn"), project, 10))
-			.isInstanceOf(IOException.class).hasMessageContaining("wrote no classpath output", "outputFile", "POM");
+			.isInstanceOf(IOException.class)
+			.hasMessageContaining("wrote no classpath output")
+			.hasMessageContaining("POM configures the dependency plugin's outputFile");
 
 		final ProcessBuilderMavenRunner empty = new ProcessBuilderMavenRunner(req -> {
 			Files.createFile(classpathOutput(req));
 			return 0;
 		});
 		assertThat(empty.run(List.of("mvn"), project, 10)).isEmpty();
+	}
+
+	/** Diagnoses a dropped launcher environment and preserves the project's literal output directory. */
+	@Test
+	void shouldReportLiteralProjectOutputWhenLauncherDropsEnvironment(@TempDir Path project) throws Exception {
+		final Path literalDirectory = project.resolve("${env.JDWP_MCP_CLASSPATH_DIR}");
+		final Path output = literalDirectory.resolve("fixture@module@1.cp");
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			Files.createDirectory(literalDirectory);
+			Files.writeString(output, "/m2/fixture.jar");
+			return 0;
+		});
+
+		assertThatThrownBy(() -> runner.run(List.of("mvn"), project, 10))
+			.isInstanceOf(IOException.class)
+			.hasMessageContaining("launcher did not pass")
+			.hasMessageContaining(literalDirectory.toString())
+			.hasMessageNotContaining("outputFile");
+		assertThat(output).hasContent("/m2/fixture.jar");
 	}
 
 	/** Reads classpath files in subdirectories created by Maven versions containing a slash. */

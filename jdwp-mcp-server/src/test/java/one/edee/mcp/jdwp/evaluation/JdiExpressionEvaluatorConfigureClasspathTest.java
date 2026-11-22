@@ -13,6 +13,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.jspecify.annotations.Nullable;
 
@@ -66,10 +67,14 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		when(thread.uniqueID()).thenReturn(42L);
 	}
 
-	/** A replacement workspace can supply a dependency missing from the initial remote options. */
+	/** Handles replacement discovery even when a completed scan added no compiler entries. */
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void probeUsesReplacementScanDuringFirstCompile(boolean ready, @TempDir Path root) throws Exception {
+	@CsvSource({"false, pending", "true, pending", "false, empty", "true, empty", "true, duplicate"})
+	void probeUsesReplacementScanDuringFirstCompile(boolean ready, String initialScan, @TempDir Path root)
+		throws Exception {
+		final boolean initialScanComplete = !initialScan.equals("pending");
+		final List<String> initialEntries = initialScan.equals("duplicate")
+			? List.of(root.resolve("remote").toString()) : List.of();
 		final Path initial = Files.createDirectory(root.resolve("initial"));
 		Files.writeString(initial.resolve("pom.xml"), "<project/>");
 		final Path replacement = Files.createDirectory(root.resolve("replacement"));
@@ -78,6 +83,9 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		final CountDownLatch release = new CountDownLatch(1);
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(initial, workspace, name -> null,
 			(command, directory, timeout) -> {
+				if (initialScanComplete && directory.equals(initial)) {
+					return initialEntries;
+				}
 				assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
 				return directory.equals(replacement) ? List.of(classes.toString()) : List.of();
 			});
@@ -103,6 +111,9 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 			compiler, jdiService, new EvaluationGuard(), provider);
 		evaluator.startLocalClasspathDiscovery(vm);
 		try {
+			if (initialScanComplete) {
+				assertThat(provider.discover()).containsExactlyElementsOf(initialEntries);
+			}
 			evaluator.configureCompilerClasspathForEvent(thread);
 			if (ready) {
 				assertThat(compileDependencyProbe(evaluator, frame)).isNotNull();
