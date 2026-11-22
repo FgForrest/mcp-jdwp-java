@@ -1223,8 +1223,8 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Builds the evaluation context, compiles (or reuses a cached) wrapper class living in
-     * {@code wrapperPackage}, defines it into the target VM, and invokes it. Factored out of
+     * Builds the evaluation context with class or interface receiver bindings, then compiles
+     * or reuses a wrapper in {@code wrapperPackage} and invokes it in the target VM. Factored out of
      * {@link #evaluate} so that method can retry in {@link #DEFAULT_EVALUATION_PACKAGE} when a
      * non-default package is rejected at define time — see {@link JdiClassDefinitionException}.
      * <p>
@@ -1259,11 +1259,11 @@ public class JdiExpressionEvaluator {
         //    accessible from a non-subclass even when `this`'s runtime type is in the wrapper
         //    package — so we'd produce a misleading "not visible" error if we rewrote it.
         //  - Private fields are never rewritten.
-        if (receiverType instanceof ClassType thisClass) {
+        if (receiverType != null) {
             final Set<String> shadowingLocals = context.getVariables().stream()
                 .map(v -> v.name)
                 .collect(Collectors.toSet());
-            expression = rewriteForReceiver(expression, thisClass, wrapperPackage, shadowingLocals,
+            expression = rewriteForReceiver(expression, receiverType, wrapperPackage, shadowingLocals,
                 context.getVariables().get(0).name);
         }
 
@@ -1352,15 +1352,15 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Returns the expression with the selected receiver binding. Outside block mode it also qualifies
-     * reachable bare fields and method calls, subject to the wrapper package's access rules.
+     * Binds explicit {@code this} to the selected receiver for classes and interfaces.
+     * For class receivers outside block mode, also qualifies accessible bare members.
      */
-    private static String rewriteForReceiver(String expression, ClassType thisClass, String wrapperPackage,
+    private static String rewriteForReceiver(String expression, ReferenceType receiverType, String wrapperPackage,
                                              Set<String> shadowingLocals, String receiver) {
         if (!"_this".equals(receiver)) {
             expression = rewriteThisKeyword(expression, receiver);
         }
-        if (isBlockMode(expression)) {
+        if (!(receiverType instanceof ClassType thisClass) || isBlockMode(expression)) {
             return expression;
         }
         final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
@@ -1495,18 +1495,19 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Rewrites the bare {@code this} fields in a probe's user text to {@code _this.field}, as an
-     * evaluation wrapper does; unchanged when {@code this} is not passed.
+     * Uses the probe's receiver binding for explicit {@code this} and eligible bare class members.
+     * Returns the original text when the probe receives no receiver.
      */
     private String rewriteForProbe(String text, StackFrame frame, boolean includeThis, String wrapperPackage,
                                    List<FastLogpointProbeSource.Parameter> parameters) {
-        if (!includeThis || !(frame.location().declaringType() instanceof ClassType thisClass)) {
+        if (!includeThis) {
             return text;
         }
         final Set<String> localNames = parameters.stream()
             .map(FastLogpointProbeSource.Parameter::name)
             .collect(Collectors.toSet());
-        return rewriteForReceiver(text, thisClass, wrapperPackage, localNames, parameters.get(0).name());
+        return rewriteForReceiver(text, frame.location().declaringType(), wrapperPackage, localNames,
+            parameters.get(0).name());
     }
 
     private static String probeClassName(String wrapperPackage, String classPrefix) {

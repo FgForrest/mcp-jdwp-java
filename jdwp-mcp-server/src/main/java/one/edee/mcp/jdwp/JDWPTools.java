@@ -5387,9 +5387,8 @@ public class JDWPTools {
     }
 
     /**
-     * Renders the fast-breakpoint section: state, mode, policy and the probe's counters. A leftover
-     * of an earlier session has no stop request, so it never stops; its provenance is shown instead
-     * of the policy, and not whether it is spent — its gate generation is not known.
+     * Renders fast-breakpoint state, pending arming captures and counters for overview.
+     * Shows provenance for leftovers, whose gate generations are unknown.
      */
     private int appendFastBreakpointOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
         final List<String> rows = new ArrayList<>();
@@ -5405,10 +5404,15 @@ public class JDWPTools {
             final String switchState = info.enabled() ? "evaluating" : "kill switch set";
             final String state = switch (info.state()) {
                 case WAITING_FOR_CLASS -> "WAITING — the class is not loaded yet; arms on the first hit after it loads";
-                case PENDING -> spent
-                    ? "PENDING, spent — stopped before its probe was installed; call jdwp_set_fast_breakpoint again "
-                    + "with the same arguments to re-arm"
-                    : "PENDING — arms on the next hit";
+                case PENDING -> {
+                    if (counters != null && counters.armingStopPending()) {
+                        yield "PENDING — stop pending (stop gate claimed, capture in progress). Wait with jdwp_resume_until_event";
+                    }
+                    yield spent
+                        ? "PENDING, spent — stopped before its probe was installed; call jdwp_set_fast_breakpoint again "
+                        + "with the same arguments to re-arm"
+                        : "PENDING — arms on the next hit";
+                }
                 case ARMED -> (spent ? "ARMED, spent — re-arm to stop again" : "ARMED") + " — " + counted;
                 case DISABLED -> "DISABLED, still installed — " + info.failureReason();
                 case FAILED -> "FAILED: " + info.failureReason();

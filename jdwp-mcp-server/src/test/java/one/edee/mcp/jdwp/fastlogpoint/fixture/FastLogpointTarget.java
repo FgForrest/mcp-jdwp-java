@@ -5,11 +5,11 @@ import java.util.concurrent.locks.LockSupport;
 
 /**
  * Target program for {@code FastLogpointLiveTest}, run in a forked JVM with a JDWP agent. Worker
- * threads call {@link #compute} and {@link #other} in a tight loop until standard input closes; a
+ * threads call {@link #compute}, {@link #other} and {@link #visitDefault} until standard input closes; a
  * {@code lock-holder} thread holds {@link #LOCK} nearly all the time. The test locates lines by the
  * {@code // MARK:} comments, so the code can move without breaking it.
  */
-public class FastLogpointTarget {
+public class FastLogpointTarget implements DefaultMethodTarget {
     /**
      * Total {@link #compute} calls — read by the test over JDWP to measure throughput.
      */
@@ -32,8 +32,9 @@ public class FastLogpointTarget {
     int base = 7;
 
     /**
-     * Starts the workers and handles test commands, including starting a virtual worker and explicit GC.
-     * Runs on the target's main thread and propagates command failures.
+     * Starts the workers, including calls into the default-method fixture, and handles test commands on
+     * the main thread, including starting a virtual worker and explicit GC. Propagates failure to read a
+     * command or load the deferred target.
      */
     public static void main(String[] args) throws Exception {
         final int threads = args.length > 0 ? Integer.parseInt(args[0]) : 2;
@@ -44,6 +45,7 @@ public class FastLogpointTarget {
                 while (true) {
                     target.compute(i);
                     target.other(i);
+                    target.visitDefault(i);
                     i++;
                 }
             }, "worker-" + t);

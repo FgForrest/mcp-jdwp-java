@@ -107,6 +107,7 @@ class JDWPToolsFastBreakpointTest {
 		verify(fastLogpoints, never()).registerBreakpoint(any(), any(), anyString(), any(), anyBoolean(), anyInt(), anyInt());
 	}
 
+	/** Verifies overview grouping and status text for pending, armed and recovered probes. */
 	@Test
 	@DisplayName("jdwp_overview lists fast breakpoints in their own section, fast logpoints in theirs")
 	void overviewSeparatesKinds() {
@@ -117,13 +118,13 @@ class JDWPToolsFastBreakpointTest {
 				4096, 0, 0, 0, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
 			new FastLogpointService.Info(5, "com.example.Cart", 50, "", "qty > 9", FastLogpointService.State.ARMED, null,
 				256, 0, 0, 0, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_ALL, true,
-				new FastLogpointService.BreakpointCounters(4, 1, 1, true)),
+				new FastLogpointService.BreakpointCounters(4, 1, 1, true, false)),
 			new FastLogpointService.Info(6, "com.example.Cart", 60, "", "id == 0", FastLogpointService.State.PENDING, null,
 				256, 0, 0, -1, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, false,
-				new FastLogpointService.BreakpointCounters(-1, -1, -1, false)),
+				new FastLogpointService.BreakpointCounters(-1, -1, -1, false, false)),
 			new FastLogpointService.Info(8, "com.example.Order", 7, "", "x", FastLogpointService.State.RECOVERED, null,
 				256, 0, 0, 0, true, provenance, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, true,
-				new FastLogpointService.BreakpointCounters(2, 0, 0, true))));
+				new FastLogpointService.BreakpointCounters(2, 0, 0, true, false))));
 
 		final String breakpoints = tools.jdwp_overview("fast_breakpoint", null, null);
 		assertThat(breakpoints)

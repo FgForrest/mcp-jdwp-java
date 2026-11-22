@@ -224,7 +224,7 @@ A generation only grows, and a thread claims the one it read on entry — both g
 
 **Capture.** Optional `capture` runs on the hitting thread after the condition returns true and the true-hit gate accepts it. Capture accepts the same Java expressions, `{ ...; return value; }` blocks and bindings as the probe condition. To report several values, return one string such as `"id=" + id + " status=" + statuses[id]`. The installed probe evaluates capture in the same call to `hit()` before suspension. Other threads can still change shared state between the condition and capture. Keep both thread-safe and free of side effects.
 
-Both paths use the fast-logpoint renderer for null, strings, boxed primitives, JDK big numbers and enums. Other values render as `type@identityHash`. Capture text keeps up to 2,048 UTF-16 code units plus a truncation marker. A failed capture appears as `capture failed: …`. If compilation fails with capture enabled, the server retries with the condition alone. When that succeeds, the probe installs and reports the capture compiler diagnostic at every stop. Condition failures use their own stop gate.
+Both paths use the fast-logpoint renderer for null, strings, boxed primitives, JDK big numbers and enums. Other values render as `type@identityHash`. Capture text keeps up to 2,048 UTF-16 code units plus a truncation marker. A failed capture appears as `capture failed: …`. If compilation fails while building the installed probe with capture enabled, the server retries with the condition alone. When that succeeds, the probe installs and reports the capture compiler diagnostic at every stop. Condition failures use their own stop gate.
 
 **Arming.** The arming request carries the requested policy. On its hit the condition is evaluated through the debugger, against server-side copies of the gates:
 
@@ -235,6 +235,8 @@ Both paths use the fast-logpoint renderer for null, strings, boxed primitives, J
 | anything else | The probe is installed: compiled, defined, gates written, `stop()` request created, class redefined (subject to § 5d), read back, `ENABLED=true`. |
 
 On a true arming hit the dispatcher evaluates capture immediately after the gate decision. It reads a fresh frame and uses the condition evaluator's invocation admission and lease (see [event pipeline](event-pipeline.md) § 14). The wrapper renders the capture in the target and holds its result until the dispatcher has copied it. The user's method keeps its original bytecode and local variables at that stop. If an ordinary breakpoint supplies the primary stop for the same event set, its ID stays in the header and each fast capture is labeled with its own ID. The corresponding `FAST_BREAKPOINT` history entry carries that ID and capture.
+
+While a once-mode arming capture is in progress, `jdwp_overview` reports a pending stop and directs the caller to `jdwp_resume_until_event`. Once capture completes, overview shows the claimed gate as spent. Re-arm after receiving the stop.
 
 So a condition that always throws is installed on the second arming hit and never stays on the debugger path. A fast breakpoint's arming hit is handled before a fast logpoint's that arrives in the same event set (both on one line): arming the logpoint first would redefine the class and replace the breakpoint's arming request, losing what may be its only true hit. After a stop the logpoint's arming is deferred (§ 5d).
 

@@ -21,16 +21,20 @@ import one.edee.mcp.jdwp.JDWPTools;
 import one.edee.mcp.jdwp.SuspensionSession;
 import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.fastlogpoint.fixture.DefaultMethodTarget;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -726,6 +730,78 @@ class FastBreakpointLiveTest {
 				logger.detachAppender(collectAfterInvoke);
 				collectAfterInvoke.stop();
 			}
+		}
+	}
+
+	/** Verifies both explicit receiver and local bindings on arming and installed default-method stops. */
+	@Order(23)
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void capturesThisInDefaultMethodWithShadowingLocal(boolean installed) throws Exception {
+		final int line = lineOf("// MARK: default probe", Path.of(
+			"src/test/java/one/edee/mcp/jdwp/fastlogpoint/fixture/DefaultMethodTarget.java"));
+		final VirtualMachine vm = connection.getVM();
+		final ClassType target = (ClassType) vm.classesByName(TARGET).get(0);
+		final Field stopField = target.fieldByName("captureTestStop");
+		final String condition = installed ? TARGET + ".captureTestStop" : "true";
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(DefaultMethodTarget.class.getName(), line, condition,
+			true, "thread", true, null, "this.receiverValue() + _this - (i & 1)"));
+		try {
+			if (installed) {
+				await("the default-method probe to arm", () -> state(id) != FastLogpointService.State.PENDING);
+				assertThat(state(id)).isEqualTo(FastLogpointService.State.ARMED);
+				target.setValue(stopField, vm.mirrorOf(true));
+			}
+			assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true", "Captured at the hit: 7");
+		} finally {
+			target.setValue(stopField, vm.mirrorOf(false));
+		}
+	}
+
+	/** Holds the dispatcher before reading a capture and checks the overview before and after publication. */
+	@Test
+	@Order(24)
+	void overviewReportsPendingStopUntilArmingCaptureFinishes() throws Exception {
+		try (LiveSession captureSession = LiveSession.start(List.of())) {
+			final AtomicInteger evaluations = new AtomicInteger();
+			final CountDownLatch readingCapture = new CountDownLatch(1);
+			final CountDownLatch finishCapture = new CountDownLatch(1);
+			final Logger logger = (Logger) LoggerFactory.getLogger(JdiExpressionEvaluator.class);
+			final AppenderBase<ILoggingEvent> pauseBeforeRead = new AppenderBase<>() {
+				/** Pauses the dispatcher's second evaluation before the capture text is copied. */
+				@Override
+				protected void append(ILoggingEvent event) {
+					if (event.getMessage().startsWith("[Evaluator] Expression evaluated in")
+						&& evaluations.incrementAndGet() == 2) {
+						readingCapture.countDown();
+						try {
+							finishCapture.await(10, TimeUnit.SECONDS);
+						} catch (InterruptedException interrupted) {
+							Thread.currentThread().interrupt();
+						}
+					}
+				}
+			};
+			pauseBeforeRead.start();
+			logger.addAppender(pauseBeforeRead);
+			final int id;
+			try {
+				id = idOf(captureSession.tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "true",
+					true, "thread", true, null, "\"arming capture\""));
+				assertThat(readingCapture.await(10, TimeUnit.SECONDS)).isTrue();
+				assertThat(captureSession.tools.jdwp_get_breakpoint_context(null, false))
+					.contains("No current breakpoint detected");
+				assertThat(captureSession.tools.jdwp_overview("fast_breakpoint", null, null))
+					.contains("stop pending", "Wait with jdwp_resume_until_event").doesNotContain("re-arm");
+			} finally {
+				finishCapture.countDown();
+				logger.detachAppender(pauseBeforeRead);
+				pauseBeforeRead.stop();
+			}
+			assertThat(captureSession.tools.jdwp_resume_until_event(20_000))
+				.contains("fast_breakpoint=" + id + ", condition true", "Captured at the hit: arming capture");
+			assertThat(captureSession.tools.jdwp_overview("fast_breakpoint", null, null))
+				.contains("PENDING, spent", "re-arm").doesNotContain("stop pending");
 		}
 	}
 

@@ -3262,8 +3262,13 @@ public class FastLogpointService {
 
     /**
      * On the dispatcher, evaluates the condition and any admitted capture outside the monitor.
-     * Returns whether the hit stopped, should install, or no longer applies. Throws
-     * {@link LocalClasspathPendingException} to defer arming and {@link FastLogpointException} if the thread resumes.
+     * This execution runs the old code, so the probe never sees it. A hit that stops (the condition
+     * holds or fails, and its gate is open) is published at once and installs nothing — redefining the
+     * method now would leave this stopped frame in an obsolete method without locals. A true stop
+     * evaluates its optional capture after claiming its gate; overview can see the pending capture
+     * until evaluation finishes. Returns whether the hit stopped, should install, or no longer
+     * applies. Throws {@link LocalClasspathPendingException} to defer arming and
+     * {@link FastLogpointException} if the thread resumes.
      */
     private BreakpointArmingHit evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
         throws FastLogpointException, LocalClasspathPendingException {
@@ -3300,6 +3305,9 @@ public class FastLogpointService {
             epoch = flp.epoch;
             previousClaimedEpoch = flp.claimedEpoch;
             if (flp.stopOnce) {
+                if (!flp.expression.isEmpty()) {
+                    flp.armingCaptureEpoch = epoch;
+                }
                 // Spent before it was ever installed: no arming until a re-arm opens the next epoch.
                 flp.claimedEpoch = epoch;
                 deleteArmingRequest(flp);
@@ -3308,24 +3316,28 @@ public class FastLogpointService {
                 return publishTrueArmingStop(flp, thread, location, null);
             }
         }
-        final String captured;
         try {
-            captured = evaluateArmingCapture(flp, thread);
-        } catch (LocalClasspathPendingException pending) {
-            synchronized (this) {
-                if (flp.stopOnce && flp.epoch == epoch) {
-                    // No stop was published. Leave this generation eligible on the next arming hit.
-                    flp.claimedEpoch = previousClaimedEpoch;
+            final String captured;
+            try {
+                captured = evaluateArmingCapture(flp, thread);
+            } catch (LocalClasspathPendingException pending) {
+                synchronized (this) {
+                    if (flp.stopOnce && flp.epoch == epoch) {
+                        // No stop was published. Leave this generation eligible on the next arming hit.
+                        flp.claimedEpoch = previousClaimedEpoch;
+                    }
                 }
+                throw pending;
             }
-            throw pending;
-        }
-        synchronized (this) {
-            if (logpoints.get(flp.id) != flp || flp.state != State.PENDING
-                || (flp.stopOnce && flp.epoch != epoch)) {
-                return BreakpointArmingHit.SKIP;
+            synchronized (this) {
+                if (logpoints.get(flp.id) != flp || flp.state != State.PENDING
+                    || (flp.stopOnce && flp.epoch != epoch)) {
+                    return BreakpointArmingHit.SKIP;
+                }
+                return publishTrueArmingStop(flp, thread, location, captured);
             }
-            return publishTrueArmingStop(flp, thread, location, captured);
+        } finally {
+            flp.armingCaptureEpoch = 0;
         }
     }
 
@@ -3654,18 +3666,21 @@ public class FastLogpointService {
     }
 
     /**
-     * Reads a fast breakpoint's counters from its probe; unread values are {@code -1}.
+     * Reads installed counters or the arming gate state for overview. Unread counters are {@code -1}.
      */
     private static BreakpointCounters breakpointCounters(FastLogpoint flp) {
         final ClassType probeType = flp.probeType;
         if (probeType == null) {
-            return new BreakpointCounters(-1, -1, -1, flp.stopOnce && flp.claimedEpoch >= flp.epoch);
+            final int captureEpoch = flp.armingCaptureEpoch;
+            final int epoch = flp.epoch;
+            return new BreakpointCounters(-1, -1, -1, flp.stopOnce && flp.claimedEpoch >= epoch,
+                captureEpoch != 0 && captureEpoch == epoch);
         }
         final long trueHits = atomicValue(probeType, FastBreakpointProbeSource.TRUE_HITS_FIELD);
         final long errors = atomicValue(probeType, FastBreakpointProbeSource.ERRORS_FIELD);
         final long stops = atomicValue(probeType, FastBreakpointProbeSource.STOPS_FIELD);
         final boolean spent = flp.stopOnce && atomicValue(probeType, FastBreakpointProbeSource.CLAIMED_FIELD) >= flp.epoch;
-        return new BreakpointCounters(trueHits, errors, stops, spent);
+        return new BreakpointCounters(trueHits, errors, stops, spent, false);
     }
 
     /**
@@ -3771,9 +3786,10 @@ public class FastLogpointService {
      * @param trueHits how often the condition held ({@code -1} when the probe is unreadable or not installed)
      * @param errors   how often the condition failed ({@code -1} likewise)
      * @param stops    how often its {@code stop()} was reached ({@code -1} likewise)
-     * @param spent    whether a once-mode breakpoint already stopped in its current epoch
+     * @param spent    whether a once-mode breakpoint has claimed its current true-hit gate
+     * @param armingStopPending whether that claim is waiting for the dispatcher to finish its arming capture
      */
-    public record BreakpointCounters(long trueHits, long errors, long stops, boolean spent) {
+    public record BreakpointCounters(long trueHits, long errors, long stops, boolean spent, boolean armingStopPending) {
     }
 
     /**
@@ -3882,7 +3898,8 @@ public class FastLogpointService {
         // Fast breakpoints, under the service monitor. The generations of the true-hit and the error
         // gate (the server is their only writer, the probe gets a copy) and, before the probe exists,
         // the generations claimed by arming hits.
-        int epoch = 1;
+        /** Current true-hit generation, also read by overview without the service monitor. */
+        volatile int epoch = 1;
         int errorEpoch = 1;
         /** Attempted stop generation if the write outcome is unknown, or zero. Guarded by the service monitor. */
         int unconfirmedEpoch;
@@ -3890,6 +3907,8 @@ public class FastLogpointService {
         int unconfirmedErrorEpoch;
         int claimedEpoch;
         int errorClaimedEpoch;
+        /** Once-mode generation whose arming capture the dispatcher is processing, or zero when idle. */
+        volatile int armingCaptureEpoch;
         @Nullable
         BreakpointRequest stopRequest;
         /**
