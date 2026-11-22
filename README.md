@@ -699,7 +699,7 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 ### Stepping: when it's worth it
 
-`jdwp_step_over`, `jdwp_step_into` and `jdwp_step_out` release the selected thread and report which other threads remain suspended by stops or manual holds. All remaining threads run. Call `jdwp_resume_until_event` to wait for the landing. Omit `threadId` to step the thread of the current stop.
+`jdwp_step_over`, `jdwp_step_into` and `jdwp_step_out` release the selected thread and report remaining stops and manual holds. A stop-all still covers threads JDI omits from the list, including virtual threads on some JVMs. Call `jdwp_resume_until_event` to wait for the landing. Omit `threadId` to step the thread of the current stop.
 
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
@@ -718,7 +718,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_reconnect`       | —                              | Re-attach to the last target; BP IDs, conditions, logpoints, chains, watchers replay onto the new VM |
 | `jdwp_wait_for_attach` | `host?`, `port?`, `timeoutMs?`, `requireVmStart?` | Poll for a listening JVM and attach. `requireVmStart=true` requires a fresh start suspension. |
 
-Attach and disconnect replies identify the local JVM by PID, start time and command when available. A live `server=y` process listens again after disconnect. `[NOT_FRESH]` means the server already has a session or the newly attached JVM was running and has been detached.
+Attach and disconnect replies show the local PID, start time, and launch selector when available. A `probably PID` reply calls for checking the port owner. A live `server=y` process listens again after disconnect. `[NOT_FRESH]` means a session already exists or the new attachment had no suspending `VM_START` during its startup check.
 
 ### Inspection (9)
 

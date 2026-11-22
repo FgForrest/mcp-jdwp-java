@@ -366,7 +366,7 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 
 If the release fails, the request is deleted and the pending entry dropped, so a failed step leaves nothing armed.
 
-With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It groups threads by stop-all or thread stop, seen or unseen, in-progress event set, or manual hold. Each group lists up to five names and a count of additional threads. Threads outside those holds run. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
+With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It reports the scope of each remaining stop-all independently of JDI enumeration. JDI can omit virtual threads, so the stop-all reports up to five names and a count from the threads JDI lists. Thread stops, in-progress events and manual holds are grouped by owner. The reply says all remaining threads run only when no stop-all remains. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
 
 Example, from stop-all hold B (every thread at count 1):
 
@@ -425,7 +425,7 @@ Limits: a spin or a native wait (no contended monitor) is not detected, nor is a
 
 ### Attach
 
-After `jdwp_connect` or `jdwp_wait_for_attach` connects, outside the connection service's monitor, `acknowledgeStart` waits up to 500 ms for the VMStart set. A suspending VMStart is published as a held stop and marked seen; the attach reply says the VM is suspended at start. A non-suspending VMStart is history only. A reattach or a delayed start event can leave the handshake without a VMStart. A later suspending start is published unseen, and the next `jdwp_resume_until_event` presents it. `requireVmStart=true` refuses existing sessions and detaches from a newly attached running VM.
+After `jdwp_connect` or `jdwp_wait_for_attach` connects, outside the connection service's monitor, `acknowledgeStart` waits up to 500 ms for the VMStart set. A suspending VMStart is published as a held stop and marked seen; the attach reply says the VM is suspended at start. A non-suspending VMStart is history only. A reattach or a delayed start event can leave the handshake without a VMStart. A later suspending start is published unseen, and the next `jdwp_resume_until_event` presents it. `requireVmStart=true` refuses existing sessions and detaches unless the handshake observed a suspending VMStart. The presence of suspended threads alone is used only for permissive attach guidance.
 
 ### Testing
 

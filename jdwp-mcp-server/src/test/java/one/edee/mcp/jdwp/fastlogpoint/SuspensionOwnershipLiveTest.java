@@ -25,6 +25,7 @@ import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.enableSuspended;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.idOf;
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.lineOf;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Suspension ownership (issue #45) against a real forked JVM: the watchdog frees an evaluation the
@@ -344,6 +345,44 @@ class SuspensionOwnershipLiveTest {
 		// worker runs on. Attach again to look.
 		reattach();
 		assertApplicationRuns();
+	}
+
+	@Test
+	@Order(8)
+	@DisplayName("Stepping out of a stop-all still covers virtual threads omitted by allThreads")
+	void reportsStopAllWhileAnUnlistedVirtualThreadStaysParked() throws Exception {
+		assumeTrue(Runtime.version().feature() >= 21);
+		final VirtualMachine vm = connection.getVM();
+		final ReferenceType type = vm.classesByName(TARGET).get(0);
+		final var virtualWorkerField = type.fieldByName("virtualWorker");
+		session.process.getOutputStream().write('V');
+		session.process.getOutputStream().flush();
+		await("the virtual worker to start", () -> type.getValue(virtualWorkerField) instanceof ThreadReference worker
+			&& "unlisted-virtual-worker".equals(worker.name()));
+		final ThreadReference virtualWorker = (ThreadReference) type.getValue(virtualWorkerField);
+		assumeTrue(!vm.allThreads().contains(virtualWorker), "JDI already enumerates virtual threads on this JVM");
+
+		final ThreadReference stepping = thread("worker-0");
+		final Location probe = type.locationsOfLine(lineOf("// MARK: probe")).get(0);
+		final BreakpointRequest stop = vm.eventRequestManager().createBreakpointRequest(probe);
+		stop.addThreadFilter(stepping);
+		stop.addCountFilter(1);
+		stop.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+		final int id = session.tracker.registerBreakpoint(stop);
+		enableSuspended(stop, stepping);
+		try {
+			assertThat(tools.jdwp_resume_until_event((int) TIMEOUT.toMillis())).contains("Thread: worker-0");
+			assertThat(virtualWorker.isSuspended()).isTrue();
+
+			final String reply = tools.jdwp_step_over(null);
+
+			assertThat(virtualWorker.isSuspended()).as("the original stop-all still holds the virtual worker").isTrue();
+			assertThat(reply).contains("presented stop-all from thread worker-0", "still covers other threads")
+				.doesNotContain("All remaining threads run.");
+		} finally {
+			tools.jdwp_clear_breakpoint(id);
+			tools.jdwp_resume();
+		}
 	}
 
 	// ── helpers ──

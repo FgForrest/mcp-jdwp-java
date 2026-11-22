@@ -150,8 +150,26 @@ class JDWPToolsStepTest {
 		when(vm.allThreads()).thenReturn(threads);
 		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
 
-		assertThat(tools.jdwp_step_over(1L)).contains("presented stop-all stops: worker-2", "and 2 more")
+		assertThat(tools.jdwp_step_over(1L)).contains("presented stop-all from thread worker-1",
+			"still covers other threads (JDI lists worker-2", "and 2 more")
 			.doesNotContain("worker-7", "worker-8");
+	}
+
+	@Test
+	@DisplayName("A stop-all is reported even if JDI only lists the stepping thread")
+	void shouldDescribeStopAllScopeWithNoOtherEnumeratedThreads() throws Exception {
+		final ThreadReference stepping = mock(ThreadReference.class);
+		when(stepping.uniqueID()).thenReturn(1L);
+		when(stepping.name()).thenReturn("main");
+		when(stepping.isSuspended()).thenReturn(true);
+		holdStop(stepping, 1, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L))
+			.contains("presented stop-all from thread main", "still covers other threads")
+			.doesNotContain("All other threads run.", "All remaining threads run.");
 	}
 
 	@Nested

@@ -15,7 +15,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class JvmDiscoveryServiceAttachApiTest {
 
 	@Test
-	@DisplayName("each attached JVM yields one descriptor with pid + main class")
+	@DisplayName("each attached JVM yields a descriptor with a PID and a safe launch summary")
 	void shouldEmitOneDescriptorPerAttachedJvm() {
 		final JvmDiscoveryService service = new JvmDiscoveryService(
 			() -> List.of(
@@ -34,7 +34,7 @@ class JvmDiscoveryServiceAttachApiTest {
 		assertThat(result.get(0).isThisProcess()).isFalse();
 		assertThat(result.get(0).jdwp()).isNull();
 		assertThat(result.get(1).pid()).isEqualTo(202L);
-		assertThat(result.get(1).mainClass()).isEqualTo("org.example.Other arg1 arg2");
+		assertThat(result.get(1).mainClass()).isNull();
 	}
 
 	@Test

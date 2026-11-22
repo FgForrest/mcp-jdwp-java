@@ -1276,6 +1276,8 @@ public class JdiEventListener {
      *       the resume-until-event latch, and returns {@code true}.</li>
      * </ul>
      * <p>
+     * The dispatcher evaluates a tracked request's condition with {@code $exception} bound before
+     * either mode handles the hit. A false result skips both the hit and its chain effects.
      * Both the log-only and the suspending paths additionally propagate chain effects for the
      * firing exception BP via {@link #applyChainEffectsAfterHit} when its synthetic ID is
      * recoverable from {@code event.request()}.
@@ -1310,17 +1312,16 @@ public class JdiEventListener {
                 return false;
             }
 
-            if (info != null && info.isLogOnly()) {
-                final String condition = firingId != null
-                    ? breakpointTracker.getCondition(firingId) : null;
-                if (condition != null && firingId != null && !evaluateConditionWithBindings(
-                        event.thread(), condition, Map.of("$exception", exception),
-                        firingId, exceptionType)) {
-                    // Condition false — skip the log AND chain effects. Same rationale as the
-                    // line-BP path: a skipped condition is not a meaningful trigger.
-                    log.debug("[JDI] Exception logpoint {} condition false, skipping", firingId);
+            if (info != null && firingId != null) {
+                final String condition = breakpointTracker.getCondition(firingId);
+                if (condition != null && !evaluateConditionWithBindings(
+                        event.thread(), condition, Map.of("$exception", exception), firingId, throwInfo)) {
+                    log.debug("[JDI] Exception request {} condition false, skipping", firingId);
                     return false;
                 }
+            }
+
+            if (info != null && info.isLogOnly()) {
                 evaluateExceptionLogpoint(event, info, exception, exceptionType,
                     throwInfo, catchInfo, threadName);
                 if (firingId != null) {

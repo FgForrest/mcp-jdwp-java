@@ -89,11 +89,11 @@ The "exactly one attempt" behaviour matters: a `getVM()` call cannot spiral into
 
 Polls `connect()` every 200 ms up to a timeout (default 30 s) — `JDWPTools.java:296-359`. `IllegalConnectorArgumentsException` fails fast (a bad host or port — no point retrying). `IOException` and other exceptions are retried (the target is simply not listening yet). On timeout, the tool runs JVM discovery (see [diagnostics.md](diagnostics.md)) so the agent can see "what JVMs did come up but on a different port".
 
-After a new connection, the tool waits up to 500 ms for VMStart outside the connection service monitor (`SuspensionSession.acknowledgeStart`). A VM suspended at start has that stop marked as seen. Set breakpoints, then call `jdwp_resume_until_event` to release the start stop. A running VM may have launched with `suspend=n` or resumed in an earlier debugger session. If VMStart has yet to arrive and a thread is suspended, the reply reports the uncertainty and the next wait can present a late start stop.
+After a new connection, the tool waits up to 500 ms for VMStart outside the connection service monitor (`SuspensionSession.acknowledgeStart`). A VM suspended at start has that stop marked as seen. Set breakpoints, then call `jdwp_resume_until_event` to release the start stop. A running VM may have launched with `suspend=n` or resumed in an earlier debugger session. In permissive mode, if VMStart has yet to arrive and a thread is suspended, the reply reports the uncertainty and the next wait can present a late start stop.
 
-With `requireVmStart=true`, an existing session is refused with `[NOT_FRESH]` and remains attached. A newly attached running JVM is also refused and is immediately detached, ending the wait. For a local target, the reply names the process when available. Each new test run starts after disconnecting and confirming the previous JVM has ended. The option defaults to false.
+With `requireVmStart=true`, an existing session is refused with `[NOT_FRESH]` and remains attached. A new attachment must observe a suspending `VM_START` within the handshake window. A JVM already running or suspended at an ordinary event, such as a launch configured with `onthrow`, is detached with `[NOT_FRESH]`. For a local target, the reply names the process when available. Each new test run starts after disconnecting and confirming the previous JVM has ended. The option defaults to false.
 
-`jdwp_connect`, `jdwp_wait_for_attach` and `jdwp_reconnect` report the local target PID, start time in the server’s time zone, uptime and command when available. See [diagnostics.md](diagnostics.md) for the lookup.
+`jdwp_connect`, `jdwp_wait_for_attach` and `jdwp_reconnect` report the local target PID, start time in the server’s time zone, uptime and launch selector when available. A discovery-only match is labelled `probably PID`. See [diagnostics.md](diagnostics.md) for the lookup.
 
 ## 3. The event listener — started here, stopped on disconnect
 
@@ -122,7 +122,7 @@ There are two cleanup paths, and the difference matters.
 4. Calls `vm.dispose()` for a clean JDWP teardown (lines 451-456). Best-effort: any exception is swallowed because the VM may already be gone.
 5. **Resets `lastHost` / `lastPort` to 0 / null** (lines 459-460).
 
-That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly. The disconnect reply includes the local process identity when available. A live target keeps running and, with `server=y`, listens again on the same port. A new JVM on that port must wait until the old process ends.
+That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly. The disconnect reply includes the local process identity when available. For a verified live socket owner it reports that the `server=y` JVM listens again on the same port and gives the PID for cleanup. For a discovery-only match it gives commands to verify the port owner.
 
 ### VM-death: `notifyVmDied()`
 

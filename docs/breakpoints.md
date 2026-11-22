@@ -130,7 +130,7 @@ Conditions accept either primitive `BooleanValue` or boxed `java.lang.Boolean` (
 
 ### Exception conditions and throw-site filters
 
-Both exception tools accept a Java `condition` evaluated in the throwing frame with `$exception` bound to the thrown object. `className` selects the exception type. `thrownIn` accepts one pattern for the class containing the throw instruction. `notThrownIn` accepts comma-separated exclusion patterns for that class. A pattern is an exact class name or has a single `*` at the start or end, such as `com.example.*` or `*Test`. JDI applies these filters before notifying the debugger and drops throws that match any exclusion. Every throw site is eligible by default, including JDK code that throws on behalf of the application.
+Both exception tools accept a Java `condition` evaluated in the throwing frame with `$exception` bound to the thrown object. A false condition skips the stop or log and any chain effects. A failed evaluation is reported and the hit proceeds. `className` selects the exception type. `thrownIn` accepts one pattern for the class containing the throw instruction. `notThrownIn` accepts comma-separated exclusion patterns for that class. A pattern is an exact class name or has a single `*` at the start or end, such as `com.example.*` or `*Test`. JDI applies these filters before notifying the debugger and drops throws that match any exclusion. Every throw site is eligible by default, including JDK code that throws on behalf of the application.
 
 The set reply and `jdwp_overview` show configured filters. The request spec carries them through class-prepare promotion and `jdwp_reconnect`.
 

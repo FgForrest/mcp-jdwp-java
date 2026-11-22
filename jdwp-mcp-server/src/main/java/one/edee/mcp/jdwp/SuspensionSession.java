@@ -701,12 +701,12 @@ public final class SuspensionSession {
      * Outcome of {@link #step}.
      *
      * @param refusal          why the step was not started, or {@code null} when it was
-     * @param remainingHolders after a started step: the other suspended threads grouped by what holds
-     *                         them, one rendered line per holder kind; empty when every other thread runs
+     * @param remainingHolders the other thread-specific holds, grouped by holder kind
+     * @param remainingStopAlls the stop-all contexts still in effect, even if JDI lists no other threads
      */
-    public record StepResult(@Nullable String refusal, List<String> remainingHolders) {
+    public record StepResult(@Nullable String refusal, List<String> remainingHolders, List<String> remainingStopAlls) {
         private static StepResult refused(String reason) {
-            return new StepResult(reason, List.of());
+            return new StepResult(reason, List.of(), List.of());
         }
     }
 
@@ -740,7 +740,7 @@ public final class SuspensionSession {
             deleteQuietly(request);
             throw e;
         }
-        return new StepResult(null, describeRemainingHolders(vmThreads));
+        return describeRemainingHolders(vmThreads);
     }
 
     /**
@@ -748,35 +748,46 @@ public final class SuspensionSession {
      * thread stops, sets still being processed, manual holds — from the session's own records, not
      * from JDI suspend counts. Runs under the session monitor.
      *
-     * @param vmThreads every thread of the VM; needed only to expand stop-all contexts
+     * @param vmThreads threads enumerated by JDI, which can omit virtual threads
+     * @return a started step's result: thread-specific holds grouped by kind, and one line per
+     *         stop-all context still in effect (independent of which threads JDI enumerates)
      */
-    private List<String> describeRemainingHolders(List<ThreadReference> vmThreads) {
+    private StepResult describeRemainingHolders(List<ThreadReference> vmThreads) {
         final Map<String, Set<ThreadReference>> groups = new LinkedHashMap<>();
+        final List<String> stopAlls = new ArrayList<>();
         for (Context context : contexts) {
-            if (context.policy == EventRequest.SUSPEND_NONE) {
-                continue;
-            }
-            final boolean all = context.policy == EventRequest.SUSPEND_ALL;
-            final String label = context.state == State.HELD
-                ? (context.reported ? "presented " : "unseen ") + (all ? "stop-all stops" : "thread stops")
-                : "events still being processed";
-            final Set<ThreadReference> held = groups.computeIfAbsent(label, ignored -> new LinkedHashSet<>());
             final ThreadReference eventThread = context.thread;
-            if (all) {
-                for (ThreadReference candidate : vmThreads) {
-                    if (covers(context, candidate)) {
-                        held.add(candidate);
+            if (context.policy == EventRequest.SUSPEND_ALL) {
+                final Set<ThreadReference> listed = new LinkedHashSet<>();
+                for (ThreadReference thread : vmThreads) {
+                    if (covers(context, thread)) {
+                        listed.add(thread);
                     }
                 }
-            } else if (eventThread != null && covers(context, eventThread)) {
-                held.add(eventThread);
+                final String state = context.state == State.HELD ? seenWord(context) : "in-progress";
+                final String origin = eventThread == null ? "" : " from thread " + safeName(eventThread);
+                final String sample = listed.isEmpty() ? "" : " (JDI lists " + describeThreadGroup(listed) + ')';
+                stopAlls.add("The " + state + " stop-all" + origin + " still covers other threads" + sample + '.');
+            } else if (context.policy == EventRequest.SUSPEND_EVENT_THREAD
+                && eventThread != null && covers(context, eventThread)) {
+                final String label = context.state == State.HELD
+                    ? seenWord(context) + " thread stops" : "events still being processed";
+                groups.computeIfAbsent(label, ignored -> new LinkedHashSet<>()).add(eventThread);
             }
         }
         groups.put("jdwp_suspend_thread holds", manual);
-        return groups.entrySet().stream()
+        final List<String> threadHolds = groups.entrySet().stream()
             .filter(entry -> !entry.getValue().isEmpty())
             .map(entry -> entry.getKey() + ": " + describeThreadGroup(entry.getValue()))
             .toList();
+        return new StepResult(null, threadHolds, List.copyOf(stopAlls));
+    }
+
+    /**
+     * Whether a held context's stop has been presented by a tool, in the words the step reply uses.
+     */
+    private static String seenWord(Context context) {
+        return context.reported ? "presented" : "unseen";
     }
 
     /**

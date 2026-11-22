@@ -42,12 +42,14 @@ public final class LocalJdwpTarget {
             thread.setDaemon(true);
             return thread;
         });
-    private static final LocalJdwpTarget UNKNOWN = new LocalJdwpTarget(List.of());
+    private static final LocalJdwpTarget UNKNOWN = new LocalJdwpTarget(List.of(), false);
 
     private final List<Candidate> candidates;
+    private final boolean verifiedSocketOwner;
 
-    private LocalJdwpTarget(List<Candidate> candidates) {
+    private LocalJdwpTarget(List<Candidate> candidates, boolean verifiedSocketOwner) {
         this.candidates = candidates;
+        this.verifiedSocketOwner = verifiedSocketOwner;
     }
 
     /**
@@ -124,19 +126,28 @@ public final class LocalJdwpTarget {
             .sorted(Comparator.comparingLong(JvmDescriptor::pid))
             .map(Candidate::new)
             .toList();
-        return new LocalJdwpTarget(candidates);
+        return new LocalJdwpTarget(candidates, socketOwners.size() == 1 && candidates.size() == 1);
     }
 
     @Nullable
     private static JdwpEndpoint advertisedEndpoint(JvmDescriptor jvm) {
         final JdwpEndpoint endpoint = jvm.jdwp();
-        if (endpoint != null) {
+        if (endpoint != null || jvm.source() != JvmDescriptor.Source.ATTACH_API) {
             return endpoint;
         }
         // The Attach API inventory supplies PIDs on platforms without /proc. If process argv
         // is readable there, use the same parser without starting an Attach API session.
-        return ProcessHandle.of(jvm.pid()).flatMap(process -> process.info().arguments())
-            .map(args -> JvmDiscoveryService.findJdwpArg(List.of(args))).orElse(null);
+        return processLaunch(ProcessHandle.of(jvm.pid()).orElse(null)).jdwp();
+    }
+
+    private static JvmDiscoveryService.JavaLaunch processLaunch(@Nullable ProcessHandle process) {
+        if (process != null) {
+            final String[] args = process.info().arguments().orElse(null);
+            if (args != null) {
+                return JvmDiscoveryService.parseLaunchArguments(List.of(args));
+            }
+        }
+        return new JvmDiscoveryService.JavaLaunch(null, null);
     }
 
     private static boolean matchesPort(@Nullable JdwpEndpoint endpoint, Set<InetAddress> addresses, int port) {
@@ -278,31 +289,41 @@ public final class LocalJdwpTarget {
             return "";
         }
         if (candidates.size() > 1) {
-            return "\nTarget process is ambiguous: " + candidates.stream().map(candidate -> candidate.describe(at)).collect(joining("; "));
+            return "\nTarget process is ambiguous (unverified candidates): "
+                + candidates.stream().map(candidate -> candidate.describe(at)).collect(joining("; "));
         }
-        return "\nTarget process: " + candidates.get(0).describe(at);
+        final String label = verifiedSocketOwner ? "\nTarget process (verified socket owner): " : "\nTarget process: probably ";
+        return label + candidates.get(0).describe(at);
     }
 
     /**
-     * The identity line for a disconnect reply, plus a warning when the single identified process is
-     * still alive: a {@code server=y} JVM listens on its port again and keeps a new run from binding it.
+     * A verified live peer can reclaim the port. With discovery alone, tell the caller how to
+     * check the listening socket before acting on the candidate.
      */
     public String describeAfterDisconnect(int port) {
         final String identity = describe();
-        if (candidates.size() == 1 && candidates.get(0).isAlive()) {
+        if (verifiedSocketOwner && candidates.get(0).isAlive()) {
             return identity + "\nThe process is still alive and keeps running. With server=y it listens again on port "
-                + port + ", so a new run cannot bind that port until this process ends.";
+                + port + ", so a new run cannot bind that port until this process ends. If this is your previous test JVM, use kill "
+                + candidates.get(0).jvm().pid() + '.';
+        }
+        if (!verifiedSocketOwner && !identity.isEmpty()) {
+            return identity + "\nVerify the port owner with ss -ltnp 'sport = :" + port + "' or lsof -nP -iTCP:"
+                + port + " -sTCP:LISTEN.";
         }
         return identity;
     }
 
-    private record Candidate(JvmDescriptor jvm, @Nullable ProcessHandle process, @Nullable Instant started) {
+    private record Candidate(JvmDescriptor jvm, @Nullable ProcessHandle process, @Nullable Instant started,
+                             @Nullable String selector) {
         Candidate(JvmDescriptor jvm) {
             this(jvm, ProcessHandle.of(jvm.pid()).orElse(null));
         }
 
         private Candidate(JvmDescriptor jvm, @Nullable ProcessHandle process) {
-            this(jvm, process, process != null ? process.info().startInstant().orElse(null) : null);
+            this(jvm, process, process != null ? process.info().startInstant().orElse(null) : null,
+                jvm.mainClass() == null && jvm.source() == JvmDescriptor.Source.ATTACH_API
+                    ? processLaunch(process).selector() : jvm.mainClass());
         }
 
         boolean isAlive() {
@@ -322,9 +343,8 @@ public final class LocalJdwpTarget {
                     .append(" (").append(DiagnoseReportRenderer.humanDuration(Duration.between(started, at)))
                     .append(" uptime)");
             }
-            final String command = jvm.mainClass() != null ? jvm.mainClass() : jvm.maskedCmdline();
-            if (command != null && !command.isBlank()) {
-                final String singleLine = JvmDiscoveryService.maskCredentials(command).replaceAll("\\R", " ");
+            if (selector != null && !selector.isBlank()) {
+                final String singleLine = JvmDiscoveryService.maskCredentials(selector).replaceAll("\\R", " ");
                 out.append(" — ").append(singleLine.length() <= 160 ? singleLine : singleLine.substring(0, 160) + "…");
             }
             return out.toString();

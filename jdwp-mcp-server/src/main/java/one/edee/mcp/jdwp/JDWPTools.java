@@ -516,9 +516,7 @@ public class JDWPTools {
                         result, attempts) + jdiService.describeTargetProcess() + jdiService.takeAttachNotice();
                 }
                 final SuspensionSession.StartState start = acknowledgeStart();
-                final boolean suspended = start == SuspensionSession.StartState.SUSPENDED
-                    || (start == SuspensionSession.StartState.NOT_SEEN && anyThreadSuspended(!freshOnly));
-                if (freshOnly && !suspended) {
+                if (freshOnly && start != SuspensionSession.StartState.SUSPENDED) {
                     final JDIConnectionService.DisconnectResult rejected = jdiService.disconnect();
                     return notFresh(result + " at " + resolvedHost + ':' + resolvedPort
                         + ". The VM had no observable VM_START suspension and has been detached.", rejected.describeTargetProcess());
@@ -526,7 +524,7 @@ public class JDWPTools {
                 final String state;
                 if (start == SuspensionSession.StartState.SUSPENDED) {
                     state = "The VM is currently suspended at VM_START.";
-                } else if (suspended) {
+                } else if (start == SuspensionSession.StartState.NOT_SEEN && anyThreadSuspended()) {
                     state = "The VM appears suspended, but VM_START was not reported yet. "
                         + "If it arrives, jdwp_resume_until_event shows it.";
                 } else {
@@ -586,7 +584,7 @@ public class JDWPTools {
      */
     private static String notFresh(String target, String identity) {
         return "[NOT_FRESH] " + target + identity
-            + "\nCall jdwp_disconnect, make sure that process has ended, then attach again with requireVmStart=true.";
+            + "\nCall jdwp_disconnect. Confirm the previous test JVM has exited before attaching again with requireVmStart=true.";
     }
 
     @McpTool(description = "Disconnect from the JDWP server. Clears ALL session state — breakpoints, "
@@ -2783,8 +2781,16 @@ public class JDWPTools {
                 return String.format("Error: cannot step thread %d (%s): %s", thread.uniqueID(), thread.name(), step.refusal());
             }
 
-            final String otherThreads = step.remainingHolders().isEmpty() ? "All other threads run."
-                : "Still suspended by " + String.join("; ", step.remainingHolders()) + ". All remaining threads run.";
+            // A remaining stop-all is named on its own: JDI may not list every thread it holds
+            // (virtual threads), so "all other threads run" is said only when none remains.
+            final List<String> otherThreadParts = new ArrayList<>(step.remainingStopAlls());
+            if (!step.remainingHolders().isEmpty()) {
+                otherThreadParts.add("Still suspended by " + String.join("; ", step.remainingHolders()) + '.');
+            }
+            if (step.remainingStopAlls().isEmpty()) {
+                otherThreadParts.add(step.remainingHolders().isEmpty() ? "All other threads run." : "All remaining threads run.");
+            }
+            final String otherThreads = String.join(" ", otherThreadParts);
             return String.format("Step %s started%s on thread %d (%s), which was released. %s "
                     + "Call jdwp_resume_until_event to wait for the STEP event.%s",
                 label, startLocation, thread.uniqueID(), thread.name(), otherThreads, fastStopNote);
@@ -3490,13 +3496,13 @@ public class JDWPTools {
     }
 
     /**
-     * Whether a late VM_START could still hold the freshly attached VM. An unreadable VM
-     * cannot establish freshness, but the default attach keeps its best-effort guidance.
+     * Whether a late VM_START could still hold the freshly attached VM. Used only for
+     * best-effort guidance after a permissive attach.
      */
-    private boolean anyThreadSuspended(boolean assumeSuspended) {
+    private boolean anyThreadSuspended() {
         final VirtualMachine vm = jdiService.attachedVM();
         if (vm == null) {
-            return assumeSuspended;
+            return true;
         }
         try {
             for (ThreadReference thread : vm.allThreads()) {
@@ -3506,7 +3512,7 @@ public class JDWPTools {
             }
             return false;
         } catch (Exception unknown) {
-            return assumeSuspended;
+            return true;
         }
     }
 

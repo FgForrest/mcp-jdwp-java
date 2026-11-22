@@ -141,23 +141,34 @@ class JvmDiscoveryServiceProcFsTest {
 	}
 
 	@Test
-	@DisplayName("two-token JVM options (-cp / --module-path / -p / --add-modules / -m / --patch-module) are skipped")
-	void shouldSkipTwoTokenJvmOptionsWhenExtractingMainClass(@TempDir Path tempProc) throws IOException {
+	@DisplayName("two-token JVM options are skipped before the module selector")
+	void shouldSkipTwoTokenJvmOptionsBeforeModuleSelector(@TempDir Path tempProc) throws IOException {
 		writeCmdline(tempProc, 7001, "/usr/bin/java",
 			"-cp", "/cp/app.jar:/cp/lib.jar",
 			"--module-path", "/modules",
 			"-p", "/more-modules",
 			"--add-modules", "java.base,java.sql",
-			"-m", "com.example/com.example.Bootstrap",
 			"--patch-module", "java.base=/patches/base.jar",
-			"com.example.RealMain");
+			"-m", "com.example/com.example.Bootstrap", "--password", "app-argument");
 
 		final List<JvmDescriptor> result = newServiceWithProcRoot(tempProc).discover();
 
 		assertThat(result).hasSize(1);
-		// The classpath, module-path, and other two-token option values must not be mistaken
-		// for the main class — the actual main class is the trailing positional argument.
-		assertThat(result.get(0).mainClass()).isEqualTo("com.example.RealMain");
+		assertThat(result.get(0).mainClass()).isEqualTo("com.example/com.example.Bootstrap");
+	}
+
+	@Test
+	@DisplayName("module selectors end JVM options in both separated and equals forms")
+	void shouldStopAtLongModuleSelector(@TempDir Path tempProc) throws IOException {
+		final String applicationArg = "-Xrunjdwp:transport=dt_socket,server=y,address=5005";
+		writeCmdline(tempProc, 7011, "java", "--module", "example/example.Main", applicationArg);
+		writeCmdline(tempProc, 7012, "java", "--module=example/example.Main", applicationArg);
+		writeCmdline(tempProc, 7013, "java", "example.Main", applicationArg);
+
+		assertThat(newServiceWithProcRoot(tempProc).discover())
+			.allSatisfy(jvm -> assertThat(jvm.jdwp()).isNull())
+			.extracting(JvmDescriptor::mainClass)
+			.containsExactlyInAnyOrder("example/example.Main", "example/example.Main", "example.Main");
 	}
 
 	@Test

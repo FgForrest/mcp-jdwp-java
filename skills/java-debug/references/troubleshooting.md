@@ -33,14 +33,13 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 
 Applies to any JDWP port — 5005 for build-system shortcuts, but also non-default ports (8003, 8000, 9009, …) used by already-running services.
 
-Check the local target PID and start time in the attach or disconnect reply. A live `server=y` target listens again after detach. `jdwp_wait_for_attach(requireVmStart=true)` reports `[NOT_FRESH]` if a session already exists or the attached JVM is running. Disconnect and confirm the previous test process has ended before relaunching.
+Check the local target PID and start time in the attach or disconnect reply. A live `server=y` target listens again after detach. `jdwp_wait_for_attach(requireVmStart=true)` reports `[NOT_FRESH]` for an existing session or if a new attachment fails to receive a suspending `VM_START` event. Disconnect and confirm the previous test process has ended before relaunching. Treat `probably PID` or an ambiguous match as a clue and verify the port owner before stopping it.
 
 To look up a listener from the shell, use one of these commands.
 
 ```bash
-ps -ef | grep "jdwp=transport"     # all JDWP-enabled JVMs
-ss -tnlp | grep <port>             # what's listening on a specific port (Linux)
-lsof -i :<port>                    # same, macOS / BSD
+ss -ltnp 'sport = :5005'        # listening TCP port and owner on Linux
+lsof -nP -iTCP:5005 -sTCP:LISTEN # listening TCP port and owner on macOS / BSD
 ```
 
 Only kill a process you launched yourself in this session. If the process is unrecognized or was not started by you, **ask the user before killing it** — it may be a long-running service the user *intends* you to attach to, or another developer's debug session. When in doubt, ask "is this the JVM I should attach to?" before doing anything destructive.

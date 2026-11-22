@@ -1,6 +1,9 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.ThreadReference;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
+import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.discovery.JdwpEndpoint;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
@@ -14,6 +17,8 @@ import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -30,16 +35,18 @@ import static org.mockito.Mockito.when;
 class JDWPToolsWaitForAttachTest {
 
 	private JDIConnectionService jdiService;
+	private BreakpointTracker tracker;
+	private EventHistory eventHistory;
 	private JvmDiscoveryService discovery;
 	private JDWPTools tools;
 
 	@BeforeEach
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
-		final BreakpointTracker tracker = new BreakpointTracker();
+		tracker = new BreakpointTracker();
 		final WatcherManager watcherManager = new WatcherManager();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final EventHistory eventHistory = new EventHistory();
+		eventHistory = new EventHistory();
 		discovery = mock(JvmDiscoveryService.class);
 		when(discovery.discover()).thenReturn(List.of(
 			new JvmDescriptor(54321L, "com.example.Other", null, null,
@@ -53,6 +60,30 @@ class JDWPToolsWaitForAttachTest {
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, tracker, watcherManager, evaluator,
 			eventHistory, new EvaluationGuard(), discovery);
+	}
+
+	@Test
+	@DisplayName("Strict attach waits for a suspending VM_START to be published after connect")
+	void shouldWaitForDelayedVmStart() throws Exception {
+		final SuspensionSession session = tracker.openSuspensionSession(eventHistory);
+		final ThreadReference thread = JdiEventListenerTestSupport.mockThread("main", 1L);
+		final EventSet eventSet = JdiEventListenerTestSupport.mockEventSet();
+		when(eventSet.suspendPolicy()).thenReturn(EventRequest.SUSPEND_ALL);
+
+		when(jdiService.connect("localhost", 5005, true)).thenAnswer(invocation -> {
+			CompletableFuture.runAsync(() -> {
+				final SuspensionSession.Context start = session.route(eventSet, thread, true);
+				session.begin(start);
+				session.candidate(start, new BreakpointTracker.LastBreakpoint(thread, -1));
+				session.finish(start);
+			}, CompletableFuture.delayedExecutor(50, TimeUnit.MILLISECONDS));
+			return "Connected to test VM";
+		});
+
+		assertThat(tools.jdwp_wait_for_attach("localhost", 5005, 2_000, true))
+			.contains("currently suspended at VM_START");
+		verify(jdiService, never()).attachedVM();
+		verify(jdiService, never()).disconnect();
 	}
 
 	@Test

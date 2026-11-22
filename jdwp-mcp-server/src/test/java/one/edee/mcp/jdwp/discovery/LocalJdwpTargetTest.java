@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp.discovery;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -30,6 +31,58 @@ class LocalJdwpTargetTest {
 		assertThat(target.describeAfterDisconnect(5005))
 			.contains("ambiguous", "PID 1234", "example.First", "PID 5678", "example.Second")
 			.doesNotContain("example.Client", "example.OffHost", "still alive");
+	}
+
+	@Test
+	void skipsJdwpFlagsPassedToTheApplication() throws Exception {
+		final String applicationArg = "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:5005";
+		writeCmdline(42424, "java", "-jar", "helper.jar", applicationArg);
+		writeCmdline(42426, "java", "-cp", "", "helper.Main", applicationArg);
+		// An argument file used as the classpath operand can supply the main class too.
+		writeCmdline(42428, "java", "-cp", "@classpath-and-main.args", applicationArg);
+		final JvmDiscoveryService discovery = new JvmDiscoveryService(List::of, -1, emptyProc, true);
+
+		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "127.0.0.1", 5005).describe()).isEmpty();
+	}
+
+	@Test
+	void showsTheModuleSelectorWithoutItsApplicationArguments() throws Exception {
+		writeCmdline(42425, "java",
+			"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:5005",
+			"-m", "example.module/example.Main", "--password", "dummy-sensitive-argument");
+		final JvmDiscoveryService discovery = new JvmDiscoveryService(List::of, -1, emptyProc, true);
+
+		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "127.0.0.1", 5005).describe())
+			.contains("probably PID 42425", "example.module/example.Main")
+			.doesNotContain("--password", "dummy-sensitive-argument");
+	}
+
+	@Test
+	void anUnverifiedLiveCandidatePromptsAPortOwnerCheck() throws Exception {
+		final long pid = ProcessHandle.current().pid();
+		final JvmDiscoveryService discovery = mock(JvmDiscoveryService.class);
+		when(discovery.discover()).thenReturn(List.of(descriptor(pid, "example.Main", "*", true)));
+
+		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "localhost", 5005).describeAfterDisconnect(5005))
+			.contains("probably PID " + pid, "ss -ltnp", "lsof", "5005")
+			.doesNotContain("still alive", "kill ", "cannot bind");
+	}
+
+	@Test
+	void anOpaqueArgumentFileDoesNotExposeTheRestOfTheCommand() throws Exception {
+		writeCmdline(42427, "java",
+			"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:5005",
+			"@launch.args", "--password", "dummy-sensitive-argument");
+		final JvmDiscoveryService discovery = new JvmDiscoveryService(List::of, -1, emptyProc, true);
+
+		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "127.0.0.1", 5005).describe())
+			.contains("probably PID 42427")
+			.doesNotContain("launch.args", "--password", "dummy-sensitive-argument");
+	}
+
+	private void writeCmdline(long pid, String... argv) throws Exception {
+		final Path process = Files.createDirectory(emptyProc.resolve(Long.toString(pid)));
+		Files.writeString(process.resolve("cmdline"), String.join("\0", argv) + '\0');
 	}
 
 	@Test

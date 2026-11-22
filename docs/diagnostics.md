@@ -47,7 +47,7 @@ The discovery sources are covered in § 2; the port-reachability classification 
 >
 > The Attach API is independent of JDWP. A JVM with `-agentlib:jdwp` set and a JVM without it are both visible to `VirtualMachine.list()`; the API tells you *what* JVMs are running, not *which* ones expose debugging. To learn the JDWP endpoint, the inspector has to either parse the argv (the `/proc` path) or attach via the Attach API and read the `sun.jdwp.listenerAddress` agent property (the `inspectAll=true` path).
 
-`viaAttachApi()` (`JvmDiscoveryService.java:151-182`) wraps `com.sun.tools.attach.VirtualMachine.list()` (`listViaAttachApi` at lines 734-757). Cross-platform, same-user only, returns PID + display name. **Does not reveal a JDWP port** — the Attach API is for hot-attach of management agents, not debug-agent introspection. Soft 100 ms budget (constant at line 56).
+`viaAttachApi()` (`JvmDiscoveryService.java:151-182`) wraps `com.sun.tools.attach.VirtualMachine.list()` (`listViaAttachApi` at lines 734-757). Cross-platform and same-user only. The inventory keeps the PID and uses a single-token display name as a launch label when available. **Does not reveal a JDWP port** — the Attach API is for hot-attach of management agents, not debug-agent introspection. Soft 100 ms budget (constant at line 56).
 
 ### Source B: `/proc` scan (Linux only)
 
@@ -55,7 +55,7 @@ The discovery sources are covered in § 2; the port-reachability classification 
 
 1. Read and split on NUL bytes (`readProcEntry` at lines 228-274, `splitNulSeparated` at lines 280-295).
 2. Heuristically classify as Java (`looksLikeJava` at lines 302-315).
-3. Extract `-agentlib:jdwp=...` or `-Xrunjdwp:...` arguments via `JdwpAgentArgParser.parse` (`discovery/JdwpAgentArgParser.java:32-87`).
+3. Read `-agentlib:jdwp=...` or `-Xrunjdwp:...` only from JVM options before the main class, JAR, or module selector. Use the selector as the launch summary.
 4. Resolve `JAVA_HOME` via the `/proc/<pid>/exe` symlink (`JvmDiscoveryService.java:385-398`).
 5. Mask sensitive argv tokens — keys named `password`, `secret`, `token`, `apikey`, `api_key` (`JvmDiscoveryService.java:80-82, 410-412`).
 
@@ -73,7 +73,7 @@ The MCP server never attaches to itself — own-PID is filtered out (line 430).
 
 ### Process identity in attach and disconnect replies
 
-For local targets, the server looks up the peer of its established JDWP TCP connection. On Linux it matches the reverse TCP endpoints in `/proc/net/tcp` and `tcp6`, then maps the peer socket inode to `/proc/<pid>/fd`. JVM discovery supplies the command summary and falls back to advertised host and port if socket ownership is unavailable. The server can also read the arguments of Attach API inventory entries where the OS exposes them. Multiple matches are reported as ambiguous with their candidate PIDs. A bounded background lookup keeps slow discovery from blocking the debugger. The lookup reuses process inventory and leaves active Attach API probes to `jdwp_diagnose(inspectAll=true)`.
+For local targets, the server looks up the peer of its established JDWP TCP connection. On Linux it matches the reverse TCP endpoints in `/proc/net/tcp` and `tcp6`, then maps the peer socket inode to `/proc/<pid>/fd`. The process summary shows the launch selector alone when available. If socket ownership is unavailable, discovery falls back to advertised host and port using JVM options. Where the OS exposes them, the server also reads the launch arguments of Attach API inventory entries. One fallback match is labelled `probably PID`, and several are reported as ambiguous. Disconnect gives PID-based cleanup advice only for a verified live socket owner. For an unverified match, it gives commands to check the listener. A bounded background lookup keeps slow discovery from blocking the debugger. The lookup reuses process inventory and leaves active Attach API probes to `jdwp_diagnose(inspectAll=true)`.
 
 ## 3. Handshake probe — `confirmAll`
 

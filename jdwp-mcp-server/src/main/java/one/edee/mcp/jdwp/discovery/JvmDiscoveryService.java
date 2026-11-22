@@ -13,6 +13,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -161,7 +162,10 @@ public class JvmDiscoveryService {
         final List<JvmDescriptor> descriptors = new ArrayList<>(attached.size());
         for (AttachedJvm jvm : attached) {
             final String displayName = jvm.displayName();
-            final String mainClass = (displayName == null || displayName.isEmpty()) ? null : displayName;
+            // The Attach API can return a flattened selector and argv. With no argument
+            // boundaries, even splitting at the first space can truncate a JAR path.
+            final String mainClass = displayName != null && !displayName.isEmpty()
+                && displayName.codePoints().noneMatch(Character::isWhitespace) ? displayName : null;
             descriptors.add(new JvmDescriptor(
                 jvm.pid(),
                 mainClass,
@@ -242,13 +246,10 @@ public class JvmDiscoveryService {
         if (argv.isEmpty()) {
             return null;
         }
-        final String executable = argv.get(0);
-        if (!looksLikeJava(executable, argv)) {
+        final JavaLaunch launch = parseLaunchArguments(argv.subList(1, argv.size()));
+        if (!looksLikeJava(argv.get(0)) && launch.jdwp() == null) {
             return null;
         }
-
-        final JdwpEndpoint jdwp = findJdwpArg(argv);
-        final String mainClass = extractMainClass(argv);
         // Mask per argv element BEFORE joining: /proc cmdlines are NUL-separated, so an
         // argv element may contain whitespace inside its value (e.g. -Dpassword=foo bar).
         // Joining first and then masking would stop at the embedded space and leak the tail.
@@ -264,10 +265,10 @@ public class JvmDiscoveryService {
 
         return new JvmDescriptor(
             pid,
-            mainClass,
+            launch.selector(),
             javaHome,
             maskedCmdline,
-            jdwp,
+            launch.jdwp(),
             pid == selfPid,
             JvmDescriptor.Source.PROC_FS
         );
@@ -275,90 +276,79 @@ public class JvmDiscoveryService {
 
     /**
      * Splits a NUL-separated {@code /proc/<pid>/cmdline} buffer into args. The buffer is
-     * usually NUL-terminated (final empty string), which we drop.
+     * usually NUL-terminated. Each terminator belongs to an argument, including an empty value.
      */
     static List<String> splitNulSeparated(byte[] raw) {
         final List<String> out = new ArrayList<>();
         int start = 0;
         for (int i = 0; i < raw.length; i++) {
             if (raw[i] == 0) {
-                if (i > start) {
-                    out.add(new String(raw, start, i - start));
-                }
+                out.add(new String(raw, start, i - start, Charset.defaultCharset()));
                 start = i + 1;
             }
         }
         if (start < raw.length) {
-            out.add(new String(raw, start, raw.length - start));
+            out.add(new String(raw, start, raw.length - start, Charset.defaultCharset()));
         }
         return out;
     }
 
     /**
-     * Heuristic Java-process detector. We trust the executable's basename plus the presence
-     * of a {@code -cp}/{@code -jar}/{@code --module-path} flag — the attach API will catch
-     * the few processes we miss here.
+     * Whether argv[0] names a Java launcher. A process launched through another executable still
+     * counts when its JVM options configure a JDWP agent (checked by the caller).
      */
-    private static boolean looksLikeJava(String executable, List<String> argv) {
+    private static boolean looksLikeJava(String executable) {
         final String base = executable.substring(executable.lastIndexOf('/') + 1);
-        if ("java".equals(base) || "javaw".equals(base) || base.startsWith("java.")) {
-            return true;
-        }
-        // Some launchers (mvn, gradle) re-exec to "java"; cover the case where the executable
-        // path is opaque but the agent flag is unmistakable.
-        for (String arg : argv) {
-            if (arg.startsWith("-agentlib:jdwp=") || arg.startsWith("-Xrunjdwp:")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /** Returns the parsed JDWP endpoint or null when no jdwp agent arg is present. */
-    @Nullable
-    static JdwpEndpoint findJdwpArg(List<String> argv) {
-        for (String arg : argv) {
-            if (arg.startsWith("-agentlib:jdwp=")) {
-                return JdwpAgentArgParser.parse(arg.substring("-agentlib:jdwp=".length()));
-            }
-            if (arg.startsWith("-Xrunjdwp:")) {
-                return JdwpAgentArgParser.parse(arg.substring("-Xrunjdwp:".length()));
-            }
-        }
-        return null;
+        return "java".equals(base) || "javaw".equals(base) || base.startsWith("java.");
     }
 
     /**
-     * Picks a best-effort "main class" string from a JVM argv. Looks for the first non-option
-     * token that follows {@code -jar} (returns the jar path), the main class on the command
-     * line (the first non-option after JVM args), or returns null when neither is obvious.
-     * Skips the value of two-token JVM options ({@code -cp}, {@code -classpath},
-     * {@code --module-path}, {@code -p}) so the classpath is not mistaken for the main class.
+     * What the Java launcher arguments say about a process.
+     *
+     * @param selector the main class, {@code -jar} file or module the launcher starts; never an
+     *                 application argument, which may carry secrets
+     * @param jdwp     the JDWP agent endpoint configured among the JVM options, if any
      */
-    @Nullable
-    private static String extractMainClass(List<String> argv) {
-        for (int i = 1; i < argv.size(); i++) {
-            final String arg = argv.get(i);
-            if ("-jar".equals(arg) && i + 1 < argv.size()) {
-                return argv.get(i + 1);
+    record JavaLaunch(@Nullable String selector, @Nullable JdwpEndpoint jdwp) {}
+
+    /**
+     * Reads Java launcher arguments (excluding argv[0]). Only options before the launch selector
+     * can configure JDWP. An unexpanded argument file can contain the selector itself, so stop
+     * there when the command line alone cannot establish the remaining argument boundaries.
+     */
+    static JavaLaunch parseLaunchArguments(List<String> args) {
+        JdwpEndpoint jdwp = null;
+        for (int i = 0; i < args.size(); i++) {
+            final String arg = args.get(i);
+            if (arg.startsWith("@")) {
+                break;
+            }
+            if ("-jar".equals(arg) || "-m".equals(arg) || "--module".equals(arg)) {
+                final String selector = i + 1 < args.size() ? args.get(i + 1) : null;
+                return new JavaLaunch(selector != null && !selector.startsWith("@") ? selector : null, jdwp);
+            }
+            if (arg.startsWith("--module=")) {
+                return new JavaLaunch(arg.substring("--module=".length()), jdwp);
             }
             if (isTwoTokenOption(arg)) {
-                i++; // skip the option's value
+                if (++i == args.size() || args.get(i).startsWith("@")) {
+                    break;
+                }
                 continue;
             }
-            if (arg.startsWith("-")) {
-                continue;
+            if (!arg.startsWith("-")) {
+                return new JavaLaunch(arg, jdwp);
             }
-            return arg;
+            if (arg.startsWith("-agentlib:jdwp=")) {
+                jdwp = JdwpAgentArgParser.parse(arg.substring("-agentlib:jdwp=".length()));
+            } else if (arg.startsWith("-Xrunjdwp:")) {
+                jdwp = JdwpAgentArgParser.parse(arg.substring("-Xrunjdwp:".length()));
+            }
         }
-        return null;
+        return new JavaLaunch(null, jdwp);
     }
 
-    /**
-     * Returns true for JVM options whose value is a separate argv token (rather than glued on
-     * with {@code =}). Used by {@link #extractMainClass} so the value isn't mistaken for the
-     * main class.
-     */
+    /** JVM options with a separate value before the launch selector. */
     private static boolean isTwoTokenOption(String arg) {
         return "-cp".equals(arg)
             || "-classpath".equals(arg)
@@ -373,8 +363,9 @@ public class JvmDiscoveryService {
             || "--add-opens".equals(arg)
             || "--limit-modules".equals(arg)
             || "--source".equals(arg)
-            || "--module".equals(arg)
-            || "-m".equals(arg);
+            || "--enable-native-access".equals(arg)
+            || "-d".equals(arg)
+            || "--describe-module".equals(arg);
     }
 
     /**

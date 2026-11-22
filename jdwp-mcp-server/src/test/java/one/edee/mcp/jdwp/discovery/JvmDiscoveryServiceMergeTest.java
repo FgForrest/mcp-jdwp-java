@@ -219,21 +219,21 @@ class JvmDiscoveryServiceMergeTest {
 		}
 
 		@Test
-		@DisplayName("buffer of only NUL bytes returns an empty list (no empty-string tokens)")
-		void shouldDropEmptyTokensFromAllNulBuffer() {
+		@DisplayName("each NUL terminates an argument even when it is empty")
+		void shouldKeepEmptyArgumentsFromAllNulBuffer() {
 			final List<String> argv = JvmDiscoveryService.splitNulSeparated(new byte[]{0, 0, 0});
 
-			assertThat(argv).isEmpty();
+			assertThat(argv).containsExactly("", "", "");
 		}
 
 		@Test
-		@DisplayName("back-to-back NULs collapse — no empty-string tokens are emitted")
-		void shouldSkipEmptyTokensBetweenAdjacentNuls() {
-			final byte[] buf = "java\0\0-jar\0\0/app.jar\0".getBytes();
+		@DisplayName("adjacent NULs preserve empty options and their values")
+		void shouldKeepEmptyArgumentsBetweenAdjacentNuls() {
+			final byte[] buf = "java\0-cp\0\0-jar\0/app.jar\0".getBytes();
 
 			final List<String> argv = JvmDiscoveryService.splitNulSeparated(buf);
 
-			assertThat(argv).containsExactly("java", "-jar", "/app.jar");
+			assertThat(argv).containsExactly("java", "-cp", "", "-jar", "/app.jar");
 		}
 	}
 }
