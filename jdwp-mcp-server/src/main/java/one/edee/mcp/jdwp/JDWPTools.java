@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.request.*;
+import one.edee.mcp.jdwp.JDIConnectionService.TargetEndpoint;
 import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
@@ -143,6 +144,7 @@ public class JDWPTools {
      * {@link #jdwp_get_events}, disarmed by {@link #jdwp_clear_breakpoint} and {@link #jdwp_reset}.
      */
     private final FastLogpointService fastLogpoints;
+    private final FastProbeApprovals fastProbeApprovals = new FastProbeApprovals();
     /**
      * Runs the tools' invocations in the target with a bounded wait (issue #45, § 19 A1).
      */
@@ -3154,10 +3156,10 @@ public class JDWPTools {
         + "expression on the application thread and appends the result to an in-target ring buffer, so hits never "
         + "suspend a thread. Use it only when suspending on every hit would distort what you are investigating — races, "
         + "lock contention, latency-sensitive paths, hot loops with a rarely-true condition; jdwp_set_logpoint stays the "
-        + "default. CONSENT PROTOCOL: call it without userApproved first — nothing is armed and a risk briefing is "
-        + "returned. Relay the briefing to the user word for word and ask. Pass userApproved=true only after the user "
-        + "agreed in this conversation; never infer consent and never reuse consent given for a different class, line "
-        + "or VM. A class that is not loaded yet is waited for. Arms on the next hit of the line — that one hit pauses "
+        + "default. CONSENT PROTOCOL: omit userApproved first. Without a standing approval, it arms nothing and "
+        + "returns a risk briefing. Relay it word for word and ask. Pass userApproved=true only after the user "
+        + "explicitly agrees in this conversation to this exact probe at this host:port. A class that is not loaded "
+        + "yet is waited for. Arms on the next hit of the line — that one hit pauses "
         + "one thread briefly and is logged through the debugger. Read hits with jdwp_get_events (FAST_LOGPOINT entries; "
         + "buffer overruns are reported as FAST_LOGPOINT_DROPPED); hits still unread when the target exits are read "
         + "before it goes (FAST_LOGPOINT_READ_AT_EXIT). jdwp_clear_breakpoint(id), jdwp_reset, "
@@ -3168,15 +3170,10 @@ public class JDWPTools {
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(description = "Java expression evaluated in the target on every hit (e.g. '\"x=\" + x') — supports `{ ...; return X; }` block syntax. Strings, boxed primitives and enums print their value; other objects print as type@hash unless you call toString() yourself.") String expression,
         @McpToolParam(required = false, description = "Optional condition evaluated in the target — only log when it is true (e.g. 'i > 100'); supports `{ ...; return X; }` block syntax") @Nullable String condition,
-        @McpToolParam(required = false, description = "Set to true ONLY after the user explicitly approved this exact fast logpoint (class, line, target VM) in this conversation. Missing or false returns the risk briefing and arms nothing.") @Nullable Boolean userApproved,
+        @McpToolParam(required = false, description = "Set to true only after the user explicitly approves this exact fast logpoint at this host:port in this conversation, granting standing approval for this server run.") @Nullable Boolean userApproved,
         @McpToolParam(required = false, description = "Ring-buffer capacity: a power of two between 16 and 65536 (default 4096). Entries overwritten before jdwp_get_events reads them are reported as dropped.") @Nullable Integer bufferSize,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
         final String effectiveCondition = condition == null || condition.isBlank() ? null : condition;
-        // Consent gate FIRST — before any VM interaction. Missing and false are treated alike.
-        if (userApproved == null || !userApproved) {
-            return FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
-                describeAttachedTarget());
-        }
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required";
         }
@@ -3187,16 +3184,29 @@ public class JDWPTools {
             return String.format("Error: bufferSize must be a power of two between %d and %d, got %d",
                 FastLogpointService.MIN_BUFFER_SIZE, FastLogpointService.MAX_BUFFER_SIZE, effectiveBufferSize);
         }
+        final boolean explicitlyApproved = Boolean.TRUE.equals(userApproved);
+        final TargetEndpoint endpoint = jdiService.targetEndpoint();
+        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(
+            FastLogpointService.Kind.LOGPOINT, className, lineNumber, expression, effectiveCondition,
+            EventRequest.SUSPEND_EVENT_THREAD, false, endpoint);
+        final Instant standingApproval = key == null ? null : fastProbeApprovals.grantedAt(key);
+        if (standingApproval == null && !explicitlyApproved) {
+            return FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
+                describeProbeTarget(endpoint));
+        }
+        if (key == null) {
+            return "Error: No JDWP target endpoint. Use jdwp_connect first.";
+        }
         try {
-            // The approval was given for the JVM the briefing named. If getting the VM re-attaches
-            // (auto-reconnect after the target died), it may be another JVM on the same port.
-            final VirtualMachine approvedFor = jdiService.getRawVM();
             final VirtualMachine vm = jdiService.getVM();
-            if (vm != approvedFor) {
-                return "[CONSENT REQUIRED AGAIN] Nothing was armed: the connection to the target JVM was re-established "
-                    + "during this call, so the approval may have been given for another JVM.\n\n"
+            final TargetEndpoint attachedEndpoint = jdiService.targetEndpointFor(vm);
+            if (attachedEndpoint == null) {
+                return FAST_PROBE_CONNECTION_CHANGED;
+            }
+            if (!key.endpoint().equals(attachedEndpoint)) {
+                return FAST_PROBE_TARGET_CHANGED
                     + FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
-                    describeAttachedTarget());
+                    describeProbeTarget(attachedEndpoint));
             }
             if (!vm.canRedefineClasses()) {
                 return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_logpoint.";
@@ -3207,16 +3217,15 @@ public class JDWPTools {
                     + "— use jdwp_set_logpoint.";
             }
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
-            ReferenceType refType = effectiveForceLoad
-                ? forceLoad(className)
-                : jdiService.findLoadedClass(className);
+            ReferenceType refType = findFastProbeClass(vm, className, effectiveForceLoad);
             if (refType == null) {
                 final int waitingId = fastLogpoints.registerWaiting(vm, FastLogpointService.Kind.LOGPOINT, className,
                     lineNumber, expression, effectiveCondition, effectiveBufferSize, EventRequest.SUSPEND_EVENT_THREAD,
                     false);
                 // Race guard: the class may have loaded between the lookup and the ClassPrepareRequest.
-                final ReferenceType late = jdiService.findLoadedClass(className);
+                final ReferenceType late = jdiService.findLoadedClass(vm, className);
                 if (late == null) {
+                    final String approvalNote = fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval);
                     return String.format("Fast logpoint set at %s:%d (ID: %d, expression: %s%s, buffer: %d) — WAITING: "
                             + "%s is not loaded yet%s. The line is checked when it loads: the fast logpoint then arms on "
                             + "the next hit of the line (FAST_LOGPOINT_CLASS_LOADED in jdwp_get_events, or "
@@ -3226,7 +3235,7 @@ public class JDWPTools {
                         className, lineNumber, waitingId, expression,
                         effectiveCondition != null ? ", condition: " + effectiveCondition : "", effectiveBufferSize,
                         className, forceLoadFailedNote(effectiveForceLoad), waitingId)
-                        + deferredClassSuggestion(vm, className);
+                        + deferredClassSuggestion(vm, className) + approvalNote;
                 }
                 // It loaded meanwhile: set it as on a loaded class.
                 fastLogpoints.clear(waitingId);
@@ -3249,6 +3258,7 @@ public class JDWPTools {
                 return "Error: the line is in a static initializer (<clinit>), which runs once — use jdwp_set_logpoint.";
             }
             final int id = fastLogpoints.register(vm, boundLocation, expression, effectiveCondition, effectiveBufferSize);
+            final String approvalNote = fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval);
             final String methodName = boundLocation.method().name();
             return String.format("Fast logpoint set at %s:%d (ID: %d, expression: %s%s, buffer: %d%s) — PENDING: it arms "
                     + "on the next hit of the line. That hit pauses one thread while the probe is compiled and "
@@ -3260,7 +3270,7 @@ public class JDWPTools {
                 className, lineNumber, id, expression,
                 effectiveCondition != null ? ", condition: " + effectiveCondition : "", effectiveBufferSize,
                 multiLocationDiagnostic(id, className, lineNumber, locations, boundLocation, "FLP"),
-                methodName, id);
+                methodName, id) + approvalNote;
         } catch (AbsentInformationException e) {
             return "Error: No line number information available. Compile with debug info (-g).";
         } catch (Exception e) {
@@ -3276,10 +3286,10 @@ public class JDWPTools {
         + "condition) would distort what you are investigating — races, hot loops, latency-sensitive paths where the "
         + "condition is rarely true. CONDITION CONTRACT: it runs unsynchronized on every thread that passes the line, "
         + "so it must be thread-safe and free of side effects and may read stale values; locals, this and non-private "
-        + "members are reachable, private fields are not. CONSENT PROTOCOL: call it without userApproved first — "
-        + "nothing is armed and a risk briefing is returned. Relay the briefing to the user word for word and ask. Pass "
-        + "userApproved=true only after the user agreed in this conversation; never infer consent and never reuse "
-        + "consent given for a different class, line or VM. A class that is not loaded yet is waited for: the fast breakpoint arms once it loads. "
+        + "members are reachable, private fields are not. CONSENT PROTOCOL: omit userApproved first. Without a standing "
+        + "approval, it arms nothing and returns a risk briefing. Relay it word for word and ask. Pass "
+        + "userApproved=true only after the user explicitly agrees in this conversation to this exact probe at this host:port. "
+        + "A class that is not loaded yet is waited for: the fast breakpoint arms once it loads. "
         + "The next hit of the line evaluates the condition through the debugger: if it holds, that hit is the stop; "
         + "otherwise the probe is installed then. Wait for the stop with jdwp_resume_until_event. stopOnce=true "
         + "(default) stops at the first hit that meets the condition; calling the tool again with the same arguments "
@@ -3290,7 +3300,7 @@ public class JDWPTools {
         @McpToolParam(description = "Fully qualified class name") String className,
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(description = "Java condition evaluated in the target on every hit (e.g. 'seat == 4711 && customer != null') — supports `{ ...; return X; }` block syntax. Must yield a boolean.") String condition,
-        @McpToolParam(required = false, description = "Set to true ONLY after the user explicitly approved this exact fast breakpoint (class, line, target VM) in this conversation. Missing or false returns the risk briefing and arms nothing.") @Nullable Boolean userApproved,
+        @McpToolParam(required = false, description = "Set to true only after the user explicitly approves this exact fast breakpoint at this host:port in this conversation, granting standing approval for this server run.") @Nullable Boolean userApproved,
         @McpToolParam(required = false, description = "Suspend policy of the stop: 'all' (default) or 'thread'") @Nullable String suspendPolicy,
         @McpToolParam(required = false, description = "If true (default), only the first hit that meets the condition stops — call again with the same arguments to re-arm. If false, every such hit stops.") @Nullable Boolean stopOnce,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
@@ -3311,21 +3321,29 @@ public class JDWPTools {
             }
         }
         final boolean effectiveStopOnce = stopOnce == null || stopOnce;
-        // Consent gate before any VM interaction. Missing and false are treated alike.
-        if (userApproved == null || !userApproved) {
+        final boolean explicitlyApproved = Boolean.TRUE.equals(userApproved);
+        final TargetEndpoint endpoint = jdiService.targetEndpoint();
+        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(
+            FastLogpointService.Kind.BREAKPOINT, className, lineNumber, null, condition, jdiPolicy,
+            effectiveStopOnce, endpoint);
+        final Instant standingApproval = key == null ? null : fastProbeApprovals.grantedAt(key);
+        if (standingApproval == null && !explicitlyApproved) {
             return FastBreakpointRiskBriefing.render(className, lineNumber, condition, policyLabel, effectiveStopOnce,
-                describeAttachedTarget());
+                describeProbeTarget(endpoint));
+        }
+        if (key == null) {
+            return "Error: No JDWP target endpoint. Use jdwp_connect first.";
         }
         try {
-            // The approval was given for the JVM the briefing named. If getting the VM re-attaches
-            // (auto-reconnect after the target died), it may be another JVM on the same port.
-            final VirtualMachine approvedFor = jdiService.getRawVM();
             final VirtualMachine vm = jdiService.getVM();
-            if (vm != approvedFor) {
-                return "[CONSENT REQUIRED AGAIN] Nothing was armed: the connection to the target JVM was re-established "
-                    + "during this call, so the approval may have been given for another JVM.\n\n"
+            final TargetEndpoint attachedEndpoint = jdiService.targetEndpointFor(vm);
+            if (attachedEndpoint == null) {
+                return FAST_PROBE_CONNECTION_CHANGED;
+            }
+            if (!key.endpoint().equals(attachedEndpoint)) {
+                return FAST_PROBE_TARGET_CHANGED
                     + FastBreakpointRiskBriefing.render(className, lineNumber, condition, policyLabel, effectiveStopOnce,
-                    describeAttachedTarget());
+                    describeProbeTarget(attachedEndpoint));
             }
             if (!vm.canRedefineClasses()) {
                 return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_breakpoint.";
@@ -3336,9 +3354,7 @@ public class JDWPTools {
                     + "— use jdwp_set_breakpoint.";
             }
             final boolean effectiveForceLoad = forceLoad != null && forceLoad;
-            ReferenceType refType = effectiveForceLoad
-                ? forceLoad(className)
-                : jdiService.findLoadedClass(className);
+            ReferenceType refType = findFastProbeClass(vm, className, effectiveForceLoad);
             if (refType == null) {
                 final Integer existing = fastLogpoints.findWaiting(FastLogpointService.Kind.BREAKPOINT, className,
                     lineNumber);
@@ -3351,8 +3367,9 @@ public class JDWPTools {
                     lineNumber, "", condition, FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE, jdiPolicy,
                     effectiveStopOnce);
                 // Race guard: the class may have loaded between the lookup and the ClassPrepareRequest.
-                final ReferenceType late = jdiService.findLoadedClass(className);
+                final ReferenceType late = jdiService.findLoadedClass(vm, className);
                 if (late == null) {
+                    final String approvalNote = fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval);
                     return String.format("Fast breakpoint set at %s:%d (ID: %d, condition: %s, %s, suspendPolicy: %s) — "
                             + "WAITING: %s is not loaded yet%s. The line is checked when it loads: the fast breakpoint "
                             + "then arms on the next hit of the line (FAST_BREAKPOINT_CLASS_LOADED in jdwp_get_events, "
@@ -3361,7 +3378,7 @@ public class JDWPTools {
                             + "it.",
                         className, lineNumber, waitingId, condition, FastLogpointService.modeLabel(effectiveStopOnce),
                         policyLabel, className, forceLoadFailedNote(effectiveForceLoad), waitingId)
-                        + deferredClassSuggestion(vm, className);
+                        + deferredClassSuggestion(vm, className) + approvalNote;
                 }
                 // It loaded meanwhile: set it as on a loaded class.
                 fastLogpoints.clear(waitingId);
@@ -3383,12 +3400,15 @@ public class JDWPTools {
             if (boundLocation.method().isStaticInitializer()) {
                 return "Error: the line is in a static initializer (<clinit>), which runs once — use jdwp_set_breakpoint.";
             }
-            final String rearmed = fastLogpoints.rearmBreakpoint(boundLocation, condition, effectiveStopOnce, jdiPolicy);
+            final FastLogpointService.RearmResult rearmed =
+                fastLogpoints.rearmBreakpoint(boundLocation, condition, effectiveStopOnce, jdiPolicy);
             if (rearmed != null) {
-                return rearmed;
+                return rearmed.message() + (rearmed.rearmed()
+                    ? fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval) : "");
             }
             final int id = fastLogpoints.registerBreakpoint(vm, boundLocation, condition, effectiveStopOnce, jdiPolicy,
                 FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
+            final String approvalNote = fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval);
             final String methodName = boundLocation.method().name();
             return String.format("Fast breakpoint set at %s:%d (ID: %d, condition: %s, %s, suspendPolicy: %s%s) — "
                     + "PENDING: the next hit of the line is an ordinary debugger stop that evaluates the condition. If "
@@ -3401,7 +3421,7 @@ public class JDWPTools {
                 className, lineNumber, id, condition, FastLogpointService.modeLabel(effectiveStopOnce), policyLabel,
                 multiLocationDiagnostic(id, className, lineNumber, locations, boundLocation, "FBP"),
                 jdiPolicy == EventRequest.SUSPEND_ALL ? "every thread is" : "that thread is",
-                methodName, id, interpretedMethodWarning(boundLocation.method()));
+                methodName, id, interpretedMethodWarning(boundLocation.method())) + approvalNote;
         } catch (AbsentInformationException e) {
             return "Error: No line number information available. Compile with debug info (-g).";
         } catch (Exception e) {
@@ -3457,21 +3477,30 @@ public class JDWPTools {
         }
     }
 
+    private static final String FAST_PROBE_CONNECTION_CHANGED =
+        "Error: The JDWP connection changed before the probe could be set. Retry on the current target.";
+    private static final String FAST_PROBE_TARGET_CHANGED =
+        "[CONSENT REQUIRED AGAIN] Nothing was armed: the target endpoint changed during this call.\n\n";
+
     /**
-     * Names the attached target for the fast-logpoint risk briefing, so consent visibly binds to one
-     * VM. Read-only — never connects. {@code null} when nothing is attached.
+     * Names the target endpoint for a fast-probe risk briefing, so the user sees which host:port the
+     * approval covers. {@code null} when nothing was attached yet.
      */
-    @Nullable
-    private String describeAttachedTarget() {
-        try {
-            final JDIConnectionService.ConnectionStatus status = jdiService.getConnectionStatus();
-            if (status.connected() && status.lastHost() != null) {
-                return String.format("the JVM attached at %s:%d", status.lastHost(), status.lastPort());
-            }
-        } catch (Exception ignored) {
-            // The briefing still renders without a target description.
-        }
-        return null;
+    private static @Nullable String describeProbeTarget(@Nullable TargetEndpoint endpoint) {
+        return endpoint == null ? null : "the JVM attached at " + endpoint;
+    }
+
+    /**
+     * Finds the probed class in {@code vm} — the VM whose endpoint passed the consent gate — or
+     * force-loads it there when asked. {@code null} when the class is not loaded (yet).
+     */
+    private @Nullable ReferenceType findFastProbeClass(VirtualMachine vm, String className, boolean forceLoad)
+        throws Exception {
+        // Both lookups stay on the VM whose endpoint passed the consent gate.
+        return forceLoad
+            ? invocations.run(null, "loading class " + className,
+                () -> jdiService.findOrForceLoadClass(className, null, vm))
+            : jdiService.findLoadedClass(vm, className);
     }
 
     /**
@@ -4601,7 +4630,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints, fast breakpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, fast_breakpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive). Empty sections are hidden by default; pass showEmpty=true to render every category header even when zero entries match.")
+    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, fast logpoints and fast breakpoints (with standing approvals), watchers, and marked instances. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, fast_breakpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive). Empty sections are hidden by default; pass showEmpty=true to render every category header even when zero entries match.")
     public String jdwp_overview(
         @McpToolParam(required = false, description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, fast_breakpoint, watcher, mark. Defaults to all.") @Nullable String types,
         @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter,
@@ -4924,12 +4953,14 @@ public class JDWPTools {
                 info.id(), info.className(), info.line(), state, info.expression(),
                 info.condition() != null ? "  cond=\"" + info.condition() + '"' : "", origin));
         }
-        if (rows.isEmpty() && !showEmpty) {
+        final List<String> approvals = fastProbeApprovalRows(FastLogpointService.Kind.LOGPOINT, needle);
+        if (rows.isEmpty() && approvals.isEmpty() && !showEmpty) {
             return 0;
         }
         out.append(String.format("\nFast logpoints (%d) — bytecode-instrumented, read with jdwp_get_events:\n", rows.size()));
         rows.forEach(r -> out.append(r).append('\n'));
-        return rows.size();
+        appendFastProbeApprovals(out, approvals);
+        return rows.size() + approvals.size();
     }
 
     /**
@@ -4973,13 +5004,47 @@ public class JDWPTools {
             rows.add(String.format("  #%d  %s:%d  [%s]  cond=\"%s\"%s",
                 info.id(), info.className(), info.line(), state, info.condition(), setting));
         }
-        if (rows.isEmpty() && !showEmpty) {
+        final List<String> approvals = fastProbeApprovalRows(FastLogpointService.Kind.BREAKPOINT, needle);
+        if (rows.isEmpty() && approvals.isEmpty() && !showEmpty) {
             return 0;
         }
         out.append(String.format("\nFast breakpoints (%d) — condition evaluated in the target, stops reported by "
             + "jdwp_resume_until_event:\n", rows.size()));
         rows.forEach(r -> out.append(r).append('\n'));
-        return rows.size();
+        appendFastProbeApprovals(out, approvals);
+        return rows.size() + approvals.size();
+    }
+
+    private List<String> fastProbeApprovalRows(FastLogpointService.Kind kind, @Nullable String needle) {
+        final List<String> rows = new ArrayList<>();
+        for (Map.Entry<FastProbeApprovals.Key, Instant> grant : fastProbeApprovals.snapshot().entrySet()) {
+            final FastProbeApprovals.Key key = grant.getKey();
+            if (key.kind() != kind || !matchesFilter(needle, key.className(), key.expression(), key.condition(),
+                key.endpoint().toString(), kind.noun())) {
+                continue;
+            }
+            final String expression = key.expression();
+            final String condition = key.condition();
+            final String settings = kind == FastLogpointService.Kind.BREAKPOINT
+                ? "  " + FastLogpointService.modeLabel(key.stopOnce())
+                    + ", suspendPolicy=" + FastLogpointService.policyLabel(key.suspendPolicy())
+                : "";
+            final String row = String.format("    %s %s:%d%s%s%s  endpoint=%s  granted at %s",
+                kind.noun(), key.className(), key.line(),
+                expression == null ? "" : "  expr=\"" + expression + '"',
+                condition == null ? "" : "  cond=\"" + condition + '"',
+                settings, key.endpoint(), JDIConnectionService.formatServerTime(grant.getValue()));
+            rows.add(row.replace("\r", "\\r").replace("\n", "\\n"));
+        }
+        Collections.sort(rows);
+        return rows;
+    }
+
+    private static void appendFastProbeApprovals(StringBuilder out, List<String> approvals) {
+        if (!approvals.isEmpty()) {
+            out.append("  Standing approvals (").append(approvals.size()).append("):\n");
+            approvals.forEach(row -> out.append(row).append('\n'));
+        }
     }
 
     /**

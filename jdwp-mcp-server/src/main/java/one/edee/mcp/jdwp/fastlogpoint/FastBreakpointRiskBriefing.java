@@ -4,7 +4,7 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * The consent gate's response: what {@code jdwp_set_fast_breakpoint} returns when it is called
- * without {@code userApproved=true}. Nothing is armed. Same protocol as
+ * without explicit or standing approval. Nothing is armed. Same protocol as
  * {@link FastLogpointRiskBriefing}: the agent relays the risks to the user word for word and calls
  * again only after the user has agreed, because the tool rewrites the running application's bytecode.
  */
@@ -17,7 +17,7 @@ public final class FastBreakpointRiskBriefing {
      * Renders the briefing for one target.
      *
      * @param suspendPolicy the requested policy as the user wrote it ("all" or "thread")
-     * @param targetVm      short description of the attached VM, or {@code null} when not connected
+     * @param targetVm      short description of the target endpoint, or {@code null} when unknown
      */
     public static String render(String className, int lineNumber, String condition, String suspendPolicy,
                                 boolean stopOnce, @Nullable String targetVm) {
@@ -26,10 +26,13 @@ public final class FastBreakpointRiskBriefing {
             + "jdwp_set_fast_breakpoint rewrites the bytecode of the running application. Relay the briefing "
             + "below to the user word for word and ask for explicit approval. Only after the user has agreed "
             + "in this conversation, call jdwp_set_fast_breakpoint again with the same arguments and "
-            + "userApproved=true. Never infer consent, and never reuse consent given for a different class, "
-            + "line or target VM. If the user declines, use jdwp_set_breakpoint with a condition instead.\n"
+            + "userApproved=true. Never infer consent. Ask again for a different probe or endpoint. "
+            + "If the user declines, use jdwp_set_breakpoint with a condition instead.\n"
+            + (targetVm == null ? "Attach to the intended endpoint before asking for approval.\n" : "")
             + "\n"
             + "── Fast breakpoint: risk briefing ──\n"
+            + "Approval covers this exact probe on this JVM and on later JVMs at the same host:port while "
+            + "this MCP server runs.\n"
             + "Target: " + className + ':' + lineNumber
             + " — condition: " + condition
             + " — " + FastLogpointService.modeLabel(stopOnce)

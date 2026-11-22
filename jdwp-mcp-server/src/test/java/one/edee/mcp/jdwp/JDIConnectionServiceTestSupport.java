@@ -113,7 +113,7 @@ final class JDIConnectionServiceTestSupport {
 	}
 
 	/**
-	 * Plants the auto-reconnect seed ({@code lastHost} / {@code lastPort} private fields) on the
+	 * Plants the auto-reconnect seed and normalized endpoint on the
 	 * service so tests can verify {@link JDIConnectionService#notifyVmDied()} preserves them
 	 * without requiring a real successful attach.
 	 */
@@ -125,8 +125,11 @@ final class JDIConnectionServiceTestSupport {
 			final Field portField = JDIConnectionService.class.getDeclaredField("lastPort");
 			portField.setAccessible(true);
 			portField.set(service, port);
+			final Field endpointField = JDIConnectionService.class.getDeclaredField("targetEndpoint");
+			endpointField.setAccessible(true);
+			endpointField.set(service, new JDIConnectionService.TargetEndpoint(host, port));
 		} catch (ReflectiveOperationException e) {
-			throw new AssertionError("Failed to plant 'lastHost'/'lastPort' fields via reflection", e);
+			throw new AssertionError("Failed to plant the last successful endpoint via reflection", e);
 		}
 	}
 }

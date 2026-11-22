@@ -3021,26 +3021,37 @@ public class FastLogpointService {
     // ── Fast breakpoints ──
 
     /**
+     * Outcome of {@link #rearmBreakpoint}: the reply line and whether the breakpoint is armed again,
+     * so a standing approval is recorded only for a probe that actually re-armed.
+     *
+     * @param message one-line report for the agent
+     * @param rearmed {@code true} when the gates were reopened, {@code false} for a refusal or failure
+     */
+    public record RearmResult(String message, boolean rearmed) {
+    }
+
+    /**
      * Re-arms the fast breakpoint this session owns at {@code location} with exactly these
      * parameters: both gates move to their next generation, so the next true hit (and the next
      * failure) stops again. A breakpoint spent before its probe was ever installed waits for its
      * first hit again.
      *
-     * @return a one-line report, or {@code null} when this session owns no such fast breakpoint
+     * @return the report and whether re-arming succeeded, or {@code null} when there is no matching location
      */
     @Nullable
-    public synchronized String rearmBreakpoint(Location location, String condition, boolean stopOnce,
-                                               int suspendPolicy) {
+    public synchronized RearmResult rearmBreakpoint(Location location, String condition, boolean stopOnce,
+                                                     int suspendPolicy) {
         for (FastLogpoint flp : logpoints.values()) {
             if (flp.kind != Kind.BREAKPOINT || flp.isLeftover() || flp.state == State.REMOVAL_PENDING
                 || !flp.refType.equals(location.declaringType()) || flp.line != location.lineNumber()) {
                 continue;
             }
             if (!condition.equals(flp.condition) || flp.stopOnce != stopOnce || flp.suspendPolicy != suspendPolicy) {
-                return String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
+                final String message = String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
                         + "(condition: %s, %s, suspendPolicy: %s) — clear it with jdwp_clear_breakpoint(%d) first, or call "
                         + "again with exactly its parameters to re-arm it.", flp.id, flp.className(), flp.line,
                     flp.condition, modeLabel(flp.stopOnce), policyLabel(flp.suspendPolicy), flp.id);
+                return new RearmResult(message, false);
             }
             switch (flp.state) {
                 case PENDING -> {
@@ -3048,27 +3059,35 @@ public class FastLogpointService {
                         // An arming hit whose condition failed spent the error gate and left the request
                         // in place; no probe exists yet, so opening both generations costs nothing.
                         reopenGates(flp);
-                        return String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
+                        final String message = String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
                             + "re-armed: the next true hit stops, and so does the next failure of the condition.",
                             flp.id, flp.className(), flp.line, flp.id);
+                        return new RearmResult(message, true);
                     }
                     reopenGates(flp);
                     rearm(flp);
-                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
+                    if (flp.state == State.FAILED) {
+                        return new RearmResult(String.format("Error: fast breakpoint %d could not be re-armed: %s.",
+                            flp.id, flp.failureReason), false);
+                    }
+                    final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
                         + "was installed, so it arms again on the next hit of the line.", flp.id, flp.className(),
                         flp.line, flp.id);
+                    return new RearmResult(message, true);
                 }
                 case ARMED -> {
                     reopenGates(flp);
-                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s", flp.id, flp.className(),
+                    final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s", flp.id, flp.className(),
                         flp.line, flp.id, stopOnce
                             ? "the next true hit stops again, and so does the next failure of the condition."
                             : "every true hit stops as before, and the next failure of the condition stops again.");
+                    return new RearmResult(message, true);
                 }
                 default -> {
-                    return String.format("Fast breakpoint %d at %s:%d is %s (ID: %d) — clear it with "
+                    final String message = String.format("Fast breakpoint %d at %s:%d is %s (ID: %d) — clear it with "
                         + "jdwp_clear_breakpoint(%d) and set it again.", flp.id, flp.className(), flp.line, flp.state,
                         flp.id, flp.id);
+                    return new RearmResult(message, false);
                 }
             }
         }

@@ -1,0 +1,203 @@
+package one.edee.mcp.jdwp;
+
+import com.sun.jdi.ClassLoaderReference;
+import com.sun.jdi.Location;
+import com.sun.jdi.Method;
+import com.sun.jdi.ReferenceType;
+import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.request.EventRequest;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@DisplayName("standing consent for fast probes")
+class JDWPToolsFastProbeConsentTest {
+
+	private static final String CART = "com.example.Cart";
+	private final JDIConnectionService connection = spy(JDIConnectionServiceTestSupport.newServiceWithMocks());
+	private final FastLogpointService probes = JDWPToolsTestSupport.fastLogpointsMock();
+	private JDWPTools tools;
+
+	@BeforeEach
+	void setUp() {
+		tools = JDWPToolsTestSupport.newTools(connection, new BreakpointTracker(), new EventHistory(), probes);
+		when(probes.findWaiting(any(), anyString(), anyInt())).thenReturn(null);
+	}
+
+	@Test
+	@DisplayName("the briefing discloses scope and only explicit approval creates a reusable grant")
+	void grantsAndReusesApprovalOnLaterVms() throws Exception {
+		attach("localhost", 5005);
+		for (Boolean approval : new Boolean[]{null, false}) {
+			assertThat(logpoint(approval)).startsWith("[CONSENT REQUIRED]")
+				.contains("later JVMs at the same host:port while this MCP server runs");
+		}
+		assertThat(tools.jdwp_overview("fast_logpoint", null, null)).doesNotContain("granted at");
+		verify(connection, never()).getVM();
+
+		assertThat(logpoint(true)).contains("WAITING");
+		final String grant = tools.jdwp_overview("fast_logpoint", null, null).lines()
+			.filter(line -> line.contains("granted at")).findFirst().orElseThrow();
+		final String grantedAt = grant.substring(grant.indexOf("granted at ") + "granted at ".length());
+		assertThat(grantedAt).matches("\\d{2}:\\d{2}:\\d{2} .+");
+		DateTimeFormatter.ofPattern("HH:mm:ss z").withZone(ZoneId.systemDefault()).parse(grantedAt);
+		assertThat(grant).contains("fast logpoint", CART + ":42", "total", "total < 0", "localhost:5005");
+		assertThat(tools.jdwp_overview("fast_logpoint", "TOTAL < 0", null)).contains(grant);
+		assertThat(tools.jdwp_overview("fast_breakpoint", null, null)).doesNotContain(grant);
+		assertThat(tools.jdwp_overview("fast_logpoint", "unmatched", null)).doesNotContain(grant);
+
+		for (String host : List.of("127.0.0.1", "::1", "localhost.")) {
+			attach(host, 5005);
+			assertThat(logpoint(null)).contains("WAITING", "Standing approval used", grantedAt);
+			assertThat(logpoint(true)).contains("WAITING", "Standing approval used", grantedAt);
+			assertThat(logpoint(false)).contains("WAITING", "Standing approval used", grantedAt);
+		}
+		final JDWPTools freshServer = JDWPToolsTestSupport.newTools(
+			connection, new BreakpointTracker(), new EventHistory(), probes);
+		assertThat(freshServer.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+	}
+
+	@Test
+	@DisplayName("a changed probe or endpoint requires its own approval")
+	void changedProbeOrEndpoint() throws Exception {
+		attach("localhost", 5005);
+		assertThat(logpoint(true)).contains("WAITING");
+
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total + 1", "total < 0", null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", "total <= 0", null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 43, "total", "total < 0", null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_logpoint("com.example.Order", 42, "total", "total < 0", null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", false, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", null, 16, null))
+			.contains("buffer: 16", "Standing approval used");
+
+		attach("localhost", 5006);
+		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
+		attach("192.0.2.1", 5005);
+		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
+	}
+
+	@Test
+	@DisplayName("fast breakpoint approvals match effective policy and stop mode")
+	void breakpointPolicyAndMode() throws Exception {
+		attach("localhost", 5005);
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+			.startsWith("[CONSENT REQUIRED]").contains("later JVMs at the same host:port while this MCP server runs");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null)).contains("WAITING");
+
+		attach("127.0.0.1", 5005);
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "ALL", true, null))
+			.contains("WAITING", "Standing approval used");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", true, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "all", false, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_overview("fast_breakpoint", null, null))
+			.contains("fast breakpoint " + CART + ":42", "total < 0", "stops once", "suspendPolicy=all",
+				"localhost:5005", "granted at");
+	}
+
+	@Test
+	@DisplayName("a refused explicit call does not create an approval")
+	void rejectedCallDoesNotGrantApproval() throws Exception {
+		final VirtualMachine vm = attach("localhost", 5005);
+		when(vm.canRedefineClasses()).thenReturn(false);
+		assertThat(logpoint(true)).contains("canRedefineClasses() is false");
+		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_overview("fast_logpoint", null, null)).doesNotContain("granted at");
+	}
+
+	@Test
+	@DisplayName("a concurrent endpoint switch cannot use or grant approval on the new endpoint")
+	void endpointSwitchDuringTheCall() throws Exception {
+		final VirtualMachine source = attach("localhost", 5005);
+		assertThat(logpoint(true)).contains("WAITING");
+		final VirtualMachine replacement = probeCapableVm();
+		doAnswer(invocation -> {
+			JDIConnectionServiceTestSupport.setVm(connection, replacement);
+			JDIConnectionServiceTestSupport.setLastSuccessfulAttach(connection, "localhost", 5006);
+			return replacement;
+		}).when(connection).getVM();
+
+		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED AGAIN]").contains("localhost:5006");
+		JDIConnectionServiceTestSupport.setVm(connection, source);
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(connection, "localhost", 5005);
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "id", null, true, null, null))
+			.startsWith("[CONSENT REQUIRED AGAIN]").contains("localhost:5006");
+		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "id", null, null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		verify(probes, never()).registerWaiting(eq(replacement), any(), anyString(),
+			anyInt(), anyString(), any(), anyInt(), anyInt(), anyBoolean());
+	}
+
+	@Test
+	@DisplayName("a breakpoint successfully re-armed with explicit approval grants consent, a refusal does not")
+	void rearmGrantsOnlyOnSuccess() throws Exception {
+		final VirtualMachine vm = attach("localhost", 5005);
+		final ReferenceType type = mock(ReferenceType.class);
+		final Location location = mock(Location.class);
+		when(vm.classesByName(CART)).thenReturn(List.of(type));
+		when(type.name()).thenReturn(CART);
+		when(type.classLoader()).thenReturn(mock(ClassLoaderReference.class));
+		when(type.locationsOfLine(42)).thenReturn(List.of(location));
+		when(location.method()).thenReturn(mock(Method.class));
+		when(probes.rearmBreakpoint(location, "total < 0", true, EventRequest.SUSPEND_ALL))
+			.thenReturn(new FastLogpointService.RearmResult("Error: fast breakpoint with other parameters", false),
+				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true));
+
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null))
+			.startsWith("Error:");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null))
+			.contains("re-armed");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+			.contains("re-armed", "Standing approval used");
+	}
+
+	private String logpoint(Boolean approval) {
+		return tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", approval, null, null);
+	}
+
+	private VirtualMachine attach(String host, int port) throws Exception {
+		final VirtualMachine vm = probeCapableVm();
+		JDIConnectionServiceTestSupport.setVm(connection, vm);
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(connection, host, port);
+		doReturn(vm).when(connection).getVM();
+		return vm;
+	}
+
+	private static VirtualMachine probeCapableVm() {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(vm.canRedefineClasses()).thenReturn(true);
+		when(vm.canGetBytecodes()).thenReturn(true);
+		when(vm.canGetConstantPool()).thenReturn(true);
+		return vm;
+	}
+}

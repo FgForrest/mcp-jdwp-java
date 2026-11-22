@@ -34,7 +34,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** â
 - **`jdwp_set_exception_breakpoint`** catches at the throw site, *before* the stack unwinds â€” invaluable when wrappers (`CompletionException`, `RuntimeException` cause chains) obscure the original.
 - **`jdwp_assert_expression(expr, expected)`** is your sanity check: "is the hash what I think it is?", "is the total what I think it is?". Returns OK, or MISMATCH with the expected and actual value.
 - **`jdwp_evaluate_expression(expr)`** is your "what is this right now?" tool. Use freely.
-- **`jdwp_set_fast_logpoint` / `jdwp_set_fast_breakpoint`** rewrite the target's bytecode, so they need the user's explicit consent: call once without `userApproved`, relay the risk briefing word for word, and ask. Never pass `userApproved=true` on your own.
+- **`jdwp_set_fast_logpoint` / `jdwp_set_fast_breakpoint`** rewrite the target's bytecode. Call without `userApproved` so the server can use a standing approval for the exact probe at this host:port. If it returns a risk briefing, relay it word for word and ask. Pass `userApproved=true` only after the user explicitly agrees.
 
 ## Reporting back
 

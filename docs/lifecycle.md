@@ -142,6 +142,8 @@ The hook fires when the listener loop observes a `VMDeathEvent` or `VMDisconnect
 
 Everything else (object cache, watchers, marks, classpath cache, target version) is cleared. The model is "the VM is gone but the conversation is not over" — keep just enough state to recover gracefully, drop everything that is tied to a specific target-VM lifetime.
 
+[Standing fast-probe approvals](breakpoints.md#5a-fast-logpoints--evaluation-moved-into-the-target) live in the MCP tool singleton. They survive JVM exit, disconnect, reconnect and reset, and are available when the same endpoint is attached again. Restarting the MCP server drops the grants.
+
 ## 5. `jdwp_reset` — clear without disconnecting
 
 `jdwp_reset` (in `JDWPTools.java`, routed to `BreakpointTracker.reset()` and a handful of cache clears) is the agent's "start fresh while keeping the connection" button. It clears:
@@ -167,6 +169,7 @@ It does **not** clear marks (those are persistent labels the agent set deliberat
 | Active JDI breakpoint requests | yes | reset in-memory | yes | no | yes |
 | Pending BPs, ID counter, dependency graph | yes | yes | yes | no | yes |
 | Watchers | yes | yes | yes | no | yes |
+| Standing fast-probe approvals | preserved | preserved | preserved | preserved | preserved |
 | Object cache | yes | yes | yes | no | yes |
 | Marked instances | yes | yes | **no** | no | yes |
 | Classpath / JDK / target-version caches | yes | yes | no | no | yes |
@@ -176,7 +179,7 @@ It does **not** clear marks (those are persistent labels the agent set deliberat
 
 (All entries reference `JDIConnectionService.java:428-461` for `cleanupSessionState`, `JDIConnectionService.java:399-416` for `notifyVmDied`, `BreakpointTracker.java:336-358` for `clearAllInMemoryStateLocked` — which is what the reset paths call internally.)
 
-The pattern: **user-initiated tear-downs are clean slates; VM-death tear-downs preserve just enough to recover.**
+The pattern: user-initiated teardown clears session state. VM-death teardown retains the event history and reconnect endpoint.
 
 ## 7. Re-attach scenarios
 

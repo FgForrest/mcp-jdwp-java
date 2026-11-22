@@ -45,6 +45,9 @@ class JDWPToolsFastLogpointTest {
 	@BeforeEach
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
+		final var endpoint = new JDIConnectionService.TargetEndpoint("localhost", 5005);
+		when(jdiService.targetEndpoint()).thenReturn(endpoint);
+		when(jdiService.targetEndpointFor(any())).thenReturn(endpoint);
 		tracker = new BreakpointTracker();
 		history = new EventHistory();
 		fastLogpoints = JDWPToolsTestSupport.fastLogpointsMock();
@@ -54,9 +57,6 @@ class JDWPToolsFastLogpointTest {
 	@Test
 	@DisplayName("missing or false userApproved returns the risk briefing and arms nothing")
 	void consentGate() throws Exception {
-		when(jdiService.getConnectionStatus()).thenReturn(
-			new JDIConnectionService.ConnectionStatus(true, "localhost", 5005, Instant.now(), null));
-
 		for (Boolean approval : new Boolean[]{null, false}) {
 			final String reply = tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", "total < 0",
 				approval, null, null);
@@ -78,8 +78,7 @@ class JDWPToolsFastLogpointTest {
 	@Test
 	@DisplayName("the briefing still renders when nothing is attached")
 	void briefingWithoutConnection() {
-		when(jdiService.getConnectionStatus()).thenReturn(
-			new JDIConnectionService.ConnectionStatus(false, null, 0, null, null));
+		when(jdiService.targetEndpoint()).thenReturn(null);
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, null, null, null))
 			.contains("the VM attached when the logpoint is set");
 	}
@@ -96,19 +95,19 @@ class JDWPToolsFastLogpointTest {
 	}
 
 	@Test
-	@DisplayName("approval does not carry over to a JVM the call re-attached to")
-	void approvalDoesNotFollowAReconnect() throws Exception {
+	@DisplayName("an explicit approval carries over when getVM reattaches to the same endpoint")
+	void approvalFollowsReconnectAtSameEndpoint() throws Exception {
 		final VirtualMachine replacement = mock(VirtualMachine.class);
 		when(jdiService.getRawVM()).thenReturn(mock(VirtualMachine.class));
 		when(jdiService.getVM()).thenReturn(replacement);
-		when(jdiService.getConnectionStatus()).thenReturn(
-			new JDIConnectionService.ConnectionStatus(true, "localhost", 5005, Instant.now(), null));
+		when(replacement.canRedefineClasses()).thenReturn(true);
+		when(replacement.canGetBytecodes()).thenReturn(true);
+		when(replacement.canGetConstantPool()).thenReturn(true);
 
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Cart", 42, "total", null, true, null, null))
-			.startsWith("[CONSENT REQUIRED AGAIN] Nothing was armed")
-			.contains("[CONSENT REQUIRED] Nothing was armed.");
-		verify(fastLogpoints, never()).register(any(), any(), anyString(), any(), anyInt());
-		verifyNoInteractions(replacement);
+			.contains("WAITING: com.example.Cart is not loaded yet");
+		verify(fastLogpoints).registerWaiting(replacement, FastLogpointService.Kind.LOGPOINT, "com.example.Cart", 42,
+			"total", null, FastLogpointService.DEFAULT_BUFFER_SIZE, EventRequest.SUSPEND_EVENT_THREAD, false);
 	}
 
 	@Test
@@ -170,7 +169,7 @@ class JDWPToolsFastLogpointTest {
 		when(vm.canGetBytecodes()).thenReturn(true);
 		when(vm.canGetConstantPool()).thenReturn(true);
 		final ReferenceType cart = mock(ReferenceType.class);
-		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(null, cart);
+		when(jdiService.findLoadedClass(vm, "com.example.Cart")).thenReturn(null, cart);
 		when(fastLogpoints.registerWaiting(any(), any(), anyString(), anyInt(), anyString(), any(), anyInt(), anyInt(),
 			anyBoolean())).thenReturn(9);
 		when(cart.name()).thenReturn("com.example.Cart");
@@ -205,7 +204,7 @@ class JDWPToolsFastLogpointTest {
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
 		when(vm.canGetConstantPool()).thenReturn(true);
-		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(type);
+		when(jdiService.findLoadedClass(vm, "com.example.Cart")).thenReturn(type);
 		when(type.name()).thenReturn("com.example.Cart");
 		when(type.classLoader()).thenReturn(mock(ClassLoaderReference.class));
 		when(fastLogpoints.leftoversIn(type, FastLogpointService.Kind.LOGPOINT)).thenReturn("refusing to arm: com.example.Cart still carries ...");

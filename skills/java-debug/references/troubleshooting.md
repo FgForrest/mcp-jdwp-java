@@ -48,6 +48,8 @@ Only kill a process you launched yourself in this session. If the process is unr
 
 Reconnect the MCP server first (`/mcp` in Claude Code, a new session in Codex). Check whether the test JVM is still alive, confirm it has ended, then relaunch the test and attach with `requireVmStart=true`.
 
+Standing fast-probe approvals survive a target JVM restart at the same host:port while the MCP server keeps running. A fresh MCP server process starts without grants. Call the fast-probe tool without `userApproved` and relay any new risk briefing to the user word for word.
+
 ## Expression evaluation fails with "X cannot be resolved"
 
 Symptoms: `jdwp_evaluate_expression`, `jdwp_assert_expression`, a logpoint, or a conditional breakpoint returns a JDT compile diagnostic like `X cannot be resolved to a type` / `cannot be resolved to a variable`, or `configureCompilerClasspath` throws `Classpath discovery failed for the current connection: neither the target VM classloader hierarchy nor the local project yielded any classpath entries`.

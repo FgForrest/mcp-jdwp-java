@@ -79,9 +79,7 @@ final class LiveSession implements AutoCloseable {
 	}
 
 	static LiveSession start(List<String> extraJvmArgs) throws Exception {
-		return start(extraJvmArgs, new LocalProjectClasspathProvider(
-			Path.of(System.getProperty("java.io.tmpdir"), "fast-logpoint-live-" + UUID.randomUUID()),
-			name -> null, (command, workingDirectory, timeoutSeconds) -> List.of()));
+		return start(extraJvmArgs, defaultLocalClasspath());
 	}
 
 	/** Starts and attaches a test target with the given server-side classpath provider. */
@@ -92,16 +90,34 @@ final class LiveSession implements AutoCloseable {
 	/** Starts and attaches a test target with an optional fixture directory on its classpath. */
 	static LiveSession start(List<String> extraJvmArgs, LocalProjectClasspathProvider localClasspath,
 	                         @Nullable Path fixtureClasspath) throws Exception {
-		final String targetClasspath = Path.of(FastLogpointTarget.class.getProtectionDomain().getCodeSource()
-			.getLocation().toURI()).toString();
-		final String classpath = fixtureClasspath == null ? targetClasspath
-			: targetClasspath + File.pathSeparator + fixtureClasspath;
 		// A fixed port, not :0 — after a detach the agent listens again on the same address, and the
 		// disconnect test re-attaches.
 		final int port;
 		try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 			port = probe.getLocalPort();
 		}
+		return start(extraJvmArgs, localClasspath, fixtureClasspath, port);
+	}
+
+	/** Starts and attaches a test target on a given port, so a later JVM can reuse the endpoint. */
+	static LiveSession start(List<String> extraJvmArgs, int port) throws Exception {
+		return start(extraJvmArgs, defaultLocalClasspath(), null, port);
+	}
+
+	/** A local classpath provider that finds nothing, for targets that need only their own classes. */
+	private static LocalProjectClasspathProvider defaultLocalClasspath() {
+		return new LocalProjectClasspathProvider(
+			Path.of(System.getProperty("java.io.tmpdir"), "fast-logpoint-live-" + UUID.randomUUID()),
+			name -> null, (command, workingDirectory, timeoutSeconds) -> List.of());
+	}
+
+	/** Launches the target with a JDWP agent on {@code port} and attaches to it. */
+	private static LiveSession start(List<String> extraJvmArgs, LocalProjectClasspathProvider localClasspath,
+	                                 @Nullable Path fixtureClasspath, int port) throws Exception {
+		final String targetClasspath = Path.of(FastLogpointTarget.class.getProtectionDomain().getCodeSource()
+			.getLocation().toURI()).toString();
+		final String classpath = fixtureClasspath == null ? targetClasspath
+			: targetClasspath + File.pathSeparator + fixtureClasspath;
 		final List<String> command = new ArrayList<>();
 		command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
 		command.add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:" + port);

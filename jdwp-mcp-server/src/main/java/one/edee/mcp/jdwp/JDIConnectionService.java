@@ -23,6 +23,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -126,6 +128,8 @@ public class JDIConnectionService {
     private String lastHost;
     /** Port of the last SUCCESSFUL attach. See {@link #lastHost} for semantics. */
     private int lastPort = 0;
+    /** Normalized endpoint of the last successful attach, also kept as the auto-reconnect seed's identity. */
+    private @Nullable TargetEndpoint targetEndpoint;
     /**
      * What the target's exit took with it — set by {@link #notifyVmDied}, cleared by the next attach
      * and by {@link #disconnect}. Lets {@code jdwp_reset} and {@code jdwp_disconnect} say that the
@@ -451,6 +455,7 @@ public class JDIConnectionService {
         }
         lastHost = host;
         lastPort = port;
+        targetEndpoint = new TargetEndpoint(host, port);
         lastConnectError = null;
         lastExit = null;
 
@@ -552,6 +557,43 @@ public class JDIConnectionService {
         @Nullable Instant lastConnectAttempt,
         @Nullable String lastConnectError
     ) {}
+
+    /** Reads the last successful endpoint without probing or connecting to the JVM. */
+    synchronized @Nullable TargetEndpoint targetEndpoint() {
+        return targetEndpoint;
+    }
+
+    /** Confirms which endpoint produced a particular VM, even if an attach raced with getVM(). */
+    synchronized @Nullable TargetEndpoint targetEndpointFor(VirtualMachine expected) {
+        return vm == expected ? targetEndpoint : null;
+    }
+
+    /**
+     * A JDWP endpoint as standing fast-probe approvals key it: the host is lower-cased, and every
+     * loopback name or address ({@code localhost}, {@code 127.0.0.1}, {@code ::1}) becomes
+     * {@code localhost}, so the same local port is one endpoint however it was written.
+     *
+     * @param host normalized host name
+     * @param port JDWP port
+     */
+    record TargetEndpoint(String host, int port) {
+        TargetEndpoint {
+            host = host.toLowerCase(Locale.ROOT);
+            try {
+                if (InetAddress.getByName(host).isLoopbackAddress()) {
+                    host = "localhost";
+                }
+            } catch (UnknownHostException ignored) {
+                // Keep the host name if it no longer resolves after the attach.
+            }
+        }
+
+        @Override
+        public String toString() {
+            final String label = host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
+            return label + ':' + port;
+        }
+    }
 
     /**
      * Verifies the VM connection is alive, attempting a single reconnect using the host/port from the
@@ -729,6 +771,7 @@ public class JDIConnectionService {
         targetLookup = null;
         lastHost = null;
         lastPort = 0;
+        targetEndpoint = null;
         lastExit = null;
         healthMonitor.stop();
     }
@@ -847,6 +890,7 @@ public class JDIConnectionService {
             // surfacing the original error.
             throw e;
         }
+        targetEndpoint = new TargetEndpoint(host, port);
         lastConnectError = null;
         // Fresh attach → new session epoch (see connect()); the RECONNECT event recorded below and
         // everything after it is tagged as this session, segmented from the dead VM's tail.
@@ -1060,8 +1104,7 @@ public class JDIConnectionService {
          */
         public String describe() {
             final String target = host != null ? "the target VM at " + host + ':' + port : "the target VM";
-            return target + " exited at " + DateTimeFormatter.ofPattern("HH:mm:ss z")
-                .format(at.atZone(ZoneId.systemDefault()));
+            return target + " exited at " + formatServerTime(at);
         }
 
         /**
@@ -1085,6 +1128,13 @@ public class JDIConnectionService {
                 parts.add(count + " " + noun + (count == 1 ? "" : "s"));
             }
         }
+    }
+
+    /**
+     * "18:42:10 CET" — a time of day in the server's time zone, the format every reply uses.
+     */
+    static String formatServerTime(Instant at) {
+        return DateTimeFormatter.ofPattern("HH:mm:ss z").format(at.atZone(ZoneId.systemDefault()));
     }
 
     /**
@@ -1688,6 +1738,11 @@ public class JDIConnectionService {
             }
             vmRef = vm;
         }
+        return findLoadedClass(vmRef, className);
+    }
+
+    @Nullable
+    ReferenceType findLoadedClass(VirtualMachine vmRef, String className) {
         try {
             final List<ReferenceType> existing = vmRef.classesByName(className);
             if (!existing.isEmpty()) {
@@ -1741,13 +1796,20 @@ public class JDIConnectionService {
      */
     @Nullable
     public ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread) {
+        return findOrForceLoadClass(className, preferredThread, null);
+    }
+
+    /** With an expected VM, force-load only in the JVM selected by the calling tool. */
+    @Nullable
+    ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread,
+                                       @Nullable VirtualMachine expected) {
         // Phase 1: cheap lookups + force-load preflight, all under the monitor.
         final VirtualMachine vmRef;
         final ThreadReference thread;
         final ClassType classClass;
         final Method forName;
         synchronized (this) {
-            if (vm == null) {
+            if (vm == null || (expected != null && vm != expected)) {
                 return null;
             }
             vmRef = vm;
