@@ -27,8 +27,11 @@ import java.nio.file.Path;
 import java.util.*;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
+/** Compares interpreter and compiler behavior in fresh target JVMs. */
 @EnabledIfSystemProperty(named = "jdwp.live", matches = "true")
 @Timeout(180)
 class InterpreterHarnessLiveTest {
@@ -319,17 +322,94 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    /** Exercises the two String transport cases and both forms of type shadowing on each target JDK. */
+    @Test
+    void checksSurrogateTransportAndShadowedTypeNames() throws Exception {
+        final List<Entry> entries = List.of(
+            mainRow("mirrored-unpaired-surrogate", "\"\\uD800\".charAt(0) == (char) 55296"),
+            mainRow("target-unpaired-surrogate", "this.malformed.charAt(0) == (char) 55296"),
+            mainRow("classpath-import-shadow", "ProcessBuilder.class"),
+            mainRow("inherited-type-shadow", "StringBuilder.class"));
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final JdiExpressionEvaluator compiler = fixture.evaluator(new InMemoryJavaCompiler());
+                final EvaluationRouter auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+                final EvaluationRouter strict = new EvaluationRouter(compiler, EvaluationRouter.Mode.INTERPRETER);
+                return replay(fixture.vm(), entries, fixture.connection(), context -> {
+                    final Entry entry = context.entry();
+                    final Planner.Plan plan = auto.prepare(auto.parse(entry.expression()), context.thread(),
+                        context::frame, context.bindings());
+                    switch (entry.id()) {
+                        case "mirrored-unpaired-surrogate" -> assertThat(plan)
+                            .isEqualTo(new Planner.Compile("literal contains an unpaired surrogate"));
+                        case "target-unpaired-surrogate" -> {
+                            assertThat(plan.kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+                            assertThatThrownBy(() -> strict.evaluateEvent(entry.expression(), context.thread(),
+                                context.bindings(), context::render)).isInstanceOf(JdiEvaluationException.class)
+                                .hasMessage("not interpreted: String transfer may have replaced a code unit");
+                        }
+                        case "classpath-import-shadow" -> {
+                            assertThat(plan).isEqualTo(new Planner.Compile("ambiguous type name: ProcessBuilder"));
+                            final Outcome imported = golden(context);
+                            assertThat(Objects.requireNonNull(imported.facts()).reflectedType())
+                                .isEqualTo("one.edee.mcp.jdwp.evaluation.fixture.shadow.ProcessBuilder");
+                            return imported;
+                        }
+                        case "inherited-type-shadow" -> {
+                            assertThat(plan.kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+                            final Outcome result = strict.evaluateEvent(entry.expression(), context.thread(),
+                                context.bindings(), context::render);
+                            assertThat(result).isEqualTo(golden(context));
+                            return result;
+                        }
+                        default -> throw new AssertionError(entry.id());
+                    }
+                    final Outcome result = auto.evaluateEvent(entry.expression(), context.thread(),
+                        context.bindings(), context::render);
+                    assertThat(result.rendered()).as(entry.id()).isEqualTo("true");
+                    return result;
+                }, null, new StringBuilder(), null);
+            });
+        }
+    }
+
+    /** Checks each expected plan and uses an isolated compiler mock for each planner-error row. */
     private static Engine routerEngine(EvaluationRouter strict, EvaluationRouter auto) {
         return context -> {
             final Entry entry = context.entry();
-            final var router = entry.expectedPlan() == Planner.KindOfPlan.COMPILE ? auto : strict;
-            final var plan = router.prepare(router.parse(entry.expression()), context.thread(), context::frame,
+            if (entry.expectedPlan() == Planner.KindOfPlan.ERROR) {
+                return plannerError(context);
+            }
+            final EvaluationRouter router = entry.expectedPlan() == Planner.KindOfPlan.COMPILE ? auto : strict;
+            final Planner.Plan plan = router.prepare(router.parse(entry.expression()), context.thread(), context::frame,
                 context.bindings());
             assertThat(plan.kind()).as("%s: %s (%s)", entry.id(), entry.expression(), plan)
                 .isEqualTo(entry.expectedPlan());
             return evaluationOutcome(() -> router.evaluateEvent(entry.expression(), context.thread(), context.bindings(),
-                context::render), plan.kind());
+                context::render));
         };
+    }
+
+    /** Requires the planner's exact diagnostic and independently checks that the compiler was untouched. */
+    private static Outcome plannerError(EvaluationContext context) throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final Entry entry = context.entry();
+        final Planner.Plan plan = router.prepare(router.parse(entry.expression()), context.thread(), context::frame,
+            context.bindings());
+        assertThat(plan).as(entry.id()).isInstanceOf(Planner.Error.class);
+        final String expected = ((Planner.Error) plan).message();
+        final String diagnostic = switch (entry.id()) {
+            case "syntax-error" -> "Syntax error:";
+            case "unresolved-name" -> "Unresolved variable 'missingLocal'";
+            default -> throw new AssertionError("Missing expected diagnostic for " + entry.id());
+        };
+        assertThat(expected).startsWith(diagnostic);
+        assertThatThrownBy(() -> router.evaluateEvent(entry.expression(), context.thread(),
+            context.bindings(), context::render)).isInstanceOf(JdiEvaluationException.class)
+            .hasMessage(expected);
+        verifyNoInteractions(compiler);
+        return new Outcome("planner error", "", expected, null);
     }
 
     private static Path writeOracle(AttachedFixture fixture, List<Entry> entries, StringBuilder vmStart)
@@ -591,22 +671,20 @@ class InterpreterHarnessLiveTest {
         return samples;
     }
 
+    /** Executes the compiled engine and records its formatted outcome. */
     private static Outcome compiledResult(JdiExpressionEvaluator evaluator, EvaluationContext context)
         throws Exception {
         return evaluationOutcome(() -> context.render(
-            evaluator.evaluate(context.frame(), context.entry().expression(), context.bindings())), null);
+            evaluator.evaluate(context.frame(), context.entry().expression(), context.bindings())));
     }
 
-    private static Outcome evaluationOutcome(java.util.concurrent.Callable<Outcome> evaluate,
-                                             Planner.@Nullable KindOfPlan plan) throws Exception {
+    /** Normalizes target exceptions and compiled diagnostics for the differential oracle. */
+    private static Outcome evaluationOutcome(java.util.concurrent.Callable<Outcome> evaluate) throws Exception {
         try {
             return evaluate.call();
         } catch (Interpreter.RaisedException e) {
             return Outcome.targetException(e.getCause().getClass().getName());
         } catch (JdiEvaluationException e) {
-            if (plan == Planner.KindOfPlan.ERROR) {
-                return new Outcome("planner error", "", "", null);
-            }
             if (e.getMessage().startsWith("Target VM threw exception:")) {
                 for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
                     if (cause instanceof InvocationException invoked) {

@@ -17,6 +17,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
 
+/** Tests navigation on holds managed by the suspension session. */
 class SuspensionSessionNavigateTest {
 
     @Test
@@ -105,5 +106,72 @@ class SuspensionSessionNavigateTest {
         when(thread.frameCount()).thenReturn(1);
         when(thread.frames(0, 1)).thenReturn(List.of(frame));
         when(thread.frame(0)).thenReturn(frame);
+    }
+
+    /** Refuses a result that mixes pre-resume locals with post-resume fields. */
+    @Test
+    void refusesWhenTheDispatcherResumesTheBystanderMidPlan() throws Exception {
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread event = target.thread("event");
+        final FakeSuspendModel.FakeThread thread = target.thread("bystander");
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
+        final SuspensionSession session = tracker.openSuspensionSession(history);
+        final SuspensionSession.Context context = session.route(target.breakpointEvent(event, EventRequest.SUSPEND_ALL), event.ref, true);
+        session.begin(context);
+
+        final JDIConnectionService connection = mock(JDIConnectionService.class);
+        when(connection.getVM()).thenReturn(target.vm);
+        final EvaluationRouter router = new EvaluationRouter(mock(JdiExpressionEvaluator.class), EvaluationRouter.Mode.AUTO);
+        final JDWPTools tools = new JDWPTools(connection, tracker, new WatcherManager(), router, history, guard,
+            mock(JvmDiscoveryService.class), new MarkedInstanceRegistry(), new JdiHealthMonitor(),
+            mock(LocalProjectClasspathProvider.class), mock(FastLogpointService.class));
+
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        final ObjectReference self = mock(ObjectReference.class);
+        final LocalVariable local = mock(LocalVariable.class);
+        final Field field = mock(Field.class);
+        final IntegerType intType = mock(IntegerType.class);
+        final IntegerValue before = mock(IntegerValue.class);
+        final IntegerValue after = mock(IntegerValue.class);
+        final IntegerValue mixed = mock(IntegerValue.class);
+
+        when(thread.ref.frameCount()).thenReturn(1);
+        when(thread.ref.frames(0, 1)).thenReturn(List.of(frame));
+        when(thread.ref.frame(0)).thenReturn(frame);
+        when(frame.location()).thenAnswer(call -> {
+            if (thread.count == 0) {
+                throw new InvalidStackFrameException("bystander resumed");
+            }
+            return location;
+        });
+        when(frame.thisObject()).thenReturn(self);
+        when(frame.visibleVariables()).thenReturn(List.of(local));
+        when(frame.getValues(List.of(local))).thenReturn(Map.of(local, before));
+        when(local.name()).thenReturn("cached");
+        when(local.type()).thenReturn(intType);
+        when(intType.name()).thenReturn("int");
+        when(location.declaringType()).thenReturn(owner);
+        when(owner.name()).thenReturn("example.App");
+        when(owner.fields()).thenReturn(List.of(field));
+        when(field.name()).thenReturn("amount");
+        when(field.declaringType()).thenReturn(owner);
+        when(field.type()).thenAnswer(call -> {
+            // A false condition finished on the event thread. It was the only hold on this bystander.
+            session.finish(context);
+            assertThat(thread.count).isZero();
+            return intType;
+        });
+        when(before.value()).thenReturn(1);
+        when(after.value()).thenReturn(20);
+        when(self.getValue(field)).thenAnswer(call -> thread.count == 0 ? after : before);
+        when(target.vm.mirrorOf(21)).thenReturn(mixed);
+        when(connection.formatFieldValue(mixed)).thenReturn("21");
+
+        assertThat(tools.jdwp_evaluate_expression(thread.ref.uniqueID(), "cached + this.amount", null))
+            .startsWith("Error:");
     }
 }

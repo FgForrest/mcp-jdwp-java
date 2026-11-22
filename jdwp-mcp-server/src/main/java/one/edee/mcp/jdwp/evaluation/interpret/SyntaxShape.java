@@ -50,13 +50,13 @@ public final class SyntaxShape extends ASTVisitor {
         return new Classification(Phase.NAVIGATION, "navigation syntax");
     }
 
-    /** Returns the plan that must handle the snippet without navigation, or null when navigation may be attempted. */
+    /** Returns the fallback plan, or null when the depth-checked expression may be navigated. */
     static Planner.@Nullable Plan routing(ExpressionParser.Parsed parsed) {
         if (parsed.error() != null) {
             return new Planner.Error(parsed.error());
         }
         if (parsed.statements() != null) {
-            return new Planner.Compile("statement block");
+            return new Planner.Compile(AstDepth.exceedsLimit(parsed) ? AstDepth.REASON : "statement block");
         }
         final SyntaxShape shape = inspect(parsed, false);
         if (shape.compiled != null) {
@@ -65,9 +65,13 @@ public final class SyntaxShape extends ASTVisitor {
         return shape.calls == null ? null : new Planner.Invoke(shape.calls);
     }
 
-    /** Walks the parsed snippet and records the constructs it contains. */
+    /** Checks depth before walking the parsed snippet to record the constructs it contains. */
     private static SyntaxShape inspect(ExpressionParser.Parsed parsed, boolean sourceOnly) {
         final SyntaxShape shape = new SyntaxShape();
+        if (AstDepth.exceedsLimit(parsed)) {
+            shape.compiled = AstDepth.REASON;
+            return shape;
+        }
         shape.sourceOnly = sourceOnly;
         if (parsed.statements() != null) {
             shape.block = true;

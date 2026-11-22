@@ -112,40 +112,34 @@ final class JdiTypes {
     }
 
     /**
-     * Resolves a simple or qualified type name as Java scoping would: nested types, the same package, {@code java.lang}, then classes the declaring type refers to and fully qualified names.
+     * Resolves lexical member types first. Package and java.lang defaults are used only when the
+     * constant pool provides no conflicting type of the same simple name.
      */
     @Nullable ReferenceType resolve(String name) {
         final ReferenceType owner = declaring;
+        ReferenceType fallback = null;
         if (owner != null) {
+            final ReferenceType lexical = lexicalType(owner, name);
+            if (lexical != null) {
+                return lexical;
+            }
             final String binary = owner.name();
-            // Include the declaring type's own name and each enclosing class's nested names.
-            for (String enclosing = binary; ; enclosing = enclosing.substring(0, enclosing.lastIndexOf('$'))) {
-                final String simple = enclosing.substring(Math.max(enclosing.lastIndexOf('.'),
-                    enclosing.lastIndexOf('$')) + 1);
-                final ReferenceType nested = simple.equals(name) ? findExact(enclosing)
-                    : findQualified(enclosing + "$" + name.replace('.', '$'));
-                if (nested != null) {
-                    return nested;
-                }
-                if (enclosing.lastIndexOf('$') <= enclosing.lastIndexOf('.')) {
-                    break;
-                }
-            }
             final int packageEnd = binary.lastIndexOf('.');
-            final ReferenceType inPackage = findQualified(binary.substring(0, packageEnd + 1) + name);
-            if (inPackage != null) {
-                return inPackage;
-            }
+            fallback = findQualified(binary.substring(0, packageEnd + 1) + name);
         }
-        final ReferenceType lang = findQualified("java.lang." + name);
-        if (lang != null) {
-            return lang;
+        if (fallback == null) {
+            fallback = findQualified("java.lang." + name);
         }
         if (owner != null && !name.contains(".")) {
             final Set<ReferenceType> candidates = new LinkedHashSet<>();
             for (String candidate : classNames(owner)) {
-                if (candidate.substring(Math.max(candidate.lastIndexOf('.'), candidate.lastIndexOf('$')) + 1)
-                        .equals(name)) {
+                if (!simpleName(candidate).equals(name)) {
+                    continue;
+                }
+                if (fallback != null && !fallback.name().equals(candidate)) {
+                    throw Planner.compile("ambiguous type name: " + name);
+                }
+                if (fallback == null) {
                     final ReferenceType type = findExact(candidate);
                     if (type != null) {
                         candidates.add(type);
@@ -156,7 +150,71 @@ final class JdiTypes {
                 return unique(name, candidates);
             }
         }
-        return findQualified(name);
+        return fallback == null ? findQualified(name) : fallback;
+    }
+
+    /** Finds a type in the declaring type's lexical scopes, including inherited member types. */
+    private @Nullable ReferenceType lexicalType(ReferenceType owner, String name) {
+        final String binary = owner.name();
+        final String suffix = "$" + name.replace('.', '$');
+        final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
+        for (String enclosing = binary; ; enclosing = enclosing.substring(0, enclosing.lastIndexOf('$'))) {
+            final ReferenceType scope = enclosing.equals(binary) ? owner : findExact(enclosing);
+            if (scope != null) {
+                if (simpleName(enclosing).equals(name)) {
+                    return scope;
+                }
+                final Set<ReferenceType> candidates = memberTypes(scope, suffix, known);
+                if (!candidates.isEmpty()) {
+                    return unique(name, candidates);
+                }
+            } else {
+                final ReferenceType declared = findExact(enclosing + suffix);
+                if (declared != null) {
+                    return declared;
+                }
+            }
+            if (enclosing.lastIndexOf('$') <= enclosing.lastIndexOf('.')) {
+                return null;
+            }
+        }
+    }
+
+    /** Resolves declared or inherited members, respecting hiding and accessibility at each inheritance edge. */
+    private Set<ReferenceType> memberTypes(ReferenceType scope, String suffix,
+                                           Map<ReferenceType, Set<ReferenceType>> known) {
+        final Set<ReferenceType> cached = known.get(scope);
+        if (cached != null) {
+            return cached;
+        }
+        final Set<ReferenceType> result = new LinkedHashSet<>();
+        final ReferenceType declared = findExact(scope.name() + suffix);
+        if (declared != null) {
+            result.add(declared);
+        } else {
+            for (ReferenceType parent : parents(scope)) {
+                for (ReferenceType inherited : memberTypes(parent, suffix, known)) {
+                    if (!inherited.isPrivate() && (!inherited.isPackagePrivate()
+                            || packageName(inherited).equals(packageName(scope)))) {
+                        result.add(inherited);
+                    }
+                }
+            }
+        }
+        known.put(scope, result);
+        return result;
+    }
+
+    /** Returns the package portion of a reference type's binary name. */
+    private static String packageName(ReferenceType type) {
+        final String binary = type.name();
+        final int separator = binary.lastIndexOf('.');
+        return separator < 0 ? "" : binary.substring(0, separator);
+    }
+
+    /** Returns the simple name of a loaded type or a binary name from the constant pool. */
+    private static String simpleName(String binary) {
+        return binary.substring(Math.max(binary.lastIndexOf('.'), binary.lastIndexOf('$')) + 1);
     }
 
     /** Finds a class by binary name that is visible from the declaring type's class loader, or null. */

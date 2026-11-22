@@ -656,9 +656,9 @@ public class JdiEventListener {
         suspensions.beginProcessing(context);
         try {
             keep = !process(eventSet, suspensions, context);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (running) {
-                log.warn("[JDI] Error processing event: {}", e.getMessage());
+                log.warn("[JDI] Error processing event: {}", evaluationFailureMessage(e));
             }
             // Fail-safe, as the handlers: an unexpected error keeps the set for inspection.
             keep = true;
@@ -1445,15 +1445,15 @@ public class JdiEventListener {
                     "expression", expression, "result", resultStr)));
             log.info("[JDI] Exception {} logged at {} with {} = {} on thread {}",
                 exceptionType, throwInfo, expression, resultStr, threadName);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_LOG_ERROR",
                 String.format("%s thrown at %s on thread %s — error evaluating '%s': %s",
-                    exceptionType, throwInfo, threadName, expression, e.getMessage()),
+                    exceptionType, throwInfo, threadName, expression, evaluationFailureMessage(e)),
                 Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
                     "thread", threadName, "expression", expression,
-                    "error", String.valueOf(e.getMessage()))));
+                    "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Exception logpoint evaluation failed for '{}': {}",
-                expression, e.getMessage());
+                expression, evaluationFailureMessage(e));
         }
     }
 
@@ -1668,16 +1668,16 @@ public class JdiEventListener {
                     "expression", expression, "result", resultStr)));
             log.info("[JDI] Field {} {} logged on {} with {} = {} (BP #{})",
                 fieldName, modeStr, threadName, expression, resultStr, bpId);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
                 String.format("Field %s.%s %s on thread %s — error evaluating '%s': %s",
-                    className, fieldName, modeStr, threadName, expression, e.getMessage()),
+                    className, fieldName, modeStr, threadName, expression, evaluationFailureMessage(e)),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
                     "expression", expression,
-                    "error", String.valueOf(e.getMessage()))));
+                    "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Field logpoint evaluation failed for {}.{}: {}",
-                className, fieldName, e.getMessage());
+                className, fieldName, evaluationFailureMessage(e));
         }
     }
 
@@ -1703,10 +1703,10 @@ public class JdiEventListener {
                     "line", String.valueOf(lineNumber), "thread", threadName)));
 
             log.info("[JDI] Logpoint {} evaluated: {} = {}", bpId, expression, resultStr);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("LOGPOINT_ERROR",
-                String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, e.getMessage())));
-            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, e.getMessage());
+                String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, evaluationFailureMessage(e))));
+            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, evaluationFailureMessage(e));
         }
     }
 
@@ -1773,15 +1773,21 @@ public class JdiEventListener {
         try {
             return evaluations.evaluateEvent(condition, thread, mergeMarkedBindings(extraBindings),
                 result -> conditionResult(result, breakpointId, location, condition));
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (e instanceof InterruptedException) {
                 // The dispatcher is being shut down; let the rest of the set's processing see it.
                 Thread.currentThread().interrupt();
             }
             recordConditionError(breakpointId, location, condition,
-                e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+                evaluationFailureMessage(e));
             return true;
         }
+    }
+
+    /** Describes an evaluation failure, using its type when no message is available. */
+    private static String evaluationFailureMessage(Throwable failure) {
+        final String message = failure.getMessage();
+        return message == null ? failure.getClass().getSimpleName() : message;
     }
 
     /**

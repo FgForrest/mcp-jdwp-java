@@ -17,9 +17,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import com.sun.jdi.event.BreakpointEvent;
+import org.assertj.core.api.SoftAssertions;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
 
+/** Tests dispatcher navigation and fail-safe evaluation errors. */
 class JdiEventListenerNavigateTest {
 
     @Test
@@ -106,6 +110,99 @@ class JdiEventListenerNavigateTest {
                 .contains("BREAKPOINT").doesNotContain("CONDITION_ERROR");
         } finally {
             releaseRead.countDown();
+            listener.stop();
+        }
+    }
+
+    /** Publishes the fail-safe stop and releases its counts on reset after an oversized condition fails. */
+    @Test
+    void publishesTheFailSafeStopForAnOversizedCondition() throws Exception {
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread thread = target.thread("event");
+        final FakeSuspendModel.FakeThread bystander = target.thread("bystander");
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final JdiEventListener listener = new JdiEventListener(tracker, history, compiler, guard, null,
+            new MarkedInstanceRegistry(), new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO));
+        final LinkedBlockingQueue<EventSet> sets = new LinkedBlockingQueue<EventSet>();
+        final EventQueue queue = mock(EventQueue.class);
+        when(target.vm.eventQueue()).thenReturn(queue);
+        when(queue.remove()).thenAnswer(call -> sets.take());
+
+        final BreakpointRequest request = mock(BreakpointRequest.class);
+        final int id = tracker.registerBreakpoint(request);
+        tracker.setCondition(id, "1 + ".repeat(10000) + "1 == 10001");
+        org.mockito.Mockito.doThrow(new StackOverflowError()).when(compiler).configureCompilerClasspathForEvent(thread.ref);
+        final EventSet set = target.breakpointEvent(thread, EventRequest.SUSPEND_ALL, request);
+        final BreakpointEvent event = (BreakpointEvent) set.iterator().next();
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        when(location.declaringType()).thenReturn(owner);
+        when(location.lineNumber()).thenReturn(10);
+        when(owner.name()).thenReturn("example.App");
+        final CountDownLatch dispatchStarted = new CountDownLatch(1);
+        when(event.location()).thenAnswer(call -> {
+            if (Thread.currentThread().getName().contains("dispatcher")) {
+                dispatchStarted.countDown();
+            }
+            return location;
+        });
+        try {
+            listener.start(target.vm);
+            sets.add(set);
+            assertThat(dispatchStarted.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThat(listener.awaitIdle(3000)).isTrue();
+            final SuspensionSession session = tracker.suspensionSession();
+            assertThat(session).isNotNull();
+            final SoftAssertions checks = new SoftAssertions();
+            checks.assertThat(history.getRecent(20)).extracting(EventHistory.DebugEvent::type)
+                .contains("CONDITION_ERROR");
+            checks.assertThat(session.presentCurrent()).as("published fail-safe stop").isNotNull();
+            session.reset();
+            checks.assertThat(bystander.count).as("bystander suspend count after reset").isZero();
+            checks.assertAll();
+        } finally {
+            listener.stop();
+        }
+    }
+    /** Records a thrown Error as a logpoint failure and settles the non-stopping event set. */
+    @Test
+    void releasesLogpointSetAfterEvaluationThrowsAnError() throws Exception {
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread thread = target.thread("event");
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final JdiEventListener listener = new JdiEventListener(tracker, history, compiler, new EvaluationGuard(),
+            null, new MarkedInstanceRegistry(), new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO));
+        final BreakpointRequest request = mock(BreakpointRequest.class);
+        final int id = tracker.registerBreakpoint(request);
+        tracker.setLogpointExpression(id, "value()");
+        final EventSet set = target.breakpointEvent(thread, EventRequest.SUSPEND_EVENT_THREAD, request);
+        final BreakpointEvent event = (BreakpointEvent) set.iterator().next();
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        when(event.location()).thenReturn(location);
+        when(location.declaringType()).thenReturn(owner);
+        when(owner.name()).thenReturn("example.App");
+        final EventQueue queue = mock(EventQueue.class);
+        final LinkedBlockingQueue<EventSet> sets = new LinkedBlockingQueue<>();
+        when(target.vm.eventQueue()).thenReturn(queue);
+        when(queue.remove()).thenAnswer(call -> sets.take());
+        org.mockito.Mockito.doThrow(new StackOverflowError()).when(compiler).configureCompilerClasspathForEvent(thread.ref);
+        try {
+            listener.start(target.vm);
+            sets.add(set);
+            verify(set, org.mockito.Mockito.timeout(3000)).resume();
+            assertThat(listener.awaitIdle(3000)).isTrue();
+            assertThat(thread.count).isZero();
+            assertThat(history.getRecent(20)).anySatisfy(record -> {
+                assertThat(record.type()).isEqualTo("LOGPOINT_ERROR");
+                assertThat(record.summary()).contains("StackOverflowError");
+            });
+        } finally {
             listener.stop();
         }
     }

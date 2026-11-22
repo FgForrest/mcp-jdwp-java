@@ -1458,7 +1458,8 @@ public class JDWPTools {
     }
 
     /**
-     * Evaluates the expression in the frame, first by interpretation under fresh frames, then by the compiled evaluator when the interpreter declines; {@code reply} renders the formatted value.
+     * Evaluates the expression under a frame reservation when navigation is available. Forced
+     * compilation and fallback use the invocation guard and runner. {@code reply} renders the value.
      */
     private String evaluateExpression(ThreadReference thread, int frameIndex, String expression,
                                       UnaryOperator<String> reply) throws Exception {
@@ -1475,6 +1476,7 @@ public class JDWPTools {
         };
         final String actual;
         try {
+            evaluations.requireReadOnlyMode();
             return withFreshFrames(thread, "call again.", () -> {
                 final Planner.Plan plan = evaluations.prepare(input, thread, frames, markedInstances.buildBindings());
                 return evaluations.readOnly(plan, value -> reply.apply(formatValue(value)));

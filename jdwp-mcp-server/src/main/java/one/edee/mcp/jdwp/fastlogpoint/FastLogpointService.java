@@ -35,6 +35,8 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Owns every fast logpoint ({@code jdwp_set_fast_logpoint}): registration, arming, reading the
@@ -172,6 +174,11 @@ public class FastLogpointService {
      */
     private static final Set<String> BOXED_TYPES = Set.of("java.lang.Integer", "java.lang.Long", "java.lang.Short",
         "java.lang.Byte", "java.lang.Character", "java.lang.Boolean", "java.lang.Float", "java.lang.Double");
+
+    /** ECJ's diagnostic for an unresolved bare variable, with or without its longer wording. */
+    private static final Pattern UNRESOLVED_VARIABLE = Pattern.compile(
+        "(?m)(?:^|: )(\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)"
+            + " cannot be resolved(?: to a variable)?\\h*$");
 
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
@@ -581,7 +588,7 @@ public class FastLogpointService {
             deferForLocalClasspath(flp);
             return ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
-            markFailed(flp, describeProbeFailure(flp.kind, e), !(e instanceof UncertainRedefinitionException));
+            markFailed(flp, describeProbeFailure(flp.kind, e, thread), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
         }
     }
@@ -1804,7 +1811,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describeProbeFailure(flp.kind, e), context, thread);
+            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describeProbeFailure(flp.kind, e, thread), context, thread);
         }
         log.debug("[FastLogpoint] #{} arming hit at {}", flp.id, location);
     }
@@ -3055,17 +3062,42 @@ public class FastLogpointService {
     }
 
     /**
-     * Describes a probe failure, adding the fallback tool's hint when compilation failed because a member is not visible.
+     * Describes a probe compilation failure and adds the ordinary probe hint for a visibility
+     * diagnostic or an unresolved name that belongs to the arming receiver.
      */
-    static String describeProbeFailure(Kind kind, Throwable failure) {
+    static String describeProbeFailure(Kind kind, Throwable failure, ThreadReference thread) {
         final String message = describe(failure);
         if (failure instanceof JdiEvaluationException && message.startsWith("Compilation failed:")
-            && message.contains(" is not visible")) {
+            && (message.contains(" is not visible") || unresolvedReceiverField(message, thread))) {
             return message + "\n" + kind.fallbackTool
                 + " can interpret the same navigation expression and reach private members, "
                 + "at the cost of a debugger round trip per hit.";
         }
         return message;
+    }
+
+    /** Checks the receiver's declared and inherited fields while the arming frame is still readable. */
+    private static boolean unresolvedReceiverField(String message, ThreadReference thread) {
+        final Matcher unresolved = UNRESOLVED_VARIABLE.matcher(message);
+        if (!unresolved.find()) {
+            return false;
+        }
+        try {
+            final StackFrame frame = thread.frame(0);
+            final ObjectReference receiver = frame.thisObject();
+            if (receiver != null) {
+                final List<Field> fields = receiver.referenceType().allFields();
+                do {
+                    final String name = unresolved.group(1);
+                    if (fields.stream().anyMatch(field -> field.name().equals(name))) {
+                        return true;
+                    }
+                } while (unresolved.find());
+            }
+        } catch (IncompatibleThreadStateException | RuntimeException ignored) {
+            // A lost frame or VM can only suppress the hint, never replace the original diagnostic.
+        }
+        return false;
     }
 
     // ── Fast breakpoints ──
@@ -3297,7 +3329,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            condition = new ArmingCondition(false, describeProbeFailure(flp.kind, e));
+            condition = new ArmingCondition(false, describeProbeFailure(flp.kind, e, thread));
         }
         final String error = condition.error();
         final int epoch;
@@ -3360,8 +3392,8 @@ public class FastLogpointService {
 
     /**
      * Evaluates a true arming hit's capture through the compiled evaluator on the dispatcher, with
-     * the same value rendering as the installed probe. A compiler visibility failure can also
-     * include a hint to use an ordinary logpoint for the capture expression.
+     * the same value rendering as the installed probe. A compiler visibility error or an unresolved
+     * receiver field can also include a hint to use an ordinary logpoint for the capture expression.
      * Throws if local discovery is pending or the event thread has resumed.
      */
     private String evaluateArmingCapture(FastLogpoint flp, ThreadReference thread)
@@ -3374,7 +3406,7 @@ public class FastLogpointService {
         } catch (Exception | LinkageError e) {
             requireStillSuspended(thread, e);
             final String diagnostic = describe(e);
-            final String withHint = describeProbeFailure(Kind.LOGPOINT, e);
+            final String withHint = describeProbeFailure(Kind.LOGPOINT, e, thread);
             // Cap the diagnostic before appending the debugger hint.
             return FastBreakpointProbeSource.captureFailure(diagnostic) + withHint.substring(diagnostic.length());
         }

@@ -8,7 +8,7 @@ import org.jspecify.annotations.Nullable;
 import java.io.Serial;
 import java.util.Objects;
 
-/** Runs a typed navigation plan. The plan contains values and metadata, never stack frames. */
+/** Runs a typed navigation plan and validates the frame that supplied its values. */
 public final class Interpreter {
     /** Not instantiable; the class only holds static entry points. */
     private Interpreter() {}
@@ -62,7 +62,7 @@ public final class Interpreter {
         T accept(@Nullable Value value) throws Exception;
     }
 
-    /** Keep created strings pinned through result consumption and formatting. */
+    /** Executes and formats the result with its strings pinned, discarding reads from an invalidated frame. */
     static <T> T execute(Planner.Navigate plan, Result<T> result) throws Exception {
         try (PinnedMirrors pins = new PinnedMirrors()) {
             final @Nullable Value value;
@@ -70,8 +70,22 @@ public final class Interpreter {
                 value = plan.read().run(new Context(plan.vm(), pins));
             } catch (NullPointerException | ArithmeticException | ClassCastException | IndexOutOfBoundsException e) {
                 throw new RaisedException(e);
+            } finally {
+                validateFrame(plan.frame());
             }
-            return result.accept(value);
+            try {
+                return result.accept(value);
+            } finally {
+                // Formatting can also read target values.
+                validateFrame(plan.frame());
+            }
+        }
+    }
+
+    /** Checks that the original frame survived, even when the target has since suspended again. */
+    private static void validateFrame(@Nullable StackFrame frame) {
+        if (frame != null) {
+            frame.location();
         }
     }
 

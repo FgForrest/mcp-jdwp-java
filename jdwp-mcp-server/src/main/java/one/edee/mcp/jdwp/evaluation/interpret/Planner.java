@@ -27,8 +27,8 @@ public final class Planner {
         KindOfPlan kind();
     }
 
-    /** A plan the interpreter can execute by navigating values. */
-    public record Navigate(VirtualMachine vm, Interpreter.Read read) implements Plan {
+    /** A navigation plan and the frame to validate after executing its snapshot, if it used one. */
+    public record Navigate(VirtualMachine vm, Interpreter.Read read, @Nullable StackFrame frame) implements Plan {
         /** Returns {@link KindOfPlan#NAVIGATE}. */
         @Override public KindOfPlan kind() { return KindOfPlan.NAVIGATE; }
     }
@@ -85,7 +85,7 @@ public final class Planner {
     /** Type lookup scoped to the declaring type. */
     private final JdiTypes types;
 
-    /** Captures the frame's receiver and locals so planning and execution never touch the frame again. */
+    /** Captures the frame's receiver and locals before planning the expression. */
     private Planner(VirtualMachine vm, @Nullable StackFrame frame, @Nullable Location location,
                     Map<String, Value> bindings) {
         this.vm = vm;
@@ -125,13 +125,13 @@ public final class Planner {
             Objects.requireNonNull(parsed.expression()));
     }
 
-    /** Plans a navigable expression, turning every refusal or unloaded type into the plan that handles it instead. */
+    /** Plans a depth-checked expression from {@link SyntaxShape#routing}, returning any fallback the expression needs. */
     static Plan navigation(VirtualMachine vm, @Nullable StackFrame frame, @Nullable Location location,
                            Map<String, Value> bindings, Expression expression) {
         try {
             final Planner planner = new Planner(vm, frame, location, bindings);
             final Node root = planner.node(expression);
-            return new Navigate(vm, root.read());
+            return new Navigate(vm, root.read(), frame);
         } catch (Refusal e) {
             return e.plan;
         } catch (ClassNotLoadedException e) {
@@ -243,7 +243,7 @@ public final class Planner {
         return (node.bits & ASTNode.OperatorMASK) >> ASTNode.OperatorSHIFT;
     }
 
-    /** Plans a literal as a constant node. */
+    /** Plans a literal as a constant node, declining literals with isolated surrogate code units. */
     private Node literal(Literal literal) {
         if (literal instanceof NullLiteral) {
             return new Node(JdiTypes.NULL, ctx -> null);
@@ -262,18 +262,22 @@ public final class Planner {
                     for (StringLiteral component : concat.getLiterals()) {
                         if (component != null) {
                             component.computeConstant();
-                            text.append(component.constant.stringValue());
+                            text.append(checkedStringLiteral(component.constant.stringValue()));
                         }
                     }
                     return stringConstant(text.toString());
                 }
-                return stringConstant(value.stringValue());
+                return stringConstant(checkedStringLiteral(value.stringValue()));
             }
             if (literal instanceof TrueLiteral || literal instanceof FalseLiteral) {
                 return constant(Kind.BOOLEAN, value.booleanValue());
             }
             if (literal instanceof CharLiteral) {
-                return constant(Kind.CHAR, value.charValue());
+                final char codeUnit = value.charValue();
+                if (Character.isSurrogate(codeUnit)) {
+                    throw compile("literal contains an unpaired surrogate");
+                }
+                return constant(Kind.CHAR, codeUnit);
             }
             if (literal instanceof IntLiteral) {
                 return constant(Kind.INT, value.intValue());
@@ -289,6 +293,15 @@ public final class Planner {
             }
         }
         throw compile("unsupported literal");
+    }
+
+    /** Checks one String literal before any concatenation can mask an isolated surrogate. */
+    private static String checkedStringLiteral(String value) {
+        if (value.codePoints().anyMatch(codePoint ->
+                Character.MIN_SURROGATE <= codePoint && codePoint <= Character.MAX_SURROGATE)) {
+            throw compile("literal contains an unpaired surrogate");
+        }
+        return value;
     }
 
     /** Plans a String constant, which the JVM interns. */
@@ -892,9 +905,7 @@ public final class Planner {
         throw compile("incompatible reference types: " + ref.name() + " and " + to.name());
     }
 
-    /**
-     * Plans a call that is evaluated without invoking target code, for example {@code String.length()}, or refuses it.
-     */
+    /** Plans an intrinsic and checks transferred String text before using it. */
     private Node intrinsic(MessageSend call) throws ClassNotLoadedException {
         final String name = new String(call.selector);
         if (call.receiver instanceof SuperReference || call.receiver instanceof QualifiedSuperReference
@@ -920,10 +931,10 @@ public final class Planner {
         }
         if (receiver.type().isString()) {
             if (arity == 0 && name.equals("length")) {
-                return intrinsic(Kind.INT, receiver, null, (self, arg) -> ((StringReference) self).value().length());
+                return intrinsic(Kind.INT, receiver, null, (self, arg) -> intrinsicString(self).length());
             }
             if (arity == 0 && name.equals("isEmpty")) {
-                return intrinsic(Kind.BOOLEAN, receiver, null, (self, arg) -> ((StringReference) self).value().isEmpty());
+                return intrinsic(Kind.BOOLEAN, receiver, null, (self, arg) -> intrinsicString(self).isEmpty());
             }
             if (arity == 1 && name.equals("charAt")) {
                 final Node arg = node(call.arguments[0]);
@@ -935,12 +946,14 @@ public final class Planner {
                 final Node position = new Node(JdiTypes.primitive(Kind.INT),
                     ctx -> ctx.mirror(Kind.INT.convert(Interpreter.primitive(arg.read().run(ctx), unbox))));
                 return intrinsic(Kind.CHAR, receiver, position,
-                    (self, index) -> ((StringReference) self).value().charAt(((IntegerValue) Objects.requireNonNull(index)).value()));
+                    (self, index) -> intrinsicString(self).charAt(((IntegerValue) Objects.requireNonNull(index)).value()));
             }
             if (arity == 1 && name.equals("equals")) {
                 return intrinsic(Kind.BOOLEAN, receiver, objectArgument(call.arguments[0]),
-                    (self, arg) -> arg instanceof StringReference text
-                        && ((StringReference) self).value().equals(text.value()));
+                    (self, arg) -> {
+                        final String receiverText = intrinsicString(self);
+                        return arg instanceof StringReference text && receiverText.equals(intrinsicString(text));
+                    });
             }
         }
         final Kind box = JdiTypes.unboxed(receiver.type());
@@ -973,6 +986,15 @@ public final class Planner {
             }
         }
         throw invoke("method call");
+    }
+
+    /** Reads a String for an intrinsic and declines if JDWP may have substituted a code unit. */
+    private static String intrinsicString(Value value) {
+        final String text = ((StringReference) value).value();
+        if (text.indexOf('�') >= 0) {
+            throw compile("String transfer may have replaced a code unit");
+        }
+        return text;
     }
 
     /** Plans an intrinsic's argument, which must not need boxing. */

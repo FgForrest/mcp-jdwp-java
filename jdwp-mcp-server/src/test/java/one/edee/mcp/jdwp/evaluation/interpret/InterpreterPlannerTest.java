@@ -13,6 +13,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
 
+/** Checks navigation plans using controlled target type metadata. */
 class InterpreterPlannerTest {
 
     @ParameterizedTest
@@ -138,6 +139,80 @@ class InterpreterPlannerTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(() ->
             Interpreter.execute((Planner.Navigate) plan, result -> result))
             .isInstanceOf(Interpreter.RaisedException.class).hasCauseInstanceOf(ClassCastException.class);
+    }
+
+    /** Rejects a deep, valid AST before syntax classification or planning can recurse through it. */
+    @Test
+    void routesDeepExpressionsToCompilation() {
+        final ExpressionParser.Parsed parsed = ExpressionParser.parse("1 + ".repeat(10000) + "1 == 10001");
+        assertThat(parsed.error()).isNull();
+        assertThat(Planner.plan(mock(VirtualMachine.class), null, Map.of(), parsed))
+            .isEqualTo(new Planner.Compile("expression too deep to interpret"));
+        assertThat(SyntaxShape.classify(parsed)).isEqualTo(
+            new SyntaxShape.Classification(SyntaxShape.Phase.COMPILED, "expression too deep to interpret"));
+    }
+
+    /** Rejects isolated surrogate code units in either kind of literal before creating a mirror. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"\"\\uD800\"", "'\\uDC00'"})
+    void routesUnpairedSurrogateLiteralsToCompilation(String source) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        type(vm, "java.lang.String", null);
+        assertThat(Planner.plan(vm, null, Map.of(), ExpressionParser.parse(source)))
+            .isEqualTo(new Planner.Compile("literal contains an unpaired surrogate"));
+    }
+
+    /** Refuses package and java.lang defaults when a different loaded type appears in the pool. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"app", "java.lang"})
+    void rejectsConflictingConstantPoolAndDefaultTypes(String defaultPackage) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, defaultPackage + ".Badge", null);
+        type(vm, "imported.Badge", null);
+        when(vm.canGetConstantPool()).thenReturn(true);
+        when(owner.constantPool()).thenReturn(pool("imported/Badge"));
+        when(owner.constantPoolCount()).thenReturn(3);
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        when(location.declaringType()).thenReturn(owner);
+        when(frame.location()).thenReturn(location);
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class")))
+            .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+    }
+
+    /** Includes a matching member type inherited from a superinterface before default lookup. */
+    @Test
+    void resolvesInheritedInterfaceMemberType() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final InterfaceType parent = mock(InterfaceType.class);
+        when(parent.name()).thenReturn("app.Contract");
+        when(owner.interfaces()).thenReturn(List.of(parent));
+        final ClassType inherited = type(vm, "app.Contract$Badge", null);
+        type(vm, "java.lang.Badge", null);
+
+        assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(inherited);
+    }
+
+    /** An inaccessible declaration in a supertype still hides a declaration above it. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void doesNotInheritHiddenOrInaccessibleMemberTypes(boolean privateMember) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType parent = type(vm, "outer.Parent", null);
+        final ClassType grandparent = type(vm, "outer.Grandparent", null);
+        final ClassType shadow = type(vm, "outer.Parent$Badge", null);
+        type(vm, "outer.Grandparent$Badge", null);
+        final ClassType standard = type(vm, "java.lang.Badge", null);
+        when(owner.superclass()).thenReturn(parent);
+        when(parent.superclass()).thenReturn(grandparent);
+        when(shadow.isPrivate()).thenReturn(privateMember);
+        when(shadow.isPackagePrivate()).thenReturn(!privateMember);
+
+        assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(standard);
     }
 
     private static byte[] pool(String... names) throws Exception {

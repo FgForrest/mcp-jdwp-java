@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp.evaluation.interpret;
 
 import com.sun.jdi.ClassType;
+import com.sun.jdi.InvalidStackFrameException;
+import com.sun.jdi.Location;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
@@ -11,11 +13,13 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 
+/** Exercises routing, fallback and navigation against JDI mirrors. */
 class EvaluationRouterTest {
 
     @Test
@@ -83,5 +87,33 @@ class EvaluationRouterTest {
         verify(compiler).evaluate(frame, "x +", Map.of());
         verify(thread, never()).virtualMachine();
         assertThat(router.diagnostics()).contains("mode compiler").doesNotContain("not interpreted");
+    }
+    /** A dispatcher result based on an invalidated frame is refused without a retry or compilation. */
+    @Test
+    void refusesDispatcherResultWhenFrameResumesDuringFormatting() throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        final AtomicBoolean resumed = new AtomicBoolean();
+        when(thread.virtualMachine()).thenReturn(vm);
+        when(thread.frame(0)).thenReturn(frame);
+        when(location.declaringType()).thenReturn(owner);
+        when(frame.location()).thenAnswer(call -> {
+            if (resumed.get()) {
+                throw new InvalidStackFrameException("resumed during formatting");
+            }
+            return location;
+        });
+
+        assertThatThrownBy(() -> router.evaluateEvent("1", thread, Map.of(), value -> {
+            resumed.set(true);
+            return "1";
+        })).isInstanceOf(InvalidStackFrameException.class).hasMessage("resumed during formatting");
+        verify(thread).frame(0);
+        verifyNoInteractions(compiler);
     }
 }

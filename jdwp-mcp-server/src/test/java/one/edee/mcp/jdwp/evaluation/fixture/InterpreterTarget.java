@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.evaluation.fixture;
 
+import one.edee.mcp.jdwp.evaluation.fixture.shadow.ProcessBuilder;
 import org.jspecify.annotations.Nullable;
 
 import java.util.HashMap;
@@ -7,7 +8,19 @@ import java.util.Map;
 import java.util.function.IntSupplier;
 import java.util.function.IntUnaryOperator;
 
+/** Supplies stopped frames and javac-compiled observations for the live harness. */
 public class InterpreterTarget extends InterpreterTargetBase {
+    /** Keeps the explicitly imported type loaded and referenced in this class's constant pool. */
+    private static final ProcessBuilder IMPORTED_PROCESS_BUILDER = new ProcessBuilder();
+    /** Makes the competing bootstrap type visible from this fixture's loader. */
+    private static final Object BOOTSTRAP_PROCESS_BUILDER = new java.lang.ProcessBuilder();
+    /** Loads the inherited member type before inspection. */
+    private static final StringBuilder INHERITED_STRING_BUILDER = new StringBuilder();
+    /** Makes the competing bootstrap StringBuilder visible from this fixture's loader. */
+    private static final Object BOOTSTRAP_STRING_BUILDER = new java.lang.StringBuilder();
+    /** A target string whose isolated UTF-16 surrogate must survive intrinsic evaluation. */
+    public final String malformed = "\uD800";
+
     public static int total = 9;
     public static int calls;
     public static String trace = "";
@@ -124,6 +137,8 @@ public class InterpreterTarget extends InterpreterTargetBase {
     public Object golden(String id) {
         return switch (id) {
             case "private-field" -> this.secret;
+            case "classpath-import-shadow" -> ProcessBuilder.class;
+            case "inherited-type-shadow" -> StringBuilder.class;
             case "super-field" -> super.hidden;
             case "erased-field-navigation" -> holder.element.inherited;
             case "nested-class-literal" -> State.class;
