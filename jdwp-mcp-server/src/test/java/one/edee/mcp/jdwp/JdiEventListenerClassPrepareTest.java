@@ -135,6 +135,31 @@ class JdiEventListenerClassPrepareTest {
 	}
 
 	@Test
+	@DisplayName("Throw-site filters survive deferred exception requests and reconnect replay")
+	void shouldPromoteExceptionWithThrowSiteFilters() throws Exception {
+		final String className = "com.example.MyException";
+		final ReferenceType type = mock(ReferenceType.class);
+		when(type.name()).thenReturn(className);
+		final EventRequestManager erm = mock(EventRequestManager.class);
+		final ExceptionRequest request = mock(ExceptionRequest.class);
+		when(erm.createExceptionRequest(type, true, true)).thenReturn(request);
+		final ExceptionBreakpointSpec spec = new ExceptionBreakpointSpec(className, true, true, false, null,
+			com.sun.jdi.request.EventRequest.SUSPEND_ALL, "com.example.*", List.of("*Test"));
+		final int id = tracker.registerPendingExceptionBreakpoint(spec);
+		tracker.setCondition(id, "$exception.getMessage() != null");
+		tracker.restoreFromSnapshotAsPending(tracker.snapshotForReconnect());
+
+		runListenerWith(listener, mockEventSet(mockClassPrepareEvent(type, erm)));
+
+		final var order = org.mockito.Mockito.inOrder(request);
+		order.verify(request).addClassFilter("com.example.*");
+		order.verify(request).addClassExclusionFilter("*Test");
+		order.verify(request).enable();
+		assertThat(tracker.getAllExceptionBreakpoints()).containsKey(id);
+		assertThat(tracker.getCondition(id)).isEqualTo("$exception.getMessage() != null");
+	}
+
+	@Test
 	@DisplayName("Empty locationsOfLine marks the pending BP as FAILED AND records BP_PROMOTION_FAILED event")
 	void shouldRecordFailureWhenLocationsOfLineEmpty() throws Exception {
 		ReferenceType refType = mock(ReferenceType.class);

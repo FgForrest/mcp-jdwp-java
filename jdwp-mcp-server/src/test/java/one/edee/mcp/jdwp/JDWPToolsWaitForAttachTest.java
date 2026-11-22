@@ -24,8 +24,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * Tests that {@link JDWPTools#jdwp_wait_for_attach} surfaces the local-JVM list on timeout
- * (so the user can spot a target on a different port) but never runs discovery on the success
- * path (where it would be pure overhead).
+ * (so the user can spot a target on a different port). Successful replies omit the inventory.
  */
 @DisplayName("jdwp_wait_for_attach")
 class JDWPToolsWaitForAttachTest {
@@ -64,7 +63,7 @@ class JDWPToolsWaitForAttachTest {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenThrow(new IOException("Connection refused"));
 
-		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 100);
+		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 100, null);
 
 		// Timeout returns the structured soft-wait envelope instead of [TIMEOUT].
 		// The actionable Local-JVM block is still appended so the agent can see candidate targets.
@@ -83,19 +82,19 @@ class JDWPToolsWaitForAttachTest {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenThrow(new IllegalConnectorArgumentsException("bad", "port"));
 
-		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000);
+		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000, null);
 
 		assertThat(result).startsWith("[ERROR]");
 		verify(discovery, never()).discover();
 	}
 
 	@Test
-	@DisplayName("successful attach does NOT trigger discovery")
-	void shouldSkipDiscoveryOnSuccessfulAttach() throws Exception {
+	@DisplayName("successful attach omits the local-JVM inventory")
+	void shouldOmitInventoryOnSuccessfulAttach() throws Exception {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenReturn("Connected to OpenJDK 64-Bit Server VM (version 21)");
 
-		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000);
+		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5000, null);
 
 		assertThat(result).contains("Connected");
 		assertThat(result).doesNotContain("Local JVMs");
@@ -113,7 +112,7 @@ class JDWPToolsWaitForAttachTest {
 			new JDIConnectionService.ConnectionStatus(false, "10.0.0.5", 5050, null, "refused")
 		);
 
-		tools.jdwp_wait_for_attach("ignored.host", 9999, 100);
+		tools.jdwp_wait_for_attach("ignored.host", 9999, 100, null);
 
 		final ArgumentCaptor<String> hostCaptor = ArgumentCaptor.forClass(String.class);
 		final ArgumentCaptor<Integer> portCaptor = ArgumentCaptor.forClass(Integer.class);
@@ -128,7 +127,7 @@ class JDWPToolsWaitForAttachTest {
 		when(jdiService.connect(Mockito.anyString(), Mockito.anyInt()))
 			.thenThrow(new IOException("Connection refused"));
 
-		tools.jdwp_wait_for_attach("localhost", 5005, 100);
+		tools.jdwp_wait_for_attach("localhost", 5005, 100, null);
 
 		// confirmAll is cheap (one TCP handshake); inspectAll attaches to every JVM and is opt-in
 		// in jdwp_diagnose. The timeout path must NOT trigger it.
@@ -144,7 +143,7 @@ class JDWPToolsWaitForAttachTest {
 		// InterruptedException on its very first invocation.
 		Thread.currentThread().interrupt();
 		try {
-			final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5_000);
+			final String result = tools.jdwp_wait_for_attach("localhost", 5005, 5_000, null);
 
 			// Interrupt is a user-requested cancellation: surface it promptly and skip the
 			// discovery overhead. The timeout path runs discovery because the user is still

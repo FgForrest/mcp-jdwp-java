@@ -10,6 +10,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -112,7 +113,7 @@ class SuspensionSessionTest {
 		session.presentCurrent();
 		for (int step = 1; step <= 3; step++) {
 			final StepRequest request = stepRequest();
-			assertThat(session.step(t.ref, () -> request)).isNull();
+			assertThat(session.step(t.ref, List::of, () -> request).refusal()).isNull();
 			assertThat(session.stepPending(t.ref)).isTrue();
 			// The step lands: thread policy.
 			final SuspensionSession.Context landing = session.route(
@@ -279,7 +280,7 @@ class SuspensionSessionTest {
 		final StepRequest request = stepRequest();
 		final EventRequestManager erm = mock(EventRequestManager.class);
 		when(model.vm.eventRequestManager()).thenReturn(erm);
-		assertThat(session.step(t.ref, () -> request)).isNull();
+		assertThat(session.step(t.ref, List::of, () -> request).refusal()).isNull();
 
 		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 2);
 
@@ -670,7 +671,7 @@ class SuspensionSessionTest {
 		session.lease(t.ref);
 
 		assertThat(session.releaseThread(t.ref).refusal()).contains("an evaluation is running");
-		assertThat(session.step(t.ref, this::stepRequest)).contains("an evaluation is running");
+		assertThat(session.step(t.ref, List::of, this::stepRequest).refusal()).contains("an evaluation is running");
 		assertThat(t.count).isEqualTo(1);
 		session.unlease(t.ref);
 	}

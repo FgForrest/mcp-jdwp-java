@@ -226,7 +226,7 @@ public final class DiagnoseReportRenderer {
         return " ".repeat(width - s.length()) + s;
     }
 
-    private static String humanDuration(Duration d) {
+    static String humanDuration(Duration d) {
         final long totalSeconds = Math.max(0, d.getSeconds());
         final long hours = totalSeconds / 3600;
         final long minutes = (totalSeconds % 3600) / 60;

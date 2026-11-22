@@ -71,7 +71,8 @@ class JDWPToolsSetExceptionBreakpointTest {
 	void shouldExposeClassParameterAsClassName() throws Exception {
 		final java.lang.reflect.Parameter first = JDWPTools.class
 			.getMethod("jdwp_set_exception_breakpoint",
-				String.class, Boolean.class, Boolean.class, Integer.class, Boolean.class, Boolean.class, String.class)
+				String.class, Boolean.class, Boolean.class, Integer.class, Boolean.class, Boolean.class,
+				String.class, String.class, String.class, String.class)
 			.getParameters()[0];
 
 		assertThat(first.getName()).isEqualTo("className");
@@ -88,7 +89,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects a null class name with a hard error, never touches the VM, and registers nothing")
 	void shouldRejectNullClassName() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			null, true, true, null, null, null, null);
+			null, true, true, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("required");
 		verify(jdiService, never()).getVM();
@@ -100,7 +101,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects a blank class name with a hard error, never touches the VM, and registers nothing")
 	void shouldRejectBlankClassName() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"   ", true, true, null, null, null, null);
+			"   ", true, true, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("required");
 		verify(jdiService, never()).getVM();
@@ -117,7 +118,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null, null, null, null, null, null);
 
 		assertThat(result).contains("Caught: true").contains("Uncaught: true").contains("Mode: suspend");
 		verify(erm).createExceptionRequest(refType, true, true);
@@ -131,7 +132,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"com.example.MyException", null, null, null, null, null, null);
+			"com.example.MyException", null, null, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("com.example.MyException");
@@ -143,9 +144,54 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, 999, null, null, null);
+			"java.lang.RuntimeException", null, null, 999, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
+	}
+
+	@Test
+	@DisplayName("Exception breakpoint wires its opt-in throw-site filters and condition before enabling")
+	void shouldWireThrowSiteFiltersAndCondition() throws Exception {
+		final ReferenceType type = mock(ReferenceType.class);
+		final ExceptionRequest request = mock(ExceptionRequest.class);
+		when(jdiService.findLoadedClass("java.lang.Exception")).thenReturn(type);
+		when(erm.createExceptionRequest(type, true, true)).thenReturn(request);
+		final String condition = "$exception.getMessage() != null";
+
+		final String reply = setFilteredBreakpoint(condition, "com.example.*", "java.*, *Test");
+
+		assertThat(reply).contains(condition, "thrownIn=com.example.*", "notThrownIn=java.*,*Test");
+		assertThat(tracker.getCondition(1)).isEqualTo(condition);
+		final var order = org.mockito.Mockito.inOrder(request);
+		order.verify(request).addClassFilter("com.example.*");
+		order.verify(request).addClassExclusionFilter("java.*");
+		order.verify(request).addClassExclusionFilter("*Test");
+		order.verify(request).setEnabled(true);
+		assertThat(tools.jdwp_overview(null, null, null))
+			.contains(condition, "thrownIn=com.example.*", "notThrownIn=java.*,*Test");
+	}
+
+	@Test
+	@DisplayName("Malformed wildcard patterns are rejected before touching the VM")
+	void shouldRejectInvalidThrowSiteFilter() throws Exception {
+		assertThat(setFilteredBreakpoint(null, "com.*.Broken", null))
+			.startsWith("Error:").contains("thrownIn", "com.*.Broken");
+		verify(jdiService, never()).getVM();
+	}
+
+	@Test
+	@DisplayName("thrownIn accepts one pattern and directs multiple exclusions to notThrownIn")
+	void shouldRejectMultipleInclusionPatterns() throws Exception {
+		when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+
+		assertThat(setFilteredBreakpoint(null, "com.a.*,com.b.*", null))
+			.startsWith("Error:").contains("thrownIn", "one pattern", "notThrownIn");
+		verify(jdiService, never()).getVM();
+	}
+
+	private String setFilteredBreakpoint(String condition, String include, String exclude) {
+		return tools.jdwp_set_exception_breakpoint("java.lang.Exception", null, null, null, null, null, null,
+			condition, include, exclude);
 	}
 
 	@Test
@@ -159,7 +205,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, triggerId, true, null, null);
+			"java.lang.RuntimeException", null, null, triggerId, true, null, null, null, null, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}

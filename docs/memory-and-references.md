@@ -33,6 +33,8 @@ Keyed on `ObjectReference.uniqueID()` — a stable JDWP-side `long` that does no
 
 Only `cacheObject(ObjectReference)` adds entries (`JDIConnectionService.java:494-498`), and it is called from `formatFieldValue(...)` whenever the value is an `ArrayReference` (line 870) or any other `ObjectReference` (line 880). Every code path that produces a user-visible representation of an object — `jdwp_get_fields`, `jdwp_get_locals`, breakpoint-context dumps, watcher evaluations — funnels through `formatFieldValue`. So **navigation seeds the cache transitively**: when the agent inspects `order`, every field of `order` whose value is an object gets a cache entry too, ready for the next `jdwp_get_fields(<id>)` drill-in.
 
+Regular line, exception and field logpoint output renders boxed primitives as their values and other objects as `Object (type)`. Event history can see many distinct objects during a long-running trace. Keeping those mirrors out of the cache prevents that trace from growing the session’s inspection state.
+
 ### When entries are removed
 
 The cache is cleared atomically on:

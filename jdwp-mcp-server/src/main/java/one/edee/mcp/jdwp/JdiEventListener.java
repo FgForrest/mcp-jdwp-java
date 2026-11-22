@@ -319,9 +319,9 @@ public class JdiEventListener {
 
     /**
      * Formats a JDI value for the human-readable logpoint output. Mirrors the format used by
-     * {@link JDIConnectionService#formatFieldValue} but without its side effects (no object cache
-     * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
-     * history, so the simpler implementation is preferred.
+     * {@link JDIConnectionService#formatFieldValue} for scalar values. Objects get a type only:
+     * event history must not grow the inspection cache or advertise IDs it did not register.
+     * Boxed values are field reads, safe even when formatting on the listener thread.
      */
     public static String formatLogpointResult(@Nullable Value value) {
         if (value == null) {
@@ -334,7 +334,10 @@ public class JdiEventListener {
             return value.toString();
         }
         if (value instanceof ObjectReference objRef) {
-            return String.format("Object#%d (%s)", objRef.uniqueID(), objRef.referenceType().name());
+            final ReferenceType type = objRef.referenceType();
+            final String typeName = type.name();
+            final String unboxed = JDIConnectionService.tryUnboxPrimitive(objRef, type, typeName);
+            return unboxed != null ? unboxed : "Object (" + typeName + ')';
         }
         return value.toString();
     }
@@ -1944,12 +1947,7 @@ public class JdiEventListener {
                 final int id = entry.getKey();
                 final BreakpointTracker.PendingExceptionBreakpoint pending = entry.getValue();
                 try {
-                    final ExceptionRequest exReq = erm.createExceptionRequest(refType, pending.isCaught(), pending.isUncaught());
-                    // The spec's policy — SUSPEND_EVENT_THREAD unless the user asked for all: logOnly
-                    // BPs are auto-resumed by handleExceptionEvent after recording / optional
-                    // expression evaluation. SUSPEND_NONE would prevent invokeMethod for the
-                    // expression eval.
-                    exReq.setSuspendPolicy(pending.getSpec().suspendPolicy());
+                    final ExceptionRequest exReq = pending.getSpec().createRequest(erm, refType);
                     exReq.enable();
                     breakpointTracker.disarmIfChained(id, exReq);
                     if (!breakpointTracker.promotePendingExceptionToActive(id, exReq)) {

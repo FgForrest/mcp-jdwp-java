@@ -112,9 +112,9 @@ When a pending entry cannot be promoted (e.g. the line number doesn't exist in t
 
 Pending entries are not auto-removed on failure — the agent gets to see why the deferred BP didn't take. Removal is explicit via `jdwp_clear_breakpoint`.
 
-### Deferred state does not survive reconnect
+### Deferred state across connections
 
-`JDIConnectionService.cleanupSessionState` (called from both `connect` and `disconnect`) runs `breakpointTracker.reset()`, which clears every map including pending ones. Each session starts fresh — by design, because the target VM may have changed and the pending classnames may resolve to different code.
+An explicit disconnect or a connection to a different target clears pending entries. `jdwp_reconnect` replays both active and deferred specs as pending, then binds requests for already-loaded classes.
 
 ## 4. Conditions
 
@@ -127,6 +127,12 @@ Pending entries are not auto-removed on failure — the agent gets to see why th
 The fail-safe rule deserves emphasis: a broken condition does **not** silently swallow breakpoint hits. The agent gets the stop, with the error in the event details, and can call `jdwp_evaluate_expression` to see why. The alternative — silent resume on a broken expression — is one of the most-feared failure modes in interactive debugging, so we explicitly avoid it.
 
 Conditions accept either primitive `BooleanValue` or boxed `java.lang.Boolean` (lines 927-941). Convenient when the expression calls a Java API that boxes.
+
+### Exception conditions and throw-site filters
+
+Both exception tools accept a Java `condition` evaluated in the throwing frame with `$exception` bound to the thrown object. `className` selects the exception type. `thrownIn` accepts one pattern for the class containing the throw instruction. `notThrownIn` accepts comma-separated exclusion patterns for that class. A pattern is an exact class name or has a single `*` at the start or end, such as `com.example.*` or `*Test`. JDI applies these filters before notifying the debugger and drops throws that match any exclusion. Every throw site is eligible by default, including JDK code that throws on behalf of the application.
+
+The set reply and `jdwp_overview` show configured filters. The request spec carries them through class-prepare promotion and `jdwp_reconnect`.
 
 ## 5. Logpoints — the auto-resume mechanic
 

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.function.Supplier;
 
 /**
  * Who owns each suspension of one JDI connection (issue #45; {@code PROPOSAL-suspension-ownership.md}).
@@ -697,23 +698,38 @@ public final class SuspensionSession {
     }
 
     /**
+     * Outcome of {@link #step}.
+     *
+     * @param refusal          why the step was not started, or {@code null} when it was
+     * @param remainingHolders after a started step: the other suspended threads grouped by what holds
+     *                         them, one rendered line per holder kind; empty when every other thread runs
+     */
+    public record StepResult(@Nullable String refusal, List<String> remainingHolders) {
+        private static StepResult refused(String reason) {
+            return new StepResult(reason, List.of());
+        }
+    }
+
+    /**
      * A step on {@code thread}, atomically: admission, installing the request, then releasing the
      * thread. A refused or failed step leaves no request behind.
-     *
-     * @return {@code null} when the step was started, otherwise why not
      */
-    @Nullable
-    public synchronized String step(ThreadReference thread, StepInstaller installer) throws Exception {
+    public synchronized StepResult step(ThreadReference thread, Supplier<List<ThreadReference>> allThreads,
+                                        StepInstaller installer) throws Exception {
         if (closed) {
-            return "the debugging session is closed";
+            return StepResult.refused("the debugging session is closed");
         }
         final String refusal = releaseRefusal(thread);
         if (refusal != null) {
-            return refusal;
+            return StepResult.refused(refusal);
         }
         if (!holds(thread)) {
-            return "nothing holds thread " + safeName(thread) + " — step from a stop or a jdwp_suspend_thread hold";
+            return StepResult.refused("nothing holds thread " + safeName(thread)
+                + " — step from a stop or a jdwp_suspend_thread hold");
         }
+        // Enumerate only for stop-all ownership; the other holders name their threads directly.
+        final List<ThreadReference> vmThreads = contexts.stream().anyMatch(c -> c.policy == EventRequest.SUSPEND_ALL)
+            ? allThreads.get() : List.of();
         final StepRequest request = installer.install();
         stamp(request);
         try {
@@ -724,7 +740,52 @@ public final class SuspensionSession {
             deleteQuietly(request);
             throw e;
         }
-        return null;
+        return new StepResult(null, describeRemainingHolders(vmThreads));
+    }
+
+    /**
+     * Groups the threads the session still holds by holder kind — presented or unseen stop-all and
+     * thread stops, sets still being processed, manual holds — from the session's own records, not
+     * from JDI suspend counts. Runs under the session monitor.
+     *
+     * @param vmThreads every thread of the VM; needed only to expand stop-all contexts
+     */
+    private List<String> describeRemainingHolders(List<ThreadReference> vmThreads) {
+        final Map<String, Set<ThreadReference>> groups = new LinkedHashMap<>();
+        for (Context context : contexts) {
+            if (context.policy == EventRequest.SUSPEND_NONE) {
+                continue;
+            }
+            final boolean all = context.policy == EventRequest.SUSPEND_ALL;
+            final String label = context.state == State.HELD
+                ? (context.reported ? "presented " : "unseen ") + (all ? "stop-all stops" : "thread stops")
+                : "events still being processed";
+            final Set<ThreadReference> held = groups.computeIfAbsent(label, ignored -> new LinkedHashSet<>());
+            final ThreadReference eventThread = context.thread;
+            if (all) {
+                for (ThreadReference candidate : vmThreads) {
+                    if (covers(context, candidate)) {
+                        held.add(candidate);
+                    }
+                }
+            } else if (eventThread != null && covers(context, eventThread)) {
+                held.add(eventThread);
+            }
+        }
+        groups.put("jdwp_suspend_thread holds", manual);
+        return groups.entrySet().stream()
+            .filter(entry -> !entry.getValue().isEmpty())
+            .map(entry -> entry.getKey() + ": " + describeThreadGroup(entry.getValue()))
+            .toList();
+    }
+
+    /**
+     * "main, worker-1 and 3 more" — at most five thread names, so a reply stays short with many threads.
+     */
+    private static String describeThreadGroup(Set<ThreadReference> threads) {
+        final int limit = 5;
+        final String names = String.join(", ", threads.stream().limit(limit).map(SuspensionSession::safeName).toList());
+        return threads.size() > limit ? names + " and " + (threads.size() - limit) + " more" : names;
     }
 
     /**
@@ -849,7 +910,7 @@ public final class SuspensionSession {
          */
         SUSPENDED,
         /**
-         * The VM started without suspending (VMStart with policy NONE).
+         * The start event does not currently hold the VM.
          */
         RUNNING,
         /**

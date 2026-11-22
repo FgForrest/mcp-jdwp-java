@@ -6,6 +6,8 @@ import com.sun.jdi.connect.Connector;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
+import one.edee.mcp.jdwp.discovery.LocalJdwpTarget;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
@@ -87,6 +89,9 @@ public class JDIConnectionService {
      * armed in {@link #connect}, torn down in {@link #cleanupSessionState} / {@link #notifyVmDied}.
      */
     private final JdiHealthMonitor healthMonitor;
+    private final JvmDiscoveryService jvmDiscovery;
+    @Nullable
+    private Future<LocalJdwpTarget> targetLookup;
     /**
      * Server-wide registry of agent-labelled JDI object references. Held here so its lifecycle is
      * gated by the connection: pinned object references must be released both on VM death (see
@@ -171,7 +176,7 @@ public class JDIConnectionService {
     public JDIConnectionService(JdiEventListener eventListener, BreakpointTracker breakpointTracker,
                                 EventHistory eventHistory, WatcherManager watcherManager,
                                 EvaluationGuard evaluationGuard, MarkedInstanceRegistry markedInstances,
-                                JdiHealthMonitor healthMonitor) {
+                                JdiHealthMonitor healthMonitor, JvmDiscoveryService jvmDiscovery) {
         this.eventListener = eventListener;
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
@@ -179,6 +184,7 @@ public class JDIConnectionService {
         this.evaluationGuard = evaluationGuard;
         this.markedInstances = markedInstances;
         this.healthMonitor = healthMonitor;
+        this.jvmDiscovery = jvmDiscovery;
         // Wire post-mortem cleanup so the listener can null the VM the moment the target dies.
         eventListener.setVmDeathHook(this::notifyVmDied);
         eventListener.setVmExitingHook(this::captureExit);
@@ -234,12 +240,11 @@ public class JDIConnectionService {
      * for any other type so the caller can fall through to the regular {@code Object#N (...)} rendering.
      */
     @Nullable
-    private static String tryUnboxPrimitive(ObjectReference obj) {
-        final String typeName = obj.referenceType().name();
+    static String tryUnboxPrimitive(ObjectReference obj, ReferenceType type, String typeName) {
         if (!isBoxedPrimitiveType(typeName)) {
             return null;
         }
-        final Field valueField = obj.referenceType().fieldByName("value");
+        final Field valueField = type.fieldByName("value");
         if (valueField == null) {
             return null;
         }
@@ -381,11 +386,22 @@ public class JDIConnectionService {
      * @return status message indicating connection result
      */
     public synchronized String connect(String host, int port) throws Exception {
+        return connect(host, port, false);
+    }
+
+    /**
+     * {@link #connect(String, int)}, except that with {@code requireVmStart} an existing session is never
+     * reused or replaced: the reply starts with "Already connected" so the caller can refuse it.
+     */
+    synchronized String connect(String host, int port, boolean requireVmStart) throws Exception {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
         String releasedNotice = "";
         if (vm != null && isVMResponsive()) {
+            if (requireVmStart) {
+                return "Already connected to " + vm.name() + " at " + lastHost + ':' + lastPort;
+            }
             if (host.equals(lastHost) && port == lastPort) {
                 lastConnectError = null;
                 return "Already connected to " + vm.name();
@@ -444,6 +460,7 @@ public class JDIConnectionService {
         eventHistory.beginNewSession();
 
         eventListener.start(vm);
+        targetLookup = LocalJdwpTarget.startLookup(jvmDiscovery, host, port);
         // Arm the health watchdog. The attach round-trip itself counts as traffic, so the
         // monitor seeds lastTrafficAt to now and only escalates to an active probe if the
         // listener subsequently sees a full silence window.
@@ -451,6 +468,20 @@ public class JDIConnectionService {
         discoverLeftovers(vm);
 
         return releasedNotice + String.format("Connected to %s (version %s)", vm.name(), vm.version());
+    }
+
+    /** The current JDI handle, without the auto-reconnect and promotion side effects of getVM(). */
+    @Nullable
+    synchronized VirtualMachine attachedVM() {
+        return vm;
+    }
+
+    /**
+     * The attached target's process identity line (PID, start time, command) for attach replies;
+     * {@code ""} when the target is remote or could not be identified within the lookup budget.
+     */
+    synchronized String describeTargetProcess() {
+        return LocalJdwpTarget.await(targetLookup).describe();
     }
 
     /**
@@ -551,7 +582,9 @@ public class JDIConnectionService {
         if (vm == null) {
             final VmExit exit = lastExit;
             lastExit = null;
-            return DisconnectResult.notConnected(exit);
+            final LocalJdwpTarget target = exit != null ? LocalJdwpTarget.await(targetLookup) : null;
+            targetLookup = null;
+            return DisconnectResult.notConnected(exit, target);
         }
         // Snapshot the state about to be wiped, before cleanupSessionState() zeroes it.
         final DisconnectResult result = new DisconnectResult(
@@ -562,7 +595,7 @@ public class JDIConnectionService {
             watcherManager.getAllWatchers().size(),
             markedInstances.size(),
             objectCache.size(),
-            eventHistory.size());
+            eventHistory.size(), null, LocalJdwpTarget.await(targetLookup));
         cleanupSessionState();
         return result;
     }
@@ -680,6 +713,7 @@ public class JDIConnectionService {
             vm = null;
         }
 
+        targetLookup = null;
         lastHost = null;
         lastPort = 0;
         lastExit = null;
@@ -713,6 +747,7 @@ public class JDIConnectionService {
         }
         final String host = lastHost;
         final int port = lastPort;
+        targetLookup = null;
 
         final BreakpointTracker.ReconnectSnapshot snapshot = breakpointTracker.snapshotForReconnect();
         final int markedCount = markedInstances.list().size();
@@ -804,6 +839,7 @@ public class JDIConnectionService {
         // everything after it is tagged as this session, segmented from the dead VM's tail.
         eventHistory.beginNewSession();
         eventListener.start(vm);
+        targetLookup = LocalJdwpTarget.startLookup(jvmDiscovery, host, port);
         healthMonitor.start(vm);
         discoverLeftovers(vm);
 
@@ -940,21 +976,29 @@ public class JDIConnectionService {
         int markedInstances,
         int objectCacheEntries,
         int eventHistoryEntries,
-        @Nullable VmExit exit
+        @Nullable VmExit exit,
+        @Nullable LocalJdwpTarget target
     ) {
         public DisconnectResult(boolean wasConnected, @Nullable String host, int port, int lineBreakpoints,
                                 int exceptionBreakpoints, int fieldBreakpoints, int watchers, int markedInstances,
                                 int objectCacheEntries, int eventHistoryEntries) {
             this(wasConnected, host, port, lineBreakpoints, exceptionBreakpoints, fieldBreakpoints, watchers,
-                markedInstances, objectCacheEntries, eventHistoryEntries, null);
+                markedInstances, objectCacheEntries, eventHistoryEntries, null, null);
         }
 
         static DisconnectResult notConnected() {
-            return notConnected(null);
+            return notConnected(null, null);
         }
 
-        static DisconnectResult notConnected(@Nullable VmExit exit) {
-            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit);
+        static DisconnectResult notConnected(@Nullable VmExit exit, @Nullable LocalJdwpTarget target) {
+            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit, target);
+        }
+
+        String describeTargetProcess() {
+            if (target == null) {
+                return "";
+            }
+            return exit != null ? target.describeAt(exit.at()) : target.describeAfterDisconnect(port);
         }
 
         /** Total breakpoints across line/exception/field, active + deferred. */
@@ -1471,12 +1515,14 @@ public class JDIConnectionService {
         }
 
         if (value instanceof ObjectReference obj) {
-            final String unboxed = tryUnboxPrimitive(obj);
+            final ReferenceType type = obj.referenceType();
+            final String typeName = type.name();
+            final String unboxed = tryUnboxPrimitive(obj, type, typeName);
             if (unboxed != null) {
                 return unboxed;
             }
             cacheObject(obj);
-            return String.format("Object#%d (%s)", obj.uniqueID(), obj.referenceType().name());
+            return String.format("Object#%d (%s)", obj.uniqueID(), typeName);
         }
 
         return value.toString();

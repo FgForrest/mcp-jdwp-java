@@ -461,7 +461,8 @@ public class JDWPTools {
         try {
             final String result = jdiService.connect(host, port);
             acknowledgeStart();
-            return result + " Next: set breakpoints, then jdwp_resume_until_event." + jdiService.takeAttachNotice();
+            return result + " Next: set breakpoints, then jdwp_resume_until_event."
+                + jdiService.describeTargetProcess() + jdiService.takeAttachNotice();
         } catch (Exception e) {
             return String.format("""
                     [ERROR] Connection failed to %s:%d
@@ -480,7 +481,9 @@ public class JDWPTools {
     public String jdwp_wait_for_attach(
         @McpToolParam(required = false, description = "Hostname (default: localhost)") @Nullable String host,
         @McpToolParam(required = false, description = "JDWP port (default: 5005 — overridable via -DJVM_JDWP_PORT)") @Nullable Integer port,
-        @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
+        @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs,
+        @McpToolParam(required = false, description = "If true, require a fresh JVM suspended at VM_START (default false).") @Nullable Boolean requireVmStart) {
+        final boolean freshOnly = requireVmStart != null && requireVmStart;
         final String resolvedHost = (host == null || host.isBlank()) ? "localhost" : host;
         final int resolvedPort = (port != null) ? port : JVM_JDWP_PORT;
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
@@ -492,37 +495,48 @@ public class JDWPTools {
         while (System.currentTimeMillis() < deadline) {
             attempts++;
             try {
-                final String result = jdiService.connect(resolvedHost, resolvedPort);
+                final String result = freshOnly
+                    ? jdiService.connect(resolvedHost, resolvedPort, true)
+                    : jdiService.connect(resolvedHost, resolvedPort);
                 // connect()'s "Already connected" fast-path returns a pre-existing, mid-execution
                 // session — NOT a fresh attach parked at VM_START. Labelling it as VM_START is wrong,
                 // and actively misleading after a same-port target restart, where the fast-path may
                 // hand back a stale handle (it passed a point-in-time liveness probe but the old JVM
                 // is exiting). Point at the recovery path instead of asserting a false suspension state.
                 if (result.startsWith("Already connected")) {
+                    if (freshOnly) {
+                        return notFresh(result + ". The server already has a session for this JVM, so this is past the fresh VM_START attach.",
+                            jdiService.describeTargetProcess());
+                    }
                     return String.format("%s (attached after %d attempt(s))%n"
                         + "This is a pre-existing session (not a fresh VM_START attach). If a breakpoint "
                         + "is already hit you can inspect/evaluate now; otherwise set breakpoints and call "
                         + "jdwp_resume_until_event. If you restarted the target on this port, run "
                         + "jdwp_diagnose to confirm identity (or jdwp_disconnect, then reconnect, for a clean attach).",
-                        result, attempts) + jdiService.takeAttachNotice();
+                        result, attempts) + jdiService.describeTargetProcess() + jdiService.takeAttachNotice();
                 }
-                // P3-4: tell the agent what to do next. At VM_START (the common suspend=y case),
-                // no thread is parked at a method-invocation event yet, so jdwp_evaluate_expression
-                // / jdwp_to_string would fail with IncompatibleThreadStateException — the agent
-                // needs to set BPs and resume first. A JVM started with suspend=n is already running.
-                final String state = switch (acknowledgeStart()) {
-                    case SUSPENDED -> "The VM is currently suspended at VM_START — expression evaluation requires "
-                        + "landing at a real BP first.";
-                    case RUNNING -> "The VM is running (it was started with suspend=n) — expression evaluation "
-                        + "requires landing at a real BP first.";
-                    case NOT_SEEN -> anyThreadSuspended()
-                        ? "The VM appears suspended at VM_START, but its start event was not reported yet — if it "
-                        + "arrives, jdwp_resume_until_event shows it; expression evaluation requires landing at a "
-                        + "real BP first."
-                        : "The VM is running — expression evaluation requires landing at a real BP first.";
-                };
-                return String.format("%s (attached after %d attempt(s))%nNext: set breakpoints, then call "
-                    + "jdwp_resume_until_event. %s", result, attempts, state) + jdiService.takeAttachNotice();
+                final SuspensionSession.StartState start = acknowledgeStart();
+                final boolean suspended = start == SuspensionSession.StartState.SUSPENDED
+                    || (start == SuspensionSession.StartState.NOT_SEEN && anyThreadSuspended(!freshOnly));
+                if (freshOnly && !suspended) {
+                    final JDIConnectionService.DisconnectResult rejected = jdiService.disconnect();
+                    return notFresh(result + " at " + resolvedHost + ':' + resolvedPort
+                        + ". The VM had no observable VM_START suspension and has been detached.", rejected.describeTargetProcess());
+                }
+                final String state;
+                if (start == SuspensionSession.StartState.SUSPENDED) {
+                    state = "The VM is currently suspended at VM_START.";
+                } else if (suspended) {
+                    state = "The VM appears suspended, but VM_START was not reported yet. "
+                        + "If it arrives, jdwp_resume_until_event shows it.";
+                } else {
+                    state = "The VM is already running. It was started with suspend=n or resumed by an earlier debugger "
+                        + "session. For a test, check the target process for a previous run still alive on this port. "
+                        + "Use requireVmStart=true to require a fresh launch.";
+                }
+                return String.format("%s (attached after %d attempt(s))%s%nNext: set breakpoints, then call "
+                    + "jdwp_resume_until_event. %s Expression evaluation requires landing at a real BP first.",
+                    result, attempts, jdiService.describeTargetProcess(), state) + jdiService.takeAttachNotice();
             } catch (IllegalConnectorArgumentsException e) {
                 // Configuration error — retrying will never make this succeed. Fail fast.
                 return String.format("[ERROR] Invalid connector arguments for %s:%d — %s",
@@ -566,11 +580,21 @@ public class JDWPTools {
         return baseMessage + '\n' + renderLocalJvmsBlock(status, false);
     }
 
+    /**
+     * The {@code [NOT_FRESH]} reply of {@code jdwp_wait_for_attach(requireVmStart=true)}: what was found,
+     * the target process's identity, and how to get a fresh attach.
+     */
+    private static String notFresh(String target, String identity) {
+        return "[NOT_FRESH] " + target + identity
+            + "\nCall jdwp_disconnect, make sure that process has ended, then attach again with requireVmStart=true.";
+    }
+
     @McpTool(description = "Disconnect from the JDWP server. Clears ALL session state — breakpoints, "
         + "watchers, marks, object cache, event history — and the reconnect seed. To keep breakpoints/"
         + "watchers across a VM restart, use jdwp_reconnect (same target, specs preserved) instead.")
     public String jdwp_disconnect() {
-        return formatDisconnectReport(jdiService.disconnect());
+        final JDIConnectionService.DisconnectResult result = jdiService.disconnect();
+        return formatDisconnectReport(result) + result.describeTargetProcess();
     }
 
     /**
@@ -627,7 +651,7 @@ public class JDWPTools {
     public String jdwp_reconnect() {
         try {
             final JDIConnectionService.ReconnectResult result = jdiService.reconnectPreservingSpecs();
-            return formatReconnectReport(result) + jdiService.takeAttachNotice();
+            return formatReconnectReport(result, jdiService.describeTargetProcess()) + jdiService.takeAttachNotice();
         } catch (IllegalStateException badPrecondition) {
             return "[ERROR] " + badPrecondition.getMessage();
         } catch (Exception e) {
@@ -643,9 +667,9 @@ public class JDWPTools {
      * explicit "target VM is running" status (re-suspending threads after a reattach is not
      * feasible in JDI). The structure is stable so the agent can pattern-match on it across calls.
      */
-    private static String formatReconnectReport(JDIConnectionService.ReconnectResult result) {
+    private static String formatReconnectReport(JDIConnectionService.ReconnectResult result, String identity) {
         final StringBuilder out = new StringBuilder();
-        out.append(String.format("Reconnected to %s:%d%n", result.host(), result.port()));
+        out.append(String.format("Reconnected to %s:%d%s%n", result.host(), result.port(), identity));
         out.append("Restored:\n");
         out.append(String.format("  - Line breakpoints: %d (%d active, %d deferred — class not yet loaded)%n",
             result.restoredLineTotal(), result.restoredLineActive(), result.restoredLineDeferred()));
@@ -2732,7 +2756,7 @@ public class JDWPTools {
 
             // Atomic under the session: admission, the request, then the release of the thread's
             // holders. A refused step leaves no request behind; the landing publishes as a stop.
-            final String refusal = suspensions().step(thread, () -> {
+            final SuspensionSession.StepResult step = suspensions().step(thread, vm::allThreads, () -> {
                 // JDI permits only one StepRequest per thread; synchronising on the EventRequestManager
                 // keeps the delete-then-create pair atomic against concurrent step calls.
                 synchronized (erm) {
@@ -2755,13 +2779,15 @@ public class JDWPTools {
                     return stepRequest;
                 }
             });
-            if (refusal != null) {
-                return String.format("Error: cannot step thread %d (%s): %s", thread.uniqueID(), thread.name(), refusal);
+            if (step.refusal() != null) {
+                return String.format("Error: cannot step thread %d (%s): %s", thread.uniqueID(), thread.name(), step.refusal());
             }
 
-            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP "
-                    + "event; other threads stay parked until jdwp_resume.%s",
-                label, startLocation, thread.uniqueID(), thread.name(), fastStopNote);
+            final String otherThreads = step.remainingHolders().isEmpty() ? "All other threads run."
+                : "Still suspended by " + String.join("; ", step.remainingHolders()) + ". All remaining threads run.";
+            return String.format("Step %s started%s on thread %d (%s), which was released. %s "
+                    + "Call jdwp_resume_until_event to wait for the STEP event.%s",
+                label, startLocation, thread.uniqueID(), thread.name(), otherThreads, fastStopNote);
         } catch (Exception e) {
             return errorReply(e);
         }
@@ -3464,20 +3490,23 @@ public class JDWPTools {
     }
 
     /**
-     * Whether the freshly attached VM has a suspended thread — true at a {@code suspend=y}
-     * VM_START, false for a JVM started with {@code suspend=n}. Assumes suspended when the VM
-     * cannot be asked, the common case for {@code jdwp_wait_for_attach}.
+     * Whether a late VM_START could still hold the freshly attached VM. An unreadable VM
+     * cannot establish freshness, but the default attach keeps its best-effort guidance.
      */
-    private boolean anyThreadSuspended() {
+    private boolean anyThreadSuspended(boolean assumeSuspended) {
+        final VirtualMachine vm = jdiService.attachedVM();
+        if (vm == null) {
+            return assumeSuspended;
+        }
         try {
-            for (ThreadReference thread : jdiService.getVM().allThreads()) {
+            for (ThreadReference thread : vm.allThreads()) {
                 if (thread.isSuspended()) {
                     return true;
                 }
             }
             return false;
         } catch (Exception unknown) {
-            return true;
+            return assumeSuspended;
         }
     }
 
@@ -3843,7 +3872,10 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, load the exception class now via Class.forName (runs `<clinit>`; needs a stopped thread, so not at VM start). Default false: a class that is not loaded yet is waited for, JDK classes included.") @Nullable Boolean forceLoad,
-        @McpToolParam(required = false, description = "Suspend policy of the stop: 'thread' (default — only the throwing thread) or 'all' (every thread, so nothing runs on while you inspect)") @Nullable String suspendPolicy) {
+        @McpToolParam(required = false, description = "Suspend policy of the stop: 'thread' (default — only the throwing thread) or 'all' (every thread, so nothing runs on while you inspect)") @Nullable String suspendPolicy,
+        @McpToolParam(required = false, description = "Java condition with $exception bound to the thrown object, with block syntax supported.") @Nullable String condition,
+        @McpToolParam(required = false, description = "One throw-site class pattern to match.") @Nullable String thrownIn,
+        @McpToolParam(required = false, description = "Comma-separated throw-site class patterns to exclude.") @Nullable String notThrownIn) {
         final String policyLabel = suspendPolicy == null || suspendPolicy.isBlank()
             ? "thread" : suspendPolicy.toLowerCase(Locale.ROOT);
         final int jdiPolicy;
@@ -3856,8 +3888,8 @@ public class JDWPTools {
         }
         return registerExceptionBreakpointInternal(
             className, caught, uncaught,
-            /* expression */ null, /* condition */ null,
-            triggerBreakpointId, oneShot, forceLoad, jdiPolicy);
+            null, condition,
+            triggerBreakpointId, oneShot, forceLoad, jdiPolicy, thrownIn, notThrownIn);
     }
 
     @McpTool(description = "Set a non-stopping breakpoint that records an EXCEPTION_LOG event for each " +
@@ -3878,7 +3910,9 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
-        @McpToolParam(required = false, description = "If true, load the exception class now via Class.forName (runs `<clinit>`; needs a stopped thread, so not at VM start). Default false: a class that is not loaded yet is waited for, JDK classes included.") @Nullable Boolean forceLoad) {
+        @McpToolParam(required = false, description = "If true, load the exception class now via Class.forName (runs `<clinit>`; needs a stopped thread, so not at VM start). Default false: a class that is not loaded yet is waited for, JDK classes included.") @Nullable Boolean forceLoad,
+        @McpToolParam(required = false, description = "One throw-site class pattern to match.") @Nullable String thrownIn,
+        @McpToolParam(required = false, description = "Comma-separated throw-site class patterns to exclude.") @Nullable String notThrownIn) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_exception_logpoint. "
                 + "Use jdwp_set_exception_breakpoint for a suspending exception BP without expression evaluation.";
@@ -3886,7 +3920,7 @@ public class JDWPTools {
         return registerExceptionBreakpointInternal(
             className, caught, uncaught,
             expression, condition,
-            triggerBreakpointId, oneShot, forceLoad, EventRequest.SUSPEND_EVENT_THREAD);
+            triggerBreakpointId, oneShot, forceLoad, EventRequest.SUSPEND_EVENT_THREAD, thrownIn, notThrownIn);
     }
 
     /**
@@ -3904,7 +3938,7 @@ public class JDWPTools {
         @Nullable Boolean caught, @Nullable Boolean uncaught,
         @Nullable String expression, @Nullable String condition,
         @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot,
-        @Nullable Boolean forceLoad, int suspendPolicy) {
+        @Nullable Boolean forceLoad, int suspendPolicy, @Nullable String thrownIn, @Nullable String notThrownIn) {
         try {
             // Fail loud on a missing class name BEFORE any registry / VM work. A null slips through
             // when the MCP client sends the argument under a different key (the sibling breakpoint
@@ -3932,10 +3966,11 @@ public class JDWPTools {
             final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
             final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
             final String conditionLine = normalisedCondition != null ? "\n  Condition: " + normalisedCondition : "";
-            final BreakpointTracker.ExceptionBreakpointSpec spec = isLogpoint
-                ? BreakpointTracker.ExceptionBreakpointSpec.logOnly(exceptionClass, effectiveCaught, effectiveUncaught, expression)
-                : BreakpointTracker.ExceptionBreakpointSpec.suspending(exceptionClass, effectiveCaught, effectiveUncaught,
-                suspendPolicy);
+            final BreakpointTracker.ExceptionBreakpointSpec spec = new BreakpointTracker.ExceptionBreakpointSpec(
+                exceptionClass, effectiveCaught, effectiveUncaught, isLogpoint, expression, suspendPolicy,
+                parseThrownIn(thrownIn), parseNotThrownIn(notThrownIn));
+            final String filters = spec.throwSiteFilterSummary();
+            final String filterLine = filters.isEmpty() ? "" : "\n  Throw-site filters:" + filters;
             final String modeLabel;
             if (isLogpoint) {
                 modeLabel = "log-only";
@@ -3980,12 +4015,13 @@ public class JDWPTools {
                           Exception: %s
                           Caught: %s
                           Uncaught: %s
-                          Mode: %s%s%s%s
+                          Mode: %s%s%s%s%s
                         Class not yet loaded%s — will activate automatically when the JVM loads it.""",
                     pendingId, exceptionClass, effectiveCaught, effectiveUncaught,
                     modeLabel,
                     expressionLine,
                     conditionLine,
+                    filterLine,
                     chainInfo,
                     forceLoadFailedNote(effectiveForceLoad))
                     + deferredClassSuggestion(vm, exceptionClass)
@@ -3996,11 +4032,7 @@ public class JDWPTools {
             // edge), and only enable as the very last step. JDI delivers events the instant a
             // request is enabled; enabling-then-disabling a chained BP opens a window where an
             // exception could fire and bypass the chain.
-            final ExceptionRequest exReq = erm.createExceptionRequest(eagerType, effectiveCaught, effectiveUncaught);
-            // The spec's policy — SUSPEND_EVENT_THREAD unless the user asked for all; logOnly BPs are
-            // auto-resumed by JdiEventListener after recording / expression evaluation (invokeMethod
-            // requires the firing thread suspended).
-            exReq.setSuspendPolicy(spec.suspendPolicy());
+            final ExceptionRequest exReq = spec.createRequest(erm, eagerType);
 
             final int id = breakpointTracker.registerExceptionBreakpoint(exReq, spec);
             if (normalisedCondition != null) {
@@ -4013,16 +4045,73 @@ public class JDWPTools {
                 exReq.setEnabled(true);
             }
 
-            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s%s",
+            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s%s%s",
                 id, exceptionClass, effectiveCaught, effectiveUncaught,
                 modeLabel,
                 expressionLine,
                 conditionLine,
+                filterLine,
                 chainInfo)
                 + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return errorReply(e);
         }
+    }
+
+    /**
+     * The single {@code thrownIn} pattern, or {@code null} when absent. JDI ANDs class filters, so a list
+     * of inclusions could never match anything and is rejected.
+     */
+    @Nullable
+    private static String parseThrownIn(@Nullable String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            return null;
+        }
+        if (pattern.indexOf(',') >= 0) {
+            throw new IllegalArgumentException("Use one pattern for thrownIn. Use notThrownIn for comma-separated exclusions.");
+        }
+        return parseThrowSitePattern("thrownIn", pattern);
+    }
+
+    /**
+     * The comma-separated {@code notThrownIn} exclusions; each one excludes on its own.
+     */
+    private static List<String> parseNotThrownIn(@Nullable String patterns) {
+        if (patterns == null || patterns.isBlank()) {
+            return List.of();
+        }
+        final List<String> result = new ArrayList<>();
+        for (String token : patterns.split(",", -1)) {
+            result.add(parseThrowSitePattern("notThrownIn", token));
+        }
+        return result;
+    }
+
+    /**
+     * Validates one throw-site class pattern the way JDI's class filters accept it: an exact class name,
+     * or a single {@code '*'} at the start or the end ({@code "com.acme.*"}, {@code "*Service"}).
+     */
+    private static String parseThrowSitePattern(String parameter, String token) {
+        final String pattern = token.strip();
+        if (pattern.isEmpty() || pattern.codePoints().anyMatch(Character::isWhitespace)
+            || !hasValidWildcard(pattern)) {
+            throw new IllegalArgumentException("Invalid " + parameter + " class pattern '" + pattern
+                + "'. Use an exact class name or one '*' at the start or end.");
+        }
+        return pattern;
+    }
+
+    /**
+     * Whether {@code pattern} has no {@code '*'}, or exactly one at its start or end.
+     */
+    private static boolean hasValidWildcard(String pattern) {
+        final int star = pattern.indexOf('*');
+        if (star < 0) {
+            return true;
+        }
+        final boolean single = star == pattern.lastIndexOf('*');
+        final boolean atEdge = star == 0 || star == pattern.length() - 1;
+        return single && atEdge;
     }
 
     @McpTool(description = "Set a field watchpoint that suspends the firing thread when the field is read " +
@@ -4906,21 +4995,25 @@ public class JDWPTools {
             final String name = info.getExceptionClass();
             final String expr = info.getExpression();
             final String cond = breakpointTracker.getCondition(id);
-            if (matchesFilter(needle, name, expr, cond)) {
-                rows.add(String.format("  #%d  %s  [%s]%s%s%s",
+            final String filters = info.getSpec().throwSiteFilterSummary();
+            if (matchesFilter(needle, name, expr, cond, filters)) {
+                rows.add(String.format("  #%d  %s  [%s]%s%s%s%s",
                     id, name,
                     info.isLogOnly() ? "log-only" : "suspend",
                     expr != null ? "  expr=\"" + expr + "\"" : "",
                     cond != null ? "  cond=\"" + cond + "\"" : "",
-                    chainSuffix(id, info.getRequest().isEnabled())));
+                    filters, chainSuffix(id, info.getRequest().isEnabled())));
             }
         }
         for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> e : pending.entrySet()) {
             final int id = e.getKey();
             final BreakpointTracker.PendingExceptionBreakpoint pb = e.getValue();
-            if (matchesFilter(needle, pb.getExceptionClass(), null)) {
-                rows.add(String.format("  #%d  %s  [PENDING]%s",
-                    id, pb.getExceptionClass(), chainSuffix(id, null)));
+            final String filters = pb.getSpec().throwSiteFilterSummary();
+            final String cond = breakpointTracker.getCondition(id);
+            if (matchesFilter(needle, pb.getExceptionClass(), cond, filters)) {
+                rows.add(String.format("  #%d  %s  [PENDING]%s%s%s",
+                    id, pb.getExceptionClass(), cond != null ? "  cond=\"" + cond + "\"" : "",
+                    filters, chainSuffix(id, null)));
             }
         }
         if (rows.isEmpty() && !showEmpty) {

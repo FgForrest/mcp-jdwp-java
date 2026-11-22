@@ -37,7 +37,7 @@ The `address=*:<port>` (or `address=<port>`) field tells you what to pass to `jd
 mvn test -Dtest=<TestClass> -Dmaven.surefire.debug
 ```
 
-This forks the test JVM with the JDWP agent on port 5005, `suspend=y`.
+This forks the test JVM with the JDWP agent on port 5005, `suspend=y`. Attach with `jdwp_wait_for_attach(port=5005, requireVmStart=true)`. After the test, disconnect and confirm the JVM and the background Maven shell have ended before starting the next run.
 
 **Surefire `<argLine>` gotcha:** Surefire poms that hardcode `<argLine>` will silently override `-DargLine=` from the command line. If `-Dmaven.surefire.debug` doesn't open port 5005, change the pom's `<argLine>X</argLine>` to `<argLine>X ${argLine}</argLine>` and add `<argLine></argLine>` to `<properties>` as the empty default.
 
@@ -47,7 +47,7 @@ This forks the test JVM with the JDWP agent on port 5005, `suspend=y`.
 ./gradlew test --tests "com.example.MyTest" --debug-jvm
 ```
 
-`--debug-jvm` enables JDWP on port 5005 with `suspend=y` and disables the test timeout. Works with `test`, `integrationTest`, or any `Test`-typed task. If `maxParallelForks > 1`, only the first worker gets the port.
+`--debug-jvm` enables JDWP on port 5005 with `suspend=y` and disables the test timeout. Works with `test`, `integrationTest`, or any `Test`-typed task. If `maxParallelForks > 1`, only the first worker gets the port. Attach with `jdwp_wait_for_attach(port=5005, requireVmStart=true)`.
 
 For manual control over the agent string (different port, `suspend=n`, or specific test tasks):
 

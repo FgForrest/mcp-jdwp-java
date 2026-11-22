@@ -54,7 +54,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects a null expression with a hard error and never touches the VM")
 	void shouldRejectNullExpression() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", null, null, null, null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("expression is required");
 		verify(jdiService, never()).getVM();
@@ -64,7 +64,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects a blank expression with a hard error and never touches the VM")
 	void shouldRejectBlankExpression() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "   ", null, null, null, null, null, null);
+			"java.lang.RuntimeException", "   ", null, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("expression is required");
 		verify(jdiService, never()).getVM();
@@ -81,7 +81,7 @@ class JDWPToolsSetExceptionLogpointTest {
 		final java.lang.reflect.Parameter first = JDWPTools.class
 			.getMethod("jdwp_set_exception_logpoint",
 				String.class, String.class, String.class, Boolean.class, Boolean.class,
-				Integer.class, Boolean.class, Boolean.class)
+				Integer.class, Boolean.class, Boolean.class, String.class, String.class)
 			.getParameters()[0];
 
 		assertThat(first.getName()).isEqualTo("className");
@@ -91,7 +91,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects a null class name even with a valid expression, and never touches the VM")
 	void shouldRejectNullClassName() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			null, "$exception", null, null, null, null, null, null);
+			null, "$exception", null, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("required");
 		verify(jdiService, never()).getVM();
@@ -107,7 +107,7 @@ class JDWPToolsSetExceptionLogpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception.getMessage()", null, null, null, null, null, null);
+			"java.lang.RuntimeException", "$exception.getMessage()", null, null, null, null, null, null, null, null);
 
 		assertThat(result).contains("Mode: log-only");
 		assertThat(result).contains("Expression: $exception.getMessage()");
@@ -123,7 +123,7 @@ class JDWPToolsSetExceptionLogpointTest {
 
 		final String result = tools.jdwp_set_exception_logpoint(
 			"java.lang.RuntimeException", "$exception.getMessage()",
-			"$exception.getMessage() != null", null, null, null, null, null);
+			"$exception.getMessage() != null", null, null, null, null, null, null, null);
 
 		assertThat(result).contains("Condition: $exception.getMessage() != null");
 		// And the metadata is queryable by the listener path via the synthetic ID.
@@ -140,7 +140,7 @@ class JDWPToolsSetExceptionLogpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", "   ", null, null, null, null, null);
+			"java.lang.RuntimeException", "$exception", "   ", null, null, null, null, null, null, null);
 
 		assertThat(result).doesNotContain("Condition:");
 		final Integer id = tracker.getAllExceptionBreakpoints().keySet().stream().findFirst().orElseThrow();
@@ -156,7 +156,7 @@ class JDWPToolsSetExceptionLogpointTest {
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, null, null, null);
+			"java.lang.RuntimeException", "$exception", null, null, null, null, null, null, null, null);
 
 		assertThat(result).contains("Caught: true").contains("Uncaught: true");
 		verify(erm).createExceptionRequest(refType, true, true);
@@ -170,7 +170,7 @@ class JDWPToolsSetExceptionLogpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"com.example.MyException", "$exception", "$exception != null", null, null, null, null, null);
+			"com.example.MyException", "$exception", "$exception != null", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("Mode: log-only");
@@ -187,7 +187,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, 999, null, null);
+			"java.lang.RuntimeException", "$exception", null, null, null, 999, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 		verify(jdiService, never()).getVM();
@@ -204,8 +204,33 @@ class JDWPToolsSetExceptionLogpointTest {
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, triggerId, true, null);
+			"java.lang.RuntimeException", "$exception", null, null, null, triggerId, true, null, null, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}
+	@Test
+	@DisplayName("Deferred exception logpoints retain and show their throw-site filters")
+	void shouldShowDeferredLogpointThrowSiteFilters() throws Exception {
+		when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+		final String reply = tools.jdwp_set_exception_logpoint(
+			"com.example.MyException", "$exception.getMessage()", null, null, null, null, null, null,
+			"*Service", "java.*");
+
+		assertThat(reply).contains("deferred", "thrownIn=*Service", "notThrownIn=java.*");
+		assertThat(tools.jdwp_overview(null, null, null))
+			.contains("[PENDING]", "thrownIn=*Service", "notThrownIn=java.*");
+	}
+
+	@Test
+	@DisplayName("Rejects a comma-separated thrownIn before creating a deferred logpoint")
+	void shouldRejectMultipleInclusionPatterns() throws Exception {
+		when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+
+		assertThat(tools.jdwp_set_exception_logpoint(
+			"com.example.MyException", "$exception", null, null, null, null, null, null,
+			"com.a.*, com.b.*", null))
+			.startsWith("Error:").contains("thrownIn", "one pattern", "notThrownIn");
+		verify(jdiService, never()).getVM();
+	}
+
 }

@@ -71,6 +71,10 @@ Soft 200 ms budget (line 57). The masking matters because `jdwp_diagnose` output
 
 The MCP server never attaches to itself — own-PID is filtered out (line 430).
 
+### Process identity in attach and disconnect replies
+
+For local targets, the server looks up the peer of its established JDWP TCP connection. On Linux it matches the reverse TCP endpoints in `/proc/net/tcp` and `tcp6`, then maps the peer socket inode to `/proc/<pid>/fd`. JVM discovery supplies the command summary and falls back to advertised host and port if socket ownership is unavailable. The server can also read the arguments of Attach API inventory entries where the OS exposes them. Multiple matches are reported as ambiguous with their candidate PIDs. A bounded background lookup keeps slow discovery from blocking the debugger. The lookup reuses process inventory and leaves active Attach API probes to `jdwp_diagnose(inspectAll=true)`.
+
 ## 3. Handshake probe — `confirmAll`
 
 > **Background — the JDWP handshake on the wire**

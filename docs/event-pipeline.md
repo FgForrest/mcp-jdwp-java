@@ -213,6 +213,8 @@ When a logpoint fires:
 
 Symmetric paths for `EXCEPTION_LOG` (`JdiEventListener.java:617-658`) and `FIELD_LOGPOINT` (`JdiEventListener.java:799-837`). All three are subject to the same fail-safe rule: if the log expression fails, record `LOGPOINT_ERROR` / `EXCEPTION_LOG_ERROR` / `FIELD_LOGPOINT_ERROR` with the failure reason and continue.
 
+Line, exception and field logpoint results share the same formatter. Boxed primitives are rendered by reading their `value` field. Other objects appear as `Object (type)` with no inspection-cache entry. The formatter also handles field-event values, including `$oldValue` and `$newValue`, and invokes no target methods.
+
 ## 8. The `EventHistory` ring buffer
 
 Internals of `EventHistory`:
@@ -259,6 +261,8 @@ The list is what production code emits (`new EventHistory.DebugEvent(` across th
 3. **`jdwp_reset` ran since the call started** (the generation changed) → `RESET`.
 4. **First pass only:** unless a step is in flight on some thread, release what the user holds — the same release as `jdwp_resume` (§ 14). While a step is pending, nothing is released; the call only waits for the landing.
 5. **Deadline passed** → `TIMEOUT`. Otherwise wait for the remaining time and select again. A notification never implies that a particular stop exists.
+
+While a step is in flight, the step reply’s remaining holds stay under their original owners.
 
 The tool renders the outcomes as `Event fired …` (the stop's location, and a note when the watchdog made the stop partial), `[VM_DEATH] …`, `[NO_EVENT] …` (reset) and the `[TIMEOUT]` soft-wait envelope with a diagnostic report. What the call released before it waited is appended as a trailing line.
 
@@ -362,7 +366,7 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 
 If the release fails, the request is deleted and the pending entry dropped, so a failed step leaves nothing armed.
 
-With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. From a stop-all hold the other threads stay parked by that hold; from a thread stop the VM is not frozen. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
+With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It groups threads by stop-all or thread stop, seen or unseen, in-progress event set, or manual hold. Each group lists up to five names and a count of additional threads. Threads outside those holds run. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
 
 Example, from stop-all hold B (every thread at count 1):
 
@@ -421,7 +425,7 @@ Limits: a spin or a native wait (no contended monitor) is not detected, nor is a
 
 ### Attach
 
-After `jdwp_connect` or `jdwp_wait_for_attach` connects, outside the connection service's monitor, `acknowledgeStart` waits up to 500 ms for the VMStart set. A suspending VMStart is published as a held stop and marked seen; the attach reply says the VM is suspended at start. A `none` VMStart (`suspend=n`) is history only. If none arrives — a re-attach: the JDWP agent reports VMStart only to its first connection — a later one is published unseen, and the next `jdwp_resume_until_event` presents it.
+After `jdwp_connect` or `jdwp_wait_for_attach` connects, outside the connection service's monitor, `acknowledgeStart` waits up to 500 ms for the VMStart set. A suspending VMStart is published as a held stop and marked seen; the attach reply says the VM is suspended at start. A non-suspending VMStart is history only. A reattach or a delayed start event can leave the handshake without a VMStart. A later suspending start is published unseen, and the next `jdwp_resume_until_event` presents it. `requireVmStart=true` refuses existing sessions and detaches from a newly attached running VM.
 
 ### Testing
 

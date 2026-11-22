@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.VirtualMachine;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -52,7 +53,7 @@ final class JDIConnectionServiceTestSupport {
 			new WatcherManager(),
 			new EvaluationGuard(),
 			new MarkedInstanceRegistry(),
-			new JdiHealthMonitor()
+			new JdiHealthMonitor(), new JvmDiscoveryService()
 		);
 	}
 
@@ -64,7 +65,7 @@ final class JDIConnectionServiceTestSupport {
 	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
 			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
 			EvaluationGuard guard) {
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor(), new JvmDiscoveryService());
 	}
 
 	/**
@@ -75,7 +76,7 @@ final class JDIConnectionServiceTestSupport {
 	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
 			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
 			EvaluationGuard guard, MarkedInstanceRegistry marks) {
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor(), new JvmDiscoveryService());
 	}
 
 	/**
@@ -92,7 +93,7 @@ final class JDIConnectionServiceTestSupport {
 		final EvaluationGuard guard = new EvaluationGuard();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor(), new JvmDiscoveryService());
 	}
 
 	/**

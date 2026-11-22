@@ -316,7 +316,7 @@ public class JvmDiscoveryService {
 
     /** Returns the parsed JDWP endpoint or null when no jdwp agent arg is present. */
     @Nullable
-    private static JdwpEndpoint findJdwpArg(List<String> argv) {
+    static JdwpEndpoint findJdwpArg(List<String> argv) {
         for (String arg : argv) {
             if (arg.startsWith("-agentlib:jdwp=")) {
                 return JdwpAgentArgParser.parse(arg.substring("-agentlib:jdwp=".length()));

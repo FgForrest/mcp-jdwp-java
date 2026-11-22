@@ -21,11 +21,11 @@ The scenarios are designed to expose bugs that **source-level reading misses** �
    mvn test -Dtest=<TestClass> -DskipTests=false -Dmaven.surefire.debug
    ```
    This hangs at "Listening for transport dt_socket at address: 5005". That is correct — it is waiting for an attach.
-3. **Attach.** `jdwp_wait_for_attach(port=5005)`. If 5005 is occupied or the launch used a different port, fall back to `jdwp_diagnose()` and pick the discovered port.
+3. **Attach.** `jdwp_wait_for_attach(port=5005, requireVmStart=true)`. If the launch used a different port, use that port. If the port is occupied, use `jdwp_diagnose()` to identify the process and check that any previous test run has ended.
 4. **Set breakpoints from the symptom outward.** Start at the failing assertion or the line nearest the user-visible wrongness. Use line breakpoints, conditional breakpoints, exception breakpoints, and field watchpoints as the situation calls for. Many flights are *much* harder to crack with the wrong tool; pick deliberately.
 5. **Inspect with `jdwp_get_breakpoint_context`** — one call returns the firing thread, the top frames, locals (including `this`), and the field dump of `this`. That replaces four separate get_* calls.
 6. **Form a hypothesis at the breakpoint, then read the source to confirm.** State the hypothesis to the user *before* reading. This is how you avoid "I read it and it must mean X" — at runtime, the JVM tells you what it actually does.
-7. **Between flights:** `jdwp_reset()` clears breakpoints and cached object refs without dropping the connection. Then ask the user to launch the next test.
+7. **Between flights:** End the flight with `jdwp_disconnect()`. If the reply says the test JVM is still alive, run `kill <pid>` with the PID it names. Stop the background `mvn test` shell if needed and confirm both have exited. Stopping the shell alone can leave the forked Surefire JVM running. Launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
 ## Tool reminders
 

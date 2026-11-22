@@ -67,7 +67,7 @@ class JDWPToolsForceLoadFallbackNoteTest {
 	@DisplayName("exception breakpoint")
 	void exceptionBreakpoint() {
 		assertThat(tools.jdwp_set_exception_breakpoint(
-			"java.sql.SQLException", null, null, null, null, true, null))
+			"java.sql.SQLException", null, null, null, null, true, null, null, null, null))
 			.startsWith("Exception breakpoint deferred")
 			.contains("Class not yet loaded (" + NOTE);
 	}
@@ -76,7 +76,7 @@ class JDWPToolsForceLoadFallbackNoteTest {
 	@DisplayName("exception logpoint")
 	void exceptionLogpoint() {
 		assertThat(tools.jdwp_set_exception_logpoint(
-			"java.sql.SQLException", "$exception.getMessage()", null, null, null, null, null, true))
+			"java.sql.SQLException", "$exception.getMessage()", null, null, null, null, null, true, null, null))
 			.startsWith("Exception breakpoint deferred")
 			.contains("Class not yet loaded (" + NOTE);
 	}
@@ -106,7 +106,7 @@ class JDWPToolsForceLoadFallbackNoteTest {
 			.contains("Class not yet loaded — will activate")
 			.doesNotContain(NOTE);
 		assertThat(tools.jdwp_set_exception_breakpoint(
-			"java.sql.SQLException", null, null, null, null, false, null))
+			"java.sql.SQLException", null, null, null, null, false, null, null, null, null))
 			.doesNotContain(NOTE);
 		assertThat(tools.jdwp_set_field_breakpoint(
 			"com.example.Foo", "value", "modification", null, null, null, null, null, null, null))

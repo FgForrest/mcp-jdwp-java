@@ -82,7 +82,7 @@ class JDWPToolsDisconnectReportTest {
 		final JDIConnectionService.VmExit exit = new JDIConnectionService.VmExit(
 			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 2, 0, 1, 1, 0, List.of());
 		when(jdiService.disconnect()).thenReturn(new JDIConnectionService.DisconnectResult(
-			false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit));
+			false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit, null));
 
 		assertThat(tools.jdwp_disconnect())
 			.startsWith("Not connected — the target VM at localhost:5005 exited at ")
