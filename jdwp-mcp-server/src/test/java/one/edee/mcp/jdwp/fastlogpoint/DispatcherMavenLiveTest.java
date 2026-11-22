@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import com.sun.jdi.ClassType;
 import com.sun.jdi.ReferenceType;
+import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.evaluation.ProcessBuilderMavenRunner;
@@ -12,7 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import javax.tools.ToolProvider;
 
@@ -122,10 +124,13 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
+	/** Selects the probe expression and the stage that first needs the local classpath. */
+	private enum ClasspathUse { LOGPOINT, BREAKPOINT_CONDITION, ARMING_CAPTURE, INSTALLED_CAPTURE }
+
 	/** Verifies that a pending fast probe retries the same ID when discovery supplies the missing type. */
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void fastProbeRetriesWhenItsTypeBecomesAvailable(boolean breakpoint, @TempDir Path project) throws Exception {
+	@EnumSource(ClasspathUse.class)
+	void fastProbeRetriesWhenItsTypeBecomesAvailable(ClasspathUse use, @TempDir Path project) throws Exception {
 		Files.writeString(project.resolve("pom.xml"), "<project/>");
 		final Path classes = Files.createDirectory(project.resolve("maven-dependency"));
 		final Path source = Files.writeString(project.resolve("BuildConstant.java"), """
@@ -149,24 +154,43 @@ class DispatcherMavenLiveTest {
 				assertThat(mavenStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 				final int line = LiveSession.lineOf("MARK: label");
 				final String constant = "probeclasspath.BuildConstant.VALUE";
-				final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
-				final int probe = LiveSession.idOf(breakpoint
-					? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, constant + " < 0",
-						true, "thread", true, null)
-					: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, constant + " + i",
-						null, true, null, null));
+				final String prefix = use == ClasspathUse.LOGPOINT ? "FAST_LOGPOINT" : "FAST_BREAKPOINT";
+				final int probe = LiveSession.idOf(switch (use) {
+					case LOGPOINT -> session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, constant + " + i",
+						null, true, null, null);
+					case BREAKPOINT_CONDITION -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						constant + " < 0", true, "thread", true, null, null);
+					case ARMING_CAPTURE -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						"true", true, "thread", true, null, constant);
+					case INSTALLED_CAPTURE -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						LiveSession.TARGET + ".captureTestStop", true, "thread", true, null, constant);
+				});
 				await("arming attempt", () -> hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED")
-					|| hasProbeEvent(session, probe, prefix + "_ARM_FAILED"));
+					|| hasProbeEvent(session, probe, prefix + "_ARM_FAILED")
+					|| hasProbeEvent(session, probe, prefix + "_ARMED")
+					|| hasProbeEvent(session, probe, "FAST_BREAKPOINT"));
+				assertThat(hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED")).isTrue();
 				assertThat(hasProbeEvent(session, probe, prefix + "_ARM_FAILED")).isFalse();
 				assertThat(hasProbeEvent(session, probe, prefix + "_ARMED")).isFalse();
 				assertThat(hasProbeEvent(session, probe, "FAST_BREAKPOINT")).isFalse();
 
 				releaseMaven.countDown();
 				assertThat(provider.discover()).containsExactly(classes.toString());
-				await("the original probe to arm", () -> hasProbeEvent(session, probe, prefix + "_ARMED"));
+				if (use != ClasspathUse.ARMING_CAPTURE) {
+					await("the original probe to arm", () -> hasProbeEvent(session, probe, prefix + "_ARMED"));
+				}
+				if (use == ClasspathUse.INSTALLED_CAPTURE) {
+					final VirtualMachine vm = session.connection.getVM();
+					final ClassType target = (ClassType) vm.classesByName(LiveSession.TARGET).get(0);
+					target.setValue(target.fieldByName("captureTestStop"), vm.mirrorOf(true));
+				}
+				if (use == ClasspathUse.ARMING_CAPTURE || use == ClasspathUse.INSTALLED_CAPTURE) {
+					assertThat(session.tools.jdwp_resume_until_event(SIGNAL_TIMEOUT_SECONDS * 1_000))
+						.contains("fast_breakpoint=" + probe + ", condition true", "Captured at the hit: 42");
+				}
 				session.tools.jdwp_clear_breakpoint(probe);
 
-				if (!breakpoint) {
+				if (use == ClasspathUse.LOGPOINT) {
 					final int invalid = LiveSession.idOf(session.tools.jdwp_set_fast_logpoint(
 						LiveSession.TARGET, line, "unknownType.unknownField + i", null, true, null, null));
 					await("permanent failure after discovery", () ->
@@ -296,8 +320,7 @@ class DispatcherMavenLiveTest {
 	/** Returns whether the live session recorded the given event type for the probe ID. */
 	private static boolean hasProbeEvent(LiveSession session, int id, String type) {
 		return session.history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(event ->
-			event.type().equals(type) && (event.summary().contains("[FastLogpoint " + id + "]")
-				|| event.summary().contains("[FastBreakpoint " + id + "]")));
+			event.type().equals(type) && String.valueOf(id).equals(event.details().get("breakpointId")));
 	}
 
 	private static Set<String> evaluatorWrappers(LiveSession session) throws Exception {

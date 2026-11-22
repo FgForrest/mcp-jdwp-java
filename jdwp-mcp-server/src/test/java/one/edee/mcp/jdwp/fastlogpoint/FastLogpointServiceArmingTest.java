@@ -66,6 +66,7 @@ class FastLogpointServiceArmingTest {
 	 */
 	private final List<BreakpointRequest> created = new ArrayList<>();
 
+	/** Builds a pending fast breakpoint and mocks its arming event and target VM. */
 	@BeforeEach
 	void setUp() throws Exception {
 		history = new EventHistory();
@@ -98,7 +99,7 @@ class FastLogpointServiceArmingTest {
 		when(frame.location()).thenReturn(location);
 		when(thread.frame(0)).thenReturn(frame);
 
-		service.registerBreakpoint(vm, location, "total > 100", true, EventRequest.SUSPEND_ALL,
+		service.registerBreakpoint(vm, location, "total > 100", null, true, EventRequest.SUSPEND_ALL,
 			FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
 		armingRequest = created.get(0);
 	}
@@ -146,7 +147,7 @@ class FastLogpointServiceArmingTest {
 		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
 
 		final FastLogpointService.RearmResult result =
-			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+			service.rearmBreakpoint(location, "total > 100", null, true, EventRequest.SUSPEND_ALL);
 
 		assertThat(result.rearmed()).isFalse();
 		assertThat(result.message()).doesNotContain("re-armed (ID:");
@@ -157,7 +158,7 @@ class FastLogpointServiceArmingTest {
 		assertThat(targetStop.get()).isEqualTo(rejectStop ? 1 : 2);
 		assertThat(targetError.get()).isEqualTo(rejectError ? 1 : 2);
 
-		assertThat(service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL).rearmed())
+		assertThat(service.rearmBreakpoint(location, "total > 100", null, true, EventRequest.SUSPEND_ALL).rearmed())
 			.isTrue();
 		assertThat(targetStop.get()).isEqualTo(rejectStop ? 2 : 3);
 		assertThat(targetError.get()).isEqualTo(rejectError ? 2 : 3);
@@ -192,12 +193,12 @@ class FastLogpointServiceArmingTest {
 		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
 
 		final FastLogpointService.RearmResult result =
-			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+			service.rearmBreakpoint(location, "total > 100", null, true, EventRequest.SUSPEND_ALL);
 		assertThat(result.rearmed()).isFalse();
 		assertThat(result.message()).contains("stop gate reopening could not be verified", "error gate reopened");
 		assertThat(targetStop.get()).isEqualTo(2);
 
-		assertThat(service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL).rearmed())
+		assertThat(service.rearmBreakpoint(location, "total > 100", null, true, EventRequest.SUSPEND_ALL).rearmed())
 			.isTrue();
 		assertThat(targetStop.get()).isEqualTo(3);
 		assertThat(readEpoch(entry, "epoch")).isEqualTo(3);
@@ -246,7 +247,7 @@ class FastLogpointServiceArmingTest {
 		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
 
 		final FastLogpointService.RearmResult result =
-			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+			service.rearmBreakpoint(location, "total > 100", null, true, EventRequest.SUSPEND_ALL);
 		assertThat(result.rearmed()).isFalse();
 		assertThat(result.message()).contains("gate reopening could not be verified");
 		assertThat(targetEpoch.get()).isEqualTo(2);
@@ -334,10 +335,11 @@ class FastLogpointServiceArmingTest {
 		return epoch.getInt(entry);
 	}
 
+	/** Checks that losing suspension during condition evaluation fails arming. */
 	@Test
 	@DisplayName("a condition evaluation cut short by a resumed thread fails the arm with that reason, never a false stop")
 	void resumedArmingThreadFailsTheArm() throws Exception {
-		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("thread not suspended"));
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any())).thenThrow(new JdiEvaluationException("thread not suspended"));
 		when(thread.isSuspended()).thenReturn(false);
 
 		assertThat(service.handleArmingHit(armingHit(), false)).isEqualTo(FastLogpointService.ArmingOutcome.RESUME);
@@ -349,10 +351,11 @@ class FastLogpointServiceArmingTest {
 			.doesNotContain("FAST_BREAKPOINT", "FAST_BREAKPOINT_ERROR");
 	}
 
+	/** Checks that a condition failure on a still-suspended arming thread is proposed as a stop. */
 	@Test
 	@DisplayName("a condition that throws on a still-suspended thread is the condition's failure: an error stop")
 	void failingConditionOnSuspendedThreadStops() throws Exception {
-		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("boom"));
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any())).thenThrow(new JdiEvaluationException("boom"));
 		when(thread.isSuspended()).thenReturn(true);
 
 		assertThat(service.handleArmingHit(armingHit(), false)).as("the error stop is published")

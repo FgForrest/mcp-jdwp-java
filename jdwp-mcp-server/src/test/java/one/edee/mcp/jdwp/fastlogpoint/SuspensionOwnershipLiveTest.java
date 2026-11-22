@@ -198,6 +198,7 @@ class SuspensionOwnershipLiveTest {
 		assertApplicationRuns();
 	}
 
+	/** Checks that co-delivered arming events yield one fast-breakpoint stop and that the logpoint later arms. */
 	@Test
 	@Order(4)
 	@DisplayName("a fast logpoint and a fast breakpoint on one line, set before either fires: one stop, both armed in the end (#47 § 4)")
@@ -211,7 +212,7 @@ class SuspensionOwnershipLiveTest {
 		try {
 			logpointId = idOf(tools.jdwp_set_fast_logpoint(TARGET, line, "\"i=\" + i", "i % 100000 == 0", true, null,
 				null));
-			breakpointId = idOf(tools.jdwp_set_fast_breakpoint(TARGET, line, "i >= 0", true, "thread", true, null));
+			breakpointId = idOf(tools.jdwp_set_fast_breakpoint(TARGET, line, "i >= 0", true, "thread", true, null, null));
 		} finally {
 			vm.resume();
 		}

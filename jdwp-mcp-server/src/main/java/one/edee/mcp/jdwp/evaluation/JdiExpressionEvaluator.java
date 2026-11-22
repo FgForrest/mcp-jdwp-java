@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.io.File;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -26,7 +27,7 @@ import java.util.stream.Collectors;
  * 2. Auto-rewrite bare field identifiers and method calls (`field` → `_this.field`, `size()` →
  * `_this.size()`) via {@link #rewriteThisMemberReferences} when safe; explicit `this`/`this.field` is handled
  * separately by {@link #rewriteThisKeyword}.
- * 3. Cache lookup keyed on `wrapperPackage + "###" + signature + "###" + expression` (the package
+ * 3. Cache lookup keyed on wrapper package, evaluation mode, signature and expression (the package
  * is part of the key because a define-time fallback may recompile the same expression into a
  * different package); on miss, generate a wrapper class with a UUID-suffixed name, compile via
  * {@link InMemoryJavaCompiler}, and cache the bytecode.
@@ -169,6 +170,16 @@ public class JdiExpressionEvaluator {
      */
     static String rewriteThisMemberReferences(String expression, Set<String> thisFieldNames,
                                               Set<String> thisMethodNames, Set<String> shadowingLocals) {
+        return rewriteThisMemberReferences(expression, thisFieldNames, thisMethodNames, shadowingLocals, "_this");
+    }
+
+    /**
+     * Returns the expression with eligible bare fields and method calls qualified by the chosen receiver name.
+     * Leaves literals, qualified members, and fields shadowed by locals as written.
+     */
+    private static String rewriteThisMemberReferences(String expression, Set<String> thisFieldNames,
+                                                      Set<String> thisMethodNames, Set<String> shadowingLocals,
+                                                      String receiver) {
         final Set<String> rewritable = thisFieldNames.stream()
             .filter(name -> !shadowingLocals.contains(name))
             .collect(Collectors.toSet());
@@ -204,7 +215,7 @@ public class JdiExpressionEvaluator {
                 if (!member || isPrecededByDot(expression, i)) {
                     out.append(identifier);
                 } else {
-                    out.append("_this.").append(identifier);
+                    out.append(receiver).append('.').append(identifier);
                 }
                 i = end;
             } else {
@@ -229,6 +240,11 @@ public class JdiExpressionEvaluator {
      * <p>Static + package-private so it can be unit-tested without a real {@link StackFrame}.
      */
     static String rewriteThisKeyword(String expression) {
+        return rewriteThisKeyword(expression, "_this");
+    }
+
+    /** Returns the expression with {@code this} tokens outside literals replaced by the receiver name. */
+    private static String rewriteThisKeyword(String expression, String receiver) {
         final StringBuilder out = new StringBuilder(expression.length() + 8);
         int i = 0;
         final int n = expression.length();
@@ -249,7 +265,7 @@ public class JdiExpressionEvaluator {
                 }
                 final String identifier = expression.substring(i, end);
                 if ("this".equals(identifier)) {
-                    out.append("_this");
+                    out.append(receiver);
                 } else {
                     out.append(identifier);
                 }
@@ -368,10 +384,9 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Extracts locals and the `this` reference from a stack frame, then appends any caller-supplied
-     * synthetic bindings. Uses declared type rather than runtime type for `this` to handle proxy
-     * classes (Guice, CGLIB, etc.). Throws `AbsentInformationException` if the frame's method was
-     * compiled without `-g` (no local variable debug info).
+     * Extracts locals and the optional receiver from a stack frame, then appends any caller-supplied
+     * synthetic bindings. A frame without local-variable debug info can still use the receiver and
+     * synthetic bindings.
      *
      * @param frame          stack frame providing locals and `this`
      * @param extraBindings  additional name → value pairs to expose as synthetic locals (used for
@@ -383,20 +398,13 @@ public class JdiExpressionEvaluator {
      *                       package of a referenced type, that type's package-private members
      *                       become accessible to the wrapper, so the type can be exposed by its
      *                       actual (non-public) name instead of walking up to a public supertype.
+     * @param receiverType   the receiver's binding type, or {@code null} to omit the receiver
      */
     private static EvaluationContext buildContext(StackFrame frame, Map<String, Value> extraBindings,
-                                                  String wrapperPackage)
+                                                  String wrapperPackage, @Nullable ReferenceType receiverType)
         throws AbsentInformationException {
         final List<ContextVariable> variables = new ArrayList<>();
         final List<Value> values = new ArrayList<>();
-
-        final ObjectReference thisObject = frame.thisObject();
-        if (thisObject != null) {
-            // Use declared type instead of runtime type to avoid issues with dynamic proxies (Guice, CGLIB, etc.)
-            final String declaredType = getDeclaredType(thisObject.referenceType(), wrapperPackage);
-            variables.add(new ContextVariable("_this", declaredType));
-            values.add(thisObject);
-        }
 
         // Enumerate locals defensively. A target compiled without a local-variable table
         // (`javac` default, or an explicit `-g:none` / debug-info-stripped release build) makes
@@ -431,8 +439,22 @@ public class JdiExpressionEvaluator {
             variables.add(new ContextVariable(entry.getKey(), inferDeclaredType(entry.getValue(), wrapperPackage)));
             values.add(entry.getValue());
         }
+        if (receiverType != null) {
+            final String receiver = availableReceiverName(variables.stream().map(v -> v.name).toList());
+            variables.add(0, new ContextVariable(receiver, getDeclaredType(receiverType, wrapperPackage)));
+            values.add(0, frame.thisObject());
+        }
 
         return new EvaluationContext(variables, values);
+    }
+
+    /** Returns {@code _this} with enough trailing dollar signs to avoid existing bindings. */
+    private static String availableReceiverName(List<String> names) {
+        String receiver = "_this";
+        while (names.contains(receiver)) {
+            receiver += '$';
+        }
+        return receiver;
     }
 
     /**
@@ -495,25 +517,41 @@ public class JdiExpressionEvaluator {
      * {@link #resolveWrapperPackage}, the wrapper compiles next to that type and can dereference
      * its package-private members directly.
      */
-    private static String generateSourceCode(String className, EvaluationContext context, String expression) {
+    private static String generateSourceCode(String className, EvaluationContext context, String expression,
+                                             boolean renderCapture, boolean retainResult) {
         final int lastDot = className.lastIndexOf('.');
         final String packageName = lastDot < 0 ? "" : className.substring(0, lastDot);
         final String simpleClassName = lastDot < 0 ? className : className.substring(lastDot + 1);
 
-        final String methodParameters = context.getVariables().stream()
-            .map(v -> v.type + ' ' + v.name)
-            .collect(Collectors.joining(", "));
+        final List<FastLogpointProbeSource.Parameter> parameters = context.getVariables().stream()
+            .map(v -> new FastLogpointProbeSource.Parameter(v.name, v.type)).toList();
 
         final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
-        return packageDecl +
+        final StringBuilder source = new StringBuilder(packageDecl +
             "// Automatically generated class for JDI expression evaluation\n" +
-            "public class " + simpleClassName + " {\n" +
-            // throws Throwable: checked exceptions of the user's code (reflection, I/O) need no
-            // try/catch; whatever escapes is reported like any exception of the invocation.
-            "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") throws Throwable {\n" +
-            generateMethodBody(expression) +
-            "    }\n" +
-            "}\n";
+            "public class " + simpleClassName + " {\n");
+        final String entry = retainResult ? "__mcpArmingValue" : EVALUATION_METHOD_NAME;
+        final String visibility = retainResult ? "private" : "public";
+        if (retainResult) {
+            final List<FastLogpointProbeSource.Parameter> forwarded = FastLogpointProbeSource.forwardedParameters(parameters);
+            source.append("    private static java.lang.Object ").append(RemoteCodeExecutor.ARMING_RESULT_FIELD).append(";\n")
+                .append("    public static java.lang.Object ").append(EVALUATION_METHOD_NAME).append('(')
+                .append(FastLogpointProbeSource.declaredParameters(forwarded)).append(") throws java.lang.Throwable {\n")
+                .append("        return ").append(RemoteCodeExecutor.ARMING_RESULT_FIELD).append(" = ")
+                .append(entry).append('(').append(FastLogpointProbeSource.arguments(forwarded)).append(");\n")
+                .append("    }\n");
+        }
+        if (renderCapture) {
+            FastBreakpointProbeSource.appendCapture(source, visibility + " static java.lang.String " + entry,
+                parameters, expression);
+            FastLogpointProbeSource.appendFailureRenderer(source);
+            FastLogpointProbeSource.appendValueRenderer(source);
+        } else {
+            source.append("    ").append(visibility).append(" static java.lang.Object ").append(entry).append('(')
+                .append(FastLogpointProbeSource.declaredParameters(parameters)).append(") throws java.lang.Throwable {\n")
+                .append(generateMethodBody(expression)).append("    }\n");
+        }
+        return source.append("}\n").toString();
     }
 
     /**
@@ -529,25 +567,23 @@ public class JdiExpressionEvaluator {
         // literals are NOT rewritten — see {@link #rewriteThisKeyword(String)}.
         final String safeExpression = rewriteThisKeyword(expression);
 
+        final String trimmed = safeExpression.trim();
+        final int bodyEnd = blockEnd(trimmed);
         final String methodBody;
-        if (isBlockMode(safeExpression)) {
+        if (bodyEnd >= 0) {
             // Extract the body inside the outermost braces — already balanced because
             // isBlockMode verified the structure (start with `{`, balanced end with `}`,
             // string/char/text-block/comment regions skipped).
             //
-            // The user body is wrapped in `if (__mcpFallthroughGuard) { ... }` where the guard
-            // is a non-final local set to true. The compiler can't treat it as a compile-time
-            // constant (JLS §15.29 — only `final` variables initialised with constant
-            // expressions qualify), so it does NOT prove the post-if `return null;` unreachable.
+            // A method call is not a compile-time constant, so the post-if return is reachable.
+            // The cast uses the JDK type in a type position, even if a local is named "java".
             // That keeps the wrapper compiling whether or not the user's body ends with an
             // explicit `return X;`. At runtime the guard is always true → user body always runs;
             // `return null;` is the safety net for blocks that fall through without returning.
-            final String trimmed = safeExpression.trim();
-            final String userBody = trimmed.substring(1, trimmed.length() - 1);
+            final String userBody = trimmed.substring(1, bodyEnd);
             methodBody =
                 "        // User block:\n" +
-                "        boolean __mcpFallthroughGuard = true;\n" +
-                "        if (__mcpFallthroughGuard) {\n" +
+                "        if (((java.lang.Boolean) true).booleanValue()) {\n" +
                 userBody + '\n' +
                 "        }\n" +
                 "        // Fallthrough guard — only reached when the user's block doesn't return.\n" +
@@ -555,14 +591,14 @@ public class JdiExpressionEvaluator {
         } else {
             methodBody =
                 "        // User expression:\n" +
-                "        return (Object) (" + safeExpression + ");\n";
+                "        return (java.lang.Object) (" + safeExpression + "\n        );\n";
         }
         return methodBody;
     }
 
     /**
      * Returns {@code true} when the user input is in block mode — i.e. its trimmed form starts
-     * with '{' and ends with the matching '}'. Tokenizer-aware: braces inside string / char /
+     * with '{' and closes with the matching '}', optionally followed by comments. Tokenizer-aware: braces inside string / char /
      * text-block literals and inside line ({@code //…}) or block ({@code /*…*}{@code /}) comments
      * are ignored, so inputs like {@code "{x}".length()} (a method call on a string literal that
      * happens to start with '{') stay in expression mode, and a comment containing '}' inside an
@@ -571,14 +607,15 @@ public class JdiExpressionEvaluator {
      * <p>Static + package-private so it can be unit-tested without a real {@link StackFrame}.
      */
     static boolean isBlockMode(String expression) {
-        final String trimmed = expression.trim();
-        if (trimmed.length() < 2 || trimmed.charAt(0) != '{' || trimmed.charAt(trimmed.length() - 1) != '}') {
-            return false;
+        return blockEnd(expression.trim()) >= 0;
+    }
+
+    /** Returns the closing brace index of a Java block followed only by whitespace or comments, or {@code -1}. */
+    private static int blockEnd(String trimmed) {
+        if (trimmed.length() < 2 || trimmed.charAt(0) != '{') {
+            return -1;
         }
-        // Walk the inside and confirm brace balance returns to zero at exactly the closing `}`.
-        // Tokenizer-aware so braces inside string / char / text-block literals and Java comments
-        // are ignored.
-        final int n = trimmed.length() - 1;
+        final int n = trimmed.length();
         int depth = 1;
         int i = 1;
         while (i < n) {
@@ -595,20 +632,10 @@ public class JdiExpressionEvaluator {
                 final char next = trimmed.charAt(i + 1);
                 if (next == '/') {
                     i = skipLineComment(trimmed, i);
-                    // A line comment that runs to end-of-string would have swallowed the
-                    // trailing `}` (no newline before it) — there is no real closer, so the
-                    // input is not block-mode.
-                    if (i > n) {
-                        return false;
-                    }
                     continue;
                 }
                 if (next == '*') {
                     i = skipBlockComment(trimmed, i);
-                    // Unterminated block comment swallows the trailing `}` too. Same rationale.
-                    if (i > n) {
-                        return false;
-                    }
                     continue;
                 }
             }
@@ -617,16 +644,33 @@ public class JdiExpressionEvaluator {
             } else if (c == '}') {
                 depth--;
                 if (depth == 0) {
-                    // Hit a top-level `}` before the trailing one — input is something like
-                    // `{stmt;} + foo` so the trailing `}` of the trimmed form is a different
-                    // closer and block-mode does not apply.
-                    return false;
+                    return onlyTrailingComments(trimmed, i + 1) ? i : -1;
                 }
             }
             i++;
         }
-        // Trailing `}` at index n closes the outer brace.
-        return depth == 1;
+        return -1;
+    }
+
+    /** Returns whether the suffix contains only whitespace and complete Java comments. */
+    private static boolean onlyTrailingComments(String text, int from) {
+        int i = from;
+        while (i < text.length()) {
+            if (Character.isWhitespace(text.charAt(i))) {
+                i++;
+            } else if (text.startsWith("//", i)) {
+                i = skipLineComment(text, i);
+            } else if (text.startsWith("/*", i)) {
+                final int end = text.indexOf("*/", i + 2);
+                if (end < 0) {
+                    return false;
+                }
+                i = end + 2;
+            } else {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -637,7 +681,7 @@ public class JdiExpressionEvaluator {
     private static int skipLineComment(String s, int start) {
         final int n = s.length();
         int i = start + 2;
-        while (i < n && s.charAt(i) != '\n') {
+        while (i < n && s.charAt(i) != '\n' && s.charAt(i) != '\r') {
             i++;
         }
         // Caller resumes scanning AT the newline (or end). The newline itself is not part of the
@@ -1032,6 +1076,42 @@ public class JdiExpressionEvaluator {
      */
     public @Nullable Value evaluate(StackFrame frame, String expression, Map<String, Value> extraBindings)
         throws JdiEvaluationException {
+        return evaluate(frame, expression, extraBindings, null, false, value -> value);
+    }
+
+    /**
+     * Returns the reader's copy of an arming result on the dispatcher while the wrapper holds it
+     * in the target. The reader must not return a JDI mirror.
+     * @throws JdiEvaluationException if evaluation fails, including when classpath discovery is pending
+     */
+    public <T extends @Nullable Object> T readArmingResult(StackFrame frame, String expression,
+                                                           Function<@Nullable Value, T> reader)
+        throws JdiEvaluationException {
+        return evaluate(frame, expression, Map.of(), null, true, reader);
+    }
+
+    /**
+     * Evaluates an arming capture under the normal invocation lease, using the probe's receiver
+     * binding and source package. Returns the target-rendered value or failure text to the dispatcher.
+     * @throws JdiEvaluationException if compiling, invoking, or reading the wrapper fails, including pending discovery
+     */
+    public String evaluateCapture(StackFrame frame, String expression, String probePackage) throws JdiEvaluationException {
+        return evaluate(frame, expression, Map.of(), probePackage, true, value -> {
+            if (value instanceof StringReference captured) {
+                return captured.value();
+            }
+            throw new IllegalStateException("the capture wrapper did not return text");
+        });
+    }
+
+    /**
+     * Evaluates against the suspended frame, retrying invalidated frame reads before invocation.
+     * Returns the reader's result, keeping retained arming values reachable through that read.
+     * @throws JdiEvaluationException if reading the frame, preparing the wrapper, invoking it, or reading the result fails
+     */
+    private <T extends @Nullable Object> T evaluate(StackFrame frame, String expression, Map<String, Value> extraBindings,
+                                                    @Nullable String capturePackage, boolean retainResult,
+                                                    Function<@Nullable Value, T> reader) throws JdiEvaluationException {
         // The invocations run under a lease of the thread (see evaluateInPackage), which is the
         // reentrancy guard and, since issue #45, the admission: a thread not stopped at an event
         // of its own is refused with the reason, reported as the evaluation's failure.
@@ -1049,7 +1129,8 @@ public class JdiExpressionEvaluator {
             StackFrame current = frame;
             for (int attempt = 1; ; attempt++) {
                 try {
-                    return evaluateAt(current, thread, location, expression, extraBindings, startTime);
+                    return evaluateAt(current, thread, location, expression, extraBindings, capturePackage,
+                        retainResult, reader, startTime);
                 } catch (InvalidStackFrameException invalidated) {
                     final StackFrame refreshed = attempt < FRAME_READ_ATTEMPTS ? sameFrame(thread, location) : null;
                     if (refreshed == null) {
@@ -1083,17 +1164,20 @@ public class JdiExpressionEvaluator {
      * {@link #evaluate} on {@code frame}: picks the wrapper package, and retries once in the default
      * package when defining the wrapper into the preferred one is refused.
      */
-    private @Nullable Value evaluateAt(StackFrame frame, ThreadReference thread, Location location, String expression,
-                                       Map<String, Value> extraBindings, long startTime)
+    private <T extends @Nullable Object> T evaluateAt(StackFrame frame, ThreadReference thread, Location location,
+                                                      String expression, Map<String, Value> extraBindings,
+                                                      @Nullable String capturePackage, boolean retainResult,
+                                                      Function<@Nullable Value, T> reader, long startTime)
         throws JdiEvaluationException, AbsentInformationException {
         // 0. Decide which package the wrapper class will live in. For a non-public `this` in an
         //    addressable package, we emit the wrapper alongside it so package-private fields and
         //    the type itself become reachable; otherwise we use the default isolated package.
-        final ObjectReference thisObject = frame.thisObject();
-        final String wrapperPackage = resolveWrapperPackage(thisObject);
+        final String wrapperPackage = capturePackage != null ? capturePackage : resolveWrapperPackage(frame.thisObject());
+        final boolean renderCapture = capturePackage != null;
 
         try {
-            return evaluateInPackage(frame, expression, extraBindings, wrapperPackage, startTime);
+            return evaluateInPackage(frame, expression, extraBindings, wrapperPackage, renderCapture, retainResult,
+                reader, startTime);
         } catch (JdiClassDefinitionException defineFailure) {
             // The wrapper could not be DEFINED into the chosen package — a sealed package, module
             // strong-encapsulation, or a restrictive custom classloader can reject defineClass for
@@ -1111,7 +1195,8 @@ public class JdiExpressionEvaluator {
             if (refreshed == null) {
                 throw defineFailure;
             }
-            return evaluateInPackage(refreshed, expression, extraBindings, DEFAULT_EVALUATION_PACKAGE, startTime);
+            return evaluateInPackage(refreshed, expression, extraBindings, DEFAULT_EVALUATION_PACKAGE, renderCapture,
+                retainResult, reader, startTime);
         }
     }
 
@@ -1148,12 +1233,14 @@ public class JdiExpressionEvaluator {
      * must redo it from the original expression. {@code expression} is the local parameter, so the
      * reassignment never leaks back to {@link #evaluate}.
      */
-    private @Nullable Value evaluateInPackage(StackFrame frame, String expression,
-                                              Map<String, Value> extraBindings, String wrapperPackage,
-                                              long startTime)
+    private <T extends @Nullable Object> T evaluateInPackage(StackFrame frame, String expression,
+                                                            Map<String, Value> extraBindings, String wrapperPackage,
+                                                            boolean renderCapture, boolean retainResult,
+                                                            Function<@Nullable Value, T> reader, long startTime)
         throws JdiEvaluationException, AbsentInformationException {
         // 1. Analyze the frame to build the evaluation context
-        final EvaluationContext context = buildContext(frame, extraBindings, wrapperPackage);
+        final ReferenceType receiverType = evaluationReceiverType(frame, renderCapture);
+        final EvaluationContext context = buildContext(frame, extraBindings, wrapperPackage, receiverType);
 
         // Auto-rewrite bare references to fields of `this` so users can write
         // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
@@ -1172,18 +1259,19 @@ public class JdiExpressionEvaluator {
         //    accessible from a non-subclass even when `this`'s runtime type is in the wrapper
         //    package — so we'd produce a misleading "not visible" error if we rewrote it.
         //  - Private fields are never rewritten.
-        final ObjectReference thisObject = frame.thisObject();
-        if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
+        if (receiverType instanceof ClassType thisClass) {
             final Set<String> shadowingLocals = context.getVariables().stream()
                 .map(v -> v.name)
                 .collect(Collectors.toSet());
-            expression = rewriteBareThisFields(expression, thisClass, wrapperPackage, shadowingLocals);
+            expression = rewriteForReceiver(expression, thisClass, wrapperPackage, shadowingLocals,
+                context.getVariables().get(0).name);
         }
 
         // 2. Cache key includes the wrapper package: the same (signature, expression) may be
         //    compiled into two different packages (e.g. after a define-time fallback), and the
         //    cached className + bytecode are package-specific.
-        final String cacheKey = wrapperPackage + "###" + context.getSignature() + "###" + expression;
+        final String cacheKey = wrapperPackage + "###" + renderCapture + "###" + retainResult
+            + "###" + context.getSignature() + "###" + expression;
 
         final CompilerState state = compilerStateFor(frame.virtualMachine());
         final Map<String, CachedCompilation> cache = state.cache();
@@ -1209,7 +1297,7 @@ public class JdiExpressionEvaluator {
             final String uniqueId = UUID.randomUUID().toString().replace("-", "");
             className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
 
-            final String sourceCode = generateSourceCode(className, context, expression);
+            final String sourceCode = generateSourceCode(className, context, expression, renderCapture, retainResult);
 
             final Compilation compilation = compileWithClasspathContext(className, sourceCode, state);
             bytecode = findCompiledBytecode(compilation.classes(), className);
@@ -1229,32 +1317,49 @@ public class JdiExpressionEvaluator {
         //    a breakpoint / exception event the invoked code raises on this thread — and the
         //    admission. A define-phase rejection surfaces as JdiClassDefinitionException, which the
         //    caller may catch to retry in the default package.
+        final Function<@Nullable Value, T> readAndReport = value -> {
+            log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
+                System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
+            return reader.apply(value);
+        };
         final Value value;
         try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
             final ClassLoaderReference classLoader = frameLoader != null ? frameLoader : systemClassLoader(vm, thread);
-            value = RemoteCodeExecutor.execute(
-                vm,
-                thread,
-                classLoader,
-                className,
-                bytecode,
-                EVALUATION_METHOD_NAME,
-                context.getValues()
-            );
+            if (retainResult) {
+                return RemoteCodeExecutor.execute(vm, thread, classLoader, className, bytecode, EVALUATION_METHOD_NAME,
+                    context.getValues(), true, readAndReport);
+            }
+            value = RemoteCodeExecutor.execute(vm, thread, classLoader, className, bytecode, EVALUATION_METHOD_NAME,
+                context.getValues());
         }
-        log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
-            System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
-        return value;
+        return readAndReport.apply(value);
     }
 
     /**
-     * Applies the bare-field auto-rewrite ({@code field} → {@code _this.field}) for the fields of
-     * {@code thisClass} that the wrapper in {@code wrapperPackage} can reach — see the comment in
-     * {@link #evaluateInPackage} for the accessibility rules. Returns {@code expression} unchanged in
-     * block mode, and when {@code thisClass} is neither public nor in the wrapper's package.
+     * The type the wrapper binds as {@code _this}: the receiver's runtime type for an ordinary
+     * evaluation; for an arming capture the method's declaring type, as the installed probe binds it,
+     * and none for static methods and constructors. {@code null} when there is no receiver.
      */
-    private static String rewriteBareThisFields(String expression, ClassType thisClass, String wrapperPackage,
-                                                Set<String> shadowingLocals) {
+    @Nullable
+    private static ReferenceType evaluationReceiverType(StackFrame frame, boolean renderCapture) {
+        if (renderCapture) {
+            final Method method = frame.location().method();
+            // Match the installed probe, including constructor lines before this is initialized.
+            return method.isStatic() || method.isConstructor() ? null : method.declaringType();
+        }
+        final ObjectReference thisObject = frame.thisObject();
+        return thisObject == null ? null : thisObject.referenceType();
+    }
+
+    /**
+     * Returns the expression with the selected receiver binding. Outside block mode it also qualifies
+     * reachable bare fields and method calls, subject to the wrapper package's access rules.
+     */
+    private static String rewriteForReceiver(String expression, ClassType thisClass, String wrapperPackage,
+                                             Set<String> shadowingLocals, String receiver) {
+        if (!"_this".equals(receiver)) {
+            expression = rewriteThisKeyword(expression, receiver);
+        }
         if (isBlockMode(expression)) {
             return expression;
         }
@@ -1272,7 +1377,8 @@ public class JdiExpressionEvaluator {
             .filter(m -> isMemberAccessibleFromWrapper(m, wrapperPackage, sharingPackage))
             .map(Method::name)
             .collect(Collectors.toSet());
-        return rewriteThisMemberReferences(expression, rewritableFieldNames, rewritableMethodNames, shadowingLocals);
+        return rewriteThisMemberReferences(expression, rewritableFieldNames, rewritableMethodNames, shadowingLocals,
+            receiver);
     }
 
     /**
@@ -1288,7 +1394,7 @@ public class JdiExpressionEvaluator {
      * the declaring class as its static type, and the verifier rejects passing it where a subclass
      * is expected. Nothing is cached — every probe gets a fresh UUID-suffixed class name.
      * <p>
-     * Must be called on a thread suspended by an event, after {@link #configureCompilerClasspath}.
+     * Called by the dispatcher with an event-suspended frame after {@link #configureCompilerClasspathForEvent}.
      *
      * @param frame          the frame stopped at the logpoint's location
      * @param includeThis    whether {@code this} is passed to the probe (false in static methods
@@ -1319,14 +1425,16 @@ public class JdiExpressionEvaluator {
      * the location {@code frame} is stopped at: the same {@code hit} parameters, {@code _this}
      * typing and naming as {@link #compileFastLogpointProbe}, with the condition evaluated inside
      * the target VM and a {@code stop} method for the server's breakpoint (see
-     * {@link FastBreakpointProbeSource}).
+     * {@link FastBreakpointProbeSource}). Both attempts use the same VM's compiler state. A permanent
+     * capture compilation failure is recorded in the probe if compiling the condition alone succeeds.
      * <p>
-     * Must be called on a thread suspended by an event, after {@link #configureCompilerClasspath}.
+     * Called by the dispatcher with an event-suspended frame after {@link #configureCompilerClasspathForEvent}.
      *
      * @param frame          the frame stopped at the breakpoint's location
      * @param includeThis    whether {@code this} is passed to the probe
      * @param wrapperPackage package the probe class is generated into
      * @param condition      the condition, as the user entered it
+     * @param capture        the optional capture expression, as the user entered it
      * @param stopOnce       whether only the first true hit of an epoch stops
      * @param bufferSize     capacity of the condition-failure ring; must be a power of two
      * @param metadata       what the probe records about itself (target, user text, arming session)
@@ -1334,14 +1442,29 @@ public class JdiExpressionEvaluator {
      * @throws JdiEvaluationException when the probe does not compile or the frame's context cannot be read
      */
     public FastLogpointProbe compileFastBreakpointProbe(StackFrame frame, boolean includeThis, String wrapperPackage,
-                                                        String condition, boolean stopOnce, int bufferSize,
+                                                        String condition, @Nullable String capture, boolean stopOnce, int bufferSize,
                                                         FastLogpointProbeSource.Metadata metadata)
         throws JdiEvaluationException {
         final List<FastLogpointProbeSource.Parameter> parameters = probeParameters(frame, includeThis, wrapperPackage);
         final String effectiveCondition = rewriteForProbe(condition, frame, includeThis, wrapperPackage, parameters);
+        final String effectiveCapture = capture == null ? null
+            : rewriteForProbe(capture, frame, includeThis, wrapperPackage, parameters);
         final String className = probeClassName(wrapperPackage, FastBreakpointProbeSource.CLASS_PREFIX);
-        return compileProbe(className, parameters, compilerStateFor(frame.virtualMachine()), FastBreakpointProbeSource.generate(
-            className, parameters, effectiveCondition, stopOnce, bufferSize, metadata));
+        final CompilerState state = compilerStateFor(frame.virtualMachine());
+        try {
+            return compileProbe(className, parameters, state, FastBreakpointProbeSource.generate(
+                className, parameters, effectiveCondition, effectiveCapture, stopOnce, bufferSize, metadata));
+        } catch (LocalClasspathPendingException pending) {
+            throw pending;
+        } catch (JdiEvaluationException failure) {
+            if (effectiveCapture == null) {
+                throw failure;
+            }
+            // A successful compile without the expression isolates the failure to the capture.
+            final String reason = Objects.requireNonNullElse(failure.getMessage(), failure.getClass().getSimpleName());
+            return compileProbe(className, parameters, state, FastBreakpointProbeSource.generate(
+                className, parameters, effectiveCondition, null, reason, stopOnce, bufferSize, metadata));
+        }
     }
 
     /**
@@ -1352,10 +1475,6 @@ public class JdiExpressionEvaluator {
     private List<FastLogpointProbeSource.Parameter> probeParameters(StackFrame frame, boolean includeThis,
                                                                     String wrapperPackage) {
         final List<FastLogpointProbeSource.Parameter> parameters = new ArrayList<>();
-        if (includeThis) {
-            parameters.add(new FastLogpointProbeSource.Parameter("_this",
-                getDeclaredType(frame.location().declaringType(), wrapperPackage)));
-        }
         try {
             for (LocalVariable var : frame.visibleVariables()) {
                 // Same `this$N` filter as buildContext — the outer-instance reference is unaddressable.
@@ -1365,6 +1484,12 @@ public class JdiExpressionEvaluator {
             }
         } catch (AbsentInformationException noLocals) {
             log.debug("[Evaluator] No local-variable table at the probe location — probe receives `this` only.");
+        }
+        if (includeThis) {
+            final String receiver = availableReceiverName(parameters.stream().map(FastLogpointProbeSource.Parameter::name)
+                .toList());
+            parameters.add(0, new FastLogpointProbeSource.Parameter(receiver,
+                getDeclaredType(frame.location().declaringType(), wrapperPackage)));
         }
         return parameters;
     }
@@ -1381,7 +1506,7 @@ public class JdiExpressionEvaluator {
         final Set<String> localNames = parameters.stream()
             .map(FastLogpointProbeSource.Parameter::name)
             .collect(Collectors.toSet());
-        return rewriteBareThisFields(text, thisClass, wrapperPackage, localNames);
+        return rewriteForReceiver(text, thisClass, wrapperPackage, localNames, parameters.get(0).name());
     }
 
     private static String probeClassName(String wrapperPackage, String classPrefix) {

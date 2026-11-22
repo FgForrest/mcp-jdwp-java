@@ -14,7 +14,12 @@ public class FastLogpointTarget {
      * Total {@link #compute} calls — read by the test over JDWP to measure throughput.
      */
     static final AtomicLong CALLS = new AtomicLong();
+    /** Virtual worker started on demand by the harness's V command. */
     static volatile Thread virtualWorker;
+    /** JDI-controlled condition that lets tests trigger a stop after the probe has armed. */
+    public static volatile boolean captureTestStop;
+    /** Number of explicit collections completed in response to the test harness's GC command. */
+    static volatile int captureTestCollections;
     /**
      * Held by the {@code lock-holder} thread, which sleeps while holding it: a monitor an evaluation
      * can wait for.
@@ -26,6 +31,10 @@ public class FastLogpointTarget {
      */
     int base = 7;
 
+    /**
+     * Starts the workers and handles test commands, including starting a virtual worker and explicit GC.
+     * Runs on the target's main thread and propagates command failures.
+     */
     public static void main(String[] args) throws Exception {
         final int threads = args.length > 0 ? Integer.parseInt(args[0]) : 2;
         final FastLogpointTarget target = new FastLogpointTarget();
@@ -54,8 +63,8 @@ public class FastLogpointTarget {
         System.out.println("TARGET READY");
         System.out.flush();
         // Runs until the test closes our standard input. "L" loads LateTarget — by name, so nothing
-        // loads it earlier — and starts its worker; "X" exits through System.exit, as a forked test
-        // JVM does.
+        // loads it earlier — and starts its worker. "V" starts a virtual worker, "X" exits through
+        // System.exit, and "G" collects before acknowledging a capture lifetime test.
         int command;
         while ((command = System.in.read()) >= 0) {
             if (command == 'L') {
@@ -70,14 +79,19 @@ public class FastLogpointTarget {
                     });
             } else if (command == 'X') {
                 System.exit(0);
+            } else if (command == 'G') {
+                System.gc();
+                captureTestCollections++;
             }
         }
     }
 
+    /** Returns the worker's computed result and exposes a local named {@code _this} at the probe line. */
     public int compute(int i) {
         final int doubled = i * 2;
+        final int _this = i & 1;
         final String label = "v" + doubled; // MARK: label
-        final int result = doubled + base + label.length(); // MARK: probe
+        final int result = doubled + base + label.length() + _this - _this; // MARK: probe
         CALLS.incrementAndGet();
         return result;
     }

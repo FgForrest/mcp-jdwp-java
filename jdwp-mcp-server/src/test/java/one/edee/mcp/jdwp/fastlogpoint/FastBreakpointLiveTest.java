@@ -1,5 +1,11 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.AppenderBase;
+import com.sun.jdi.ClassType;
+import com.sun.jdi.Field;
+import com.sun.jdi.IntegerValue;
 import com.sun.jdi.Location;
 import com.sun.jdi.LongValue;
 import com.sun.jdi.ObjectReference;
@@ -13,14 +19,21 @@ import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.JDWPTools;
 import one.edee.mcp.jdwp.SuspensionSession;
+import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
+import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static one.edee.mcp.jdwp.fastlogpoint.LiveSession.TARGET;
@@ -112,12 +125,13 @@ class FastBreakpointLiveTest {
 		return !state.contains("QUEUED") && !state.contains("PROCESSING");
 	}
 
+	/** Checks that a briefing and invalid calls leave the target without fast-breakpoint requests. */
 	@Test
 	@Order(1)
 	@DisplayName("without userApproved=true nothing is armed; invalid arguments are refused before the briefing")
 	void consentGateArmsNothing() throws Exception {
 		for (Boolean approval : new Boolean[]{null, false}) {
-			final String reply = tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", approval, null, null, null);
+			final String reply = tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", approval, null, null, null, null);
 			assertThat(reply)
 				.startsWith("[CONSENT REQUIRED] Nothing was armed.")
 				.contains(TARGET + ':' + probeLine)
@@ -126,20 +140,21 @@ class FastBreakpointLiveTest {
 				.contains("localhost:" + port)
 				.contains("word for word");
 		}
-		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, "none", null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, "none", null, null, null))
 			.startsWith("Error: Invalid suspend policy 'none'");
-		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, " ", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, " ", true, null, null, null, null))
 			.startsWith("Error: condition is required");
 		assertThat(fastLogpoints.list()).isEmpty();
 		assertThat(connection.getVM().eventRequestManager().breakpointRequests()).isEmpty();
 	}
 
+	/** Checks stop-all suspension and one true stop per generation across a re-arm. */
 	@Test
 	@Order(2)
 	@DisplayName("stop once: the first true hit parks every thread at the user's line, later ones run on; re-arm stops again")
 	void stopOnceParksAllThreadsAndReArms() throws Exception {
 		final String condition = "i % 2000000 == 1999999";
-		final String reply = tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null);
+		final String reply = tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null, null);
 		assertThat(reply).contains("PENDING").contains("stops once").contains("suspendPolicy: all");
 		final int id = idOf(reply);
 
@@ -163,25 +178,26 @@ class FastBreakpointLiveTest {
 		assertThat(tools.jdwp_resume_until_event(QUIET_MS)).as("a spent breakpoint does not stop").contains("still_waiting");
 		assertThat(counters(id).stops()).isEqualTo(1);
 
-		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null, null))
 			.contains("Fast breakpoint " + id).contains("re-armed");
 		assertThat(waitForStop())
 			.contains("fast_breakpoint=" + id + ", condition true");
 		tools.jdwp_resume();
 		await("the second stop counted", () -> counters(id).stops() == 2);
 
-		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, null, null, null, null))
 			.startsWith("Error: fast breakpoint " + id + " is already set");
 		assertThat(tools.jdwp_clear_breakpoint(id)).contains("cleared — original bytecode");
 		assertBytecodeRestored();
 	}
 
+	/** Checks that every-hit mode parks the firing thread while another worker keeps running. */
 	@Test
 	@Order(3)
 	@DisplayName("every hit with suspendPolicy=thread: each true hit stops, only its own thread is parked")
 	void everyHitParksOnlyItsThread() throws Exception {
 		final String reply = tools.jdwp_set_fast_breakpoint(TARGET, probeLine,
-			"Thread.currentThread().getName().equals(\"worker-0\") && i % 3000000 == 0", true, "thread", false, null);
+			"Thread.currentThread().getName().equals(\"worker-0\") && i % 3000000 == 0", true, "thread", false, null, null);
 		assertThat(reply).contains("stops on every hit").contains("suspendPolicy: thread");
 		final int id = idOf(reply);
 
@@ -200,12 +216,13 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** Checks that the first condition failure stops and a later hit installs the probe. */
 	@Test
 	@Order(4)
 	@DisplayName("a condition that throws stops once, then the probe installs and only counts the failures")
 	void failingConditionStopsOnceThenInstalls() throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "10 / (i - i) == 0", true, null, null,
-			null));
+			null, null));
 
 		assertThat(waitForStop())
 			.startsWith("Event fired at " + TARGET + ':' + probeLine)
@@ -220,28 +237,40 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** Checks that the dispatcher captures an arming hit in the user frame without redefining the method. */
 	@Test
 	@Order(5)
-	@DisplayName("a first hit that meets the condition stops through the debugger and leaves the class untouched")
+	@DisplayName("a true arming hit captures on the user's frame and leaves the class untouched")
 	void trueFirstHitStopsWithoutInstalling() throws Exception {
-		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i >= 0", true, null, null, null));
+		final int watchId = idOf(tools.jdwp_set_field_breakpoint(TARGET, "base", "modification",
+			null, null, null, null, null, null, null));
+		try {
+			// A field event raised by capture must be drained while the dispatcher is invoking it.
+			final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i >= 0", true, null, null, null,
+				"{ this.base = this.base; return Long.valueOf(_this - (i & 1) + this.base); }"));
 
-		assertThat(waitForStop())
-			.startsWith("Event fired at " + TARGET + ':' + probeLine)
-			.contains("fast_breakpoint=" + id + ", condition true");
-		assertThat(stoppedThread().frame(0).location().method().name()).as("stopped in the user's frame").isEqualTo("compute");
-		assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
-		assertBytecodeRestored();
-		assertThat(tools.jdwp_overview("fast_breakpoint", null, null)).contains("PENDING, spent");
-		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
-			&& "true".equals(e.details().get("armingHit")));
+			assertThat(waitForStop())
+				.startsWith("Event fired at " + TARGET + ':' + probeLine)
+				.contains("fast_breakpoint=" + id + ", condition true", "Captured at the hit: 7");
+			assertThat(tools.jdwp_get_breakpoint_context(null, null)).contains("Captured at the hit: 7");
+			assertThat(tools.jdwp_get_events(null)).contains("Captured at the hit: 7", "FIELD_BREAKPOINT_SUPPRESSED");
+			assertThat(stoppedThread().frame(0).location().method().name())
+				.as("stopped in the user's frame").isEqualTo("compute");
+			assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
+			assertBytecodeRestored();
+			assertThat(tools.jdwp_overview("fast_breakpoint", null, null)).contains("PENDING, spent");
+			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
+				&& "true".equals(e.details().get("armingHit")) && "7".equals(e.details().get("capture")));
 
-		tools.jdwp_resume();
-		assertThat(tools.jdwp_clear_breakpoint(id)).contains("never modified");
-		assertBytecodeRestored();
+			tools.jdwp_resume();
+			assertThat(tools.jdwp_clear_breakpoint(id)).contains("never modified");
+			assertBytecodeRestored();
+		} finally {
+			tools.jdwp_clear_breakpoint(watchId);
+		}
 	}
 
-	/** A fast stop also records the user site for replies that can no longer read its frames. */
+	/** Checks the published user site and application frames of a fast stop with no capture. */
 	@Test
 	@Order(6)
 	@DisplayName("a fast stop is inspected at the user's frame: stack, locals, evaluation, set_local, and a step")
@@ -249,7 +278,7 @@ class FastBreakpointLiveTest {
 		// suspendPolicy=thread: after a step from a stop-all stop, today's blind jdwp_resume leaves the other
 		// threads one suspension behind (issue #45).
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		final SuspensionSession suspended = Objects.requireNonNull(session.tracker.suspensionSession());
 		final SuspensionSession.NextStop stop = suspended.nextStop(TIMEOUT.toMillis());
 		assertThat(stop.outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
@@ -349,12 +378,13 @@ class FastBreakpointLiveTest {
 		}
 	}
 
+	/** Checks that clearing a fast breakpoint defers bytecode restoration until the held frame is released. */
 	@Test
 	@Order(9)
 	@DisplayName("clear while a thread is stopped in the method: disabled at once, the class restored once the stop is released")
 	void clearWhileStoppedRestoresAfterTheRelease() throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		final ThreadReference stopped = stoppedThread();
 
@@ -374,12 +404,13 @@ class FastBreakpointLiveTest {
 		assertThat(eventTypes()).contains("FAST_BREAKPOINT_DISARMED");
 	}
 
+	/** Checks that resetting the session completes an outstanding bytecode restoration. */
 	@Test
 	@Order(10)
 	@DisplayName("jdwp_reset completes a removal still waiting for a stopped thread: it releases every stop as well")
 	void resetCompletesAPendingRemoval() throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		assertThat(tools.jdwp_clear_breakpoint(id)).contains("disabled now");
 
@@ -396,6 +427,7 @@ class FastBreakpointLiveTest {
 		});
 	}
 
+	/** Checks watcher attachment and evaluation from the stopped application frame. */
 	@Test
 	@Order(11)
 	@DisplayName("watchers by fast ID: refused on a fast logpoint, evaluated at the fast stop in both scopes, removed by clear")
@@ -406,7 +438,7 @@ class FastBreakpointLiveTest {
 		assertThat(tools.jdwp_clear_breakpoint(logpoint)).contains("cleared");
 
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		// The other worker keeps running. Use a cached boxed result so it stays reachable for formatting.
 		final String expression = "(doubled & 1) == 0";
 		assertThat(tools.jdwp_attach_watcher(id, "doubled is even", expression)).startsWith("✓ Watcher [");
@@ -430,6 +462,7 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** Checks that clearing two probes in one class restores the class after the hold ends. */
 	@Test
 	@Order(12)
 	@DisplayName("two cleared entries of one class wait for the same stopped thread; its release restores the class")
@@ -438,7 +471,7 @@ class FastBreakpointLiveTest {
 			null));
 		await("the fast logpoint armed", () -> state(logpoint) == FastLogpointService.State.ARMED);
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		final ThreadReference stopped = stoppedThread();
 
@@ -457,16 +490,17 @@ class FastBreakpointLiveTest {
 		assertThat(eventTypes()).contains("FAST_LOGPOINT_DISARMED", "FAST_BREAKPOINT_DISARMED");
 	}
 
+	/** Checks that re-arming after a condition error admits a later error stop. */
 	@Test
 	@Order(13)
 	@DisplayName("re-arming a breakpoint whose first hit failed reopens its error gate: the next failure stops again")
 	void reArmAfterAFailedFirstHit() throws Exception {
 		final String condition = "10 / (i - i) == 0";
-		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null));
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition failed:");
 		assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
 
-		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null, null))
 			.contains("still waits for its first hit").contains("re-armed");
 		tools.jdwp_resume();
 		assertThat(waitForStop()).as("the reopened error gate stops the next failure")
@@ -476,12 +510,13 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** Checks that stepping from either kind of probe stop lands in application code. */
 	@Test
 	@Order(14)
 	@DisplayName("a step into from a fast stop, true or failed, lands in the user's code, never in the probe's helpers")
 	void stepIntoFromAFastStopLandsInTheUsersCode() throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
-			null, null));
+			null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		final long trueStop = stoppedThread().uniqueID();
 		tools.jdwp_step_into(trueStop);
@@ -493,12 +528,205 @@ class FastBreakpointLiveTest {
 
 		// The first hit is false and installs the probe; a later one fails inside it.
 		final int failing = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine,
-			"i % 2000000 == 1999999 && 10 / (i - i) == 0", true, "thread", null, null));
-		assertThat(waitForStop()).contains("fast_breakpoint=" + failing + ", condition failed:");
+			"i % 2000000 == 1999999 && 10 / (i - i) == 0", true, "thread", null, null, "i"));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + failing + ", condition failed:")
+			.doesNotContain("Captured at the hit:");
 		assertThat(state(failing)).as("the failure came through the probe").isEqualTo(FastLogpointService.State.ARMED);
 		final long errorStop = stoppedThread().uniqueID();
 		tools.jdwp_step_into(errorStop);
 		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':').contains("via=step");
+	}
+
+	/** Checks that an installed probe reports the same capture in stop, context and history replies. */
+	@Test
+	@Order(15)
+	@DisplayName("the probe delivers the hit's capture in the stop, context and history")
+	void capturesTheHit() throws Exception {
+		final String condition = "i % 2000000 == 1999999";
+		final String capture = "{ return \"remainder=\" + (i % 2000000) + \" base=\" + (this.base + _this - (i & 1))"
+			+ " + \" thread=\" + Thread.currentThread().getName(); }";
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, "thread",
+			null, null, capture));
+		final String stop = waitForStop();
+		assertThat(state(id)).isEqualTo(FastLogpointService.State.ARMED);
+		final String value = "remainder=1999999 base=7 thread=" + stoppedThread().name();
+		assertThat(stop).contains("fast_breakpoint=" + id + ", condition true", "Captured at the hit: " + value);
+		assertThat(tools.jdwp_get_breakpoint_context(null, null)).contains("Captured at the hit: " + value);
+		assertThat(tools.jdwp_get_events(null)).contains("Captured at the hit: " + value);
+		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
+			&& value.equals(e.details().get("capture")));
+		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, "thread", null, null, "i"))
+			.startsWith("Error: fast breakpoint " + id + " is already set").contains("capture:");
+	}
+
+	/** Checks that an installed probe reports a thrown capture error on a true stop. */
+	@Test
+	@Order(16)
+	@DisplayName("a capture error leaves the true stop intact and appears in the report")
+	void captureFailureStillStops() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999",
+			true, "thread", null, null, "{ throw new AssertionError(\"capture broke\"); }"));
+		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true",
+			"Captured at the hit: capture failed: java.lang.AssertionError: capture broke");
+		assertThat(state(id)).isEqualTo(FastLogpointService.State.ARMED);
+		assertThat(counters(id).errors()).isZero();
+		assertThat(tools.jdwp_get_breakpoint_context(null, null)).contains("capture broke");
+	}
+
+	/** Checks capture metadata after reconnect and restores the leftover probe's class. */
+	@Test
+	@Order(17)
+	@DisplayName("a leftover fast breakpoint keeps its capture description and can be disabled and restored")
+	void recoversCaptureProbe() throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0",
+			true, "thread", null, null, "doubled + 5"));
+		await("the capture probe to arm", () -> state(id) == FastLogpointService.State.ARMED);
+		fastLogpoints.forgetAll();
+		connection.disconnect();
+		session.reattach();
+		assertThat(connection.takeAttachNotice()).contains("RECOVERED", "capture=\"doubled + 5\"");
+		final FastLogpointService.Info recovered = fastLogpoints.list().get(0);
+		assertThat(recovered.state()).isEqualTo(FastLogpointService.State.RECOVERED);
+		assertThat(tools.jdwp_overview("fast_breakpoint", "doubled + 5", null))
+			.contains("RECOVERED", "capture=\"doubled + 5\"");
+		assertThat(tools.jdwp_clear_breakpoint(recovered.id())).contains("disabled");
+		assertThat(tools.jdwp_restore_fast_logpoints(recovered.id(), true)).startsWith("Restored the class file of " + TARGET);
+		assertBytecodeRestored();
+	}
+
+	/** Checks that capture errors on arming hits still leave every-hit mode ready for the next stop. */
+	@Order(18)
+	@ParameterizedTest
+	@CsvSource(delimiter = '|', value = {
+		"{ throw new AssertionError(\"arming broke\"); } | java.lang.AssertionError: arming broke",
+		"unknownCaptureVariable | unknownCaptureVariable"
+	})
+	@DisplayName("a failure while capturing an arming hit still stops and leaves every-hit mode armed")
+	void armingCaptureFailureStillStops(String capture, String error) throws Exception {
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i >= 0", true, "thread", false,
+			null, capture));
+		for (int hit = 0; hit < 2; hit++) {
+			assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true",
+				"Captured at the hit: capture failed:", error);
+			assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
+		}
+		assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
+			&& "true".equals(e.details().get("armingHit"))
+			&& e.details().getOrDefault("capture", "").startsWith("capture failed:"));
+		assertBytecodeRestored();
+	}
+
+	/** Checks that arming capture uses the probe display limit and preserves surrogate pairs. */
+	@Test
+	@Order(19)
+	@DisplayName("arming capture applies the probe's limit and preserves surrogate pairs")
+	void boundsArmingCapture() throws Exception {
+		final String prefix = "x".repeat(FastLogpointProbeSource.MAX_METADATA_CHARS - 1);
+		tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i >= 0", true, "thread", null, null,
+			"\"x\".repeat(" + prefix.length() + ") + \"😀!\"");
+		assertThat(waitForStop()).contains("Captured at the hit: " + prefix + FastLogpointProbeSource.TRUNCATION_MARKER)
+			.doesNotContain("😀");
+	}
+
+	/** Checks that a capture compile error becomes a diagnostic at successive installed-probe stops. */
+	@Test
+	@Order(20)
+	void invalidCaptureStillInstallsAndReportsAtEveryStop() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		final ClassType target = (ClassType) vm.classesByName(TARGET).get(0);
+		final Field stopField = target.fieldByName("captureTestStop");
+		final String condition = TARGET + ".captureTestStop";
+		final String capture = "unknownCaptureVariable";
+		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, "all", true, null,
+			capture));
+		await("capture failure leaves the pending state", () -> state(id) != FastLogpointService.State.PENDING);
+		assertThat(state(id)).isEqualTo(FastLogpointService.State.ARMED);
+		target.setValue(stopField, vm.mirrorOf(true));
+		try {
+			for (int hit = 0; hit < 2; hit++) {
+				assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true",
+					"Captured at the hit: capture failed:", capture);
+				if (hit == 0) {
+					assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, "all", true, null,
+						capture)).contains("re-armed");
+				}
+			}
+			assertThat(counters(id).errors()).isZero();
+		} finally {
+			target.setValue(stopField, vm.mirrorOf(false));
+		}
+	}
+
+	/** Checks that a shared event set retains the ordinary stop ID and reports the fast capture. */
+	@Test
+	@Order(21)
+	void ordinaryStopKeepsTheCaptureOfTheCoLocatedFastBreakpoint() throws Exception {
+		final VirtualMachine vm = connection.getVM();
+		vm.suspend();
+		final int ordinaryId;
+		final int fastId;
+		try {
+			ordinaryId = idOf(tools.jdwp_set_breakpoint(TARGET, probeLine, "all", null, null, null, null));
+			fastId = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "true", true, "all", true, null,
+				"\"arming-value\""));
+		} finally {
+			vm.resume();
+		}
+		try {
+			final String capture = "Captured at the hit (fast_breakpoint=" + fastId + "): arming-value";
+			assertThat(waitForStop()).contains("breakpoint=" + ordinaryId + ")", capture);
+			assertThat(tools.jdwp_get_breakpoint_context(null, false)).contains("breakpoint=" + ordinaryId + ")", capture);
+			assertThat(tools.jdwp_get_events(null)).contains("Fast breakpoint " + fastId + " hit", "Captured at the hit: arming-value");
+			assertThat(history.getRecent(EventHistory.MAX_EVENTS)).anyMatch(e -> "FAST_BREAKPOINT".equals(e.type())
+				&& Integer.toString(fastId).equals(e.details().get("breakpointId"))
+				&& "arming-value".equals(e.details().get("capture")));
+		} finally {
+			tools.jdwp_clear_breakpoint(ordinaryId);
+		}
+	}
+
+	/** Forces target GC after invocation and checks that the arming result remains readable. */
+	@Test
+	@Order(22)
+	void armingResultSurvivesGarbageCollectionBeforeTheDebuggerCopiesIt() throws Exception {
+		try (LiveSession gcSession = LiveSession.start(List.of("-XX:+UseSerialGC"))) {
+			final ReferenceType target = gcSession.connection.getVM().classesByName(TARGET).get(0);
+			final Field collections = target.fieldByName("captureTestCollections");
+			final AtomicInteger evaluated = new AtomicInteger();
+			final AtomicReference<String> collected = new AtomicReference<>("evaluation hook did not run");
+			final Logger logger = (Logger) LoggerFactory.getLogger(JdiExpressionEvaluator.class);
+			final AppenderBase<ILoggingEvent> collectAfterInvoke = new AppenderBase<>() {
+				/** Triggers target GC from the dispatcher log callback after the capture invocation. */
+				@Override
+				protected void append(ILoggingEvent event) {
+					if (!event.getMessage().startsWith("[Evaluator] Expression evaluated in")
+						|| evaluated.incrementAndGet() != 2) {
+						return;
+					}
+					try {
+						gcSession.process.getOutputStream().write('G');
+						gcSession.process.getOutputStream().flush();
+						await("target garbage collection", Duration.ofSeconds(5),
+							() -> ((IntegerValue) target.getValue(collections)).value() == 1);
+						collected.set("completed");
+					} catch (Exception | AssertionError failure) {
+						collected.set(failure.toString());
+					}
+				}
+			};
+			collectAfterInvoke.start();
+			logger.addAppender(collectAfterInvoke);
+			try {
+				idOf(gcSession.tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "true", true, "thread", true,
+					null, "label + \"-snapshot\""));
+				final String stop = gcSession.tools.jdwp_resume_until_event(20_000);
+				assertThat(collected.get()).isEqualTo("completed");
+				assertThat(stop).containsPattern("Captured at the hit: v-?\\d+-snapshot");
+			} finally {
+				logger.detachAppender(collectAfterInvoke);
+				collectAfterInvoke.stop();
+			}
+		}
 	}
 
 	// ── helpers ──
@@ -613,8 +841,14 @@ class FastBreakpointLiveTest {
 			.allSatisfy((method, code) -> assertThat(code).as(method).isEqualTo(originalBytecode.get(method)));
 	}
 
+	/** Waits for the stated condition using the suite's default timeout. */
 	private void await(String what, BooleanSupplier condition) throws Exception {
-		final long deadline = System.nanoTime() + TIMEOUT.toNanos();
+		await(what, TIMEOUT, condition);
+	}
+
+	/** Polls until the condition holds or throws an assertion error with recent events when the timeout expires. */
+	private void await(String what, Duration timeout, BooleanSupplier condition) throws Exception {
+		final long deadline = System.nanoTime() + timeout.toNanos();
 		while (System.nanoTime() < deadline) {
 			if (condition.getAsBoolean()) {
 				return;

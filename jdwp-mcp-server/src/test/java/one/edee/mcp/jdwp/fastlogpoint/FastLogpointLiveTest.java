@@ -222,6 +222,7 @@ class FastLogpointLiveTest {
 		assertThat(survivor.isEnabled()).isFalse();
 	}
 
+	/** Checks restoration after reset and after reconnecting to the same target. */
 	@Test
 	@Order(7)
 	@DisplayName("jdwp_reset, jdwp_disconnect and jdwp_reconnect restore the original bytecode")
@@ -232,7 +233,7 @@ class FastLogpointLiveTest {
 
 		awaitArmed(idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null)));
 		connection.disconnect();
-		reattach();
+		session.reattach();
 		assertBytecodeRestored();
 
 		awaitArmed(idOf(tools.jdwp_set_fast_logpoint(TARGET, probeLine, "i", "i < 0", true, null, null)));
@@ -382,6 +383,7 @@ class FastLogpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** Checks recovery, disable and approved restoration of leftovers after a crash. */
 	@Test
 	@Order(13)
 	@DisplayName("fast logpoints of a server that died are listed on the next attach, disabled, and restored on approval")
@@ -420,7 +422,7 @@ class FastLogpointLiveTest {
 		assertBytecodeRestored();
 
 		connection.disconnect();
-		reattach();
+		session.reattach();
 		assertThat(connection.takeAttachNotice()).as("nothing is left after the restore").isEmpty();
 		assertThat(fastLogpoints.list()).isEmpty();
 	}
@@ -576,7 +578,7 @@ class FastLogpointLiveTest {
 	private void simulateServerCrash() throws Exception {
 		fastLogpoints.forgetAll();
 		connection.disconnect();
-		reattach();
+		session.reattach();
 	}
 
 	/**
@@ -624,28 +626,6 @@ class FastLogpointLiveTest {
 	private static byte[] targetClassFile() throws Exception {
 		return Files.readAllBytes(Path.of(FastLogpointTarget.class.getProtectionDomain()
 			.getCodeSource().getLocation().toURI()).resolve(TARGET.replace('.', '/') + ".class"));
-	}
-
-	/**
-	 * Re-attaches after a detach. The target's JDWP agent takes a moment to listen again, and an
-	 * attach that lands while it is still tearing down the previous session is dropped right away —
-	 * so a connection only counts once it is still answering a little later.
-	 */
-	private void reattach() throws Exception {
-		final long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-		while (true) {
-			try {
-				connection.connect("127.0.0.1", port);
-				Thread.sleep(300);
-				connection.getVM().allThreads();
-				return;
-			} catch (Exception notYet) {
-				if (System.nanoTime() > deadline) {
-					throw notYet;
-				}
-				Thread.sleep(100);
-			}
-		}
 	}
 
 	private void awaitArmed(int id) throws Exception {

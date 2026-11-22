@@ -112,6 +112,8 @@ public class FastLogpointService {
      * Capacity of a fast breakpoint probe's ring, which records condition failures only.
      */
     public static final int BREAKPOINT_ERROR_BUFFER_SIZE = 256;
+    /** Event history detail holding a fast breakpoint's rendered capture. */
+    public static final String CAPTURE_DETAIL = "capture";
     /**
      * Upper bound for one teardown ({@link #disarmAll}) or discovery ({@link #discover}).
      */
@@ -289,14 +291,17 @@ public class FastLogpointService {
      * {@code location}, with {@code suspendPolicy}, whose first hit evaluates the condition through
      * the debugger and then either stops or arms the probe (see {@link #handleArmingHit}).
      *
+     * @param capture       optional expression the probe evaluates before stopping on a true hit
      * @param suspendPolicy {@link EventRequest#SUSPEND_ALL} or {@link EventRequest#SUSPEND_EVENT_THREAD};
      *                      used by the arming request and by the probe's stop request
      * @param stopOnce      whether only the first true hit of an epoch stops
      * @return the new fast breakpoint's ID (shared ID space with every other breakpoint kind)
      */
-    public synchronized int registerBreakpoint(VirtualMachine vm, Location location, String condition, boolean stopOnce,
-                                               int suspendPolicy, int bufferSize) {
-        return registerEntry(vm, location, Kind.BREAKPOINT, "", condition, bufferSize, suspendPolicy, stopOnce);
+    public synchronized int registerBreakpoint(VirtualMachine vm, Location location, String condition,
+                                               @Nullable String capture, boolean stopOnce, int suspendPolicy,
+                                               int bufferSize) {
+        return registerEntry(vm, location, Kind.BREAKPOINT, Objects.requireNonNullElse(capture, ""), condition,
+            bufferSize, suspendPolicy, stopOnce);
     }
 
     private int registerEntry(VirtualMachine vm, Location location, Kind kind, String expression,
@@ -601,7 +606,7 @@ public class FastLogpointService {
      * release the thread (issue #45) — and the arm fails with this reason instead of reporting a
      * condition error for a running thread.
      */
-    private static void requireStillSuspended(ThreadReference thread, Exception failure) throws FastLogpointException {
+    private static void requireStillSuspended(ThreadReference thread, Throwable failure) throws FastLogpointException {
         if (!isSuspended(thread)) {
             throw new FastLogpointException("the thread was resumed while its arming hit was evaluated: "
                 + describe(failure));
@@ -646,7 +651,7 @@ public class FastLogpointService {
             return false;
         }
         final ThreadReference thread = event.thread();
-        final StopArguments stop = stopArguments(thread);
+        final StopArguments stop = stopArguments(thread, true);
         final Location location = userLocation(thread, event.location());
         synchronized (this) {
             if (logpoints.get(flp.id) != flp || flp.stopRequest != request) {
@@ -671,7 +676,7 @@ public class FastLogpointService {
                 reason = CONDITION_TRUE;
             }
             final String uncertainty = generation == StopGeneration.UNCERTAIN ? " (gate generation uncertain)" : "";
-            publishStop(flp, thread, location, reason + uncertainty, false);
+            publishStop(flp, thread, location, reason + uncertainty, false, stop != null ? stop.captured() : null);
             return true;
         }
     }
@@ -689,7 +694,7 @@ public class FastLogpointService {
             return;
         }
         final ThreadReference thread = event.thread();
-        final StopArguments stop = stopArguments(thread);
+        final StopArguments stop = stopArguments(thread, false);
         eventHistory.record(new EventHistory.DebugEvent("FAST_BREAKPOINT_SUPPRESSED",
             String.format("[FastBreakpoint %d] hit on thread %s inside an expression evaluation — not stopped",
                 flp.id, thread.name()),
@@ -1309,6 +1314,7 @@ public class FastLogpointService {
             + " — they stay listed as STRANDED, disabled (jdwp_overview says why).";
     }
 
+    /** Returns the restore consent briefing with the affected probes and their expressions. */
     private static String restoreBriefing(FastLogpoint flp, List<FastLogpoint> group, GenerationRecord record) {
         final StringBuilder out = new StringBuilder("RESTORE NOT PERFORMED — this needs the user's explicit approval.\n\n")
             .append("jdwp_restore_fast_logpoints redefines ").append(flp.className()).append(" (loader ")
@@ -1316,7 +1322,7 @@ public class FastLogpointService {
             .append(flp.armedBy).append(", ").append(Instant.ofEpochMilli(flp.armedAt)).append("). It removes:\n");
         for (FastLogpoint member : group) {
             out.append("  #").append(member.id).append(" line ").append(member.line).append(" in ")
-                .append(member.methodName).append(" — expr=\"").append(member.expression).append('"')
+                .append(member.methodName).append(" — ").append(describeUserText(member))
                 .append(member.enabled ? " [evaluating]" : " [kill switch set]").append('\n');
         }
         out.append("\nWhat is checked, and what is not:\n")
@@ -1614,8 +1620,11 @@ public class FastLogpointService {
         expressionEvaluator.configureCompilerClasspathForEvent(thread);
         if (flp.kind == Kind.LOGPOINT) {
             logArmingHit(flp, thread, location);
-        } else if (evaluateArmingHit(flp, thread, location)) {
-            return true;
+        } else {
+            final BreakpointArmingHit hit = evaluateArmingHit(flp, thread, location);
+            if (hit != BreakpointArmingHit.INSTALL) {
+                return hit == BreakpointArmingHit.STOPPED;
+            }
         }
         final Set<String> changed = Set.of(method.name() + method.signature());
         synchronized (this) {
@@ -1652,7 +1661,7 @@ public class FastLogpointService {
         final DefinedProbe deferred = flp.deferredProbe;
         final DefinedProbe probe = deferred != null ? deferred : retryTransient(
             () -> compileAndDefineProbe(flp, vm, thread, refType, loader, includeThis));
-        final ProbeInstrumenter.ProbeSite site = buildSite(flp, method, probe, point);
+        final ProbeInstrumenter.ProbeSite site = buildSite(flp, method, probe, point, includeThis);
 
         // 4. Install — under the monitor, after re-checking that nobody cleared the logpoint meanwhile.
         synchronized (this) {
@@ -1766,7 +1775,7 @@ public class FastLogpointService {
     /**
      * Logs the arming hit itself through the debugger: the arming thread runs the pre-instrumentation
      * code, so without this the very hit that triggered arming — possibly the rare one the user is
-     * waiting for — would be lost.
+     * waiting for — would be lost. Runs on the dispatcher and propagates pending discovery to defer arming.
      */
     private void logArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
         throws FastLogpointException, LocalClasspathPendingException {
@@ -1774,19 +1783,19 @@ public class FastLogpointService {
             flp.className(), flp.line, thread.name());
         try {
             if (flp.condition != null) {
-                final Value passed = expressionEvaluator.evaluate(thread.frame(0), flp.condition);
-                final Boolean result = asBoolean(passed);
-                if (result == null) {
-                    recordArmingHit(flp, "FAST_LOGPOINT_ERROR", "condition did not evaluate to a boolean: "
-                        + renderArmingValue(passed), context, thread);
+                final ArmingCondition result = expressionEvaluator.readArmingResult(thread.frame(0), flp.condition,
+                    FastLogpointService::readArmingCondition);
+                if (result.error() != null) {
+                    recordArmingHit(flp, "FAST_LOGPOINT_ERROR", result.error(), context, thread);
                     return;
                 }
-                if (!result) {
+                if (!result.passed()) {
                     return;
                 }
             }
-            final Value value = expressionEvaluator.evaluate(thread.frame(0), flp.expression);
-            recordArmingHit(flp, "FAST_LOGPOINT", renderArmingValue(value), context, thread);
+            final String value = expressionEvaluator.readArmingResult(thread.frame(0), flp.expression,
+                FastLogpointService::renderArmingValue);
+            recordArmingHit(flp, "FAST_LOGPOINT", value, context, thread);
         } catch (LocalClasspathPendingException pending) {
             throw pending;
         } catch (Exception e) {
@@ -1882,6 +1891,21 @@ public class FastLogpointService {
             }
         }
         return null;
+    }
+
+    /**
+     * Copies the condition result on the dispatcher while the target still retains it.
+     * Returns the boolean or a diagnostic when the value has a different type or is absent.
+     */
+    private static ArmingCondition readArmingCondition(@Nullable Value value) {
+        final Boolean result = asBoolean(value);
+        return result == null
+            ? new ArmingCondition(false, "condition did not evaluate to a boolean: " + renderArmingValue(value))
+            : new ArmingCondition(result, null);
+    }
+
+    /** Copied arming result with an optional diagnostic when condition evaluation failed. */
+    private record ArmingCondition(boolean passed, @Nullable String error) {
     }
 
     /**
@@ -2199,7 +2223,8 @@ public class FastLogpointService {
             ? expressionEvaluator.compileFastLogpointProbe(thread.frame(0), includeThis, probePackage, flp.expression,
             flp.condition, flp.bufferSize, metadata)
             : expressionEvaluator.compileFastBreakpointProbe(thread.frame(0), includeThis, probePackage,
-            Objects.requireNonNull(flp.condition), flp.stopOnce, flp.bufferSize, metadata);
+            Objects.requireNonNull(flp.condition), flp.expression.isEmpty() ? null : flp.expression,
+            flp.stopOnce, flp.bufferSize, metadata);
         final ClassType type;
         try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
             type = RemoteCodeExecutor.defineAndInitialize(vm, thread, loader, compiled.className(), compiled.bytecode());
@@ -2238,7 +2263,7 @@ public class FastLogpointService {
      * slots, checking each against the {@code LocalVariableTable} at the insertion point.
      */
     private static ProbeInstrumenter.ProbeSite buildSite(FastLogpoint flp, Method method, DefinedProbe probe,
-                                                         ProbeInstrumenter.InsertionPoint point)
+                                                         ProbeInstrumenter.InsertionPoint point, boolean includeThis)
         throws FastLogpointException {
         final String hitDescriptor = ProbeInstrumenter.methodDescriptor(probe.compiled().bytecode(),
             FastLogpointProbeSource.HIT_METHOD);
@@ -2251,7 +2276,7 @@ public class FastLogpointService {
         for (int i = 0; i < names.size(); i++) {
             final String name = names.get(i);
             final Type parameterType = parameterTypes[i];
-            if ("_this".equals(name)) {
+            if (includeThis && i == 0) {
                 if (point.staticMethod()) {
                     throw new FastLogpointException("probe expects `this`, but " + method.name() + " is static");
                 }
@@ -3046,18 +3071,20 @@ public class FastLogpointService {
      * @return the report and whether re-arming succeeded, or {@code null} when there is no matching location
      */
     @Nullable
-    public synchronized RearmResult rearmBreakpoint(Location location, String condition, boolean stopOnce,
-                                                     int suspendPolicy) {
+    public synchronized RearmResult rearmBreakpoint(Location location, String condition, @Nullable String capture,
+                                                     boolean stopOnce, int suspendPolicy) {
         for (FastLogpoint flp : logpoints.values()) {
             if (flp.kind != Kind.BREAKPOINT || flp.isLeftover() || flp.state == State.REMOVAL_PENDING
                 || !flp.refType.equals(location.declaringType()) || flp.line != location.lineNumber()) {
                 continue;
             }
-            if (!condition.equals(flp.condition) || flp.stopOnce != stopOnce || flp.suspendPolicy != suspendPolicy) {
+            if (!condition.equals(flp.condition) || !flp.expression.equals(Objects.requireNonNullElse(capture, ""))
+                || flp.stopOnce != stopOnce || flp.suspendPolicy != suspendPolicy) {
                 final String message = String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
-                        + "(condition: %s, %s, suspendPolicy: %s) — clear it with jdwp_clear_breakpoint(%d) first, or call "
+                        + "(condition: %s, capture: %s, %s, suspendPolicy: %s) — clear it with jdwp_clear_breakpoint(%d) first, or call "
                         + "again with exactly its parameters to re-arm it.", flp.id, flp.className(), flp.line,
-                    flp.condition, modeLabel(flp.stopOnce), policyLabel(flp.suspendPolicy), flp.id);
+                    flp.condition, flp.expression.isEmpty() ? "none" : flp.expression,
+                    modeLabel(flp.stopOnce), policyLabel(flp.suspendPolicy), flp.id);
                 return new RearmResult(message, false);
             }
             switch (flp.state) {
@@ -3234,76 +3261,116 @@ public class FastLogpointService {
     }
 
     /**
-     * The fast breakpoint's arming hit, evaluated through the debugger: this execution runs the old
-     * code, so the probe never sees it. A hit that stops (the condition holds or fails, and its gate
-     * is open) is published at once and installs nothing — redefining the method now would leave this
-     * stopped frame in an obsolete method without locals. Any other hit installs the probe. Runs
-     * outside the monitor apart from the gate decision; never invokes under it.
-     *
-     * @return whether the hit was published as a stop
+     * On the dispatcher, evaluates the condition and any admitted capture outside the monitor.
+     * Returns whether the hit stopped, should install, or no longer applies. Throws
+     * {@link LocalClasspathPendingException} to defer arming and {@link FastLogpointException} if the thread resumes.
      */
-    private boolean evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
+    private BreakpointArmingHit evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
         throws FastLogpointException, LocalClasspathPendingException {
-        String error = null;
-        boolean passed = false;
+        ArmingCondition condition;
         try {
-            final Value value = expressionEvaluator.evaluate(thread.frame(0), Objects.requireNonNull(flp.condition));
-            final Boolean result = asBoolean(value);
-            if (result == null) {
-                error = "condition did not evaluate to a boolean: " + renderArmingValue(value);
-            } else {
-                passed = result;
-            }
+            condition = expressionEvaluator.readArmingResult(thread.frame(0), Objects.requireNonNull(flp.condition),
+                FastLogpointService::readArmingCondition);
         } catch (LocalClasspathPendingException pending) {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            error = describe(e);
+            condition = new ArmingCondition(false, describe(e));
         }
+        final String error = condition.error();
+        final int epoch;
+        final int previousClaimedEpoch;
         synchronized (this) {
             if (logpoints.get(flp.id) != flp || flp.state != State.PENDING) {
-                return false;
+                return BreakpointArmingHit.SKIP;
             }
             if (error != null) {
                 recordArmingError(flp, error, thread);
                 if (flp.errorClaimedEpoch >= flp.errorEpoch) {
-                    return false;
+                    return BreakpointArmingHit.INSTALL;
                 }
                 flp.errorClaimedEpoch = flp.errorEpoch;
-                publishStop(flp, thread, location, CONDITION_FAILED + error, true);
+                publishStop(flp, thread, location, CONDITION_FAILED + error, true, null);
                 rearm(flp);
-                return true;
+                return BreakpointArmingHit.STOPPED;
             }
-            if (!passed) {
-                return false;
+            if (!condition.passed() || (flp.stopOnce && flp.claimedEpoch >= flp.epoch)) {
+                return BreakpointArmingHit.INSTALL;
             }
-            if (!flp.stopOnce) {
-                publishStop(flp, thread, location, CONDITION_TRUE, true);
-                rearm(flp);
-                return true;
+            epoch = flp.epoch;
+            previousClaimedEpoch = flp.claimedEpoch;
+            if (flp.stopOnce) {
+                // Spent before it was ever installed: no arming until a re-arm opens the next epoch.
+                flp.claimedEpoch = epoch;
+                deleteArmingRequest(flp);
             }
-            if (flp.claimedEpoch >= flp.epoch) {
-                return false;
+            if (flp.expression.isEmpty()) {
+                return publishTrueArmingStop(flp, thread, location, null);
             }
-            // Spent before it was ever installed: no arming until a re-arm opens the next epoch.
-            flp.claimedEpoch = flp.epoch;
-            deleteArmingRequest(flp);
-            publishStop(flp, thread, location, CONDITION_TRUE, true);
-            return true;
+        }
+        final String captured;
+        try {
+            captured = evaluateArmingCapture(flp, thread);
+        } catch (LocalClasspathPendingException pending) {
+            synchronized (this) {
+                if (flp.stopOnce && flp.epoch == epoch) {
+                    // No stop was published. Leave this generation eligible on the next arming hit.
+                    flp.claimedEpoch = previousClaimedEpoch;
+                }
+            }
+            throw pending;
+        }
+        synchronized (this) {
+            if (logpoints.get(flp.id) != flp || flp.state != State.PENDING
+                || (flp.stopOnce && flp.epoch != epoch)) {
+                return BreakpointArmingHit.SKIP;
+            }
+            return publishTrueArmingStop(flp, thread, location, captured);
         }
     }
 
     /**
+     * Evaluates the capture of a true arming hit through the debugger, on the dispatcher, with the same
+     * rendering as the installed probe. Returns the value or {@code capture failed: …} text.
+     * Throws if local discovery is pending or the event thread has resumed.
+     */
+    private String evaluateArmingCapture(FastLogpoint flp, ThreadReference thread)
+        throws FastLogpointException, LocalClasspathPendingException {
+        try {
+            // The condition's invocation invalidated its frame. The evaluator acquires a new lease.
+            return expressionEvaluator.evaluateCapture(thread.frame(0), flp.expression, probePackage(flp.className()));
+        } catch (LocalClasspathPendingException pending) {
+            throw pending;
+        } catch (Exception | LinkageError e) {
+            requireStillSuspended(thread, e);
+            return FastBreakpointProbeSource.captureFailure(describe(e));
+        }
+    }
+
+    /**
+     * Publishes a true arming hit and keeps every-hit mode listening. Caller holds the monitor.
+     */
+    private BreakpointArmingHit publishTrueArmingStop(FastLogpoint flp, ThreadReference thread, Location location,
+                                                      @Nullable String captured) {
+        publishStop(flp, thread, location, CONDITION_TRUE, true, captured);
+        if (!flp.stopOnce) {
+            rearm(flp);
+        }
+        return BreakpointArmingHit.STOPPED;
+    }
+
+    /**
      * Publishes a fast-breakpoint stop the way the listener publishes a breakpoint hit: the tracker
-     * snapshot with the user-code location, then the {@code FAST_BREAKPOINT} history entry, then
+     * snapshot with the user-code location and capture, then the {@code FAST_BREAKPOINT} history entry, then
      * the next-event latch. Caller holds the monitor.
      *
      * @param location   the user's location (the first frame below the probe's)
      * @param reason     why it stopped, as the stop report shows it
      * @param armingHit  whether the hit was evaluated through the debugger
+     * @param captured   the rendered capture, if this stop evaluated one
      */
     private void publishStop(FastLogpoint flp, ThreadReference thread, Location location, String reason,
-                             boolean armingHit) {
+                             boolean armingHit, @Nullable String captured) {
         final String className = location.declaringType().name();
         final int line = location.lineNumber();
         final String threadName = thread.name();
@@ -3311,7 +3378,7 @@ public class FastLogpointService {
         // Per stop, not per entry: two threads held at stops of this ID at once can stop for
         // different reasons (#47 § 1).
         breakpointTracker.recordStopDetail(thread, BreakpointTracker.EventKind.BREAKPOINT, flp.id, reason);
-        breakpointTracker.setLastBreakpointThread(thread, flp.id, className + ':' + line);
+        breakpointTracker.setLastBreakpointThread(thread, flp.id, className + ':' + line, captured);
         final Map<String, String> details = new LinkedHashMap<>();
         details.put("breakpointId", String.valueOf(flp.id));
         details.put("class", className);
@@ -3321,6 +3388,9 @@ public class FastLogpointService {
         details.put("reason", reason);
         if (armingHit) {
             details.put("armingHit", "true");
+        }
+        if (captured != null) {
+            details.put(CAPTURE_DETAIL, captured);
         }
         eventHistory.record(new EventHistory.DebugEvent("FAST_BREAKPOINT",
             String.format("Fast breakpoint %d hit at %s:%d on thread %s (%s%s)", flp.id, className, line, threadName,
@@ -3537,20 +3607,22 @@ public class FastLogpointService {
     }
 
     /**
-     * The arguments of the probe's {@code stop(kind, epoch, error)} in frame 0, or {@code null} when
+     * The arguments of the probe's {@code stop()} in frame 0, or {@code null} when
      * they cannot be read. {@code getArgumentValues} needs no local-variable table. The event keeps
      * the thread suspended, so a frame invalidated by a resume elsewhere (another set's release, the
      * VM-wide suspend that enables an arming request) is read again: it is the same activation.
      */
     @Nullable
-    private static StopArguments stopArguments(ThreadReference thread) {
+    private static StopArguments stopArguments(ThreadReference thread, boolean readCapture) {
         for (int attempt = 1; attempt <= STOP_ARGUMENT_ATTEMPTS; attempt++) {
             try {
                 final List<Value> args = thread.frame(0).getArgumentValues();
-                if (args.size() == 3 && args.get(0) instanceof IntegerValue kind
+                if ((args.size() == 3 || args.size() == 4) && args.get(0) instanceof IntegerValue kind
                     && args.get(1) instanceof IntegerValue epoch) {
                     final String error = args.get(2) instanceof StringReference text ? text.value() : null;
-                    return new StopArguments(kind.value(), epoch.value(), error);
+                    final String captured = readCapture && args.size() == 4 && args.get(3) instanceof StringReference text
+                        ? text.value() : null;
+                    return new StopArguments(kind.value(), epoch.value(), error, captured);
                 }
                 return null;
             } catch (InvalidStackFrameException e) {
@@ -3620,13 +3692,14 @@ public class FastLogpointService {
      * a fast breakpoint.
      */
     private static String describeUserText(FastLogpoint flp) {
-        return flp.kind == Kind.LOGPOINT ? "expr=\"" + flp.expression + '"' : "condition=\"" + flp.condition + '"';
+        return flp.kind == Kind.LOGPOINT ? "expr=\"" + flp.expression + '"'
+            : "condition=\"" + flp.condition + '"' + (flp.expression.isEmpty() ? "" : " capture=\"" + flp.expression + '"');
     }
 
     /**
      * What a fast breakpoint probe's {@code stop()} was called with.
      */
-    private record StopArguments(int kind, int epoch, @Nullable String error) {
+    private record StopArguments(int kind, int epoch, @Nullable String error, @Nullable String captured) {
     }
 
     // ── State ──
@@ -3681,6 +3754,7 @@ public class FastLogpointService {
     /**
      * Read-only view of one fast logpoint for {@code jdwp_overview}.
      *
+     * @param expression the logpoint expression or the breakpoint capture (empty when omitted)
      * @param written    live value of the probe's sequence counter, or {@code -1} when unavailable
      * @param enabled    whether the probe's kill switch lets it evaluate, as last set or read
      * @param provenance who armed it, for leftovers of an earlier session; {@code null} for this session's
@@ -3714,6 +3788,16 @@ public class FastLogpointService {
          * Keep it suspended: the hit was published as a fast breakpoint's stop.
          */
         STOPPED
+    }
+
+    /** The dispatcher's decision after evaluating a fast breakpoint's arming hit. */
+    private enum BreakpointArmingHit {
+        /** Continue arming by installing the probe. */
+        INSTALL,
+        /** Propose a stop for publication with the event set. */
+        STOPPED,
+        /** Skip this hit without installing the probe or proposing a stop. */
+        SKIP
     }
 
     /**
@@ -3781,6 +3865,7 @@ public class FastLogpointService {
         final int line;
         final String methodName;
         final String methodSignature;
+        /** Logpoint expression or breakpoint capture (empty when omitted). */
         final String expression;
         @Nullable
         final String condition;

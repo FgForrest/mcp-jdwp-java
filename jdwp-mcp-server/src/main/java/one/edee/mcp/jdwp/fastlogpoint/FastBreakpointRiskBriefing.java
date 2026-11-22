@@ -16,11 +16,12 @@ public final class FastBreakpointRiskBriefing {
     /**
      * Renders the briefing for one target.
      *
+     * @param capture       the capture expression, or {@code null} when omitted
      * @param suspendPolicy the requested policy as the user wrote it ("all" or "thread")
      * @param targetVm      short description of the target endpoint, or {@code null} when unknown
      */
-    public static String render(String className, int lineNumber, String condition, String suspendPolicy,
-                                boolean stopOnce, boolean forceLoad, @Nullable String targetVm) {
+    public static String render(String className, int lineNumber, String condition, @Nullable String capture,
+                                String suspendPolicy, boolean stopOnce, boolean forceLoad, @Nullable String targetVm) {
         final boolean all = "all".equals(suspendPolicy);
         return "[CONSENT REQUIRED] Nothing was armed.\n"
             + "jdwp_set_fast_breakpoint rewrites the bytecode of the running application. Relay the briefing "
@@ -35,6 +36,7 @@ public final class FastBreakpointRiskBriefing {
             + "this MCP server runs.\n"
             + "Target: " + className + ':' + lineNumber
             + " — condition: " + condition
+            + (capture == null ? "" : " — capture: " + capture)
             + " — " + FastLogpointService.modeLabel(stopOnce)
             + " — suspendPolicy: " + suspendPolicy
             + " — VM: " + (targetVm != null ? targetVm : "the VM attached when the breakpoint is set") + '\n'
@@ -48,9 +50,13 @@ public final class FastBreakpointRiskBriefing {
             + "although nothing stops any more. The next debugging session lists it and can switch it off; "
             + "restoring the class then needs the user's approval again, and is impossible if the class was "
             + "changed meanwhile (until the JVM restarts). The probe keeps the class's original bytes and the "
-            + "condition text in the target's memory.\n"
+            + "condition text in the target's memory."
+            + (capture == null ? "" : " It also retains the capture text and can still evaluate it when a hit passes "
+            + "the stop gate after detach.") + "\n"
             + "2. The first hit of the line is an ordinary debugger stop that evaluates the condition. If it "
-            + "holds, that hit is the stop. Otherwise the probe is compiled and installed while "
+            + "holds, that hit is the stop."
+            + (capture == null ? "" : " On that true stop the debugger evaluates the capture on the same thread.")
+            + " Otherwise the probe is compiled and installed while "
             + (all ? "every thread is paused" : "that thread is paused")
             + " — a one-time pause of a second or more. "
             + (all ? "With a class loader that is not parallel-capable, installing can stall if a paused thread "
@@ -62,7 +68,10 @@ public final class FastBreakpointRiskBriefing {
             + "directly changes the application's latency; infinite loops and deadlocks are not caught. Private "
             + "members are not reachable (locals, this and non-private members are), and the class needs "
             + "local-variable debug info (-g).\n"
-            + "4. The thread that meets the condition stops at once"
+            + (capture == null ? "" : "   The capture runs on the application thread after a true hit passes the "
+            + "installed probe's stop gate and before the thread suspends. The same binding, thread-safety, side-effect "
+            + "and latency risks apply. A thrown capture failure is reported at the stop.\n")
+            + "4. The thread that meets the condition stops " + (capture == null ? "at once" : "after capture")
             + (all ? ", but the other threads are paused a moment later (microseconds to milliseconds) and may "
             + "have moved past the state you want to see" : "; the other threads keep running")
             + ". "

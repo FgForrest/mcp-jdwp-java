@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -53,6 +55,7 @@ class FastLogpointServiceLookupTest {
 	private int breakpointId;
 	private int logpointId;
 
+	/** Registers fast probes with mocked JDI requests for lookup and removal checks. */
 	@BeforeEach
 	void setUp() throws Exception {
 		evaluator = mock(JdiExpressionEvaluator.class);
@@ -79,7 +82,7 @@ class FastLogpointServiceLookupTest {
 			});
 			locations.put(line, location);
 		}
-		breakpointId = service.registerBreakpoint(vm, locations.get(BREAKPOINT_LINE), "total > 100", true,
+		breakpointId = service.registerBreakpoint(vm, locations.get(BREAKPOINT_LINE), "total > 100", null, true,
 			EventRequest.SUSPEND_ALL, FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
 		logpointId = service.register(vm, locations.get(LOGPOINT_LINE), "total", null, 256);
 	}
@@ -104,6 +107,7 @@ class FastLogpointServiceLookupTest {
 		assertThat(service.watcherRefusal(999)).as("left to the tracker").isNull();
 	}
 
+	/** Checks that a fast breakpoint whose arm failed is ineligible for watchers. */
 	@Test
 	@DisplayName("a fast breakpoint whose arming failed never stops, so it takes no watcher")
 	void failedBreakpointTakesNoWatcher() throws Exception {
@@ -111,7 +115,7 @@ class FastLogpointServiceLookupTest {
 		final StackFrame frame = mock(StackFrame.class);
 		when(frame.location()).thenReturn(locations.get(BREAKPOINT_LINE));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException("thread not suspended"));
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any())).thenThrow(new JdiEvaluationException("thread not suspended"));
 		when(thread.isSuspended()).thenReturn(false);
 		service.handleArmingHit(armingHit(BREAKPOINT_LINE, thread), false);
 

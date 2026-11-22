@@ -70,23 +70,26 @@ class FastProbeLifecycleLiveTest {
 		assertThat(session.tools.jdwp_clear_breakpoint(id)).contains("original bytecode of " + LATE + " restored");
 	}
 
+	/** Checks that a deferred fast breakpoint binds on class load and captures its first true stop. */
 	@Test
 	@DisplayName("a fast breakpoint on a class not loaded yet waits for it, then stops at the user's line")
 	void fastBreakpointWaitsForItsClass() throws Exception {
 		session = LiveSession.start(List.of());
 		final int line = lineOf("// MARK: late", LATE_SOURCE);
 
-		final String reply = session.tools.jdwp_set_fast_breakpoint(LATE, line, "n == 300000", true, null, null, null);
+		final String capture = "\"n=\" + n";
+		final String reply = session.tools.jdwp_set_fast_breakpoint(LATE, line, "n == 300000", true,
+			null, null, null, capture);
 		assertThat(reply).contains("WAITING: " + LATE + " is not loaded yet");
 		final int id = idOf(reply);
-		assertThat(session.tools.jdwp_set_fast_breakpoint(LATE, line, "n == 300000", true, null, null, null))
+		assertThat(session.tools.jdwp_set_fast_breakpoint(LATE, line, "n == 300000", true, null, null, null, capture))
 			.as("a second identical call does not register a duplicate").contains("already waits for");
 
 		session.loadLateTarget();
 		final String stop = session.tools.jdwp_resume_until_event(60_000);
 		// The probe frames are hidden: the reply's location is the user's line.
 		assertThat(stop).startsWith("Event fired at " + LATE + ':' + line).contains("Thread: late-worker")
-			.contains("breakpoint=" + id);
+			.contains("breakpoint=" + id, "Captured at the hit: n=300000");
 		assertThat(types()).contains("FAST_BREAKPOINT_CLASS_LOADED");
 
 		assertThat(session.tools.jdwp_reset()).contains("In-target probes cleared:      1");

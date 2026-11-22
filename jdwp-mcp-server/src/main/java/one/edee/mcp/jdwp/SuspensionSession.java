@@ -679,8 +679,23 @@ public final class SuspensionSession {
         return false;
     }
 
+    /**
+     * Publishes a held stop with the first candidate's identity and site plus all accepted captures.
+     * Called by {@link #finish} with the session monitor held.
+     */
     private void publish(Context context) {
-        final BreakpointTracker.LastBreakpoint report = context.candidates.get(0);
+        final BreakpointTracker.LastBreakpoint primary = context.candidates.get(0);
+        BreakpointTracker.LastBreakpoint report = primary;
+        if (context.candidates.size() > 1) {
+            final Map<Integer, String> captures = new LinkedHashMap<>();
+            for (BreakpointTracker.LastBreakpoint candidate : context.candidates) {
+                candidate.captures().forEach(captures::putIfAbsent);
+            }
+            if (!captures.equals(primary.captures())) {
+                report = new BreakpointTracker.LastBreakpoint(primary.thread(), primary.id(), primary.kind(),
+                    primary.sourceSite(), captures);
+            }
+        }
         context.report = new StopReport(report, report.thread().uniqueID(), safeName(report.thread()),
             stopLocation(context, report), unblockedNote(context));
         context.state = State.HELD;

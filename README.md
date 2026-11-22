@@ -443,7 +443,7 @@ On the next hit of the line the server compiles a small probe class, defines it 
 
 Because this **rewrites the running application's bytecode**, the tool requires explicit user consent. Call without `userApproved`. If there's no standing grant, the tool returns a risk briefing (instrumentation that outlives a crashed server, user code on application threads, interaction with other bytecode agents, breakpoint re-creation, two stop-the-world pauses). Relay the briefing word for word and ask the user before retrying with `userApproved=true`.
 
-Approval covers the exact probe at the same host:port while this MCP server runs. An approved retry returns a fresh briefing if the last briefing preceded attachment or named a different endpoint. The match includes probe kind, exact binary class name, line, logpoint expression and buffer capacity, condition, suspend policy, stop mode, and `forceLoad`. The briefing shows the logpoint capacity and discloses that `forceLoad=true` can run the class initializer. Loopback aliases share a grant at the same port when the attach uses a loopback address. A wildcard destination uses the resolved local address for its approval key. On later JVMs, call again without `userApproved`. The reply reports the original grant time, and the fast-probe sections of `jdwp_overview` list the grants. JVM exit, disconnect, reconnect and reset preserve the grants. An MCP server restart drops them.
+Approval covers the exact probe at the same host:port while this MCP server runs. An approved retry returns a fresh briefing if the last briefing preceded attachment or named a different endpoint. The match includes probe kind, exact binary class name, line, logpoint expression and buffer capacity, breakpoint capture, condition, suspend policy, stop mode, and `forceLoad`. The briefing shows the logpoint capacity and discloses that `forceLoad=true` can run the class initializer. Loopback aliases share a grant at the same port when the attach uses a loopback address. A wildcard destination uses the resolved local address for its approval key. On later JVMs, call again without `userApproved`. The reply reports the original grant time, and the fast-probe sections of `jdwp_overview` list the grants. JVM exit, disconnect, reconnect and reset preserve the grants. An MCP server restart drops them.
 
 If the server dies without restoring the class, the probe keeps running — but it describes itself, and the next attach finds it: the attach reply and `jdwp_overview` list it as `RECOVERED` (the class is exactly as that session left it) or `STRANDED` (it is not), with the expression and who armed it when. `jdwp_clear_breakpoint` switches a leftover off without touching the bytecode; `jdwp_restore_fast_logpoints(id, userApproved=true)` restores a `RECOVERED` class's original bytecode, with fresh approval for each restore. Nothing an earlier session left is ever restored implicitly. Arming is refused when the live bytecode differs from the class file — e.g. JaCoCo or the Mockito inline mock maker instrumented the class — because redefining from the class file would silently strip their changes. Measured on the live test target (two threads calling the instrumented method in a loop, condition never true): throughput stayed at the no-logpoint level (about 25 million calls/s on the test machine), against a few hundred calls/s — 3–7 ms per hit — under `jdwp_set_logpoint`. `jdwp_set_logpoint` stays the default; reach for the fast variant only when suspending on every hit would distort what you are looking at.
 
@@ -456,6 +456,7 @@ jdwp_set_fast_breakpoint(
   className="com.example.OrderService",
   lineNumber=42,
   condition="order.getTotal() < 0",
+  capture="order.getTotal()",
   suspendPolicy="all",       // default; "thread" parks only the thread that met the condition
   stopOnce=true,             // default: the first hit that meets it stops; call again with the same arguments to re-arm
   userApproved=true          // only after the user explicitly agreed — same protocol as fast logpoints
@@ -463,6 +464,10 @@ jdwp_set_fast_breakpoint(
 ```
 
 The first hit of the line goes through the debugger: if the condition holds, that hit is the stop; otherwise the server installs a probe, as for a fast logpoint. The probe calls an empty `stop()` method only when the condition holds, and the debugger's breakpoint sits on `stop()` — so the instrumented method keeps running compiled. In the spike, a method holding a breakpoint that never fired ran at 74 ns per call against 7 ns; with a fast breakpoint the difference stayed within run-to-run noise. Wait for the stop with `jdwp_resume_until_event`; the report reads `fast_breakpoint=N, condition true`. The stack, locals, evaluation, `jdwp_set_local`, watchers and steps all work from the user's frame — the probe frames on top are hidden, and a step lands on the stop line. A condition that throws stops once and is then only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
+
+Use optional `capture` for values that may change just after the condition holds. When a true hit passes the stop gate, the Java expression or `{ ...; return value; }` block runs on the hitting thread. The dispatcher evaluates capture on a true arming stop, and the installed probe evaluates it before suspension on later stops. Both expressions must be thread-safe and free of side effects. The result or failure appears as `Captured at the hit: …` in the stop, breakpoint context and event history. For several values, return one string. Changing or omitting the capture requires its own standing approval.
+
+If the capture fails to compile, a probe with a valid condition still installs and reports the capture diagnostic at every stop. When a regular breakpoint supplies the stop at the same line, the fast capture appears with its own breakpoint ID.
 
 The consent protocol, the risk briefing, waiting for a class that is not loaded yet and the handling of leftovers after a crashed server are those of fast logpoints. Clearing a fast breakpoint while a thread is stopped in its method switches it off at once and restores the class once that thread is released, so the stopped frame keeps its local variables; `jdwp_overview` lists the restore as pending until then. The condition runs unsynchronized on every thread that passes the line: it must be thread-safe and free of side effects, and private fields are out of its reach. `jdwp_set_breakpoint` with a condition stays the default; reach for the fast variant only when going through the debugger on every hit would distort what you are looking at — a race, a hot loop, a latency-sensitive path where the condition is rarely true.
 
@@ -741,7 +746,7 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_get_locals`             | `threadId`, `frameIndex`                  | Local variables at a frame (includes `this`)          |
 | `jdwp_get_fields`             | `objectId`                                | Object fields, collection elements, or array contents |
 | `jdwp_to_string`              | `objectId`, `threadId?`                   | Invoke `toString()` on a cached object                |
-| `jdwp_get_breakpoint_context` | `maxFrames?`, `includeThisFields?`        | One-shot context dump at current breakpoint           |
+| `jdwp_get_breakpoint_context` | `maxFrames?`, `includeThisFields?`        | One-shot context dump at the current breakpoint, including any fast-breakpoint capture |
 | `jdwp_get_current_thread`     | —                                         | Thread ID of the last breakpoint hit                  |
 
 ### Execution control (7)
@@ -751,12 +756,12 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_resume`             | —            | Release the stops you have seen and `jdwp_suspend_thread` holds; event sets still being processed keep their threads until processed |
 | `jdwp_resume_thread`      | `threadId`   | Resume a specific thread. Retrying a failed automatic stop-all release releases the VM-wide suspension. |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
-| `jdwp_resume_until_event` | `timeoutMs?`, `threadId?` | Resume and wait for the next stop, optionally scoped to one thread |
+| `jdwp_resume_until_event` | `timeoutMs?`, `threadId?` | Resume and wait for the next stop, optionally scoped to one thread. Stop replies include any fast-breakpoint captures. Returns `[RESUME_FAILED]` on a failed release |
 | `jdwp_step_over`          | `threadId?`, `wait?` | Step over the current line and optionally wait for the thread's next stop |
 | `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call and optionally wait for the thread's next stop |
 | `jdwp_step_out`           | `threadId?`, `wait?` | Step out of the current frame and optionally wait for the thread's next stop |
 
-Resume replies list which holds were released and which failed, with the JDI exception. For `[RESUME_FAILED]`, use `jdwp_resume_thread(threadId=…)` with the reported retry thread ID when available. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach.
+Resume replies list which holds were released and which failed, with the JDI exception. For `[RESUME_FAILED]`, use `jdwp_resume_thread(threadId=…)` with the reported retry thread ID when available. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach. A step with `wait=true` includes any captures from the stop that ended it.
 
 ### Breakpoints (10)
 
@@ -765,7 +770,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 | `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, trigger chaining; `forceLoad=true` binds immediately and runs `<clinit>`) |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`, `forceLoad?` | Non-stopping line breakpoint that logs expression result |
 | `jdwp_set_fast_logpoint`          | `className`, `lineNumber`, `expression`, `condition?`, `userApproved?`, `bufferSize?`, `forceLoad?` | **Rare, consent required.** Logpoint evaluated inside the target by injected bytecode — hits never suspend. Arms with standing approval for the exact probe at this host:port, or asks for `userApproved=true` after a risk briefing |
-| `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?` | **Rare, consent required.** Conditional breakpoint whose condition is evaluated inside the target by injected bytecode — hits that do not meet it never reach the debugger. Arms with standing approval for the exact probe at this host:port, or asks for `userApproved=true` after a risk briefing |
+| `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?`, `capture?` | **Rare, consent required.** Evaluates the condition inside the target and optionally captures a value on each true stop, including the arming hit. Arms with standing approval for the exact probe at this host:port, or asks for `userApproved=true` after a risk briefing |
 | `jdwp_restore_fast_logpoints`     | `id`, `userApproved?`                                     | **Rare, consent required.** Restores the original bytecode of a class carrying fast logpoints or fast breakpoints an earlier, crashed session left behind (`RECOVERED` in `jdwp_overview`). Without `userApproved=true` it changes nothing and returns a briefing |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, field BPs, fast logpoints and fast breakpoints (restoring the original bytecode, after the release of a thread stopped in the method; a leftover of an earlier session is only switched off) and removes its watchers |
 | `jdwp_set_exception_breakpoint`   | `className`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?`, `suspendPolicy?`, `condition?`, `thrownIn?`, `notThrownIn?` | Suspend on exception throw with optional condition and throw-site filters. Supports deferral, trigger chaining and `suspendPolicy="all"`. |
@@ -796,7 +801,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                | Parameters | Description                                               |
 |---------------------|------------|-----------------------------------------------------------|
-| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, fast logpoint hits, chain events, late evaluation results) |
+| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, fast logpoint hits, fast-breakpoint stops with captures, chain events, late evaluation results) |
 | `jdwp_clear_events` | —          | Clear event history                                       |
 
 ### Diagnostics (1)
