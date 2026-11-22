@@ -133,6 +133,7 @@ class JDWPToolsStepTest {
 			"All remaining threads run.");
 	}
 
+	/** Reserves space for the stepping thread and stop-all origin in the shared name cap. */
 	@Test
 	@DisplayName("Step from stop-all shows the remaining threads with a capped list")
 	void shouldCapStopAllThreadNames() throws Exception {
@@ -151,8 +152,8 @@ class JDWPToolsStepTest {
 		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
 
 		assertThat(tools.jdwp_step_over(1L)).contains("presented stop-all from thread worker-1",
-			"still covers other threads (JDI lists worker-2", "and 2 more")
-			.doesNotContain("worker-7", "worker-8");
+			"still covers other threads (JDI lists worker-2", "and 4 more")
+			.doesNotContain("worker-5", "worker-6", "worker-7", "worker-8");
 	}
 
 	@Test
@@ -170,6 +171,57 @@ class JDWPToolsStepTest {
 		assertThat(tools.jdwp_step_over(1L))
 			.contains("presented stop-all from thread main", "still covers other threads")
 			.doesNotContain("All other threads run.", "All remaining threads run.");
+	}
+
+	/** Exercises several presented stop-alls still held after repeatedly releasing only their origin. */
+	@Test
+	void shouldCountRepeatedStopAllsFromTheSameThread() throws Exception {
+		final ThreadReference stepping = mock(ThreadReference.class);
+		when(stepping.uniqueID()).thenReturn(1L);
+		when(stepping.name()).thenReturn("main");
+		when(stepping.isSuspended()).thenReturn(true);
+		final ThreadReference bystander = mock(ThreadReference.class);
+		when(bystander.uniqueID()).thenReturn(2L);
+		when(bystander.name()).thenReturn("bystander");
+		for (int hit = 1; hit <= 8; hit++) {
+			holdStop(stepping, hit, EventRequest.SUSPEND_ALL, true);
+			if (hit < 8) {
+				assertThat(session.releaseThread(stepping).refusal()).isNull();
+			}
+		}
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping, bystander));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		assertThat(tools.jdwp_step_over(1L))
+			.contains("8 presented stop-alls from thread main")
+			.containsOnlyOnce("JDI lists bystander");
+	}
+
+	/** Shares one thread-name budget across stop-all scopes and manual-hold groups. */
+	@Test
+	void shouldCapThreadNamesAcrossDifferentHolders() throws Exception {
+		final List<ThreadReference> threads = new java.util.ArrayList<>();
+		for (int i = 1; i <= 8; i++) {
+			final ThreadReference thread = mock(ThreadReference.class);
+			when(thread.uniqueID()).thenReturn((long) i);
+			when(thread.name()).thenReturn("sample-" + i);
+			threads.add(thread);
+		}
+		final ThreadReference stepping = threads.get(0);
+		when(stepping.isSuspended()).thenReturn(true);
+		assertThat(session.suspendThread(threads.get(7))).isNull();
+		holdStop(stepping, 1, EventRequest.SUSPEND_ALL, true);
+		holdStop(threads.get(1), 2, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(threads);
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		final String reply = tools.jdwp_step_over(1L);
+		assertThat(reply).contains("jdwp_suspend_thread holds", "stop-all")
+			.doesNotContain("All remaining threads run.");
+		assertThat(java.util.regex.Pattern.compile("sample-\\d+").matcher(reply).results().count())
+			.isLessThanOrEqualTo(5);
 	}
 
 	@Nested

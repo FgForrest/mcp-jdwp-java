@@ -33,7 +33,7 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 
 Applies to any JDWP port — 5005 for build-system shortcuts, but also non-default ports (8003, 8000, 9009, …) used by already-running services.
 
-Check the local target PID and start time in the attach or disconnect reply. A live `server=y` target listens again after detach. `jdwp_wait_for_attach(requireVmStart=true)` reports `[NOT_FRESH]` for an existing session or if a new attachment fails to receive a suspending `VM_START` event. Disconnect and confirm the previous test process has ended before relaunching. Treat `probably PID` or an ambiguous match as a clue and verify the port owner before stopping it.
+Check the local target PID and start time in the attach or disconnect reply. A live `server=y` target listens again after detach. `jdwp_wait_for_attach(requireVmStart=true)` reports `[NOT_FRESH]` for an existing session or if a new attachment fails to receive a suspending `VM_START` event. Disconnect and confirm the previous test process has ended before relaunching. A TCP peer may be a port forwarder. For a TCP peer, `probably PID`, ambiguous match, or missing PID, verify the port owner before stopping the process.
 
 To look up a listener from the shell, use one of these commands.
 

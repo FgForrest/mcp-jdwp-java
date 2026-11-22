@@ -85,11 +85,23 @@ class LocalJdwpTargetTest {
 		Files.writeString(process.resolve("cmdline"), String.join("\0", argv) + '\0');
 	}
 
+	/** Supplies a listener lookup after detaching from a local endpoint without any PID evidence. */
+	@Test
+	void unidentifiedLocalTargetStillPromptsAPortOwnerCheck() throws Exception {
+		final JvmDiscoveryService discovery = new JvmDiscoveryService(List::of, -1, emptyProc, true);
+		final LocalJdwpTarget target = LocalJdwpTarget.identify(discovery, emptyProc, "127.0.0.1", 5005);
+
+		assertThat(target.describeAfterDisconnect(5005)).contains("ss -ltnp", "lsof", "5005")
+			.doesNotContain("PID ", "kill ");
+	}
+
+	/** Remote attachments carry no local listener lookup advice. */
 	@Test
 	void remoteHostSkipsLocalProcessMatching() throws Exception {
 		final JvmDiscoveryService discovery = mock(JvmDiscoveryService.class);
 
-		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "192.0.2.1", 5005).describe()).isEmpty();
+		assertThat(LocalJdwpTarget.identify(discovery, emptyProc, "192.0.2.1", 5005)
+			.describeAfterDisconnect(5005)).isEmpty();
 		verifyNoInteractions(discovery);
 	}
 

@@ -718,7 +718,7 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 | `jdwp_reconnect`       | —                              | Re-attach to the last target; BP IDs, conditions, logpoints, chains, watchers replay onto the new VM |
 | `jdwp_wait_for_attach` | `host?`, `port?`, `timeoutMs?`, `requireVmStart?` | Poll for a listening JVM and attach. `requireVmStart=true` requires a fresh start suspension. |
 
-Attach and disconnect replies show the local PID, start time, and launch selector when available. A `probably PID` reply calls for checking the port owner. A live `server=y` process listens again after disconnect. `[NOT_FRESH]` means a session already exists or the new attachment had no suspending `VM_START` during its startup check.
+Attach and disconnect replies show the local PID, start time, and launch selector when available. For an unverified local JVM, disconnect gives commands to check the port owner. A forwarder may appear as the TCP peer. A live `server=y` process listens again after disconnect. `[NOT_FRESH]` means a session already exists or the new attachment had no suspending `VM_START` during its startup check.
 
 ### Inspection (9)
 

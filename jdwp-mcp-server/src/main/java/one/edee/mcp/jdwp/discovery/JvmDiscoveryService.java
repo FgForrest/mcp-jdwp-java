@@ -296,8 +296,9 @@ public class JvmDiscoveryService {
     /**
      * Whether argv[0] names a Java launcher. A process launched through another executable still
      * counts when its JVM options configure a JDWP agent (checked by the caller).
+     * Package-private so the target lookup can check a peer's executable path.
      */
-    private static boolean looksLikeJava(String executable) {
+    static boolean looksLikeJava(String executable) {
         final String base = executable.substring(executable.lastIndexOf('/') + 1);
         return "java".equals(base) || "javaw".equals(base) || base.startsWith("java.");
     }

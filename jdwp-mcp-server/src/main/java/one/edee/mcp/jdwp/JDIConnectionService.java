@@ -90,8 +90,8 @@ public class JDIConnectionService {
      */
     private final JdiHealthMonitor healthMonitor;
     private final JvmDiscoveryService jvmDiscovery;
-    @Nullable
-    private Future<LocalJdwpTarget> targetLookup;
+    /** Asynchronous locality and process evidence for the current attachment. */
+    private LocalJdwpTarget.@Nullable Lookup targetLookup;
     /**
      * Server-wide registry of agent-labelled JDI object references. Held here so its lifecycle is
      * gated by the connection: pinned object references must be released both on VM death (see

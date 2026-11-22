@@ -171,9 +171,10 @@ For each event type, the handler returns `true` (it wants a stop: its candidate 
 | `StepEvent` | Reentrancy-guarded | false | Delete the one-shot `StepRequest`, `STEP_SUPPRESSED` |
 | | Normal step | **true** | Delete the one-shot `StepRequest`, candidate (`STEP`), history |
 | `ExceptionEvent` | Reentrancy-guarded | false | `EXCEPTION_SUPPRESSED` |
-| | Log-only + condition false | false | |
-| | Log-only + condition true | false | Evaluate, log, chain effect |
-| | Suspending | **true** | Candidate, history, chain effect when `firingId != null` |
+| | Either mode + condition false | false | No stop, log entry, or chain effect |
+| | Log-only + true or absent condition | false | Evaluate, log, chain effect |
+| | Suspending + true or absent condition | **true** | Candidate, history, chain effect when `firingId != null` |
+| | Condition evaluation fails | By mode | Record `CONDITION_ERROR` and process the hit as if the condition passed |
 | `WatchpointEvent` | Reentrancy-guarded | false | `FIELD_BREAKPOINT_SUPPRESSED` |
 | | Untracked | **true** | Defensive |
 | | Condition false | false | No chain effect |
@@ -366,7 +367,7 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 
 If the release fails, the request is deleted and the pending entry dropped, so a failed step leaves nothing armed.
 
-With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It reports the scope of each remaining stop-all independently of JDI enumeration. JDI can omit virtual threads, so the stop-all reports up to five names and a count from the threads JDI lists. Thread stops, in-progress events and manual holds are grouped by owner. The reply says all remaining threads run only when no stop-all remains. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
+With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It reports remaining stop-alls independently of JDI enumeration, which can omit virtual threads. Stop-alls with the same state and origin are counted together. The whole step reply shows up to five thread names across the stepping thread, stop-all origins and samples, and other hold groups. Further groups are summarized by count. The reply says all remaining threads run only when no stop-all remains. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
 
 Example, from stop-all hold B (every thread at count 1):
 

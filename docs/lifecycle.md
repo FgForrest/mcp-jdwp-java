@@ -122,7 +122,7 @@ There are two cleanup paths, and the difference matters.
 4. Calls `vm.dispose()` for a clean JDWP teardown (lines 451-456). Best-effort: any exception is swallowed because the VM may already be gone.
 5. **Resets `lastHost` / `lastPort` to 0 / null** (lines 459-460).
 
-That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly. The disconnect reply includes the local process identity when available. For a verified live socket owner it reports that the `server=y` JVM listens again on the same port and gives the PID for cleanup. For a discovery-only match it gives commands to verify the port owner.
+That last step is the key distinction: after `disconnect()`, the next tool call **cannot** auto-reconnect, because there is no remembered target. The agent has to ask explicitly. The disconnect reply includes the local process identity when available. When the socket owner is a live JVM configured to serve JDWP on that port, the reply reports that it listens there again and gives the PID for cleanup. For a local TCP peer, discovery-only match, or missing PID, the reply gives commands to verify the port owner.
 
 ### VM-death: `notifyVmDied()`
 

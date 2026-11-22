@@ -702,7 +702,8 @@ public final class SuspensionSession {
      *
      * @param refusal          why the step was not started, or {@code null} when it was
      * @param remainingHolders the other thread-specific holds, grouped by holder kind
-     * @param remainingStopAlls the stop-all contexts still in effect, even if JDI lists no other threads
+     * @param remainingStopAlls summaries of stop-alls still in effect, grouped and counted
+     *                          even if JDI lists no other threads
      */
     public record StepResult(@Nullable String refusal, List<String> remainingHolders, List<String> remainingStopAlls) {
         private static StepResult refused(String reason) {
@@ -744,30 +745,21 @@ public final class SuspensionSession {
     }
 
     /**
-     * Groups the threads the session still holds by holder kind — presented or unseen stop-all and
-     * thread stops, sets still being processed, manual holds — from the session's own records, not
-     * from JDI suspend counts. Runs under the session monitor.
+     * Summarizes the remaining holds under the session monitor. Equivalent stop-alls share their
+     * state and origin. The displayed sample covers the union of JDI-enumerated threads they hold.
      *
      * @param vmThreads threads enumerated by JDI, which can omit virtual threads
-     * @return a started step's result: thread-specific holds grouped by kind, and one line per
-     *         stop-all context still in effect (independent of which threads JDI enumerates)
+     * @return the grouped stop-all and thread-specific holds, with one display budget
      */
     private StepResult describeRemainingHolders(List<ThreadReference> vmThreads) {
         final Map<String, Set<ThreadReference>> groups = new LinkedHashMap<>();
-        final List<String> stopAlls = new ArrayList<>();
+        final Map<StopAllGroup, StopAllSummary> stopAlls = new LinkedHashMap<>();
         for (Context context : contexts) {
             final ThreadReference eventThread = context.thread;
             if (context.policy == EventRequest.SUSPEND_ALL) {
-                final Set<ThreadReference> listed = new LinkedHashSet<>();
-                for (ThreadReference thread : vmThreads) {
-                    if (covers(context, thread)) {
-                        listed.add(thread);
-                    }
-                }
                 final String state = context.state == State.HELD ? seenWord(context) : "in-progress";
-                final String origin = eventThread == null ? "" : " from thread " + safeName(eventThread);
-                final String sample = listed.isEmpty() ? "" : " (JDI lists " + describeThreadGroup(listed) + ')';
-                stopAlls.add("The " + state + " stop-all" + origin + " still covers other threads" + sample + '.');
+                stopAlls.computeIfAbsent(new StopAllGroup(state, eventThread), ignored -> new StopAllSummary())
+                    .add(context, vmThreads);
             } else if (context.policy == EventRequest.SUSPEND_EVENT_THREAD
                 && eventThread != null && covers(context, eventThread)) {
                 final String label = context.state == State.HELD
@@ -776,11 +768,64 @@ public final class SuspensionSession {
             }
         }
         groups.put("jdwp_suspend_thread holds", manual);
+        final StepThreadNames names = new StepThreadNames();
+        final List<String> stopAllDescriptions = describeStopAlls(stopAlls, names);
         final List<String> threadHolds = groups.entrySet().stream()
             .filter(entry -> !entry.getValue().isEmpty())
-            .map(entry -> entry.getKey() + ": " + describeThreadGroup(entry.getValue()))
+            .map(entry -> entry.getKey() + ": " + names.describeGroup(entry.getValue()))
             .toList();
-        return new StepResult(null, threadHolds, List.copyOf(stopAlls));
+        return new StepResult(null, threadHolds, stopAllDescriptions);
+    }
+
+    /** Combines stop-alls with the same presentation state and originating thread. */
+    private record StopAllGroup(String state, @Nullable ThreadReference origin) {}
+
+    /** Counts the contexts in one group and keeps the distinct threads JDI lists for that group. */
+    private static final class StopAllSummary {
+        /** Number of stop-all contexts in the group. */
+        private int count;
+        /** Enumerated threads held by at least one context in this group. */
+        private final Set<ThreadReference> listed = new LinkedHashSet<>();
+
+        /** Adds one context and its share of the enumerated threads. */
+        private void add(Context context, List<ThreadReference> vmThreads) {
+            count++;
+            for (ThreadReference thread : vmThreads) {
+                if (covers(context, thread)) {
+                    listed.add(thread);
+                }
+            }
+        }
+    }
+
+    /** Reports named stop-all groups and combines origins beyond the name budget by state. */
+    private static List<String> describeStopAlls(Map<StopAllGroup, StopAllSummary> stopAlls, StepThreadNames names) {
+        final List<String> descriptions = new ArrayList<>();
+        final Map<String, Integer> additional = new LinkedHashMap<>();
+        for (Map.Entry<StopAllGroup, StopAllSummary> entry : stopAlls.entrySet()) {
+            final StopAllGroup key = entry.getKey();
+            final StopAllSummary group = entry.getValue();
+            final ThreadReference thread = key.origin();
+            if (thread != null && names.exhausted()) {
+                additional.merge(key.state(), group.count, Integer::sum);
+                continue;
+            }
+            final String origin = thread == null ? "" : " from thread " + names.take(thread);
+            final String sample = group.listed.isEmpty() ? "" : " (JDI lists " + names.describeGroup(group.listed) + ')';
+            if (group.count == 1) {
+                descriptions.add("The " + key.state() + " stop-all" + origin + " still covers other threads" + sample + '.');
+            } else {
+                descriptions.add(group.count + " " + key.state() + " stop-alls" + origin + " still cover other threads" + sample + '.');
+            }
+        }
+        additional.forEach((state, count) -> {
+            if (count == 1) {
+                descriptions.add("One additional " + state + " stop-all still covers other threads.");
+            } else {
+                descriptions.add(count + " additional " + state + " stop-alls still cover other threads.");
+            }
+        });
+        return List.copyOf(descriptions);
     }
 
     /**
@@ -790,13 +835,31 @@ public final class SuspensionSession {
         return context.reported ? "presented" : "unseen";
     }
 
-    /**
-     * "main, worker-1 and 3 more" — at most five thread names, so a reply stays short with many threads.
-     */
-    private static String describeThreadGroup(Set<ThreadReference> threads) {
-        final int limit = 5;
-        final String names = String.join(", ", threads.stream().limit(limit).map(SuspensionSession::safeName).toList());
-        return threads.size() > limit ? names + " and " + (threads.size() - limit) + " more" : names;
+    /** Tracks the shared name budget for the entire step reply. */
+    private static final class StepThreadNames {
+        /** The reply header already spends one of the five names on the stepping thread. */
+        private int remaining = 4;
+
+        /** Whether subsequent groups must be described by count alone. */
+        private boolean exhausted() {
+            return remaining == 0;
+        }
+
+        /** Spends one slot on a known thread when room remains. */
+        private String take(ThreadReference thread) {
+            remaining--;
+            return safeName(thread);
+        }
+
+        /** Shows a sample of the group, or just its size when the name budget is exhausted. */
+        private String describeGroup(Set<ThreadReference> threads) {
+            if (exhausted()) {
+                return threads.size() == 1 ? "1 thread" : threads.size() + " threads";
+            }
+            final int shown = Math.min(remaining, threads.size());
+            final String names = String.join(", ", threads.stream().limit(shown).map(this::take).toList());
+            return threads.size() > shown ? names + " and " + (threads.size() - shown) + " more" : names;
+        }
     }
 
     /**

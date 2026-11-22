@@ -39,7 +39,7 @@ The test process **hangs** at "Listening for transport dt_socket at address: 500
 
 **Terminal 2** — open Claude Code or Codex in this folder and paste the assignment prompt below.
 
-The agent will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it is solved, end the flight with `jdwp_disconnect()`. If the verified socket owner is your still-running test JVM, use `kill <pid>` with that PID. For an unverified or missing PID, check the listener with `ss -ltnp 'sport = :<port>'` or `lsof -nP -iTCP:<port> -sTCP:LISTEN` first. Stop the background `mvn test` shell if needed and confirm both have exited. Stopping the shell alone can leave the forked Surefire JVM running. Then launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
+The agent will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it is solved, end the flight with `jdwp_disconnect()`. If the verified socket owner is your still-running test JVM, use `kill <pid>` with that PID. For a TCP peer or an unverified or missing PID, check the listener with `ss -ltnp 'sport = :<port>'` or `lsof -nP -iTCP:<port> -sTCP:LISTEN` first. Stop the background `mvn test` shell if needed and confirm both have exited. Stopping the shell alone can leave the forked Surefire JVM running. Then launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
 ## The assignment prompt
 
