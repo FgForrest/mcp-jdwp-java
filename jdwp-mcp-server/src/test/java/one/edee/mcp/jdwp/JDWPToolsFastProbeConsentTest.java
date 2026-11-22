@@ -10,6 +10,8 @@ import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -27,6 +29,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @DisplayName("standing consent for fast probes")
@@ -93,13 +96,86 @@ class JDWPToolsFastProbeConsentTest {
 			.startsWith("[CONSENT REQUIRED]");
 		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", false, null))
 			.startsWith("[CONSENT REQUIRED]");
-		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", null, 16, null))
-			.contains("buffer: 16", "Standing approval used");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", null,
+			FastLogpointService.DEFAULT_BUFFER_SIZE, null)).contains("Standing approval used");
 
 		attach("localhost", 5006);
 		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
 		attach("192.0.2.1", 5005);
 		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	@DisplayName("an explicit retry must use the endpoint of the latest briefing")
+	void approvalStaysWithTheBriefedEndpoint(boolean breakpoint) throws Exception {
+		attach("localhost", 5005);
+		assertThat(setProbe(breakpoint, null, null)).startsWith("[CONSENT REQUIRED]").contains("localhost:5005");
+
+		attach("localhost", 5006);
+		assertThat(setProbe(breakpoint, true, null))
+			.startsWith("[CONSENT REQUIRED AGAIN]").contains("localhost:5006").doesNotContain("WAITING");
+		verify(connection, never()).getVM();
+		assertThat(setProbe(breakpoint, null, null)).startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_overview(null, null, null)).doesNotContain("granted at");
+
+		assertThat(setProbe(breakpoint, true, null)).contains("WAITING");
+		attach("127.0.0.1", 5006);
+		assertThat(setProbe(breakpoint, null, null)).contains("Standing approval used");
+
+		attach("localhost", 5005);
+		assertThat(setProbe(breakpoint, null, null)).startsWith("[CONSENT REQUIRED]").contains("localhost:5005");
+		attach("localhost", 5006);
+		assertThat(setProbe(breakpoint, true, null)).startsWith("[CONSENT REQUIRED AGAIN]");
+		assertThat(setProbe(breakpoint, null, null)).contains("Standing approval used");
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	@DisplayName("passive approval cannot authorize forced class initialization")
+	void passiveGrantCannotForceLoad(boolean breakpoint) throws Exception {
+		attach("localhost", 5005);
+		assertThat(setProbe(breakpoint, true, null)).contains("WAITING");
+		final VirtualMachine nextVm = attach("localhost", 5005);
+		doReturn(null).when(connection).findOrForceLoadClass(CART, null, nextVm);
+
+		final String reply = setProbe(breakpoint, null, true);
+		verify(connection, never()).findOrForceLoadClass(CART, null, nextVm);
+		assertThat(reply).startsWith("[CONSENT REQUIRED]").contains("forceLoad=true", "<clinit>");
+		assertThat(setProbe(breakpoint, true, true)).contains("WAITING");
+		verify(connection).findOrForceLoadClass(CART, null, nextVm);
+		assertThat(setProbe(breakpoint, null, false)).contains("Standing approval used");
+		attach("localhost", 5005);
+		assertThat(setProbe(breakpoint, null, true)).contains("Standing approval used");
+	}
+
+	@Test
+	@DisplayName("a logpoint grant covers its effective buffer capacity")
+	void bufferCapacityIsPartOfApproval() throws Exception {
+		attach("localhost", 5005);
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", null, true, 16, null)).contains("buffer: 16");
+		attach("localhost", 5005);
+
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", null, null, 65536, null))
+			.startsWith("[CONSENT REQUIRED]").contains("buffer: 65536");
+		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", null, null, 16, null))
+			.contains("Standing approval used");
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"example.*", "example/Cart", "example..Cart", "example.Cart[]", "example.Cart ",
+		".example.Cart", "example.Cart.", ""})
+	@DisplayName("both fast tools reject non-binary class names before asking for consent")
+	void invalidClassNamesAreRejected(String className) throws Exception {
+		attach("localhost", 5005);
+		for (Boolean approval : new Boolean[]{null, true}) {
+			assertThat(tools.jdwp_set_fast_logpoint(className, 42, "total", null, approval, null, null))
+				.startsWith("Error:").contains("binary class name");
+			assertThat(tools.jdwp_set_fast_breakpoint(className, 42, "total < 0", approval, null, null, null))
+				.startsWith("Error:").contains("binary class name");
+		}
+		verify(connection, never()).getVM();
+		verifyNoInteractions(probes);
 	}
 
 	@Test
@@ -169,7 +245,9 @@ class JDWPToolsFastProbeConsentTest {
 		when(location.method()).thenReturn(mock(Method.class));
 		when(probes.rearmBreakpoint(location, "total < 0", true, EventRequest.SUSPEND_ALL))
 			.thenReturn(new FastLogpointService.RearmResult("Error: fast breakpoint with other parameters", false),
-				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true));
+				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true),
+				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true),
+				new FastLogpointService.RearmResult("Error: stop gate did not reopen. Error gate reopened.", false));
 
 		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null))
 			.startsWith("Error:");
@@ -179,10 +257,18 @@ class JDWPToolsFastProbeConsentTest {
 			.contains("re-armed");
 		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
 			.contains("re-armed", "Standing approval used");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+			.contains("stop gate did not reopen").doesNotContain("Standing approval used");
 	}
 
 	private String logpoint(Boolean approval) {
 		return tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", approval, null, null);
+	}
+
+	private String setProbe(boolean breakpoint, Boolean approval, Boolean forceLoad) {
+		return breakpoint
+			? tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", approval, null, null, forceLoad)
+			: tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", approval, null, forceLoad);
 	}
 
 	private VirtualMachine attach(String host, int port) throws Exception {

@@ -45,7 +45,7 @@ class JDWPToolsFastLogpointTest {
 	@BeforeEach
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
-		final var endpoint = new JDIConnectionService.TargetEndpoint("localhost", 5005);
+		final var endpoint = new JDIConnectionService.TargetEndpoint("localhost", 5005, true);
 		when(jdiService.targetEndpoint()).thenReturn(endpoint);
 		when(jdiService.targetEndpointFor(any())).thenReturn(endpoint);
 		tracker = new BreakpointTracker();

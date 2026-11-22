@@ -20,7 +20,7 @@ public final class FastBreakpointRiskBriefing {
      * @param targetVm      short description of the target endpoint, or {@code null} when unknown
      */
     public static String render(String className, int lineNumber, String condition, String suspendPolicy,
-                                boolean stopOnce, @Nullable String targetVm) {
+                                boolean stopOnce, boolean forceLoad, @Nullable String targetVm) {
         final boolean all = "all".equals(suspendPolicy);
         return "[CONSENT REQUIRED] Nothing was armed.\n"
             + "jdwp_set_fast_breakpoint rewrites the bytecode of the running application. Relay the briefing "
@@ -38,6 +38,7 @@ public final class FastBreakpointRiskBriefing {
             + " — " + FastLogpointService.modeLabel(stopOnce)
             + " — suspendPolicy: " + suspendPolicy
             + " — VM: " + (targetVm != null ? targetVm : "the VM attached when the breakpoint is set") + '\n'
+            + (forceLoad ? "forceLoad=true can load the class and run its <clinit> in the target JVM before arming.\n" : "")
             + "A fast breakpoint evaluates its condition inside the target JVM, so hits that do not meet it never "
             + "involve the debugger. To do that it changes the running application:\n"
             + "1. It rewrites the class's bytecode. The change stays until it is reverted by clearing the "

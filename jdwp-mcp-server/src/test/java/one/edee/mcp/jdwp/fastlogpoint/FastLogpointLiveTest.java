@@ -91,7 +91,7 @@ class FastLogpointLiveTest {
 			assertThat(reply)
 				.startsWith("[CONSENT REQUIRED] Nothing was armed.")
 				.contains(TARGET + ':' + probeLine)
-				.contains("127.0.0.1:" + port)
+				.contains("localhost:" + port)
 				.contains("word for word");
 		}
 		assertThat(fastLogpoints.list()).isEmpty();

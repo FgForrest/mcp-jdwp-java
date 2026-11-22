@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
+import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
@@ -23,8 +24,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -425,27 +426,10 @@ public class JDIConnectionService {
             cleanupSessionState();
         }
 
-        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-        AttachingConnector connector = null;
-
-        for (AttachingConnector ac : vmm.attachingConnectors()) {
-            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                connector = ac;
-                break;
-            }
-        }
-
-        if (connector == null) {
-            lastConnectError = "SocketAttach connector not found";
-            throw new RuntimeException("SocketAttach connector not found");
-        }
-
-        final Map<String, Connector.Argument> args = connector.defaultArguments();
-        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
-
         try {
-            vm = connector.attach(args);
+            final SocketAttachment attached = attachSocket(socketConnector(), host, port);
+            vm = attached.vm();
+            targetEndpoint = attached.endpoint();
         } catch (Exception e) {
             lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             // Do NOT seed lastHost/lastPort on failure — ensureConnected() uses those for the
@@ -455,7 +439,6 @@ public class JDIConnectionService {
         }
         lastHost = host;
         lastPort = port;
-        targetEndpoint = new TargetEndpoint(host, port);
         lastConnectError = null;
         lastExit = null;
 
@@ -568,31 +551,58 @@ public class JDIConnectionService {
         return vm == expected ? targetEndpoint : null;
     }
 
-    /**
-     * A JDWP endpoint as standing fast-probe approvals key it: the host is lower-cased, and every
-     * loopback name or address ({@code localhost}, {@code 127.0.0.1}, {@code ::1}) becomes
-     * {@code localhost}, so the same local port is one endpoint however it was written.
-     *
-     * @param host normalized host name
-     * @param port JDWP port
-     */
-    record TargetEndpoint(String host, int port) {
+    /** JDWP endpoint for a standing approval. Loopback is determined by the address used to attach. */
+    record TargetEndpoint(String host, int port, boolean loopback) {
         TargetEndpoint {
-            host = host.toLowerCase(Locale.ROOT);
-            try {
-                if (InetAddress.getByName(host).isLoopbackAddress()) {
-                    host = "localhost";
+            if (loopback) {
+                host = "localhost";
+            } else {
+                if (host.startsWith("[") && host.endsWith("]")) {
+                    host = host.substring(1, host.length() - 1);
                 }
-            } catch (UnknownHostException ignored) {
-                // Keep the host name if it no longer resolves after the attach.
+                final int zone = host.contains(":") ? host.indexOf('%') : -1;
+                host = zone < 0 ? host.toLowerCase(Locale.ROOT)
+                    : host.substring(0, zone).toLowerCase(Locale.ROOT) + host.substring(zone);
             }
         }
 
         @Override
         public String toString() {
-            final String label = host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
-            return label + ':' + port;
+            final String label = host.contains(":") ? "[" + host + "]" : host;
+            return label + ':' + port + (!loopback && host.equals("localhost") ? " (non-loopback)" : "");
         }
+    }
+
+    /**
+     * A VM attached through {@code SocketAttach}, with the endpoint derived from the same resolved
+     * address the connector used.
+     */
+    record SocketAttachment(VirtualMachine vm, TargetEndpoint endpoint) {
+    }
+
+    /**
+     * The JDK's {@code com.sun.jdi.SocketAttach} connector.
+     */
+    private static AttachingConnector socketConnector() {
+        for (AttachingConnector connector : Bootstrap.virtualMachineManager().attachingConnectors()) {
+            if ("com.sun.jdi.SocketAttach".equals(connector.name())) {
+                return connector;
+            }
+        }
+        throw new IllegalStateException("SocketAttach connector not found");
+    }
+
+    /** Resolve once and pass the numeric address to SocketAttach so it uses the selected address. */
+    static SocketAttachment attachSocket(AttachingConnector connector, String host, int port)
+        throws IOException, IllegalConnectorArgumentsException {
+        final InetAddress address = host.isEmpty() || "*".equals(host)
+            ? InetAddress.getLoopbackAddress() : InetAddress.getByName(host);
+        final Map<String, Connector.Argument> args = connector.defaultArguments();
+        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument")
+            .setValue(address.getHostAddress());
+        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument")
+            .setValue(String.valueOf(port));
+        return new SocketAttachment(connector.attach(args), new TargetEndpoint(host, port, address.isLoopbackAddress()));
     }
 
     /**
@@ -866,23 +876,10 @@ public class JDIConnectionService {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
-        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-        AttachingConnector connector = null;
-        for (AttachingConnector ac : vmm.attachingConnectors()) {
-            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                connector = ac;
-                break;
-            }
-        }
-        if (connector == null) {
-            lastConnectError = "SocketAttach connector not found";
-            throw new RuntimeException("SocketAttach connector not found");
-        }
-        final Map<String, Connector.Argument> args = connector.defaultArguments();
-        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
         try {
-            vm = connector.attach(args);
+            final SocketAttachment attached = attachSocket(socketConnector(), host, port);
+            vm = attached.vm();
+            targetEndpoint = attached.endpoint();
         } catch (Exception e) {
             lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             // Tracker is already in pending state from the restore above — the agent's BPs
@@ -890,7 +887,6 @@ public class JDIConnectionService {
             // surfacing the original error.
             throw e;
         }
-        targetEndpoint = new TargetEndpoint(host, port);
         lastConnectError = null;
         // Fresh attach → new session epoch (see connect()); the RECONNECT event recorded below and
         // everything after it is tagged as this session, segmented from the dead VM's tail.

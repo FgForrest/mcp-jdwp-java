@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp;
 
+import one.edee.mcp.jdwp.JDIConnectionService.TargetEndpoint;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService.Kind;
 import org.jspecify.annotations.Nullable;
 
@@ -18,8 +19,7 @@ import java.util.concurrent.ConcurrentMap;
 final class FastProbeApprovals {
 
     /**
-     * What one approval covers. Every field must match exactly for a grant to apply; a different
-     * expression, condition, suspend policy, stop mode or endpoint is a different probe.
+     * The effective probe settings, before binding a briefing or approval to an endpoint.
      *
      * @param kind          fast logpoint or fast breakpoint
      * @param className     fully qualified class of the probed line
@@ -28,14 +28,30 @@ final class FastProbeApprovals {
      * @param condition     the condition, or {@code null} when the probe has none
      * @param suspendPolicy JDI suspend policy of the probe's stop
      * @param stopOnce      fast breakpoint stop mode (once per generation, or every hit)
-     * @param endpoint      normalized host:port the approval was given for
+     * @param forceLoad     whether setting the probe may run the class initializer
+     * @param bufferSize    effective ring capacity (fixed for a fast breakpoint)
      */
-    record Key(Kind kind, String className, int line, @Nullable String expression, @Nullable String condition,
-               int suspendPolicy, boolean stopOnce, JDIConnectionService.TargetEndpoint endpoint) {
+    record Probe(Kind kind, String className, int line, @Nullable String expression, @Nullable String condition,
+                 int suspendPolicy, boolean stopOnce, boolean forceLoad, int bufferSize) {
+    }
+
+    /** What a grant covers. Every probe setting and the normalized host:port must match. */
+    record Key(Probe probe, TargetEndpoint endpoint) {
     }
 
     /** Grant time per approved probe; the first grant wins. */
     private final ConcurrentMap<Key, Instant> grants = new ConcurrentHashMap<>();
+    /** Last named endpoint per probe, including briefings that have already led to a grant. */
+    private final ConcurrentMap<Probe, TargetEndpoint> briefedEndpoints = new ConcurrentHashMap<>();
+
+    void recordBriefing(Probe probe, TargetEndpoint endpoint) {
+        briefedEndpoints.put(probe, endpoint);
+    }
+
+    boolean briefedAtDifferentEndpoint(Key key) {
+        final TargetEndpoint briefed = briefedEndpoints.get(key.probe());
+        return briefed != null && !briefed.equals(key.endpoint());
+    }
 
     /**
      * When the user approved exactly this probe, or {@code null} when no standing approval exists.

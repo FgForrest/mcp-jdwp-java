@@ -392,11 +392,13 @@ public class FastLogpointService {
         if (probe == null || probe.failure() != null) {
             return;
         }
-        deleteQuietly(probe.request());
         final Kind kind = probe.kind();
         String failure;
         Location location = null;
         try {
+            if (!probe.className().equals(refType.name())) {
+                return;
+            }
             failure = rejectHost(refType, kind);
             if (failure == null) {
                 failure = leftoversIn(refType, kind);
@@ -416,6 +418,7 @@ public class FastLogpointService {
         } catch (Exception e) {
             failure = describe(e);
         }
+        deleteQuietly(probe.request());
         if (location == null) {
             failWaiting(probe, Objects.requireNonNullElse(failure, "the line could not be resolved"));
             return;
@@ -3054,17 +3057,26 @@ public class FastLogpointService {
                 return new RearmResult(message, false);
             }
             switch (flp.state) {
-                case PENDING -> {
+                case PENDING, ARMED -> {
+                    final String gateFailure = reopenGates(flp);
+                    if (gateFailure != null) {
+                        return new RearmResult("Error: fast breakpoint " + flp.id + " — " + gateFailure, false);
+                    }
+                    if (flp.state == State.ARMED) {
+                        final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s",
+                            flp.id, flp.className(), flp.line, flp.id, stopOnce
+                                ? "the next true hit stops again, and so does the next failure of the condition."
+                                : "every true hit stops as before, and the next failure of the condition stops again.");
+                        return new RearmResult(message, true);
+                    }
                     if (flp.armingRequest != null) {
                         // An arming hit whose condition failed spent the error gate and left the request
                         // in place; no probe exists yet, so opening both generations costs nothing.
-                        reopenGates(flp);
                         final String message = String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
                             + "re-armed: the next true hit stops, and so does the next failure of the condition.",
                             flp.id, flp.className(), flp.line, flp.id);
                         return new RearmResult(message, true);
                     }
-                    reopenGates(flp);
                     rearm(flp);
                     if (flp.state == State.FAILED) {
                         return new RearmResult(String.format("Error: fast breakpoint %d could not be re-armed: %s.",
@@ -3073,14 +3085,6 @@ public class FastLogpointService {
                     final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
                         + "was installed, so it arms again on the next hit of the line.", flp.id, flp.className(),
                         flp.line, flp.id);
-                    return new RearmResult(message, true);
-                }
-                case ARMED -> {
-                    reopenGates(flp);
-                    final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s", flp.id, flp.className(),
-                        flp.line, flp.id, stopOnce
-                            ? "the next true hit stops again, and so does the next failure of the condition."
-                            : "every true hit stops as before, and the next failure of the condition stops again.");
                     return new RearmResult(message, true);
                 }
                 default -> {
@@ -3095,11 +3099,16 @@ public class FastLogpointService {
     }
 
     /**
-     * Moves both gates of {@code flp} to their next generation; caller holds the monitor.
+     * Attempts both gates and reports their individual outcomes on failure. Caller holds the monitor.
      */
-    private void reopenGates(FastLogpoint flp) {
-        advanceEpoch(flp, false);
-        advanceEpoch(flp, true);
+    private @Nullable String reopenGates(FastLogpoint flp) {
+        final String stopFailure = advanceEpoch(flp, false);
+        final String errorFailure = advanceEpoch(flp, true);
+        if (stopFailure == null && errorFailure == null) {
+            return null;
+        }
+        return (stopFailure == null ? "stop gate reopened" : stopFailure) + ". "
+            + (errorFailure == null ? "error gate reopened" : errorFailure) + ".";
     }
 
     /**
@@ -3338,31 +3347,81 @@ public class FastLogpointService {
     }
 
     /**
-     * Opens the next generation of a gate, here and in the probe. Caller holds the monitor.
+     * Opens the next generation of a gate and returns a failure reason if it could not be opened.
+     * The server acknowledges the generation once the target holds it. Caller holds the monitor.
      */
-    private void advanceEpoch(FastLogpoint flp, boolean errorGate) {
-        final int current = errorGate ? flp.errorEpoch : flp.epoch;
-        if (current == Integer.MAX_VALUE) {
-            recordWarning(flp, "its " + (errorGate ? "error" : "stop") + " gate cannot be re-opened any more — clear it "
-                + "and set it again");
-            return;
-        }
-        if (errorGate) {
-            flp.errorEpoch = current + 1;
-        } else {
-            flp.epoch = current + 1;
-        }
+    private @Nullable String advanceEpoch(FastLogpoint flp, boolean errorGate) {
+        final String gate = errorGate ? "error gate" : "stop gate";
         final ClassType probeType = flp.probeType;
+        final Field field;
+        final int current;
         if (probeType == null) {
-            return;
+            field = null;
+            current = errorGate ? flp.errorEpoch : flp.epoch;
+        } else {
+            try {
+                field = probeField(probeType, errorGate
+                    ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD);
+                // A previous write may have landed even if its reply and read-back failed.
+                current = readGateEpoch(probeType, field);
+                confirmEpoch(flp, errorGate, current);
+            } catch (Exception e) {
+                return gateFailure(flp, gate + " did not reopen (could not read the target generation: "
+                    + describe(e) + ")");
+            }
         }
-        try {
-            probeType.setValue(probeField(probeType, errorGate
-                    ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD),
-                flp.vm.mirrorOf(current + 1));
-        } catch (Exception e) {
-            recordWarning(flp, "its gate could not be re-opened in the target JVM: " + describe(e));
+        if (current == Integer.MAX_VALUE) {
+            return gateFailure(flp, gate + " did not reopen (generation limit reached; clear and set the breakpoint again)");
         }
+        final int next = current + 1;
+        if (probeType != null && field != null) {
+            try {
+                probeType.setValue(field, flp.vm.mirrorOf(next));
+            } catch (Exception writeFailure) {
+                final int observed;
+                try {
+                    observed = readGateEpoch(probeType, field);
+                } catch (Exception readFailure) {
+                    return gateFailure(flp, gate + " reopening could not be verified (" + describe(writeFailure)
+                        + "; read-back failed: " + describe(readFailure) + ")");
+                }
+                if (observed != next) {
+                    confirmEpoch(flp, errorGate, observed);
+                    return gateFailure(flp, gate + " did not reopen (" + describe(writeFailure) + ")");
+                }
+            }
+        }
+        confirmEpoch(flp, errorGate, next);
+        return null;
+    }
+
+    /**
+     * Records a gate that could not be reopened as a warning on the probe and returns the reason.
+     */
+    private String gateFailure(FastLogpoint flp, String failure) {
+        recordWarning(flp, failure);
+        return failure;
+    }
+
+    /**
+     * Adopts the generation the target actually holds as the server's view of that gate.
+     */
+    private static void confirmEpoch(FastLogpoint flp, boolean errorGate, int generation) {
+        if (errorGate) {
+            flp.errorEpoch = generation;
+        } else {
+            flp.epoch = generation;
+        }
+    }
+
+    /**
+     * Reads a gate generation from the probe class (a plain static field read, no invocation).
+     */
+    private static int readGateEpoch(ClassType probeType, Field field) throws FastLogpointException {
+        if (probeType.getValue(field) instanceof IntegerValue epoch) {
+            return epoch.value();
+        }
+        throw new FastLogpointException("probe field " + field.name() + " is not an int");
     }
 
     /**

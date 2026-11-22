@@ -24,6 +24,7 @@ import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Service;
 
+import javax.lang.model.SourceVersion;
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -3173,6 +3174,9 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Set to true only after the user explicitly approves this exact fast logpoint at this host:port in this conversation, granting standing approval for this server run.") @Nullable Boolean userApproved,
         @McpToolParam(required = false, description = "Ring-buffer capacity: a power of two between 16 and 65536 (default 4096). Entries overwritten before jdwp_get_events reads them are reported as dropped.") @Nullable Integer bufferSize,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
+        if (className == null || !SourceVersion.isName(className)) {
+            return FAST_PROBE_INVALID_CLASS_NAME;
+        }
         final String effectiveCondition = condition == null || condition.isBlank() ? null : condition;
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required";
@@ -3184,18 +3188,22 @@ public class JDWPTools {
             return String.format("Error: bufferSize must be a power of two between %d and %d, got %d",
                 FastLogpointService.MIN_BUFFER_SIZE, FastLogpointService.MAX_BUFFER_SIZE, effectiveBufferSize);
         }
+        final boolean effectiveForceLoad = Boolean.TRUE.equals(forceLoad);
         final boolean explicitlyApproved = Boolean.TRUE.equals(userApproved);
         final TargetEndpoint endpoint = jdiService.targetEndpoint();
-        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(
+        final FastProbeApprovals.Probe probe = new FastProbeApprovals.Probe(
             FastLogpointService.Kind.LOGPOINT, className, lineNumber, expression, effectiveCondition,
-            EventRequest.SUSPEND_EVENT_THREAD, false, endpoint);
+            EventRequest.SUSPEND_EVENT_THREAD, false, effectiveForceLoad, effectiveBufferSize);
+        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(probe, endpoint);
         final Instant standingApproval = key == null ? null : fastProbeApprovals.grantedAt(key);
         if (standingApproval == null && !explicitlyApproved) {
-            return FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
-                describeProbeTarget(endpoint));
+            return fastProbeBriefing(probe, endpoint);
         }
         if (key == null) {
             return "Error: No JDWP target endpoint. Use jdwp_connect first.";
+        }
+        if (explicitlyApproved && fastProbeApprovals.briefedAtDifferentEndpoint(key)) {
+            return FAST_PROBE_BRIEFING_TARGET_CHANGED + fastProbeBriefing(probe, key.endpoint());
         }
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -3204,9 +3212,7 @@ public class JDWPTools {
                 return FAST_PROBE_CONNECTION_CHANGED;
             }
             if (!key.endpoint().equals(attachedEndpoint)) {
-                return FAST_PROBE_TARGET_CHANGED
-                    + FastLogpointRiskBriefing.render(className, lineNumber, expression, effectiveCondition,
-                    describeProbeTarget(attachedEndpoint));
+                return FAST_PROBE_TARGET_CHANGED + fastProbeBriefing(probe, attachedEndpoint);
             }
             if (!vm.canRedefineClasses()) {
                 return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_logpoint.";
@@ -3216,7 +3222,6 @@ public class JDWPTools {
                     + "canGetConstantPool() is false), so the guard against stripping other agents' changes cannot run "
                     + "— use jdwp_set_logpoint.";
             }
-            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             ReferenceType refType = findFastProbeClass(vm, className, effectiveForceLoad);
             if (refType == null) {
                 final int waitingId = fastLogpoints.registerWaiting(vm, FastLogpointService.Kind.LOGPOINT, className,
@@ -3304,6 +3309,9 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Suspend policy of the stop: 'all' (default) or 'thread'") @Nullable String suspendPolicy,
         @McpToolParam(required = false, description = "If true (default), only the first hit that meets the condition stops — call again with the same arguments to re-arm. If false, every such hit stops.") @Nullable Boolean stopOnce,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
+        if (className == null || !SourceVersion.isName(className)) {
+            return FAST_PROBE_INVALID_CLASS_NAME;
+        }
         // Arguments first: they need no VM, and the user should not be asked to approve a call that
         // cannot succeed.
         if (condition == null || condition.isBlank()) {
@@ -3321,18 +3329,22 @@ public class JDWPTools {
             }
         }
         final boolean effectiveStopOnce = stopOnce == null || stopOnce;
+        final boolean effectiveForceLoad = Boolean.TRUE.equals(forceLoad);
         final boolean explicitlyApproved = Boolean.TRUE.equals(userApproved);
         final TargetEndpoint endpoint = jdiService.targetEndpoint();
-        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(
+        final FastProbeApprovals.Probe probe = new FastProbeApprovals.Probe(
             FastLogpointService.Kind.BREAKPOINT, className, lineNumber, null, condition, jdiPolicy,
-            effectiveStopOnce, endpoint);
+            effectiveStopOnce, effectiveForceLoad, FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
+        final FastProbeApprovals.Key key = endpoint == null ? null : new FastProbeApprovals.Key(probe, endpoint);
         final Instant standingApproval = key == null ? null : fastProbeApprovals.grantedAt(key);
         if (standingApproval == null && !explicitlyApproved) {
-            return FastBreakpointRiskBriefing.render(className, lineNumber, condition, policyLabel, effectiveStopOnce,
-                describeProbeTarget(endpoint));
+            return fastProbeBriefing(probe, endpoint);
         }
         if (key == null) {
             return "Error: No JDWP target endpoint. Use jdwp_connect first.";
+        }
+        if (explicitlyApproved && fastProbeApprovals.briefedAtDifferentEndpoint(key)) {
+            return FAST_PROBE_BRIEFING_TARGET_CHANGED + fastProbeBriefing(probe, key.endpoint());
         }
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -3341,9 +3353,7 @@ public class JDWPTools {
                 return FAST_PROBE_CONNECTION_CHANGED;
             }
             if (!key.endpoint().equals(attachedEndpoint)) {
-                return FAST_PROBE_TARGET_CHANGED
-                    + FastBreakpointRiskBriefing.render(className, lineNumber, condition, policyLabel, effectiveStopOnce,
-                    describeProbeTarget(attachedEndpoint));
+                return FAST_PROBE_TARGET_CHANGED + fastProbeBriefing(probe, attachedEndpoint);
             }
             if (!vm.canRedefineClasses()) {
                 return "Error: the target VM cannot redefine classes (canRedefineClasses() is false) — use jdwp_set_breakpoint.";
@@ -3353,7 +3363,6 @@ public class JDWPTools {
                     + "canGetConstantPool() is false), so the guard against stripping other agents' changes cannot run "
                     + "— use jdwp_set_breakpoint.";
             }
-            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
             ReferenceType refType = findFastProbeClass(vm, className, effectiveForceLoad);
             if (refType == null) {
                 final Integer existing = fastLogpoints.findWaiting(FastLogpointService.Kind.BREAKPOINT, className,
@@ -3481,13 +3490,25 @@ public class JDWPTools {
         "Error: The JDWP connection changed before the probe could be set. Retry on the current target.";
     private static final String FAST_PROBE_TARGET_CHANGED =
         "[CONSENT REQUIRED AGAIN] Nothing was armed: the target endpoint changed during this call.\n\n";
+    private static final String FAST_PROBE_BRIEFING_TARGET_CHANGED =
+        "[CONSENT REQUIRED AGAIN] Nothing was armed: the last briefing for this probe named a different endpoint.\n\n";
+    private static final String FAST_PROBE_INVALID_CLASS_NAME =
+        "Error: className must be a binary class name, such as com.example.Outer$Inner. Wildcards are unsupported.";
 
     /**
-     * Names the target endpoint for a fast-probe risk briefing, so the user sees which host:port the
-     * approval covers. {@code null} when nothing was attached yet.
+     * Renders the briefing and remembers the endpoint it names for the next explicit approval.
      */
-    private static @Nullable String describeProbeTarget(@Nullable TargetEndpoint endpoint) {
-        return endpoint == null ? null : "the JVM attached at " + endpoint;
+    private String fastProbeBriefing(FastProbeApprovals.Probe probe, @Nullable TargetEndpoint endpoint) {
+        final String target = endpoint == null ? null : "the JVM attached at " + endpoint;
+        final String briefing = probe.kind() == FastLogpointService.Kind.LOGPOINT
+            ? FastLogpointRiskBriefing.render(probe.className(), probe.line(), Objects.requireNonNull(probe.expression()),
+                probe.condition(), probe.bufferSize(), probe.forceLoad(), target)
+            : FastBreakpointRiskBriefing.render(probe.className(), probe.line(), Objects.requireNonNull(probe.condition()),
+                FastLogpointService.policyLabel(probe.suspendPolicy()), probe.stopOnce(), probe.forceLoad(), target);
+        if (endpoint != null) {
+            fastProbeApprovals.recordBriefing(probe, endpoint);
+        }
+        return briefing;
     }
 
     /**
@@ -4697,7 +4718,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Delete debug state by type and/or substring filter. The 'types' arg is REQUIRED so an empty call cannot wipe everything by accident; pass 'all' to clear every supported type. To preview what would be cleared, call jdwp_overview with the same types/filter first.")
+    @McpTool(description = "Delete debug state by type and/or substring filter. The 'types' arg is REQUIRED; pass 'all' to clear every supported type. Preview with jdwp_overview using the same types/filter. Standing approval rows are informational.")
     public String jdwp_clear(
         @McpToolParam(description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, fast_logpoint, fast_breakpoint, watcher, mark. Use 'all' for every type. REQUIRED.") String types,
         @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter) {
@@ -5019,21 +5040,22 @@ public class JDWPTools {
         final List<String> rows = new ArrayList<>();
         for (Map.Entry<FastProbeApprovals.Key, Instant> grant : fastProbeApprovals.snapshot().entrySet()) {
             final FastProbeApprovals.Key key = grant.getKey();
-            if (key.kind() != kind || !matchesFilter(needle, key.className(), key.expression(), key.condition(),
+            final FastProbeApprovals.Probe probe = key.probe();
+            if (probe.kind() != kind || !matchesFilter(needle, probe.className(), probe.expression(), probe.condition(),
                 key.endpoint().toString(), kind.noun())) {
                 continue;
             }
-            final String expression = key.expression();
-            final String condition = key.condition();
+            final String expression = probe.expression();
+            final String condition = probe.condition();
             final String settings = kind == FastLogpointService.Kind.BREAKPOINT
-                ? "  " + FastLogpointService.modeLabel(key.stopOnce())
-                    + ", suspendPolicy=" + FastLogpointService.policyLabel(key.suspendPolicy())
-                : "";
-            final String row = String.format("    %s %s:%d%s%s%s  endpoint=%s  granted at %s",
-                kind.noun(), key.className(), key.line(),
+                ? "  " + FastLogpointService.modeLabel(probe.stopOnce())
+                    + ", suspendPolicy=" + FastLogpointService.policyLabel(probe.suspendPolicy())
+                : "  bufferSize=" + probe.bufferSize();
+            final String row = String.format("    %s %s:%d%s%s%s  forceLoad=%s  endpoint=%s  granted at %s",
+                kind.noun(), probe.className(), probe.line(),
                 expression == null ? "" : "  expr=\"" + expression + '"',
                 condition == null ? "" : "  cond=\"" + condition + '"',
-                settings, key.endpoint(), JDIConnectionService.formatServerTime(grant.getValue()));
+                settings, probe.forceLoad(), key.endpoint(), JDIConnectionService.formatServerTime(grant.getValue()));
             rows.add(row.replace("\r", "\\r").replace("\n", "\\n"));
         }
         Collections.sort(rows);

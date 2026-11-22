@@ -19,7 +19,7 @@ public final class FastLogpointRiskBriefing {
      * @param targetVm short description of the target endpoint, or {@code null} when unknown
      */
     public static String render(String className, int lineNumber, String expression, @Nullable String condition,
-                                @Nullable String targetVm) {
+                                int bufferSize, boolean forceLoad, @Nullable String targetVm) {
         return "[CONSENT REQUIRED] Nothing was armed.\n"
             + "jdwp_set_fast_logpoint rewrites the bytecode of the running application. Relay the briefing "
             + "below to the user word for word and ask for explicit approval. Only after the user has agreed "
@@ -34,7 +34,9 @@ public final class FastLogpointRiskBriefing {
             + "Target: " + className + ':' + lineNumber
             + " — expression: " + expression
             + (condition != null ? " — condition: " + condition : "")
+            + " — buffer: " + bufferSize
             + " — VM: " + (targetVm != null ? targetVm : "the VM attached when the logpoint is set") + '\n'
+            + (forceLoad ? "forceLoad=true can load the class and run its <clinit> in the target JVM before arming.\n" : "")
             + "A fast logpoint evaluates the expression inside the target JVM instead of pausing the thread on "
             + "every hit. To do that it changes the running application:\n"
             + "1. It rewrites the class's bytecode. The change stays until it is reverted by clearing the "
