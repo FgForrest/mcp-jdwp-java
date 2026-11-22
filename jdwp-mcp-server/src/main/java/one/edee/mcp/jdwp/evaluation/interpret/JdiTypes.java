@@ -141,46 +141,44 @@ final class JdiTypes {
         return qualifier;
     }
 
-    /**
-     * Resolves a simple name in lexical scope first, checking package and java.lang defaults
-     * against the declaring type's constant pool.
-     */
+    /** Binds simple names lexically or to an unambiguous java.lang type. */
     private @Nullable ReferenceType resolveSimple(String name) {
         final ReferenceType owner = declaring;
-        ReferenceType fallback = null;
         if (owner != null) {
             final ReferenceType lexical = lexicalType(owner, name);
             if (lexical != null) {
                 return lexical;
             }
             final String binary = owner.name();
-            final int packageEnd = binary.lastIndexOf('.');
-            fallback = findQualified(binary.substring(0, packageEnd + 1) + name);
+            final String packagePrefix = binary.substring(0, binary.lastIndexOf('.') + 1);
+            if (!vm.classesByName(packagePrefix + name).isEmpty()) {
+                throw needsQualification(name);
+            }
         }
-        if (fallback == null) {
-            fallback = findQualified("java.lang." + name);
-        }
-        if (owner != null) {
-            final Set<ReferenceType> candidates = new LinkedHashSet<>();
-            for (String candidate : classNames(owner)) {
+        final String standardName = "java.lang." + name;
+        final ReferenceType standard = findExact(standardName);
+        for (Set<String> pool : constantPoolClasses.values()) {
+            for (String candidate : pool) {
                 if (!simpleName(candidate).equals(name)) {
                     continue;
                 }
-                if (fallback != null && !fallback.name().equals(candidate)) {
+                if (standard == null) {
+                    throw needsQualification(name);
+                }
+                if (!standardName.equals(candidate)) {
                     throw Planner.compile("ambiguous type name: " + name);
                 }
-                if (fallback == null) {
-                    final ReferenceType type = findExact(candidate);
-                    if (type != null) {
-                        candidates.add(type);
-                    }
-                }
-            }
-            if (!candidates.isEmpty()) {
-                return unique(name, candidates);
             }
         }
-        return fallback == null ? findQualified(name) : fallback;
+        if (standard == null && !vm.classesByName(name).isEmpty()) {
+            throw needsQualification(name);
+        }
+        return standard;
+    }
+
+    /** Reports a simple name that the interpreter cannot bind without qualification. */
+    private static Planner.Refusal needsQualification(String name) {
+        return Planner.compile("type name needs an import or the frame's package: " + name);
     }
 
     /** Finds a simple type name after ruling out possible type parameters and local classes. */

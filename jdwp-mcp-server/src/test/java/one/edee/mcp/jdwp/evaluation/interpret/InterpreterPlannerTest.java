@@ -65,28 +65,30 @@ class InterpreterPlannerTest {
         verifyNoInteractions(self);
     }
 
+    /** Constant-pool names can trigger fallback while qualified lookup keeps the loader visibility check. */
     @Test
-    void resolvesConstantPoolTypesThroughTheFrameLoaderAndRefusesAmbiguity() throws Exception {
+    void defersConstantPoolBindingsAndResolvesQualifiedTypesThroughTheFrameLoader() throws Exception {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassLoaderReference frameLoader = mock(ClassLoaderReference.class);
         final ClassLoaderReference parent = mock(ClassLoaderReference.class);
         final ClassType owner = type(vm, "app.Example", frameLoader);
         final ClassType one = type(vm, "first.Badge", parent);
         final ClassType two = type(vm, "second.Badge", parent);
+        type(vm, "java.lang.Class", null);
         when(vm.canGetConstantPool()).thenReturn(true);
         when(owner.constantPool()).thenReturn(pool("first/Badge", "second/Badge"));
         when(owner.constantPoolCount()).thenReturn(5);
         when(frameLoader.visibleClasses()).thenReturn(List.of(one));
 
-        assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(one);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final ExpressionParser.Parsed simple = ExpressionParser.parse("Badge.class");
+        final Planner.Compile expected = new Planner.Compile("type name needs an import or the frame's package: Badge");
+        assertThat(Planner.plan(vm, frame, Map.of(), simple)).isEqualTo(expected);
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("first.Badge.class")).kind())
+            .isEqualTo(Planner.KindOfPlan.NAVIGATE);
         assertThat(new JdiTypes(vm, owner).resolve("second.Badge")).isNull();
         when(frameLoader.visibleClasses()).thenReturn(List.of(one, two));
-        final var declaring = mock(Location.class);
-        final var frame = mock(StackFrame.class);
-        when(declaring.declaringType()).thenReturn(owner);
-        when(frame.location()).thenReturn(declaring);
-        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class")))
-            .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+        assertThat(Planner.plan(vm, frame, Map.of(), simple)).isEqualTo(expected);
     }
 
     @Test
@@ -186,7 +188,7 @@ class InterpreterPlannerTest {
             .isEqualTo(new Planner.Compile("literal contains an unpaired surrogate"));
     }
 
-    /** Applies constant-pool ambiguity checks to simple names and to the first segment of a qualifier. */
+    /** Defers package bindings and ambiguous java.lang bindings for simple and dotted names. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"app", "java.lang"})
     void rejectsConflictingConstantPoolAndDefaultTypes(String defaultPackage) throws Exception {
@@ -199,17 +201,107 @@ class InterpreterPlannerTest {
         when(vm.canGetConstantPool()).thenReturn(true);
         when(owner.constantPool()).thenReturn(pool("imported/Badge"));
         when(owner.constantPoolCount()).thenReturn(3);
-        final StackFrame frame = mock(StackFrame.class);
-        final Location location = mock(Location.class);
-        when(location.declaringType()).thenReturn(owner);
-        when(frame.location()).thenReturn(location);
-
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final String reason = defaultPackage.equals("app")
+            ? "type name needs an import or the frame's package: Badge" : "ambiguous type name: Badge";
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class")))
-            .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+            .isEqualTo(new Planner.Compile(reason));
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.Member.class")))
-            .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+            .isEqualTo(new Planner.Compile(reason));
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(defaultPackage + ".Badge.Member.class"))
             .kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+    }
+
+    /** Defers a loaded package type even if it would shadow a loaded java.lang type. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void defersSimplePackageTypes(boolean javaLangLoaded) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "app.Integer", null);
+        type(vm, "java.lang.Class", null);
+        if (javaLangLoaded) {
+            type(vm, "java.lang.Integer", null);
+        }
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Integer.class")))
+            .isEqualTo(new Planner.Compile("type name needs an import or the frame's package: Integer"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("app.Integer.class")).kind())
+            .isEqualTo(Planner.KindOfPlan.NAVIGATE);
+    }
+
+    /** Allows a java.lang type when its constant-pool reference agrees and no package type is loaded. */
+    @Test
+    void navigatesAnUncontestedJavaLangType() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "java.lang.Integer", null);
+        type(vm, "java.lang.Class", null);
+        when(vm.canGetConstantPool()).thenReturn(true);
+        when(owner.constantPool()).thenReturn(pool("java/lang/Integer"));
+        when(owner.constantPoolCount()).thenReturn(3);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Integer.class")).kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+    }
+
+    /** Checks a conflicting class name in the pool of a loaded enclosing type. */
+    @Test
+    void defersJavaLangWhenAnEnclosingPoolConflicts() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType enclosing = type(vm, "app.Outer", null);
+        final ClassType owner = type(vm, "app.Outer$Frame", null);
+        type(vm, "java.lang.Integer", null);
+        type(vm, "java.lang.Class", null);
+        when(vm.canGetConstantPool()).thenReturn(true);
+        when(enclosing.constantPool()).thenReturn(pool("imported/Integer"));
+        when(enclosing.constantPoolCount()).thenReturn(3);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Integer.class"))).isEqualTo(new Planner.Compile("ambiguous type name: Integer"));
+    }
+
+    /** Defers a raw simple binary name from the default package. */
+    @Test
+    void defersLastResortSimpleTypeNames() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "DefaultType", null);
+        type(vm, "java.lang.Class", null);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("DefaultType.class")))
+            .isEqualTo(new Planner.Compile("type name needs an import or the frame's package: DefaultType"));
+    }
+
+    /** An array mirror alone cannot establish a simple component name's binding. */
+    @Test
+    void defersAnArrayWithoutAProvenSimpleComponentType() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ArrayType array = mock(ArrayType.class);
+        type(vm, "java.lang.Class", null);
+        when(vm.classesByName("Badge[]")).thenReturn(List.of(array));
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Badge[].class")))
+            .isEqualTo(new Planner.Compile("type is not loaded or visible: Badge"));
+    }
+
+    /** Keeps lexical bindings for both the frame's class and its member type. */
+    @Test
+    void navigatesTheFrameTypeAndItsMember() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "app.Example$Badge", null);
+        type(vm, "app.Badge", null);
+        type(vm, "java.lang.Class", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Example.class")).kind())
+            .isEqualTo(Planner.KindOfPlan.NAVIGATE);
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class")).kind())
+            .isEqualTo(Planner.KindOfPlan.NAVIGATE);
     }
 
     /** Includes a matching member type inherited from a superinterface before default lookup. */
@@ -368,10 +460,10 @@ class InterpreterPlannerTest {
         return frame;
     }
 
-    /** An inaccessible declaration in a supertype still hides a declaration above it. */
+    /** An inaccessible declaration still hides a declaration above it before package or java.lang checks. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
-    void doesNotInheritHiddenOrInaccessibleMemberTypes(boolean privateMember) {
+    @CsvSource({"false, false", "true, false", "false, true", "true, true"})
+    void doesNotInheritHiddenOrInaccessibleMemberTypes(boolean privateMember, boolean packageTypeLoaded) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Example", null);
         final ClassType parent = type(vm, "outer.Parent", null);
@@ -379,12 +471,20 @@ class InterpreterPlannerTest {
         final ClassType shadow = type(vm, "outer.Parent$Badge", null);
         type(vm, "outer.Grandparent$Badge", null);
         final ClassType standard = type(vm, "java.lang.Badge", null);
+        type(vm, "java.lang.Class", null);
         when(owner.superclass()).thenReturn(parent);
         when(parent.superclass()).thenReturn(grandparent);
         when(shadow.isPrivate()).thenReturn(privateMember);
         when(shadow.isPackagePrivate()).thenReturn(!privateMember);
 
-        assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(standard);
+        if (packageTypeLoaded) {
+            type(vm, "app.Badge", null);
+            assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+                ExpressionParser.parse("Badge.class")))
+                .isEqualTo(new Planner.Compile("type name needs an import or the frame's package: Badge"));
+        } else {
+            assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(standard);
+        }
     }
 
     private static byte[] pool(String... names) throws Exception {

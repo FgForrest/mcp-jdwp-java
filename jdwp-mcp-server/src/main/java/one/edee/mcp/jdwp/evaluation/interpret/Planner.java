@@ -510,7 +510,7 @@ public final class Planner {
         }, null, constantCandidate, type.isString() && constantCandidate, null);
     }
 
-    /** Resolves a type written in the source, including primitives, arrays and intersection casts. */
+    /** Resolves a source type, requiring a binding for an array's simple reference component name. */
     private StaticType type(TypeReference syntax) {
         if (syntax instanceof IntersectionCastTypeReference intersection) {
             final List<ReferenceType> bounds = Arrays.stream(intersection.typeReferences)
@@ -526,15 +526,16 @@ public final class Planner {
         }
         final String name = Arrays.stream(syntax.getTypeName()).map(String::new)
             .reduce((a, b) -> a + "." + b).orElseThrow();
-        if (syntax.dimensions() == 0) {
-            final Optional<Kind> primitive = primitiveNamed(name);
-            if (primitive.isPresent()) {
-                return JdiTypes.primitive(primitive.get());
-            }
+        final Optional<Kind> primitive = primitiveNamed(name);
+        if (syntax.dimensions() == 0 && primitive.isPresent()) {
+            return JdiTypes.primitive(primitive.get());
         }
         final ReferenceType ref;
         if (syntax.dimensions() > 0) {
-            final ReferenceType component = primitiveNamed(name).isPresent() ? null : types.resolve(name);
+            final ReferenceType component = primitive.isPresent() ? null : types.resolve(name);
+            if (component == null && primitive.isEmpty() && !name.contains(".")) {
+                throw compile("type is not loaded or visible: " + name);
+            }
             final String arrayName = (component == null ? name : component.name()) + "[]".repeat(syntax.dimensions());
             ref = types.findExact(arrayName);
         } else {

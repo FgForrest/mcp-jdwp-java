@@ -380,14 +380,15 @@ class InterpreterHarnessLiveTest {
         }
     }
 
-    /** Resolves loaded members through the selected qualifier, including an imported qualifier. */
+    /** Resolves loaded members through lexical or fully qualified names and defers imported simple names. */
     @Test
     void navigatesLoadedQualifiedMemberTypes() throws Exception {
         final List<Entry> entries = List.of(
             mainRow("loaded-qualified-member", "LoadedScope.Badge.class"),
             mainRow("qualified-member-cast", "(LoadedScope.Badge) LOADED_SCOPE[1]"),
             mainRow("qualified-member-field", "LoadedScope.Badge.CODE"),
-            mainRow("imported-qualified-member", "Map.Entry.class"));
+            mainRow("imported-qualified-member", "Map.Entry.class"),
+            mainRow("fully-qualified-member", "java.util.Map.Entry.class"));
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             withFixture(javaHome, fixture -> {
                 final EvaluationRouter strict = new EvaluationRouter(mock(JdiExpressionEvaluator.class),
@@ -399,6 +400,11 @@ class InterpreterHarnessLiveTest {
                     assertThat(fixture.vm().classesByName(TARGET + "Base$LoadedScope$Badge")).hasSize(1);
                     final Planner.Plan plan = strict.prepare(strict.parse(entry.expression()), context.thread(),
                         context::frame, context.bindings());
+                    if (entry.id().equals("imported-qualified-member")) {
+                        assertThat(plan).isEqualTo(
+                            new Planner.Compile("type name needs an import or the frame's package: Map"));
+                        return golden(context);
+                    }
                     assertThat(plan.kind()).as("%s, %s, %s", javaHome.getFileName(), entry.expression(), plan)
                         .isEqualTo(Planner.KindOfPlan.NAVIGATE);
                     final Outcome result = strict.evaluateEvent(entry.expression(), context.thread(),

@@ -149,7 +149,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
             case "loaded-qualified-member" -> LoadedScope.Badge.class;
             case "qualified-member-cast" -> (LoadedScope.Badge) LOADED_SCOPE[1];
             case "qualified-member-field" -> LoadedScope.Badge.CODE;
-            case "imported-qualified-member" -> Map.Entry.class;
+            case "imported-qualified-member", "fully-qualified-member" -> Map.Entry.class;
             case "super-field" -> super.hidden;
             case "erased-field-navigation" -> holder.element.inherited;
             case "nested-class-literal" -> State.class;
