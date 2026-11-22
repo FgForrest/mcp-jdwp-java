@@ -68,9 +68,7 @@ public class LocalProjectClasspathProvider {
      * Filesystem-scan depth cap. Five levels covers reactor / module / sub-module layouts without
      * walking into Node / Gradle / IDE caches that an unbounded walk would otherwise stat-flood.
      */
-    // Package-private (not private) so ProcessBuilderMavenRunner.HARVEST_MAX_DEPTH can derive from
-    // it at compile time, keeping the harvester's walk depth genuinely coupled to the scan depth.
-    static final int MAX_SCAN_DEPTH = 5;
+    private static final int MAX_SCAN_DEPTH = 5;
     /**
      * Cold-cache {@code mvn} may download dependencies on first run, which routinely takes 1-3
      * minutes on a fresh machine. 180s covers the common case; a real timeout still logs a clear
@@ -85,16 +83,6 @@ public class LocalProjectClasspathProvider {
     private static final Set<String> SKIP_DIRS = Set.of(
         ".git", ".idea", ".vscode", "node_modules", ".gradle", ".mvn",
         "target" // skip target itself — we look at it explicitly, never recurse into it
-    );
-
-    /**
-     * Subset of {@link #SKIP_DIRS} that other components (notably the Maven-output harvester) must
-     * also skip when walking the project tree. {@code target} is excluded here because the harvester
-     * specifically looks for files whose direct parent is {@code target/} — that gate handles the
-     * "skip nested target dirs we shouldn't descend into" concern without needing this list.
-     */
-    static final Set<String> HARVEST_SKIP_DIRS = Set.of(
-        ".git", ".idea", ".vscode", "node_modules", ".gradle", ".mvn"
     );
 
     /**
@@ -777,7 +765,7 @@ public class LocalProjectClasspathProvider {
          * contributed.
          *
          * @param command          Maven executable and discovery arguments; the runner supplies its output path
-         * @param workingDirectory CWD for the spawned process; output files are harvested under it
+         * @param workingDirectory CWD for the spawned process; the runner reads output from its private directory
          * @param timeoutSeconds   wall-clock budget; on timeout the implementation MUST kill the
          *                         process before reporting the failure
          * @return harvested classpath entries

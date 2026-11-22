@@ -222,6 +222,44 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
+	/** Reports the compiler's typo after a live probe's initial discovery deferral. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void invalidProbeReportsCompilerErrorOnceDiscoveryFinishes(boolean breakpoint, @TempDir Path project)
+		throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				assertThat(releaseMaven.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+				return List.of();
+			});
+		try (LiveSession session = LiveSession.start(List.of(), provider)) {
+			final int line = LiveSession.lineOf("MARK: label");
+			final int probe = LiveSession.idOf(breakpoint
+				? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, "unknownLocal < i",
+					true, "all", true, null)
+				: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, "unknownLocal + i",
+					null, true, null, null));
+			final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
+			await("discovery deferral", () -> hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED"));
+
+			releaseMaven.countDown();
+			assertThat(provider.discoverWithBreakdown().failure()).isNull();
+			if (breakpoint) {
+				assertThat(session.tools.jdwp_resume_until_event(30_000))
+					.contains("condition failed", "unknownLocal cannot be resolved");
+				session.tools.jdwp_resume();
+			}
+			await("compiler error", () -> session.history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(event ->
+				event.type().equals(prefix + "_ARM_FAILED")
+					&& Integer.toString(probe).equals(event.details().get("breakpointId"))
+					&& event.summary().contains("unknownLocal cannot be resolved")));
+		} finally {
+			releaseMaven.countDown();
+		}
+	}
+
 	/** Retains both process handles before disconnect and checks that both exit. */
 	@Test
 	@EnabledOnOs({OS.LINUX, OS.MAC})

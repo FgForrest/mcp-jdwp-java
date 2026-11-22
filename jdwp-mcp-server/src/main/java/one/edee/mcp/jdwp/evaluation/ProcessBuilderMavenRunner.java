@@ -4,26 +4,28 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.util.FileSystemUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileVisitOption;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
-import java.util.EnumSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -33,12 +35,12 @@ import java.util.stream.Stream;
 /**
  * Production {@link LocalProjectClasspathProvider.MavenRunner} that shells out to {@code mvn} (or
  * the project's Maven wrapper) via {@link ProcessBuilder} and harvests the per-module
- * classpath files Maven writes under each module's {@code target/}, with a private name per run.
+ * classpath files Maven writes to a private temporary directory for each run.
  *
- * <p>Responsibility boundary: this class owns the process invocation, timeout enforcement, stdout
- * draining, and output-file collection. Cleanup deletes only regular files with this run's exact
- * output name in the Maven build directories it scans. Callers receive any failure so they can
- * diagnose a partial classpath.
+ * <p>This class owns invocation, timeout enforcement, stdout draining, and the temporary output
+ * directory. Maven resolves its own reactor module coordinates, so output collection is independent
+ * of module paths and does not scan or remove files from the project tree. Callers receive
+ * read failures alongside any successfully collected classpath entries.
  *
  * <p>Thread model: each {@link #run} invocation spawns ONE daemon platform thread named
  * {@code jdwp-mcp-maven-stdout-drainer} to drain the child process's merged stdout/stderr stream.
@@ -49,18 +51,14 @@ import java.util.stream.Stream;
 @Service
 public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.MavenRunner {
 
-    /** Prefix of the unique filename Maven writes into each module's {@code target/}. */
-    private static final String OUTPUT_FILE_PREFIX = ".jdwp-mcp-classpath-";
+    /** Uses full Maven coordinates because a reactor can build multiple versions of an artifact. */
+    private static final String MODULE_OUTPUT = "${project.groupId}@${project.artifactId}@${project.version}.cp";
+    /** Passes the private path outside argv so platform launchers cannot reinterpret it. */
+    private static final String OUTPUT_DIRECTORY_ENV = "JDWP_MCP_CLASSPATH_DIR";
+    /** Maven's output-directory expression, also the literal directory name if expansion fails. */
+    private static final String OUTPUT_DIRECTORY_EXPRESSION = "${env." + OUTPUT_DIRECTORY_ENV + "}";
     /** Upper bound on captured child stdout/stderr included in the WARN log on failure. */
     private static final int STDOUT_CAPTURE_BYTES = 64 * 1024;
-    /**
-     * Walk cap for the classpath-file harvester: the provider's filesystem scan depth plus two —
-     * covering {@code <module>/target/.jdwp-mcp-classpath-<run-id>} for modules sitting at the scan
-     * boundary (the file is two segments below the module directory). Derived
-     * from {@link LocalProjectClasspathProvider#MAX_SCAN_DEPTH} at compile time so a future bump to
-     * the scan depth is mirrored here automatically rather than silently dropping boundary modules.
-     */
-    private static final int HARVEST_MAX_DEPTH = LocalProjectClasspathProvider.MAX_SCAN_DEPTH + 2;
     /**
      * Runs Maven with its argv intact and reports its exit code on a separate status channel.
      * The session leader reads the server's pipe even while Maven runs and kills its own group on EOF.
@@ -81,7 +79,13 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
 
     /** Default Spring wiring — uses the real {@link ProcessBuilder}-based command executor. */
     public ProcessBuilderMavenRunner() {
-        isolated = Files.isExecutable(Path.of("/usr/bin/setsid")) && Files.isExecutable(Path.of("/bin/sh"));
+        this(false);
+    }
+
+    /** Test seam to exercise real descendant polling on hosts that also have setsid. */
+    ProcessBuilderMavenRunner(boolean forcePolling) {
+        isolated = !forcePolling && Files.isExecutable(Path.of("/usr/bin/setsid"))
+            && Files.isExecutable(Path.of("/bin/sh"));
         commandExecutor = request -> executeRealCommand(request, isolated);
     }
 
@@ -101,146 +105,119 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     @Override
     public List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds)
         throws IOException, InterruptedException {
-        final String outputName = OUTPUT_FILE_PREFIX + UUID.randomUUID();
-        final List<String> argv = new ArrayList<>(command);
-        // Maven resolves this path under each module. Keep writes in its build directory, and
-        // give reconnects separate outputs even if the cancelled process can still write.
-        argv.add("-Dmdep.outputFile=target/" + outputName);
+        checkDiscoveryInterrupted();
+        final Path outputDirectory = Files.createTempDirectory("jdwp-mcp-maven-classpath-").toAbsolutePath();
         try {
+            final List<String> argv = new ArrayList<>(command);
+            // Maven expands the environment reference and reactor coordinates for each module.
+            // Keep the absolute path out of argv, especially when launching mvnw.cmd on Windows.
+            argv.add("-Dmdep.outputFile=" + OUTPUT_DIRECTORY_EXPRESSION + "/" + MODULE_OUTPUT);
             final int exitCode = commandExecutor.execute(new CommandRequest(List.copyOf(argv), workingDirectory,
-                timeoutSeconds));
-            if (exitCode == -1) {
-                throw new IOException("Maven timed out after " + timeoutSeconds + " seconds");
+                timeoutSeconds, outputDirectory));
+            switch (exitCode) {
+                case -1 -> throw new IOException("Maven timed out after " + timeoutSeconds + " seconds");
+                case 126, 127 -> throw new IOException("Maven executable could not be started: " + command.get(0)
+                    + " (exit code " + exitCode + "). Check for a command not on PATH, a missing interpreter,"
+                    + " CRLF line endings, or a missing inner command.");
+                case 0 -> { return harvestOutputFiles(outputDirectory, workingDirectory); }
+                default -> throw new IOException("Maven exited with code " + exitCode);
             }
-            if (exitCode != 0) {
-                throw new IOException("Maven exited with code " + exitCode);
-            }
-            return harvestOutputFiles(workingDirectory, outputName, true);
-        } catch (IOException | InterruptedException | RuntimeException | Error e) {
-            // An interrupt can arrive during execution or harvest. Once the executor has stopped
-            // the process, make a cleanup-only pass even if this discovery is already cancelled.
-            final boolean interrupted = Thread.interrupted();
-            try {
-                harvestOutputFiles(workingDirectory, outputName, false);
-            } catch (IOException | RuntimeException cleanup) {
-                e.addSuppressed(cleanup);
-                log.warn("[LocalClasspath] Could not remove all Maven classpath output (cwd={})", workingDirectory,
-                    cleanup);
-            } finally {
-                if (interrupted) {
-                    Thread.currentThread().interrupt();
-                }
-            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw e;
+        } finally {
+            removeOutputDirectory(outputDirectory);
         }
     }
 
     /**
-     * On the discovery worker, walks {@code root} for this run's output and removes it.
-     * When {@code readEntries} is true, returns parsed entries or throws with partial results.
-     *
-     * <p><b>Depth.</b> The walk's max depth is {@link #HARVEST_MAX_DEPTH} (= filesystem-scan depth
-     * + 2), so a module discovered at the scan boundary still has its {@code target/<file>}
-     * reachable. Counting from the root, {@code <root>/a/b/c/d/e/target/<file>} is
-     * seven levels deep; the previous fixed depth of 5 would silently drop reactor modules at the
-     * deeper boundary even though the scan correctly discovered them.
-     *
-     * <p><b>File-safety invariant.</b> A candidate must have this run's exact name and a
-     * {@code target} parent, and cannot be under a skipped or symlinked directory. This keeps the
-     * read and deletion confined to the Maven-owned output for this run.
-     *
-     * <p>Uses {@link Files#walkFileTree} with {@code preVisitDirectory} pruning so skip-listed
-     * directories ({@code node_modules}, {@code .git}, {@code .idea}, {@code .gradle}, etc.)
-     * are never descended into — a meaningful saving on large repos where {@code node_modules/}
-     * alone can hold tens of thousands of files. Symlinks are not followed because no
-     * {@link FileVisitOption#FOLLOW_LINKS} is passed.
+     * Reads regular files recursively without following links, including paths nested by a version.
+     * Returns the union of entries, reports read failures with partial results, and treats an
+     * interrupted read as cancellation. A successful Maven run must produce at least one file.
+     * With no private output, a literal directory in the project identifies a dropped environment.
      */
-    private static List<String> harvestOutputFiles(Path root, String outputName, boolean readEntries)
-        throws IOException {
+    private static List<String> harvestOutputFiles(Path directory, Path workingDirectory)
+        throws IOException, InterruptedException {
+        checkDiscoveryInterrupted();
         final Set<String> entries = new LinkedHashSet<>();
         final List<IOException> failures = new ArrayList<>();
-        try {
-            Files.walkFileTree(root, EnumSet.noneOf(FileVisitOption.class), HARVEST_MAX_DEPTH, new SimpleFileVisitor<Path>() {
-                /** Prunes excluded directories and checks for cancellation during harvest. */
-                @Override
-                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
-                    if (readEntries) {
-                        checkHarvestInterrupted();
-                    }
-                    if (!dir.equals(root)) {
-                        final Path name = dir.getFileName();
-                        if (name != null && LocalProjectClasspathProvider.HARVEST_SKIP_DIRS.contains(name.toString())) {
-                            return FileVisitResult.SKIP_SUBTREE;
+        boolean foundOutput = false;
+        try (Stream<Path> paths = Files.walk(directory)) {
+            final Iterator<Path> files = paths.iterator();
+            while (files.hasNext()) {
+                checkDiscoveryInterrupted();
+                final Path file = files.next();
+                try {
+                    if (Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)
+                        .isRegularFile()) {
+                        foundOutput = true;
+                        if (directory.relativize(file).toString().contains("${")) {
+                            throw new IOException("Maven did not expand the classpath output path");
                         }
+                        readOutputFile(file, entries);
                     }
-                    return FileVisitResult.CONTINUE;
+                } catch (IOException e) {
+                    checkHarvestInterrupted(e);
+                    failures.add(new IOException("Could not read classpath output " + file + ": " + e, e));
+                } catch (InvalidPathException e) {
+                    failures.add(new IOException("Could not read classpath output " + file + ": " + e, e));
                 }
-
-                /** Reads when requested and removes only matching regular output files. */
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    if (readEntries) {
-                        checkHarvestInterrupted();
-                    }
-                    if (attrs.isRegularFile() && isClasspathOutput(file, outputName)) {
-                        try {
-                            if (readEntries) {
-                                readOutputFile(file, entries);
-                            }
-                        } catch (IOException | InvalidPathException e) {
-                            failures.add(new IOException("Could not read classpath output " + file + ": " + e, e));
-                        } finally {
-                            try {
-                                Files.deleteIfExists(file);
-                            } catch (IOException e) {
-                                failures.add(new IOException("Could not remove classpath output " + file + ": " + e, e));
-                            }
-                        }
-                    }
-                    return FileVisitResult.CONTINUE;
-                }
-
-                /** Records inaccessible classpath output and continues unless cancelled. */
-                @Override
-                public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
-                    if (readEntries) {
-                        checkHarvestInterrupted();
-                    }
-                    final Path name = file.getFileName();
-                    if (isClasspathOutput(file, outputName) || (name != null && "target".equals(name.toString()))) {
-                        failures.add(new IOException("Could not access classpath output at " + file + ": " + exc, exc));
-                    } else {
-                        log.debug("[LocalClasspath] Skipping unreadable path {}: {}", file, exc.getMessage());
-                    }
-                    return FileVisitResult.CONTINUE;
-                }
-            });
+            }
+        } catch (UncheckedIOException e) {
+            final IOException cause = Objects.requireNonNull(e.getCause());
+            checkHarvestInterrupted(cause);
+            failures.add(cause);
         } catch (IOException e) {
+            checkHarvestInterrupted(e);
             failures.add(e);
         }
+        checkDiscoveryInterrupted();
         if (!failures.isEmpty()) {
             throw new OutputReadException(List.copyOf(entries), failures);
         }
-        return new ArrayList<>(entries);
+        if (!foundOutput) {
+            final Path literalDirectory = workingDirectory.resolve(OUTPUT_DIRECTORY_EXPRESSION);
+            if (Files.isDirectory(literalDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Maven succeeded but wrote no private classpath output. "
+                    + "The Maven launcher did not pass the " + OUTPUT_DIRECTORY_ENV
+                    + " environment variable through, so Maven wrote into directories named "
+                    + OUTPUT_DIRECTORY_EXPRESSION + " inside the project's modules, such as " + literalDirectory
+                    + ". Delete them.");
+            }
+            throw new IOException("Maven succeeded but wrote no classpath output. "
+                + "Check whether the POM configures the dependency plugin's outputFile.");
+        }
+        return List.copyOf(entries);
     }
 
-    /**
-     * Whether {@code file} matches this Maven run's output name and is directly under {@code target}.
-     */
-    private static boolean isClasspathOutput(Path file, String outputName) {
-        final Path name = file.getFileName();
-        final Path parent = file.getParent();
-        final Path parentName = parent == null ? null : parent.getFileName();
-        return name != null && outputName.equals(name.toString())
-            && parentName != null && "target".equals(parentName.toString());
-    }
-
-    /**
-     * Ends the output walk when the discovery was cancelled (a superseded connection or directory).
-     */
-    private static void checkHarvestInterrupted() throws InterruptedIOException {
+    /** Stops a cancelled discovery before process launch or at an output-read boundary. */
+    private static void checkDiscoveryInterrupted() throws InterruptedException {
         if (Thread.currentThread().isInterrupted()) {
-            throw new InterruptedIOException("Maven classpath output scan was interrupted");
+            throw new InterruptedException("Maven classpath discovery was interrupted");
+        }
+    }
+
+    /** Recognizes cancellation reported as a filesystem read failure, even if it cleared the flag. */
+    private static void checkHarvestInterrupted(IOException cause) throws InterruptedException {
+        if (cause instanceof InterruptedIOException || cause instanceof ClosedByInterruptException
+            || Thread.currentThread().isInterrupted()) {
+            final InterruptedException cancelled = new InterruptedException("Maven classpath discovery was interrupted");
+            cancelled.initCause(cause);
+            throw cancelled;
+        }
+    }
+
+    /** Deletes only this run's private output directory without following links, even after cancellation. */
+    private static void removeOutputDirectory(Path directory) {
+        final boolean interrupted = Thread.interrupted();
+        try {
+            FileSystemUtils.deleteRecursively(directory);
+        } catch (IOException | RuntimeException e) {
+            log.warn("[LocalClasspath] Could not remove Maven classpath output directory {}", directory, e);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -275,13 +252,16 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     /**
-     * Reads a Maven-written {@code .jdwp-mcp-classpath} file, splits on the host
+     * Reads a module's private classpath file without following links, splits on the host
      * {@link File#pathSeparator}, and appends non-blank, non-duplicate entries to {@code entries}.
      * Maven wrote this file on the host so its entries are separated by the host's separator —
      * splitting on {@code [;:]} would shred {@code C:\foo} on Windows.
      */
     private static void readOutputFile(Path file, Set<String> entries) throws IOException {
-        final String content = Files.readString(file);
+        final String content;
+        try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+            content = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(input.readAllBytes())).toString();
+        }
         if (content.indexOf('\0') >= 0) {
             throw new IOException("NUL byte in classpath output");
         }
@@ -339,9 +319,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     /**
-     * Drains output while waiting for Maven on the discovery worker. Cleans up before joining
-     * the drainer, since a reparented helper can hold the pipe open. Returns the Maven exit code,
-     * or {@code -1} on timeout, and propagates interruption or a status-channel failure.
+     * Exports the private output directory and drains output while waiting on the discovery worker.
+     * Cleans up before joining the drainer, since a reparented helper can hold the pipe open.
+     * Returns the Maven exit code, or {@code -1} on timeout, and propagates interruption or a
+     * status-channel failure.
      */
     private static int collectProcessOutput(CommandRequest req, List<String> command, @Nullable Path status)
         throws IOException, InterruptedException {
@@ -359,14 +340,21 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         // atomic and the toString() snapshot consistent.
         final Object capturedLock = new Object();
         final Set<ProcessHandle> observed = new LinkedHashSet<>();
-        final Process process = new ProcessBuilder(command).directory(req.workingDirectory().toFile())
-            .redirectErrorStream(true).start();
+        final ProcessBuilder builder = new ProcessBuilder(command).directory(req.workingDirectory().toFile())
+            .redirectErrorStream(true);
+        builder.environment().put(OUTPUT_DIRECTORY_ENV, req.outputDirectory().toString());
+        final Process process = builder.start();
         final Thread drainer;
-        final int exit;
+        int exit = -1;
+        IOException statusFailure = null;
         try {
             drainer = startOutputDrainer(process, captured, capturedLock);
             if (status != null) {
-                exit = awaitMavenStatus(process, status, req.timeoutSeconds());
+                try {
+                    exit = awaitMavenStatus(process, status, req.timeoutSeconds());
+                } catch (IOException e) {
+                    statusFailure = e;
+                }
             } else {
                 exit = waitForAndObserveChildren(process, req.timeoutSeconds(), observed) ? process.exitValue() : -1;
             }
@@ -385,6 +373,11 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             // still holding the pipe open. We have already collected the exit code, so this is not
             // a correctness issue, but a one-line DEBUG helps anyone investigating slow shutdowns.
             log.debug("[LocalClasspath] stdout drainer still alive after 1s join — leaving as daemon");
+        }
+        if (statusFailure != null) {
+            log.warn("[LocalClasspath] {}. Captured output (up to {} bytes):\n{}",
+                statusFailure.getMessage(), STDOUT_CAPTURE_BYTES, snapshotCaptured(captured, capturedLock));
+            throw statusFailure;
         }
         if (exit == -1) {
             log.warn("[LocalClasspath] Maven invocation timed out after {}s. Captured output (up to {} bytes):\n{}",
@@ -424,28 +417,43 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
 
     /**
      * Waits up to the Maven budget for a complete status line from the supervisor's child.
-     * Returns the Maven exit code or -1 on timeout. Unexpected supervisor exits fail discovery.
+     * Returns the Maven exit code or -1 on timeout. If the supervisor exits, checks for a last
+     * status write before reporting failure.
      */
     private static int awaitMavenStatus(Process supervisor, Path status, int timeoutSeconds)
         throws IOException, InterruptedException {
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         while (true) {
-            final String code = Files.readString(status);
-            if (code.endsWith("\n")) {
-                try {
-                    return Integer.parseInt(code.trim());
-                } catch (NumberFormatException e) {
-                    throw new IOException("Invalid Maven exit status: " + code, e);
-                }
+            final Integer code = readMavenStatus(status);
+            if (code != null) {
+                return code;
             }
             final long remaining = deadline - System.nanoTime();
             if (remaining <= 0) {
                 return -1;
             }
             if (supervisor.waitFor(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(50)), TimeUnit.NANOSECONDS)) {
+                final Integer lastCode = readMavenStatus(status);
+                if (lastCode != null) {
+                    return lastCode;
+                }
                 throw new IOException("Maven process group supervisor exited before reporting status (code "
                     + supervisor.exitValue() + ')');
             }
+        }
+    }
+
+    /** Reads a complete Maven status line, or returns null while the status write is unfinished. */
+    private static @Nullable Integer readMavenStatus(Path status) throws IOException {
+        final String code = Files.readString(status);
+        if (!code.endsWith("\n")) {
+            return null;
+        }
+        final String value = code.trim();
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IOException("Invalid Maven exit status: " + value, e);
         }
     }
 
@@ -581,6 +589,6 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         int execute(CommandRequest request) throws IOException, InterruptedException;
     }
 
-    /** Bundles the inputs the {@link CommandExecutor} needs so the seam stays a single-arg lambda. */
-    record CommandRequest(List<String> command, Path workingDirectory, int timeoutSeconds) {}
+    /** Carries the argv, process directory, timeout and private output directory to the executor. */
+    record CommandRequest(List<String> command, Path workingDirectory, int timeoutSeconds, Path outputDirectory) {}
 }

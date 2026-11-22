@@ -578,8 +578,8 @@ public class FastLogpointService {
     }
 
     /**
-     * Keep the same logical probe pending. The firing request was single-use, so re-arm it and
-     * release this event set. Future hits skip compilation until the background result is ready.
+     * Keep the same logical probe pending and re-arm its single-use request without proposing a
+     * stop. Future hits skip compilation while the current background result is pending.
      */
     private synchronized void deferForLocalClasspath(FastLogpoint flp) {
         if (flp.state != State.PENDING || logpoints.get(flp.id) != flp) {
