@@ -349,6 +349,65 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    /** Refuses to bind a base member type when the hiding qualifier is unloaded. */
+    @Test
+    void fallsBackForAnUnloadedHidingQualifier() throws Exception {
+        final Entry entry = mainRow("unloaded-qualified-member", "Scope.Badge.class");
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final EvaluationRouter auto = new EvaluationRouter(fixture.evaluator(new InMemoryJavaCompiler()),
+                    EvaluationRouter.Mode.AUTO);
+                return replay(fixture.vm(), List.of(entry), fixture.connection(), context -> {
+                    assertThat(fixture.vm().classesByName(TARGET + "$Scope")).isEmpty();
+                    assertThat(fixture.vm().classesByName(TARGET + "$AlternateScope$Badge")).isEmpty();
+                    assertThat(fixture.vm().classesByName(TARGET + "Base$Scope$Badge")).hasSize(1);
+                    final Planner.Plan plan = auto.prepare(auto.parse(entry.expression()), context.thread(),
+                        context::frame, context.bindings());
+                    final Outcome result = evaluationOutcome(() -> auto.evaluateEvent(entry.expression(),
+                        context.thread(), context.bindings(), context::render));
+                    final InterpreterValueFacts facts = result.facts();
+                    if (facts != null) {
+                        assertThat(facts.reflectedType()).isNotEqualTo(TARGET + "Base$Scope$Badge");
+                    }
+                    assertThat(plan).as("%s", javaHome.getFileName())
+                        .isEqualTo(new Planner.Compile("type is not loaded: " + TARGET + "$Scope"));
+                    return result;
+                }, null, new StringBuilder(), null);
+            });
+        }
+    }
+
+    /** Resolves loaded members through the selected qualifier, including an imported qualifier. */
+    @Test
+    void navigatesLoadedQualifiedMemberTypes() throws Exception {
+        final List<Entry> entries = List.of(
+            mainRow("loaded-qualified-member", "LoadedScope.Badge.class"),
+            mainRow("qualified-member-cast", "(LoadedScope.Badge) LOADED_SCOPE[1]"),
+            mainRow("qualified-member-field", "LoadedScope.Badge.CODE"),
+            mainRow("imported-qualified-member", "Map.Entry.class"));
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final EvaluationRouter strict = new EvaluationRouter(mock(JdiExpressionEvaluator.class),
+                    EvaluationRouter.Mode.INTERPRETER);
+                return replay(fixture.vm(), entries, fixture.connection(), context -> {
+                    final Entry entry = context.entry();
+                    assertThat(fixture.vm().classesByName(TARGET + "$LoadedScope")).hasSize(1);
+                    assertThat(fixture.vm().classesByName(TARGET + "$LoadedAlternateScope$Badge")).hasSize(1);
+                    assertThat(fixture.vm().classesByName(TARGET + "Base$LoadedScope$Badge")).hasSize(1);
+                    final Planner.Plan plan = strict.prepare(strict.parse(entry.expression()), context.thread(),
+                        context::frame, context.bindings());
+                    assertThat(plan.kind()).as("%s, %s, %s", javaHome.getFileName(), entry.expression(), plan)
+                        .isEqualTo(Planner.KindOfPlan.NAVIGATE);
+                    final Outcome result = strict.evaluateEvent(entry.expression(), context.thread(),
+                        context.bindings(), context::render);
+                    assertThat(result).as("%s, %s", javaHome.getFileName(), entry.expression())
+                        .isEqualTo(golden(context));
+                    return result;
+                }, null, new StringBuilder(), null);
+            });
+        }
+    }
+
     /** Exercises the two String transport cases and both forms of type shadowing on each target JDK. */
     @Test
     void checksSurrogateTransportAndShadowedTypeNames() throws Exception {

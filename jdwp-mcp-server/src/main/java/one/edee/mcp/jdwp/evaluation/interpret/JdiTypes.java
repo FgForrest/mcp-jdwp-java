@@ -111,11 +111,31 @@ final class JdiTypes {
         return bootstrap("java.lang." + BOXES.get(kind));
     }
 
-    /**
-     * Resolves lexical member types first. Package and java.lang defaults are used only when the
-     * constant pool provides no conflicting type of the same simple name.
-     */
+    /** Resolves a type name left to right, using package lookup if the first segment has no type binding. */
     @Nullable ReferenceType resolve(String name) {
+        final int dot = name.indexOf('.');
+        if (dot < 0) {
+            return resolveSimple(name);
+        }
+        ReferenceType qualifier = resolveSimple(name.substring(0, dot));
+        if (qualifier == null) {
+            return findQualified(name);
+        }
+        for (String member : name.substring(dot + 1).split("\\.")) {
+            final Set<ReferenceType> candidates = memberTypes(qualifier, "$" + member, new HashMap<>());
+            if (candidates.isEmpty()) {
+                throw Planner.compile("member type is unavailable: " + qualifier.name() + "." + member);
+            }
+            qualifier = unique(member, candidates);
+        }
+        return qualifier;
+    }
+
+    /**
+     * Resolves a simple name in lexical scope first, checking package and java.lang defaults
+     * against the declaring type's constant pool.
+     */
+    private @Nullable ReferenceType resolveSimple(String name) {
         final ReferenceType owner = declaring;
         ReferenceType fallback = null;
         if (owner != null) {
@@ -130,7 +150,7 @@ final class JdiTypes {
         if (fallback == null) {
             fallback = findQualified("java.lang." + name);
         }
-        if (owner != null && !name.contains(".")) {
+        if (owner != null) {
             final Set<ReferenceType> candidates = new LinkedHashSet<>();
             for (String candidate : classNames(owner)) {
                 if (!simpleName(candidate).equals(name)) {
@@ -153,10 +173,10 @@ final class JdiTypes {
         return fallback == null ? findQualified(name) : fallback;
     }
 
-    /** Finds a type in the declaring type's lexical scopes, including inherited member types. */
+    /** Finds a simple name in the declaring type's lexical scopes, including inherited member types. */
     private @Nullable ReferenceType lexicalType(ReferenceType owner, String name) {
         final String binary = owner.name();
-        final String suffix = "$" + name.replace('.', '$');
+        final String suffix = "$" + name;
         final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
         for (String enclosing = binary; ; enclosing = enclosing.substring(0, enclosing.lastIndexOf('$'))) {
             final ReferenceType scope = enclosing.equals(binary) ? owner : findExact(enclosing);

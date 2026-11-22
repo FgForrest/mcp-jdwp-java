@@ -186,14 +186,16 @@ class InterpreterPlannerTest {
             .isEqualTo(new Planner.Compile("literal contains an unpaired surrogate"));
     }
 
-    /** Refuses package and java.lang defaults when a different loaded type appears in the pool. */
+    /** Applies constant-pool ambiguity checks to simple names and to the first segment of a qualifier. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"app", "java.lang"})
     void rejectsConflictingConstantPoolAndDefaultTypes(String defaultPackage) throws Exception {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Example", null);
         type(vm, defaultPackage + ".Badge", null);
+        type(vm, defaultPackage + ".Badge$Member", null);
         type(vm, "imported.Badge", null);
+        type(vm, "java.lang.Class", null);
         when(vm.canGetConstantPool()).thenReturn(true);
         when(owner.constantPool()).thenReturn(pool("imported/Badge"));
         when(owner.constantPoolCount()).thenReturn(3);
@@ -204,6 +206,10 @@ class InterpreterPlannerTest {
 
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class")))
             .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.Member.class")))
+            .isEqualTo(new Planner.Compile("ambiguous type name: Badge"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(defaultPackage + ".Badge.Member.class"))
+            .kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
     }
 
     /** Includes a matching member type inherited from a superinterface before default lookup. */
@@ -251,6 +257,26 @@ class InterpreterPlannerTest {
         final Planner.Compile expected = new Planner.Compile("type is not loaded: app.Example$Badge");
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class"))).isEqualTo(expected);
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.LIMIT"))).isEqualTo(expected);
+    }
+
+    /** Refuses a missing member of a bound qualifier even when a hidden qualifier has that member. */
+    @Test
+    void routesMissingQualifiedMemberToCompilation() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType base = type(vm, "app.Base", null);
+        type(vm, "app.Example$Scope", null);
+        type(vm, "app.Base$Scope", null);
+        type(vm, "app.Base$Scope$Badge", null);
+        type(vm, "java.lang.Class", null);
+        when(owner.superclass()).thenReturn(base);
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        when(location.declaringType()).thenReturn(owner);
+        when(frame.location()).thenReturn(location);
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Scope.Badge.class")))
+            .isEqualTo(new Planner.Compile("member type is unavailable: app.Example$Scope.Badge"));
     }
 
     /** An inaccessible declaration in a supertype still hides a declaration above it. */

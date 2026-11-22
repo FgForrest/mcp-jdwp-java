@@ -18,6 +18,10 @@ public class InterpreterTarget extends InterpreterTargetBase {
     private static final StringBuilder INHERITED_STRING_BUILDER = new StringBuilder();
     /** Makes the competing bootstrap StringBuilder visible from this fixture's loader. */
     private static final Object BOOTSTRAP_STRING_BUILDER = new java.lang.StringBuilder();
+    /** Loads the qualifier and its inherited member without touching the unloaded qualifier. */
+    private static final Object[] LOADED_SCOPE = {new LoadedScope(), new LoadedScope.Badge()};
+    /** Links the imported Map's member type through this fixture's class loader. */
+    private static final String LOADED_MAP_ENTRY_KEY = Map.entry("key", "value").getKey();
     /** A target string whose isolated UTF-16 surrogate must survive intrinsic evaluation. */
     public final String malformed = "\uD800";
 
@@ -140,6 +144,10 @@ public class InterpreterTarget extends InterpreterTargetBase {
             case "classpath-import-shadow" -> ProcessBuilder.class;
             case "inherited-type-shadow" -> StringBuilder.class;
             case "unloaded-hiding-member" -> HiddenBadge.tag;
+            case "loaded-qualified-member" -> LoadedScope.Badge.class;
+            case "qualified-member-cast" -> (LoadedScope.Badge) LOADED_SCOPE[1];
+            case "qualified-member-field" -> LoadedScope.Badge.CODE;
+            case "imported-qualified-member" -> Map.Entry.class;
             case "super-field" -> super.hidden;
             case "erased-field-navigation" -> holder.element.inherited;
             case "nested-class-literal" -> State.class;
@@ -157,6 +165,27 @@ public class InterpreterTarget extends InterpreterTargetBase {
         /** Distinguishes this member from the loaded base class's member. */
         public static String tag = "sub";
     }
+
+    /** Declares the member inherited by the unloaded qualifier. */
+    public static class AlternateScope {
+        /** The member reached through the target's unloaded qualifier. */
+        public static final class Badge {}
+    }
+
+    /** Hides the base qualifier and stays unloaded during the test. */
+    public static final class Scope extends AlternateScope {}
+
+    /** Declares the member inherited by the loaded qualifier. */
+    public static class LoadedAlternateScope {
+        /** The member reached through the target's loaded qualifier. */
+        public static final class Badge {
+            /** Exercises a static field reached through a qualified type name. */
+            public static final int CODE = 42;
+        }
+    }
+
+    /** Hides the base qualifier while inheriting its badge from a different type. */
+    public static final class LoadedScope extends LoadedAlternateScope {}
 
     public static String genericGolden(Map<String, Session> sessions) {
         return sessions.get("key").getRole();
