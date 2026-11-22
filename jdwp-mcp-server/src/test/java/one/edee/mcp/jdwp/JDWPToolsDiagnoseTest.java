@@ -101,6 +101,18 @@ class JDWPToolsDiagnoseTest {
 	 * inventory — the agent can never attach to it, so the row is pure noise. Other JVMs on the
 	 * list continue to render normally.
 	 */
+	/** Shows a remote classpath gap without restarting discovery. */
+	@Test
+	void reportsIncompleteRemoteClasspath() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			true, "localhost", 5005, Instant.now(), null));
+		when(jdiService.getClasspathDiscoveryProblem())
+			.thenReturn("classpath discovery was incomplete: example.Loader: could not read parent");
+
+		assertThat(tools.jdwp_diagnose(null)).contains("▸ Remote classpath",
+			"classpath discovery was incomplete: example.Loader: could not read parent", "▸ Local project classpath");
+	}
+
 	@Test
 	@DisplayName("THIS PROCESS row is filtered from the JVM block (P1-5)")
 	void shouldFlagThisProcessRow() {

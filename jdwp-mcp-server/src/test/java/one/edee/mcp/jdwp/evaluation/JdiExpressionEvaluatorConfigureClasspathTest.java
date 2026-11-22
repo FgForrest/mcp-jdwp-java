@@ -424,6 +424,23 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		verify(jdiService, never()).discoverClasspath(any());
 	}
 
+	/** Carries a remote gap into a missing-type error while using the available entries. */
+	@Test
+	void compileErrorNamesTheIncompleteRemoteWalk(@TempDir Path project) throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final StackFrame frame = configureProbeFrame(vm, project);
+		final String problem = "classpath discovery was incomplete: example.Loader: could not read parent";
+		when(jdiService.getClasspathDiscoveryProblem()).thenReturn(problem);
+		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), jdiService,
+			new EvaluationGuard(), LocalProjectClasspathProviderTestSupport.noOpProvider());
+
+		evaluator.configureCompilerClasspathForEvent(thread);
+
+		assertThatThrownBy(() -> compileDependencyProbe(evaluator, frame))
+			.isInstanceOf(JdiEvaluationException.class).hasMessageContaining("cannot be resolved")
+			.hasMessageContaining(problem);
+	}
+
 	@Test
 	@DisplayName("Successful discovery resets then configures the compiler with discovered values")
 	void shouldConfigureOnSuccessfulDiscovery() throws Exception {

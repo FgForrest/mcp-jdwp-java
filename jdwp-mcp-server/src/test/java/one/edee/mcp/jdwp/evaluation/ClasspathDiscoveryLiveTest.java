@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import com.sun.jdi.BooleanValue;
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.event.ClassPrepareEvent;
@@ -16,6 +18,7 @@ import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.JdiEventListener;
 import one.edee.mcp.jdwp.SuspensionSession;
 import one.edee.mcp.jdwp.evaluation.CountingJdwpConnection.Command;
+import one.edee.mcp.jdwp.evaluation.fixture.ClasspathTarget;
 import one.edee.mcp.jdwp.evaluation.fixture.InterpreterTarget;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -25,6 +28,10 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import javax.tools.ToolProvider;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -145,5 +152,146 @@ class ClasspathDiscoveryLiveTest {
     private static long invocations(Map<Command, Long> before, Map<Command, Long> after) {
         return after.getOrDefault(CLASS_INVOKE, 0L) - before.getOrDefault(CLASS_INVOKE, 0L)
             + after.getOrDefault(OBJECT_INVOKE, 0L) - before.getOrDefault(OBJECT_INVOKE, 0L);
+    }
+
+    /** Resolves isolated classes on the first compile or after the connection has compiled elsewhere. */
+    @ParameterizedTest
+    @ValueSource(strings = {"standard", "lazy", "later", "override"})
+    void seesIsolatedRepositories(String mode, @TempDir Path temp) throws Exception {
+        final Path sources = Files.createDirectory(temp.resolve("sources"));
+        final Path classes = Files.createDirectory(temp.resolve("isolated classpath"));
+        final Path isolated = Files.writeString(sources.resolve("Isolated.java"),
+            "package classpath.fixture; public class Isolated { public static void stop() {} }");
+        final Path dependency = Files.writeString(sources.resolve("Dependency.java"),
+            "package classpath.fixture; public class Dependency { public static int answer() { return 42; } }");
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", classes.toString(), isolated.toString(), dependency.toString())).isZero();
+
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withTarget(javaHome, mode, classes.toString(), "firstPlainStop", EventRequest.SUSPEND_EVENT_THREAD,
+                (vm, tracker, history, router, connection, session, type) -> {
+                    final BreakpointTracker.LastBreakpoint initial = waitForStop(session);
+                    if (mode.equals("later")) {
+                        assertThat(router.evaluateEvent("1 + 1", initial.thread(), Map.of(),
+                            connection::formatFieldValue)).isEqualTo("2");
+                    }
+                    if (mode.equals("override")) {
+                        // This app-loader frame can see the repository only through the overridden getter.
+                        // ECJ still resolves the short-circuited type reference.
+                        assertThat(router.evaluateEvent("true || classpath.fixture.Dependency.answer() == 42",
+                            initial.thread(), Map.of(), connection::formatFieldValue)).isEqualTo("true");
+                    }
+                    final ReferenceType isolatedType = vm.classesByName("classpath.fixture.Isolated").get(0);
+                    final int isolatedStop = arm(vm, tracker, isolatedType, "stop", EventRequest.SUSPEND_EVENT_THREAD);
+                    tracker.setCondition(isolatedStop, "classpath.fixture.Dependency.answer() == 42");
+                    final String jdkBefore = connection.getDiscoveredJdkPath();
+                    session.releaseAll();
+                    final BreakpointTracker.LastBreakpoint next = waitForStop(session);
+                    assertThat(next.thread().frame(0).location().declaringType().name()).isEqualTo("classpath.fixture.Isolated");
+                    final List<String> errors = history.getRecent(20).stream()
+                        .filter(event -> event.type().equals("CONDITION_ERROR")).map(EventHistory.DebugEvent::summary)
+                        .toList();
+                    System.out.printf("%s JDK %s: JDK after first plain stop = %s, condition errors = %s%n",
+                        mode, vm.version(), jdkBefore, errors);
+                    assertThat(errors).isEmpty();
+                    assertThat(router.evaluateEvent("classpath.fixture.Dependency.answer()", next.thread(),
+                        Map.of(), connection::formatFieldValue)).isEqualTo("42");
+                });
+        }
+    }
+
+    /** Keeps a stop-all condition from entering a private helper that waits on a suspended worker. */
+    @Test
+    void stopAllCompiledConditionDoesNotRunPrivateLoaderHelper() throws Exception {
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withTarget(javaHome, "private-accessor", "", "conditionStop", EventRequest.SUSPEND_ALL,
+                (vm, tracker, history, router, connection, session, type) -> {
+                    await().atMost(Duration.ofSeconds(15)).until(() -> session.unseenCount() == 1 || entered(type));
+                    final ThreadReference holder = vm.allThreads().stream()
+                        .filter(thread -> thread.name().equals("repository-worker")).findFirst().orElseThrow();
+                    System.out.printf("JDK %s: private helper entered=%s, repository worker suspended=%s, "
+                            + "unseen stops=%d, events=%s%n", vm.version(), entered(type), holder.isSuspended(),
+                        session.unseenCount(), history.getRecent(12).stream().map(EventHistory.DebugEvent::type).toList());
+                    assertThat(session.unseenCount())
+                        .as("published stop (private loader helper entered=%s)", entered(type)).isEqualTo(1);
+                    assertThat(entered(type)).isFalse();
+                    assertThat(holder.isSuspended()).isTrue();
+                    assertThat(history.getRecent(12).stream().map(EventHistory.DebugEvent::type))
+                        .doesNotContain("CONDITION_ERROR");
+                });
+        }
+    }
+
+    /** Reports whether the private helper ran. */
+    private static boolean entered(ReferenceType type) {
+        return ((BooleanValue) type.getValue(Objects.requireNonNull(type.fieldByName("privateAccessorEntered")))).value();
+    }
+
+    /** Waits for the dispatcher to publish and presents the stop to the caller. */
+    private static BreakpointTracker.LastBreakpoint waitForStop(SuspensionSession session) {
+        await().atMost(Duration.ofSeconds(15)).until(() -> session.unseenCount() == 1);
+        return Objects.requireNonNull(session.presentCurrent());
+    }
+
+    /** Checks a fixture driven by the production listener. */
+    private interface Check {
+        /** Runs the assertions after class preparation is released. */
+        void run(VirtualMachine vm, BreakpointTracker tracker, EventHistory history, EvaluationRouter router,
+                 JDIConnectionService connection, SuspensionSession session, ReferenceType type)
+            throws Exception;
+    }
+
+    /** Attaches the counting transport and starts the dispatcher at a prepared breakpoint. */
+    private static void withTarget(Path javaHome, String mode, String classpath, String stopMethod, int policy,
+                                   Check check) throws Exception {
+        try (InterpreterTargetVm target = InterpreterTargetVm.startClass(javaHome, ClasspathTarget.class,
+                 mode, classpath);
+             CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+            final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
+            final BreakpointTracker tracker = new BreakpointTracker();
+            final EventHistory history = new EventHistory();
+            final EvaluationGuard guard = new EvaluationGuard();
+            final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, guard);
+            final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection,
+                guard, InterpreterHarnessLiveTest.noLocalClasspath());
+            final EvaluationRouter router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+            final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard,
+                null, new MarkedInstanceRegistry(), router);
+            try {
+                final ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
+                prepare.addClassFilter(ClasspathTarget.class.getName());
+                prepare.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                prepare.enable();
+                Objects.requireNonNull(vm.eventQueue().remove(15_000)).resume();
+                final EventSet prepared = Objects.requireNonNull(vm.eventQueue().remove(15_000));
+                final ReferenceType type = ((ClassPrepareEvent) prepared.iterator().next()).referenceType();
+                vm.eventRequestManager().deleteEventRequest(prepare);
+                final int first = arm(vm, tracker, type, stopMethod, policy);
+                if (mode.equals("private-accessor")) {
+                    tracker.setCondition(first, "java.lang.Integer.parseInt(\"1\") == 1");
+                }
+                listener.start(vm);
+                final SuspensionSession session = Objects.requireNonNull(tracker.suspensionSession());
+                prepared.resume();
+                check.run(vm, tracker, history, router, connection, session, type);
+            } finally {
+                try {
+                    vm.dispose();
+                } finally {
+                    listener.stop();
+                }
+            }
+        }
+    }
+
+    /** Registers a tracked breakpoint at the first instruction of a fixture method. */
+    private static int arm(VirtualMachine vm, BreakpointTracker tracker, ReferenceType type, String method,
+                           int policy) {
+        final BreakpointRequest breakpoint = vm.eventRequestManager().createBreakpointRequest(
+            type.methodsByName(method).get(0).location());
+        breakpoint.setSuspendPolicy(policy);
+        final int id = tracker.registerBreakpoint(breakpoint);
+        breakpoint.enable();
+        return id;
     }
 }

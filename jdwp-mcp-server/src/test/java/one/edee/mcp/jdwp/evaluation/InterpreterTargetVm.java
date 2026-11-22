@@ -26,13 +26,18 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
 
     /** Starts the target with optional directories for its context classloader fixture. */
     static InterpreterTargetVm start(Path javaHome, String... loaderDirectories) throws Exception {
-        final String classpath = Path.of(InterpreterTarget.class.getProtectionDomain().getCodeSource()
+        return startClass(javaHome, InterpreterTarget.class, loaderDirectories);
+    }
+
+    /** Starts a fixture with the same classpath and JDWP transport as the interpreter target. */
+    static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... args) throws Exception {
+        final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
         final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, CLASS));
-        command.addAll(List.of(loaderDirectories));
+            "-cp", classpath, mainClass.getName()));
+        command.addAll(List.of(args));
         final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<>();

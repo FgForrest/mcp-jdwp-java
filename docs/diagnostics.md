@@ -27,6 +27,10 @@ This block answers "what process is the agent talking to?". Useful when a sessio
 
 When connected, an inline breakpoint-and-events sub-report is appended (`JDWPTools.java:1239-1241`, via `buildDiagnosticReport(false, null)` at line 1307+). That gives the agent the breakpoint registry state and the recent event timeline without having to fan out across multiple tool calls.
 
+### Remote classpath
+
+When a connected target's most recent classpath walk was incomplete, this block names the affected loader and the failed read or invocation. Compilation can use partial entries, and the next compile retries the missing parts. Diagnose reads the last published result immediately.
+
 ### Local project classpath
 
 This section shows the current project directory, whether the client reported it, the presence of a root `pom.xml`, and the state of `JDWP_EXTRA_CLASSPATH`. It reports progress while discovery runs and shows the per-source counts, total entries, and any Maven failure when it finishes. Output-read failures identify the affected per-run file and preserve entries from readable modules. If Maven exits successfully without creating any private output, the failure points to the dependency plugin's `outputFile` setting in the POM. When the project contains a literal `${env.JDWP_MCP_CLASSPATH_DIR}` directory, the failure instead identifies a launcher that dropped the environment and names the generated directory. On hosts where Maven cleanup uses descendant polling, the section warns that helper processes may outlive a cancelled or timed-out run, even if there is no current root POM. A torn-down connection no longer reports a scan in progress. Diagnose reads the available snapshot immediately.

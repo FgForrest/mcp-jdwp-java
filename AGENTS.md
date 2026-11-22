@@ -44,7 +44,7 @@ Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Targe
 Ordinary expressions enter through **EvaluationRouter** in `evaluation/interpret/`. ECJ parses the source and **Planner** snapshots the frame, resolves names and types, and selects a path. **Interpreter** reads private fields, arrays and other supported expressions over JDI without invoking, including on manually suspended and blocked threads. Other expressions use the compiled pipeline below. Fast-probe arming depends directly on **JdiExpressionEvaluator**.
 
 1. **JdiExpressionEvaluator** — Orchestrator. Analyzes the stack frame, generates a wrapper class with a unique UUID name, delegates compilation, and caches results.
-2. **ClasspathDiscoverer** — Reads the launch classpath through JDWP and walks the context loader chain through JDI fields. It can invoke a custom loader’s `getURLs()` during compiler setup when its URL list cannot be read from the JDK fields. **JdkDiscoveryService** uses the debugger-reported VM version to find a matching local JDK.
+2. **ClasspathDiscoverer** — Reads the launch classpath through JDWP and walks the context and selected frame loader chains through JDI fields. Compiler setup can invoke an overridden context getter or public `URLClassLoader.getURLs()`. Later compiles add new chains and retry incomplete reads. **JdkDiscoveryService** uses the debugger-reported VM version to find a matching local JDK.
 3. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory.
 4. **RemoteCodeExecutor** — Injects compiled bytecode into the target JVM via `ClassLoader.defineClass()` and invokes it.
 

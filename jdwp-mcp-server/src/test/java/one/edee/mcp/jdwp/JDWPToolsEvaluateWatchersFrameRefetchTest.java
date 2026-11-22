@@ -65,6 +65,7 @@ class JDWPToolsEvaluateWatchersFrameRefetchTest {
 		vm = mock(VirtualMachine.class);
 	}
 
+	/** Gives each watcher a distinct frame after compiler setup may resume the thread. */
 	@Test
 	@DisplayName("two watchers on one BP: both evaluate because frame is re-fetched per iteration")
 	void shouldRefetchFramePerWatcherSoBothEvaluate() throws Exception {
@@ -73,12 +74,13 @@ class JDWPToolsEvaluateWatchersFrameRefetchTest {
 		final Watcher w2 = new Watcher("second", 1, "y");
 		when(watcherManager.getWatchersForBreakpoint(1)).thenReturn(List.of(w1, w2));
 
-		// Two distinct frames simulate JDI's invalidation behaviour: every call to thread.frame(0)
-		// returns a NEW StackFrame instance, and the OLD one would throw on any access. The
-		// production code must therefore re-fetch on each iteration.
+		// Each watcher reads once for loader selection and again for execution.
+		// Only the post-setup frame can be used for the wrapper.
 		final ThreadReference thread = mock(ThreadReference.class);
 		final StackFrame headerFrame = mock(StackFrame.class);
+		final StackFrame loaderFrame1 = mock(StackFrame.class);
 		final StackFrame frameForWatcher1 = mock(StackFrame.class);
+		final StackFrame loaderFrame2 = mock(StackFrame.class);
 		final StackFrame frameForWatcher2 = mock(StackFrame.class);
 
 		when(jdiService.getVM()).thenReturn(vm);
@@ -87,9 +89,7 @@ class JDWPToolsEvaluateWatchersFrameRefetchTest {
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frameCount()).thenReturn(5);
 		when(thread.name()).thenReturn("main");
-		// Three sequential thread.frame(0) calls — once for the header location read, then once
-		// per watcher iteration. Order matters; the test assertion below verifies invocation count.
-		when(thread.frame(0)).thenReturn(headerFrame, frameForWatcher1, frameForWatcher2);
+		when(thread.frame(0)).thenReturn(headerFrame, loaderFrame1, frameForWatcher1, loaderFrame2, frameForWatcher2);
 
 		final Location loc = mock(Location.class);
 		final ReferenceType declaringType = mock(ReferenceType.class);
@@ -115,8 +115,8 @@ class JDWPToolsEvaluateWatchersFrameRefetchTest {
 		assertThat(result).doesNotContain("[ERROR");
 		// Tally must read 2 (both succeeded) — no split because no errors.
 		assertThat(result).contains("Total: Evaluated 2 expression(s)");
-		// And the frame was re-fetched at least three times: header + once per watcher.
-		verify(thread, times(3)).frame(0);
+		// One header read and two reads per compiled watcher.
+		verify(thread, times(5)).frame(0);
 	}
 
 	@Test

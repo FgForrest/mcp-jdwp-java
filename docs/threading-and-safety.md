@@ -79,7 +79,7 @@ Use sites:
 
 - `JdiExpressionEvaluator.systemClassLoader` — the `getSystemClassLoader()` fallback.
 - `RemoteCodeExecutor` — the wrapper method invoke, `ClassLoader.defineClass`, `Class.forName`.
-- `ClasspathDiscoverer` — the `getURLs()` fallback for custom classloaders during compiler setup.
+- `ClasspathDiscoverer` — an overridden context-loader getter or public `URLClassLoader.getURLs()` during compiler setup.
 - `JDIConnectionService.findOrForceLoadClass` — `Class.forName`.
 - `JDWPTools.jdwp_to_string` — `Object.toString`.
 - `FastLogpointService` — reading the class file (`getResourceAsStream`, `read`, `close`).
@@ -132,7 +132,7 @@ The listener checks `isEvaluating` before it routes a set (`fromEvaluatingThread
 
 Lease sites:
 
-- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and around `configureCompilerClasspath` for a possible custom-loader fallback.
+- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and in `ClasspathDiscoverer` around optional context and URL accessor calls.
 - `FastLogpointService` — the arming, once around reading the class file and once around defining the probe.
 - `JDIConnectionService.findOrForceLoadClass` — around `Class.forName`.
 - `JDWPTools.jdwp_to_string` — around `toString()`.
@@ -153,7 +153,7 @@ So the lease captures the `long` once, when it is taken and the thread is provab
 1. Agent: jdwp_evaluate_expression(threadId=T, expression="this.compute(3)")
    The MCP worker hands the job to InvocationRunner and waits ≤ 20 s.
 
-2. On jdi-invoker-N: configureCompilerClasspath (its own lease), the
+2. On jdi-invoker-N: configureCompilerClasspath (leases an optional accessor invocation), the
    frame read (locals, this, class loader), the wrapper compile.
 
 3. evaluationGuard.lease(T): hold {chain = jdi-invoker-N, session}.

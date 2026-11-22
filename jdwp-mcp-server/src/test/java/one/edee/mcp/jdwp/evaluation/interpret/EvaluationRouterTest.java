@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.evaluation.interpret;
 
+import com.sun.jdi.ClassLoaderReference;
 import com.sun.jdi.ClassType;
 import com.sun.jdi.InvalidStackFrameException;
 import com.sun.jdi.Location;
@@ -10,6 +11,7 @@ import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.util.List;
 import java.util.Map;
@@ -57,23 +59,50 @@ class EvaluationRouterTest {
         verifyNoInteractions(compiler, thread);
     }
 
+    /** Reads the selected loader before setup and refreshes the frame before executing the wrapper. */
     @Test
     void compiledErrorsKeepTheirDiagnosticAndTheFallbackReason() throws Exception {
-        final var compiler = mock(JdiExpressionEvaluator.class);
-        final var auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
-        final var thread = mock(ThreadReference.class);
-        final var frame = mock(StackFrame.class);
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final StackFrame frame = mock(StackFrame.class);
         when(thread.frame(0)).thenReturn(frame);
         when(compiler.evaluate(frame, "fetch()", Map.of()))
             .thenThrow(new JdiEvaluationException("Compilation failed: missing member"));
         assertThatThrownBy(() -> auto.evaluateEvent("fetch()", thread, Map.of(), String::valueOf))
             .isInstanceOf(JdiEvaluationException.class)
             .hasMessage("Compilation failed: missing member\nnot interpreted: method call");
-        final var order = inOrder(compiler, thread);
+        final InOrder order = inOrder(compiler, thread);
+        order.verify(thread).frame(0);
         order.verify(compiler).configureCompilerClasspathForEvent(thread);
         order.verify(thread).frame(0);
         order.verify(compiler).evaluate(frame, "fetch()", Map.of());
         assertThat(auto.diagnostics()).contains("interpreted 0, compiled 1", "method call (1)");
+    }
+
+    /** Checks each selected frame in a batch even when the tool is on the same target thread. */
+    @Test
+    void compiledToolJobUsesEachSelectedFramesDefiningLoader() throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.COMPILER);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final EvaluationRouter.ToolJob job = router.toolJob(thread, () -> {});
+        final EvaluationRouter.Input input = router.parse("fetch()");
+        for (final ClassLoaderReference definingLoader :
+            List.of(mock(ClassLoaderReference.class), mock(ClassLoaderReference.class))) {
+            final StackFrame frame = mock(StackFrame.class);
+            final Location location = mock(Location.class);
+            final ClassType owner = mock(ClassType.class);
+            when(frame.location()).thenReturn(location);
+            when(location.declaringType()).thenReturn(owner);
+            when(owner.classLoader()).thenReturn(definingLoader);
+
+            job.evaluate(input, () -> frame, Map.of(), String::valueOf);
+
+            verify(compiler).configureCompilerClasspath(thread, definingLoader);
+            verify(compiler).evaluate(frame, "fetch()", Map.of());
+        }
+        verifyNoInteractions(thread);
     }
 
     @Test

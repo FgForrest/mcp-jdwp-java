@@ -55,8 +55,8 @@ import static one.edee.mcp.jdwp.ThreadFormatting.isJvmInternalThread;
  * is stored in {@link #objectCache} so subsequent tool calls can navigate object graphs by ID.
  * The cache is cleared on disconnect and `jdwp_reset`.
  * - Classpath discovery for expression evaluation: collaborates with {@link ClasspathDiscoverer}
- * and {@link JdkDiscoveryService} on the first breakpoint hit and caches
- * the result in {@link #cachedClasspath} / {@link #discoveredJdkPath} until disconnect.
+ * and {@link JdkDiscoveryService} on demand. Later compiles can extend the connection's classpath
+ * or retry failed loader reads before the state is discarded on disconnect.
  * - Post-mortem cleanup driven by {@link JdiEventListener}'s VM-death hook (see
  * {@link #notifyVmDied()}), distinct from the user-initiated {@link #disconnect()} path.
  * <p>
@@ -160,11 +160,13 @@ public class JDIConnectionService {
     @Nullable
     private volatile String lastConnectError;
     /**
-     * Cached path-separated classpath of the target JVM. Populated by {@link #discoverClasspath}
-     * on the first successful call and reused thereafter; cleared on disconnect.
+     * Last published path-separated classpath. Its walk tracks whether it needs a retry or extension.
+     * Both are cleared on disconnect.
      */
     @Nullable
     private volatile String cachedClasspath;
+    /** Walk results and the successfully read loaders, published under the connection monitor. */
+    private volatile @Nullable DiscoveryResult classpathDiscovery;
     /**
      * Filesystem path to a local JDK matching the target JVM version. Populated as a side effect of
      * {@link #discoverClasspath} and consumed by {@link InMemoryJavaCompiler}
@@ -743,6 +745,7 @@ public class JDIConnectionService {
         markedInstances.clearAll();
         objectCache.clear();
         cachedClasspath = null;
+        classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
         healthMonitor.stop();
@@ -789,6 +792,7 @@ public class JDIConnectionService {
         markedInstances.clearAll();
         objectCache.clear();
         cachedClasspath = null;
+        classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
         eventHistory.clear();
@@ -884,6 +888,7 @@ public class JDIConnectionService {
         markedInstances.clearAll();
         objectCache.clear();
         cachedClasspath = null;
+        classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
 
@@ -1613,75 +1618,81 @@ public class JDIConnectionService {
         return value.toString();
     }
 
-    /**
-     * Discovers and caches the target VM's launch classpath and URL-based loader repositories.
-     * The first successful result is reused until {@link #cleanupSessionState}.
-     * <p>
-     * Side effects: also populates {@link #discoveredJdkPath} and {@link #targetMajorVersion} via
-     * {@link JdkDiscoveryService} so the JDT compiler can be configured.
-     * <p>
-     * Returns `null` (and logs at error level) on any failure, including when no matching local JDK
-     * can be found — the {@link JdkDiscoveryService.JdkNotFoundException} is
-     * caught here and never bubbles out.
-     *
-     * @param suspendedThread compilation thread. A custom loader fallback requires an event
-     *                        suspension that admits method invocation.
-     * @return classpath string (separator inferred from the first entry), or `null` on any failure
-     */
-    @Nullable
-    public String discoverClasspath(@Nullable ThreadReference suspendedThread) {
-        if (cachedClasspath != null) {
-            return cachedClasspath;
-        }
+    /** Discovers repositories reachable from the compilation thread's context loader. */
+    public @Nullable String discoverClasspath(@Nullable ThreadReference thread) {
+        return discoverClasspath(thread, null);
+    }
 
-        if (suspendedThread == null) {
-            log.error("[JDI] discoverClasspath() requires a suspended thread from a breakpoint");
+    /** Checks whether a compile needs to extend or retry the current connection's walk. */
+    public boolean classpathNeedsDiscovery(@Nullable ClassLoaderReference definingLoader) {
+        final DiscoveryResult current = classpathDiscovery;
+        return current == null || current.needsWalk(definingLoader);
+    }
+
+    /** Returns the last incomplete walk's problem without talking to the target. */
+    public @Nullable String getClasspathDiscoveryProblem() {
+        final DiscoveryResult current = classpathDiscovery;
+        return current == null ? null : current.problem();
+    }
+
+    /**
+     * Extends the remote classpath for a frame's defining loader and retries incomplete reads.
+     * Walks outside the connection monitor so the listener can drain events raised by an accessor.
+     * Publishes only against the VM and previous result that the walk started from.
+     */
+    public @Nullable String discoverClasspath(@Nullable ThreadReference thread,
+                                               @Nullable ClassLoaderReference definingLoader) {
+        if (thread == null) {
+            log.error("[JDI] discoverClasspath() requires a suspended compilation thread");
             return null;
         }
 
         final long startTime = System.currentTimeMillis();
         try {
-            // Route through synchronized getVM() to avoid a race with disconnect().
-            final VirtualMachine currentVm = getVM();
-            if (suspendedThread.virtualMachine() != currentVm) {
-                return null;
-            }
-
-            log.info("[JDI] Discovering full classpath using breakpoint thread '{}'", suspendedThread.name());
-
-            final ClasspathDiscoverer discoverer = new ClasspathDiscoverer(currentVm);
-            final DiscoveryResult result = discoverer.discoverFullClasspath(suspendedThread);
-
-            final Set<String> classpathEntries = result.applicationClasspath();
-            final String resolved;
-            if (classpathEntries.isEmpty()) {
-                resolved = null;
-            } else {
-                // Infer the target's separator from the first entry. Windows uses semicolons.
-                final String first = classpathEntries.iterator().next();
-                final String separator = first.contains("\\") ? ";" : ":";
-                resolved = String.join(separator, classpathEntries);
-            }
-            synchronized (this) {
-                // The remote walk ran outside the service monitor and might have outlived its VM.
-                if (vm != currentVm) {
+            final VirtualMachine currentVm = thread.virtualMachine();
+            while (true) {
+                final DiscoveryResult previous;
+                synchronized (this) {
+                    if (vm != currentVm) {
+                        return null;
+                    }
+                    previous = classpathDiscovery;
+                    if (previous != null && !previous.needsWalk(definingLoader)) {
+                        return cachedClasspath;
+                    }
+                }
+                if (previous == null && getVM() != currentVm) {
                     return null;
                 }
-                cachedClasspath = resolved;
-                discoveredJdkPath = result.localJdkPath();
-                targetMajorVersion = result.targetMajorVersion();
+
+                final DiscoveryResult result = new ClasspathDiscoverer(currentVm, evaluationGuard)
+                    .discoverClasspath(thread, definingLoader, previous);
+                final Set<String> entries = result.applicationClasspath();
+                final String resolved;
+                if (entries.isEmpty()) {
+                    resolved = null;
+                } else {
+                    final String first = entries.iterator().next();
+                    final String separator = first.contains("\\") ? ";" : ":";
+                    resolved = String.join(separator, entries);
+                }
+                synchronized (this) {
+                    if (vm != currentVm) {
+                        return null;
+                    }
+                    if (classpathDiscovery != previous) {
+                        continue;
+                    }
+                    cachedClasspath = resolved;
+                    discoveredJdkPath = result.localJdkPath();
+                    targetMajorVersion = result.targetMajorVersion();
+                    classpathDiscovery = result;
+                }
+                log.info("[JDI] {} classpath ({} entries) in {}ms",
+                    result.problem() == null ? "Discovered" : "Using partial",
+                    entries.size(), System.currentTimeMillis() - startTime);
+                return resolved;
             }
-            log.info("[JDI] Using local JDK: {} (Java {})", result.localJdkPath(), result.targetMajorVersion());
-            if (resolved == null) {
-                log.warn("[JDI] No classpath entries discovered after {}ms", System.currentTimeMillis() - startTime);
-                return null;
-            }
-
-            log.info("[JDI] Full classpath discovered ({} entries) in {}ms",
-                classpathEntries.size(), System.currentTimeMillis() - startTime);
-
-            return resolved;
-
         } catch (JdkNotFoundException e) {
             log.error("[JDI] {} (after {}ms)", e.getMessage(), System.currentTimeMillis() - startTime);
             return null;

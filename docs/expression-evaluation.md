@@ -80,9 +80,13 @@ Three-phase injection: `defineClass` → `Class.forName` → `invokeMethod`. Ide
 
 ### `ClasspathDiscoverer`
 
-Discovery starts with the launch classpath from JDWP `VirtualMachine.ClassPaths` through JDI's `PathSearchingVirtualMachine.classPath()`. JDWP reports the value captured at agent initialization. The debugger reads `Thread.contextClassLoader` and follows `ClassLoader.parent`, adding entries in child-to-parent order. For JDK 17 and 21, loaders that inherit `URLClassLoader.getURLs()` expose their URL list through `ucp → URLClassPath.path`. The built-in loader's path supplies entries when the launch classpath is unavailable. When JDWP supplies launch entries, their original spellings and order are kept.
+Discovery starts with the launch classpath from JDWP `VirtualMachine.ClassPaths`, which reports the value captured at agent initialization. The first compile adds the thread's context loader chain. Compiles add the selected frame's defining loader chain as needed, in first-seen order. Each chain follows `ClassLoader.parent` from child to parent. Entries keep their first position when a later chain contains the same path.
 
-A loader whose effective URL list has an unknown layout can fall back to `getURLs()` on the compilation thread. This includes overrides that expose separate repositories, such as Tomcat's `WebappClassLoaderBase`. Discovery logs the loader name at debug level when it invokes the fallback. Both paths read the URL's path field and apply the same UTF-8 decoding. The deduplicated result is cached in `JDIConnectionService.cachedClasspath`. [Mirror lifetimes](memory-and-references.md#9-classpath-discovery-is-transient)
+The debugger reads `Thread.contextClassLoader`. When the thread's class hierarchy overrides `getContextClassLoader()`, the compile thread can invoke that getter under an invocation lease. If the getter is unavailable, discovery uses the field provisionally and logs the fallback at debug level.
+
+On JDK 17 and 21, standard URL loaders expose `ucp → URLClassPath.path`. The built-in loader's path supplies entries when JDWP provides no launch entries. Only `URLClassLoader` and its subclasses can use the public instance `getURLs()` fallback. This covers overrides that expose separate repositories, including Tomcat's `WebappClassLoaderBase`. Both URL paths use the same JDI field reads and UTF-8 decoding.
+
+A failed field read, unreadable layout, or failed accessor leaves the walk incomplete. Compilation can use the entries already found. The next compile retries the incomplete reads and can extend the connection's classpath. The log and `jdwp_diagnose` report the affected loader and reason. A missing-type compilation error includes the remote discovery problem. [Mirror lifetimes](memory-and-references.md#9-classpath-loader-and-url-mirrors)
 
 `JdkDiscoveryService` uses the JDWP-reported VM version to select a matching local JDK. Where available, it reads the target's startup Java home through JDI and checks that path locally before searching `JAVA_HOME` and standard installation directories.
 
@@ -232,7 +236,7 @@ Dynamically derived from the target JVM's major version: `1.8` for Java 8, the b
 
 ### Classpath configuration precedes compiled evaluation
 
-The router configures the classpath before fetching the compiled evaluation frame. Fast probes configure it through the compiled evaluator. Compiler setup holds an invocation lease for the custom loader `getURLs()` fallback, which requires a thread stopped at an invocation event.
+The router reads the selected frame's defining loader before compiler setup and reads the frame again before evaluation because an accessor can resume its thread. Fast probes pass their method's defining loader. Optional context or URL accessor invocations take an invocation lease.
 
 ### Injected classes persist in the target JVM
 
@@ -301,6 +305,6 @@ Covered invocation sites:
 - Compiled evaluations from `jdwp_evaluate_expression`, `jdwp_assert_expression` and `jdwp_evaluate_watchers`.
 - Compiled conditions and logpoint expressions for line, exception and field events.
 - `jdwp_to_string`.
-- Custom classloader `getURLs()` fallback during compiler classpath discovery.
+- An overridden `Thread.getContextClassLoader()` or public `URLClassLoader.getURLs()` during compiler classpath discovery.
 - Deferred class loading via `Class.forName`.
 - Fast-logpoint arming: reading the class file, defining the probe.

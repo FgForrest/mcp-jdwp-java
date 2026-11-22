@@ -591,7 +591,7 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath and standard loader fields, with a `getURLs()` fallback for custom loaders.
+The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath, then the context and selected frame loader chains. A public `URLClassLoader.getURLs()` may supply custom repositories. Diagnose reports incomplete loader reads.
 
 Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
@@ -660,7 +660,7 @@ When an expression evaluation at a breakpoint re-enters the breakpointed line (e
 2. A `BREAKPOINT_SUPPRESSED` / `EXCEPTION_SUPPRESSED` / `STEP_SUPPRESSED` entry is recorded in event history
 3. The outer breakpoint context is preserved
 
-**Covered invocation sites:** `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`, logpoint evaluation, conditional breakpoint evaluation, `jdwp_to_string`, custom loader `getURLs()` fallback during compiler setup, and deferred class loading via `Class.forName`.
+**Covered invocation sites:** `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`, logpoint evaluation, conditional breakpoint evaluation, `jdwp_to_string`, an overridden context-loader getter or public `URLClassLoader.getURLs()` during compiler setup, and deferred class loading via `Class.forName`.
 
 ### Smart filtering
 
@@ -956,7 +956,7 @@ The server is `SYNC` mode, `web-application-type=none` — JSON over STDIO, no H
 ### Expression evaluation pipeline (`evaluation/`)
 
 1. **JdiExpressionEvaluator** — Analyzes the stack frame, generates a wrapper class with a UUID name, delegates compilation, caches results.
-2. **ClasspathDiscoverer** — Reads the target's JDWP launch classpath and follows its context loader fields. A custom loader can fall back to `getURLs()` during compiler setup. **JdkDiscoveryService** uses the debugger-reported version to locate a matching local JDK.
+2. **ClasspathDiscoverer** — Reads the JDWP launch classpath and the context and defining loader chains. Later compiles add newly selected loader chains and retry failed reads. **JdkDiscoveryService** uses the debugger-reported version to locate a matching local JDK.
 3. **LocalProjectClasspathProvider** — Additive fallback for when the target's classloader hierarchy hides JARs (Tomcat, Spring Boot dev-tools, custom `URLClassLoader`s). Composes `JDWP_EXTRA_CLASSPATH` (override), a depth-5 scan of `target/classes` / `target/test-classes` under the project directory, and `mvn dependency:build-classpath` there. Discovery starts on attach and dispatcher evaluations use the remote classpath until the local entries are ready. The project directory is the server's working directory, or the session directory the client reports (Codex). Set `JDWP_EXTRA_CLASSPATH=/path/extra.jar:/path/more.jar` (colon/semicolon-separated) to plug specific gaps; `jdwp_diagnose` shows a per-source breakdown. Details in [docs/expression-evaluation.md](docs/expression-evaluation.md#localprojectclasspathprovider--local-project-classpath-fallback).
 4. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory.
 5. **RemoteCodeExecutor** — Injects bytecode via `ClassLoader.defineClass()` and invokes it.

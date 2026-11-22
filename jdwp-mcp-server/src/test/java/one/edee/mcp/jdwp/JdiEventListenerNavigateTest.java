@@ -191,6 +191,8 @@ class JdiEventListenerNavigateTest {
         final LinkedBlockingQueue<EventSet> sets = new LinkedBlockingQueue<>();
         when(target.vm.eventQueue()).thenReturn(queue);
         when(queue.remove()).thenAnswer(call -> sets.take());
+        final StackFrame frame = mock(StackFrame.class);
+        when(thread.ref.frame(0)).thenReturn(frame);
         org.mockito.Mockito.doThrow(new StackOverflowError()).when(compiler).configureCompilerClasspathForEvent(thread.ref);
         try {
             listener.start(target.vm);

@@ -1,6 +1,12 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.sun.jdi.ArrayReference;
+import com.sun.jdi.IncompatibleThreadStateException;
+import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ClassLoaderReference;
 import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
@@ -12,11 +18,17 @@ import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.Value;
+import one.edee.mcp.jdwp.EvaluationGuard;
+import one.edee.mcp.jdwp.EvaluationRefusedException;
+import one.edee.mcp.jdwp.JDIConnectionService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
 import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
@@ -48,6 +60,7 @@ class ClasspathDiscovererTest {
     /** Supplies the JDK version and home from debugger reads. */
     @BeforeEach
     void setUp() {
+        when(thread.virtualMachine()).thenReturn(vm);
         when(vm.version()).thenReturn(Runtime.version().toString());
         when(vm.classesByName("java.lang.System")).thenReturn(List.of(systemType));
         when(vm.classesByName("java.lang.Thread")).thenReturn(List.of(threadType));
@@ -82,7 +95,7 @@ class ClasspathDiscovererTest {
         when(child.getValue(parent)).thenReturn(ancestor);
         when(child.getValue(shadowedParent)).thenReturn(child);
 
-        final ClasspathDiscoverer.DiscoveryResult found = new ClasspathDiscoverer(vm).discoverFullClasspath(thread);
+        final ClasspathDiscoverer.DiscoveryResult found = new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null);
 
         assertThat(found.targetMajorVersion()).isEqualTo(Runtime.version().feature());
         assertThat(found.applicationClasspath()).containsExactly("/first", "/second", "/has spaces.jar",
@@ -105,7 +118,7 @@ class ClasspathDiscovererTest {
         when(thread.getValue(context)).thenReturn(application);
         when(application.getValue(parent)).thenReturn(platform);
 
-        assertThat(new ClasspathDiscoverer(vm).discoverFullClasspath(thread).applicationClasspath())
+        assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null).applicationClasspath())
             .containsExactly("/app.jar");
         verify(application, never()).invokeMethod(any(), any(), any(), anyInt());
         verify(platform, never()).invokeMethod(any(), any(), any(), anyInt());
@@ -119,15 +132,15 @@ class ClasspathDiscovererTest {
             url("/app/target/classes/"));
         when(thread.getValue(context)).thenReturn(application);
 
-        assertThat(new ClasspathDiscoverer(vm).discoverFullClasspath(thread).applicationClasspath())
+        assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null).applicationClasspath())
             .containsExactly("target/classes");
         verify(application, never()).invokeMethod(any(), any(), any(), anyInt());
     }
 
-    /** Invokes only the unknown loader and decodes its returned URLs with field reads. */
+    /** Reads the parent and never invokes a matching helper on a non-URL loader. */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void fallsBackForAnUnknownLoader(boolean hasUnexpectedUcp) throws Exception {
+    void skipsAccessorOnUnknownLoader(boolean hasUnexpectedUcp) throws Exception {
         final ClassType customType = type("example.CustomLoader");
         final ClassLoaderReference custom = mirror(ClassLoaderReference.class, customType);
         final ClassLoaderReference ancestor = loader(urlLoaderType, urlLoaderType, url("/parent.jar"));
@@ -136,7 +149,7 @@ class ClasspathDiscovererTest {
             final ObjectReference otherPath = mirror(ObjectReference.class, type("example.OtherPath"));
             when(custom.getValue(unknownUcp)).thenReturn(otherPath);
         }
-        final Method getUrls = mock(Method.class);
+        final Method getUrls = accessor(customType);
         when(customType.methodsByName("getURLs", "()[Ljava/net/URL;")).thenReturn(List.of(getUrls));
         final ObjectReference entry = url("/another%20jar.jar");
         final ArrayReference urls = mock(ArrayReference.class);
@@ -145,11 +158,132 @@ class ClasspathDiscovererTest {
         when(thread.getValue(context)).thenReturn(custom);
         when(custom.getValue(parent)).thenReturn(ancestor);
 
-        assertThat(new ClasspathDiscoverer(vm).discoverFullClasspath(thread).applicationClasspath())
-            .containsExactly("/another jar.jar", "/parent.jar");
-        verify(custom).invokeMethod(thread, getUrls, List.of(), ObjectReference.INVOKE_SINGLE_THREADED);
+        assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null).applicationClasspath())
+            .containsExactly("/parent.jar");
+        verify(custom, never()).invokeMethod(any(), any(), any(), anyInt());
         verify(ancestor, never()).invokeMethod(any(), any(), any(), anyInt());
         verify(entry, never()).invokeMethod(any(), any(), any(), anyInt());
+    }
+
+    /** A rejected URLClassLoader accessor does not freeze a partial connection classpath. */
+    @Test
+    void retriesFailedPublicFallback() throws Exception {
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final ClassLoaderReference loader = mirror(ClassLoaderReference.class, urlLoaderType);
+        final Method getUrls = accessor(urlLoaderType);
+        when(thread.getValue(context)).thenReturn(loader);
+        final ArrayReference recovered = urlArray("/container%20only.jar");
+        when(loader.invokeMethod(thread, getUrls, List.of(), ObjectReference.INVOKE_SINGLE_THREADED))
+            .thenThrow(new IncompatibleThreadStateException()).thenReturn(recovered);
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+
+        assertThat(connection.discoverClasspath(thread)).isEqualTo("/launch.jar");
+        assertThat(connection.getClasspathDiscoveryProblem())
+            .contains("java.net.URLClassLoader", "getURLs() invocation failed", "IncompatibleThreadStateException");
+        assertThat(connection.discoverClasspath(thread))
+            .isEqualTo(String.join(File.pathSeparator, "/launch.jar", "/container only.jar"));
+        assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+    }
+
+    /** A missing field and a failed read both keep the parent walk retryable. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retriesMissingOrUnreadableParent(boolean missingField) throws Exception {
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final ClassType childType = type("example.ChildLoader");
+        final ClassLoaderReference child = loader(childType, urlLoaderType, url("/child.jar"));
+        final ClassLoaderReference ancestor = loader(urlLoaderType, urlLoaderType, url("/parent-only.jar"));
+        when(thread.getValue(context)).thenReturn(child);
+        if (missingField) {
+            when(classLoaderType.fields()).thenReturn(List.of(), List.of(parent));
+            when(child.getValue(parent)).thenReturn(ancestor);
+        } else {
+            when(child.getValue(parent)).thenThrow(new ObjectCollectedException()).thenReturn(ancestor);
+        }
+        final Logger logger = (Logger) LoggerFactory.getLogger(ClasspathDiscoverer.class);
+        final ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+            assertThat(connection.discoverClasspath(thread))
+                .isEqualTo(String.join(File.pathSeparator, "/launch.jar", "/child.jar"));
+            assertThat(appender.list).anySatisfy(event -> {
+                assertThat(event.getLevel().isGreaterOrEqual(Level.WARN)).isTrue();
+                assertThat(event.getFormattedMessage()).contains("parent", "example.ChildLoader");
+            });
+            assertThat(connection.discoverClasspath(thread))
+                .isEqualTo(String.join(File.pathSeparator, "/launch.jar", "/child.jar", "/parent-only.jar"));
+            assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+            final Field ucp = urlLoaderType.fieldByName("ucp");
+            verify(child).getValue(ucp);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    /** Ignores private and static lookalikes even on a URLClassLoader subclass. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void skipsNonPublicOrStaticUrlAccessor(boolean isStatic) throws Exception {
+        final ClassType type = type("example.UrlLoader");
+        final ClassLoaderReference loader = loader(type, urlLoaderType, url("/from-fields.jar"));
+        final Method lookalike = accessor(type);
+        when(lookalike.isStatic()).thenReturn(isStatic);
+        when(lookalike.isPublic()).thenReturn(isStatic);
+        when(thread.getValue(context)).thenReturn(loader);
+
+        final ClasspathDiscoverer.DiscoveryResult result = new ClasspathDiscoverer(vm, new EvaluationGuard())
+            .discoverClasspath(thread, null, null);
+        assertThat(result.applicationClasspath()).containsExactly("/from-fields.jar");
+        assertThat(result.problem()).isNull();
+        verify(loader, never()).invokeMethod(any(), any(), any(), anyInt());
+    }
+
+    /** Uses the inherited context field provisionally when the override cannot take a lease. */
+    @Test
+    void readsContextFieldWhenGetterInvocationIsRefused() throws Exception {
+        final ClassType childThread = type("example.ChildThread");
+        final ClassType parentThread = type("example.ParentThread");
+        when(thread.referenceType()).thenReturn(childThread);
+        when(childThread.superclass()).thenReturn(parentThread);
+        when(parentThread.superclass()).thenReturn(threadType);
+        final Method getter = mock(Method.class);
+        when(getter.isPublic()).thenReturn(true);
+        when(getter.name()).thenReturn("getContextClassLoader");
+        when(getter.signature()).thenReturn("()Ljava/lang/ClassLoader;");
+        when(parentThread.methods()).thenReturn(List.of(getter));
+        final ClassLoaderReference loader = loader(urlLoaderType, urlLoaderType, url("/from-field.jar"));
+        when(thread.getValue(context)).thenReturn(loader);
+        final EvaluationGuard guard = mock(EvaluationGuard.class);
+        when(guard.lease(thread)).thenThrow(new EvaluationRefusedException("thread has no invocation event"));
+
+        final ClasspathDiscoverer.DiscoveryResult result = new ClasspathDiscoverer(vm, guard)
+            .discoverClasspath(thread, null, null);
+        assertThat(result.applicationClasspath()).containsExactly("/from-field.jar");
+        assertThat(result.problem()).contains("example.ChildThread", "getContextClassLoader", "no invocation event");
+        verify(thread, never()).invokeMethod(any(), any(), any(), anyInt());
+    }
+
+    /** Publishes both declared and visible mirrors for a public instance URL accessor. */
+    private static Method accessor(ClassType type) {
+        final Method method = mock(Method.class);
+        when(method.name()).thenReturn("getURLs");
+        when(method.signature()).thenReturn("()[Ljava/net/URL;");
+        when(method.declaringType()).thenReturn(type);
+        when(method.isPublic()).thenReturn(true);
+        when(type.methods()).thenReturn(List.of(method));
+        when(type.methodsByName("getURLs", "()[Ljava/net/URL;")).thenReturn(List.of(method));
+        return method;
+    }
+
+    /** Builds the array returned by an invoked accessor. */
+    private ArrayReference urlArray(String path) {
+        final ObjectReference url = url(path);
+        final ArrayReference array = mock(ArrayReference.class);
+        when(array.getValues()).thenReturn(List.of(url));
+        return array;
     }
 
     /** Builds a loader with URLClassPath.path backed by an ArrayList with spare capacity. */
