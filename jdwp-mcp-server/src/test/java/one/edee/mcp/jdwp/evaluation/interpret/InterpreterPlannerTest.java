@@ -245,6 +245,26 @@ class InterpreterPlannerTest {
             ExpressionParser.parse("Integer.class")).kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
     }
 
+    /** Uses an array class constant as evidence of a competing reference component name. */
+    @Test
+    void detectsConstantPoolConflictsFromArrayComponents() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "java.lang.Integer", null);
+        type(vm, "java.lang.Class", null);
+        when(vm.canGetConstantPool()).thenReturn(true);
+        when(owner.constantPool()).thenReturn(pool("[[I"));
+        when(owner.constantPoolCount()).thenReturn(3);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final ExpressionParser.Parsed expression = ExpressionParser.parse("Integer.class");
+        assertThat(Planner.plan(vm, frame, Map.of(), expression).kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+
+        when(owner.constantPool()).thenReturn(pool("[[Lalias/Integer;", "[[I"));
+        when(owner.constantPoolCount()).thenReturn(5);
+        assertThat(Planner.plan(vm, frame, Map.of(), expression))
+            .isEqualTo(new Planner.Compile("ambiguous type name: Integer"));
+    }
+
     /** Checks a conflicting class name in the pool of a loaded enclosing type. */
     @Test
     void defersJavaLangWhenAnEnclosingPoolConflicts() throws Exception {
@@ -318,6 +338,18 @@ class InterpreterPlannerTest {
         assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(inherited);
     }
 
+    /** Searches the member scope before considering the frame class's own simple name. */
+    @Test
+    void inheritedMemberShadowsTheFrameClassName() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.SelfFrame", null);
+        final ClassType base = type(vm, "app.Base", null);
+        final ClassType member = type(vm, "app.Base$SelfFrame", null);
+        when(owner.superclass()).thenReturn(base);
+
+        assertThat(new JdiTypes(vm, owner).resolve("SelfFrame")).isSameAs(member);
+    }
+
     /** An unloaded declaration in the current or enclosing scope still hides a loaded inherited type. */
     @ParameterizedTest
     @CsvSource({"app.Example", "app.Example$Inner"})
@@ -389,6 +421,33 @@ class InterpreterPlannerTest {
         }
     }
 
+    /** Allows package-qualified navigation while simple and uppercase qualifiers still require lexical metadata. */
+    @Test
+    void navigatesQualifiedNamesAtAnUnloadedEnclosingType() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Outer$Frame", null);
+        final ClassType integer = type(vm, "java.lang.Integer", null);
+        type(vm, "java.lang.String", null);
+        type(vm, "java.lang.Class", null);
+        final IntegerType intType = mock(IntegerType.class);
+        when(intType.name()).thenReturn("int");
+        final Field maxValue = field(integer, "MAX_VALUE");
+        when(maxValue.isStatic()).thenReturn(true);
+        when(maxValue.type()).thenReturn(intType);
+        when(integer.isInitialized()).thenReturn(true);
+        when(integer.fields()).thenReturn(List.of(maxValue));
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+
+        for (String source : List.of("java.lang.String.class", "java.lang.Integer.MAX_VALUE")) {
+            assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(source)).kind()).as(source)
+                .isEqualTo(Planner.KindOfPlan.NAVIGATE);
+        }
+        for (String source : List.of("String.class", "String.Inner.class", "java.class")) {
+            assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(source))).as(source)
+                .isEqualTo(new Planner.Compile("enclosing type is not loaded: app.Outer"));
+        }
+    }
+
     /** Finds formal names after nested generic and interface-only bounds in all three supported scopes. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"method", "declaring", "enclosing"})
@@ -410,6 +469,25 @@ class InterpreterPlannerTest {
         }
         final StackFrame frame = typeFrame(owner, method);
         assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Marker.Part.class")))
+            .isEqualTo(new Planner.Compile("type parameter may shadow type: Marker"));
+    }
+
+    /** Detects possible type parameters of another declared method from ordinary and synthetic frames. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void defersTypeParametersOfOtherMethods(boolean synthetic) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "app.Example$Marker", null);
+        type(vm, "java.lang.Class", null);
+        final Method frameMethod = mock(Method.class);
+        when(frameMethod.name()).thenReturn(synthetic ? "lambda$enter$0" : "inspect");
+        when(frameMethod.isSynthetic()).thenReturn(synthetic);
+        final Method generic = mock(Method.class);
+        when(generic.genericSignature()).thenReturn("<Marker:Ljava/lang/Object;>()V");
+        when(owner.methods()).thenReturn(List.of(frameMethod, generic));
+
+        assertThat(Planner.plan(vm, typeFrame(owner, frameMethod), Map.of(), ExpressionParser.parse("Marker.class")))
             .isEqualTo(new Planner.Compile("type parameter may shadow type: Marker"));
     }
 

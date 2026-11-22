@@ -121,13 +121,19 @@ final class JdiTypes {
         return bootstrap("java.lang." + BOXES.get(kind));
     }
 
-    /** Resolves a type name left to right, using package lookup if the first segment has no type binding. */
+    /** Resolves a complete type name, binding its segments from left to right. */
     @Nullable ReferenceType resolve(String name) {
+        return resolve(name, false);
+    }
+
+    /** Resolves a name that may be followed by a field in a dotted expression. */
+    @Nullable ReferenceType resolve(String name, boolean followedByField) {
         final int dot = name.indexOf('.');
+        final boolean packagePrefix = (dot >= 0 || followedByField) && Character.isLowerCase(name.codePointAt(0));
         if (dot < 0) {
-            return resolveSimple(name);
+            return resolveSimple(name, packagePrefix);
         }
-        ReferenceType qualifier = resolveSimple(name.substring(0, dot));
+        ReferenceType qualifier = resolveSimple(name.substring(0, dot), packagePrefix);
         if (qualifier == null) {
             return findQualified(name);
         }
@@ -141,14 +147,48 @@ final class JdiTypes {
         return qualifier;
     }
 
-    /** Binds simple names lexically or to an unambiguous java.lang type. */
-    private @Nullable ReferenceType resolveSimple(String name) {
+    /** Binds a simple name lexically, allowing a package prefix past an unloaded enclosing scope. */
+    private @Nullable ReferenceType resolveSimple(String name, boolean packagePrefix) {
+        final ReferenceType owner = declaring;
+        if (owner == null) {
+            return resolveNonLexicalType(name);
+        }
+        if (method != null && FormalTypeParameters.contains(method.genericSignature(), name)) {
+            throw Planner.compile("type parameter may shadow type: " + name);
+        }
+        final List<LexicalScope> lexicalScopes = lexicalScopes(owner);
+        for (LexicalScope scope : lexicalScopes) {
+            final ReferenceType type = scope.type();
+            if (type != null) {
+                checkContextualBinding(type, name);
+            }
+        }
+        final String suffix = "$" + name;
+        final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
+        for (LexicalScope scope : lexicalScopes) {
+            final ReferenceType type = scope.type();
+            if (type == null) {
+                final ReferenceType declared = findExact(scope.binary() + suffix);
+                if (declared != null || packagePrefix) {
+                    return declared;
+                }
+                throw Planner.compile("enclosing type is not loaded: " + scope.binary());
+            }
+            final Set<ReferenceType> candidates = memberTypes(type, suffix, known);
+            if (!candidates.isEmpty()) {
+                return unique(name, candidates);
+            }
+            if (simpleName(scope.binary()).equals(name)) {
+                return type;
+            }
+        }
+        return resolveNonLexicalType(name);
+    }
+
+    /** Checks for an uncontested java.lang binding when lexical lookup found no type. */
+    private @Nullable ReferenceType resolveNonLexicalType(String name) {
         final ReferenceType owner = declaring;
         if (owner != null) {
-            final ReferenceType lexical = lexicalType(owner, name);
-            if (lexical != null) {
-                return lexical;
-            }
             final String binary = owner.name();
             final String packagePrefix = binary.substring(0, binary.lastIndexOf('.') + 1);
             if (!vm.classesByName(packagePrefix + name).isEmpty()) {
@@ -181,40 +221,6 @@ final class JdiTypes {
         return Planner.compile("type name needs an import or the frame's package: " + name);
     }
 
-    /** Finds a simple type name after ruling out possible type parameters and local classes. */
-    private @Nullable ReferenceType lexicalType(ReferenceType owner, String name) {
-        if (method != null && FormalTypeParameters.contains(method.genericSignature(), name)) {
-            throw Planner.compile("type parameter may shadow type: " + name);
-        }
-        final List<LexicalScope> lexicalScopes = lexicalScopes(owner);
-        for (LexicalScope scope : lexicalScopes) {
-            final ReferenceType type = scope.type();
-            if (type != null) {
-                checkContextualBinding(type, name);
-            }
-        }
-        final String suffix = "$" + name;
-        final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
-        for (LexicalScope scope : lexicalScopes) {
-            final ReferenceType type = scope.type();
-            if (type == null) {
-                final ReferenceType declared = findExact(scope.binary() + suffix);
-                if (declared != null) {
-                    return declared;
-                }
-                throw Planner.compile("enclosing type is not loaded: " + scope.binary());
-            }
-            if (simpleName(scope.binary()).equals(name)) {
-                return type;
-            }
-            final Set<ReferenceType> candidates = memberTypes(type, suffix, known);
-            if (!candidates.isEmpty()) {
-                return unique(name, candidates);
-            }
-        }
-        return null;
-    }
-
     /** A lexical scope's binary name and its mirror if visible to the frame loader. */
     private record LexicalScope(String binary, @Nullable ReferenceType type) {}
 
@@ -235,10 +241,15 @@ final class JdiTypes {
         return scopes;
     }
 
-    /** Defers when a loaded lexical scope exposes a possible shadowing type parameter or local class. */
+    /** Checks a loaded lexical scope and its declared methods for possible shadowing bindings. */
     private void checkContextualBinding(ReferenceType scope, String name) {
         if (FormalTypeParameters.contains(scope.genericSignature(), name)) {
             throw Planner.compile("type parameter may shadow type: " + name);
+        }
+        for (Method declared : scope.methods()) {
+            if (FormalTypeParameters.contains(declared.genericSignature(), name)) {
+                throw Planner.compile("type parameter may shadow type: " + name);
+            }
         }
         for (String candidate : classNames(scope)) {
             if (isLocalClassName(candidate, name)) {
@@ -347,9 +358,7 @@ final class JdiTypes {
         return constantPoolClasses.computeIfAbsent(type, this::readClassNames);
     }
 
-    /**
-     * Parses the constant pool bytes and collects the names of the referenced classes, or none when the VM cannot supply it.
-     */
+    /** Collects class names and reference array component names from the target's constant pool. */
     private Set<String> readClassNames(ReferenceType type) {
         if (!vm.canGetConstantPool()) {
             return Set.of();
@@ -379,8 +388,16 @@ final class JdiTypes {
             final Set<String> names = new LinkedHashSet<>();
             for (int index : classes) {
                 final String name = utf8[index];
-                if (name != null && !name.startsWith("[")) {
+                if (name == null) {
+                    continue;
+                }
+                if (!name.startsWith("[")) {
                     names.add(name.replace('/', '.'));
+                } else {
+                    final int component = name.lastIndexOf('[') + 1;
+                    if (name.startsWith("L", component) && name.endsWith(";")) {
+                        names.add(name.substring(component + 1, name.length() - 1).replace('/', '.'));
+                    }
                 }
             }
             return names;

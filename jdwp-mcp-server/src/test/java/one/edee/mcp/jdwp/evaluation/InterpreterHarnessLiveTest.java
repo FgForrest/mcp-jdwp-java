@@ -16,6 +16,7 @@ import one.edee.mcp.jdwp.evaluation.interpret.Interpreter;
 import one.edee.mcp.jdwp.evaluation.interpret.Planner;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
+import org.assertj.core.api.SoftAssertions;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -417,16 +418,22 @@ class InterpreterHarnessLiveTest {
         }
     }
 
-    /** Defers names that can be shadowed by unloaded enclosing scopes or method-local bindings. */
+    /** Checks lexical bindings and fallback plans, comparing navigated results with javac. */
     @Test
-    void defersUncertainLexicalTypeBindings() throws Exception {
+    void checksLexicalTypeBindings() throws Exception {
         final String pkg = TypeBindingFixture.class.getPackageName() + ".";
         final String localFrame = TypeBindingFixture.class.getName() + "$LocalFrame";
-        final Map<String, String> expressions = Map.of(
-            pkg + "HiddenOuter$Frame", "Scope.Token.class",
-            pkg + "EnclosingOuter$Middle$Frame", "Shared.class",
-            localFrame, "Marker.class",
-            TypeBindingFixture.class.getName() + "$GenericFrame", "((Marker) value).code");
+        final Map<String, List<String>> expressions = Map.of(
+            pkg + "HiddenOuter$Frame", List.of("Scope.Token.class", "String.class",
+                "java.lang.String.class", "java.lang.Integer.MAX_VALUE", "(java.lang.String) x"),
+            pkg + "EnclosingOuter$Middle$Frame", List.of("Shared.class"),
+            localFrame, List.of("Marker.class"),
+            TypeBindingFixture.class.getName() + "$GenericFrame", List.of("((Marker) value).code"),
+            pkg + "TypeBindingArrayFrame", List.of("Integer.class", "Integer.MAX_VALUE", "Integer[][].class"),
+            pkg + "GenericOuter$1Frame", List.of("((Marker) value).code"),
+            pkg + "SelfNameFrame", List.of("SelfNameFrame.class", "SelfNameFrame.CONSTANT"));
+        final Set<String> navigate = Set.of("java.lang.String.class", "java.lang.Integer.MAX_VALUE",
+            "(java.lang.String) x", "SelfNameFrame.class", "SelfNameFrame.CONSTANT");
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             withFixture(javaHome, fixture -> {
                 final VirtualMachine vm = fixture.vm();
@@ -439,10 +446,11 @@ class InterpreterHarnessLiveTest {
                 }
                 final EvaluationRouter router = new EvaluationRouter(mock(JdiExpressionEvaluator.class),
                     EvaluationRouter.Mode.INTERPRETER);
-                final Map<String, Planner.Plan> plans = new LinkedHashMap<>();
-                while (plans.size() < expressions.size()) {
+                final Set<String> seen = new HashSet<>();
+                final SoftAssertions checks = new SoftAssertions();
+                while (seen.size() < expressions.size()) {
                     final EventSet events = vm.eventQueue().remove(15_000);
-                    assertThat(events).as("next lexical-binding stop after %s", plans.keySet()).isNotNull();
+                    assertThat(events).as("next lexical-binding stop after %s", seen).isNotNull();
                     try {
                         for (Event event : events) {
                             if (event instanceof ClassPrepareEvent prepare) {
@@ -459,7 +467,6 @@ class InterpreterHarnessLiveTest {
                             } else if (event instanceof BreakpointEvent hit) {
                                 requests.deleteEventRequest(hit.request());
                                 final String owner = hit.location().declaringType().name();
-                                final ThreadReference thread = hit.thread();
                                 if (owner.equals(pkg + "HiddenOuter$Frame")) {
                                     assertThat(vm.classesByName(pkg + "HiddenOuter")).isEmpty();
                                     assertThat(vm.classesByName(pkg + "HiddenOuter$Scope")).isEmpty();
@@ -470,21 +477,43 @@ class InterpreterHarnessLiveTest {
                                 } else if (owner.equals(localFrame)) {
                                     assertThat(vm.classesByName(localFrame + "$1Marker")).hasSize(1);
                                 }
-                                final String source = Objects.requireNonNull(expressions.get(owner));
-                                plans.put(source, router.prepare(router.parse(source), thread, () -> thread.frame(0),
-                                    Map.of()));
+                                for (String source : Objects.requireNonNull(expressions.get(owner))) {
+                                    checkLexicalBinding(router, hit, source, navigate.contains(source), checks);
+                                }
+                                seen.add(owner);
                             } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
-                                throw new AssertionError("fixture exited after lexical-binding stops " + plans.keySet());
+                                throw new AssertionError("fixture exited after lexical-binding stops " + seen);
                             }
                         }
                     } finally {
                         events.resume();
                     }
                 }
-                assertThat(plans).as("%s", javaHome.getFileName()).allSatisfy((source, plan) ->
-                    assertThat(plan.kind()).as("%s: %s", source, plan).isEqualTo(Planner.KindOfPlan.COMPILE));
-                return plans;
+                checks.assertAll();
+                return seen;
             });
+        }
+    }
+
+    /** Checks the plan and compares a navigated value with the fixture method compiled by javac. */
+    private static void checkLexicalBinding(EvaluationRouter router, BreakpointEvent hit, String source,
+                                            boolean navigate, SoftAssertions checks) throws Exception {
+        final ThreadReference thread = hit.thread();
+        final ClassType owner = (ClassType) hit.location().declaringType();
+        final Planner.Plan plan = router.prepare(router.parse(source), thread, () -> thread.frame(0), Map.of());
+        final Planner.KindOfPlan expected = navigate ? Planner.KindOfPlan.NAVIGATE : Planner.KindOfPlan.COMPILE;
+        checks.assertThat(plan.kind()).as("%s in %s on %s: %s", source, owner.name(),
+            thread.virtualMachine().version(), plan).isEqualTo(expected);
+        if (navigate && plan.kind() == Planner.KindOfPlan.NAVIGATE) {
+            final InterpreterValueFacts result = router.evaluateEvent(source, thread, Map.of(),
+                value -> InterpreterValueFacts.capture(value, Map.of(), false));
+            final StackFrame frame = thread.frame(0);
+            final Value x = source.equals("(java.lang.String) x")
+                ? frame.getValue(frame.visibleVariableByName("x")) : null;
+            final Value golden = owner.invokeMethod(thread, owner.methodsByName("golden").get(0),
+                Arrays.asList(thread.virtualMachine().mirrorOf(source), x), ClassType.INVOKE_SINGLE_THREADED);
+            checks.assertThat(result).as("%s in %s agrees with javac", source, owner.name())
+                .isEqualTo(InterpreterValueFacts.capture(golden, Map.of(), false));
         }
     }
 

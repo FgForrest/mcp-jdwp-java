@@ -12,10 +12,16 @@ public final class TypeBindingFixture {
     static void run() {
         sink = new Object[]{new Marker(), new EnclosingOuter(), new EnclosingOuter.Shared(),
             new EnclosingBase.Shared(), new HiddenOuter.Scope.Token(), new Scope(), new Scope.Token()};
-        HiddenOuter.Frame.inspect();
+        HiddenOuter.Frame.inspect("fixture");
         EnclosingOuter.Middle.Frame.inspect();
         LocalFrame.inspect();
         GenericFrame.inspect(new GenericActual());
+        sink = new Object[]{new java.lang.Integer[][]{{1}},
+            new one.edee.mcp.jdwp.evaluation.fixture.shadow.Integer[][]{
+                {new one.edee.mcp.jdwp.evaluation.fixture.shadow.Integer()}}, new SelfNameBase.SelfNameFrame()};
+        TypeBindingArrayFrame.inspect();
+        GenericOuter.enter();
+        SelfNameFrame.inspect();
     }
 
     /** Stops after a local class has shadowed the package's marker. */
@@ -84,8 +90,18 @@ class HiddenOuter {
     /** Stops while the enclosing scope is still unavailable through JDI. */
     static class Frame {
         /** Provides a breakpoint location without accessing either enclosing type. */
-        static void inspect() {
-            TypeBindingFixture.sink = 0;
+        static void inspect(Object x) {
+            TypeBindingFixture.sink = x;
+        }
+
+        /** Computes javac's values for the fully qualified expressions in the unloaded scope. */
+        static Object golden(String source, Object x) {
+            return switch (source) {
+                case "java.lang.String.class" -> java.lang.String.class;
+                case "java.lang.Integer.MAX_VALUE" -> java.lang.Integer.MAX_VALUE;
+                case "(java.lang.String) x" -> (java.lang.String) x;
+                default -> throw new IllegalArgumentException(source);
+            };
         }
     }
 }
@@ -94,4 +110,60 @@ class HiddenOuter {
 class Scope {
     /** The incorrect token type is loaded and available to JDI. */
     static class Token {}
+}
+
+/** Supplies a local class whose enclosing method declares the type parameter. */
+final class GenericOuter {
+    /** The member type shadowed by the enclosing method's parameter. */
+    static class Marker {
+        /** Distinguishes the member's field from the field of the bound type. */
+        public int code = 61;
+    }
+
+    /** The bound of the enclosing method's parameter. */
+    static final class Actual extends Marker {
+        /** The field selected through the enclosing method's parameter. */
+        public int code = 62;
+    }
+
+    /** Enters the local frame with a value compatible with both casts. */
+    static <Marker extends Actual> void enter() {
+        /** Stops in a method with no formal type parameters of its own. */
+        class Frame {
+            /** Reads through the enclosing method's formal parameter. */
+            int inspect(Object value) {
+                return ((Marker) value).code;
+            }
+        }
+        TypeBindingFixture.sink = new Frame().inspect(new Actual());
+    }
+}
+
+/** Declares a member type with the same simple name as its subclass. */
+class SelfNameBase {
+    /** The type javac selects in the subclass's scope. */
+    static final class SelfNameFrame {
+        /** Makes the two bindings distinguishable by a static field read. */
+        static final int CONSTANT = 92;
+    }
+}
+
+/** Stops where an inherited member type shadows the frame's own name. */
+final class SelfNameFrame extends SelfNameBase {
+    /** The value a wrongly selected binding would read. */
+    static final int CONSTANT = 91;
+
+    /** Provides a breakpoint in the subclass's lexical scope. */
+    static void inspect() {
+        TypeBindingFixture.sink = SelfNameFrame.class;
+    }
+
+    /** Computes javac's values for expressions using the shadowed class name. */
+    static Object golden(String source, Object unused) {
+        return switch (source) {
+            case "SelfNameFrame.class" -> SelfNameFrame.class;
+            case "SelfNameFrame.CONSTANT" -> SelfNameFrame.CONSTANT;
+            default -> throw new IllegalArgumentException(source);
+        };
+    }
 }

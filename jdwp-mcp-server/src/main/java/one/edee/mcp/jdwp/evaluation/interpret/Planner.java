@@ -315,7 +315,7 @@ public final class Planner {
         return new Node(JdiTypes.primitive(kind), ctx -> ctx.mirror(value), value, true, false, null);
     }
 
-    /** Plans a simple or dotted name: a variable followed by fields, or a type followed by a static field. */
+    /** Plans a variable and its fields, or a potentially qualified type followed by a static field. */
     private Node name(List<String> path) throws ClassNotLoadedException {
         final String first = path.get(0);
         final Node value = variable(first);
@@ -324,7 +324,7 @@ public final class Planner {
         }
         // A type prefix is followed by at least one field. Try the leftmost name first.
         for (int end = 1; end < path.size(); end++) {
-            final ReferenceType type = types.resolve(String.join(".", path.subList(0, end)));
+            final ReferenceType type = types.resolve(String.join(".", path.subList(0, end)), true);
             if (type != null) {
                 final String member = path.get(end);
                 // A qualified type may contain further nested types. A field wins over a type.
