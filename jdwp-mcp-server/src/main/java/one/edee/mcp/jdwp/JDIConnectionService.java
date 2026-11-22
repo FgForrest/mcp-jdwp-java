@@ -25,6 +25,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -553,13 +554,12 @@ public class JDIConnectionService {
 
     /** JDWP endpoint for a standing approval. Loopback is determined by the address used to attach. */
     record TargetEndpoint(String host, int port, boolean loopback) {
+        /** Canonicalizes loopback and host spelling while preserving case-sensitive IPv6 zones. */
         TargetEndpoint {
             if (loopback) {
                 host = "localhost";
             } else {
-                if (host.startsWith("[") && host.endsWith("]")) {
-                    host = host.substring(1, host.length() - 1);
-                }
+                host = stripHostBrackets(host);
                 final int zone = host.contains(":") ? host.indexOf('%') : -1;
                 host = zone < 0 ? host.toLowerCase(Locale.ROOT)
                     : host.substring(0, zone).toLowerCase(Locale.ROOT) + host.substring(zone);
@@ -592,17 +592,35 @@ public class JDIConnectionService {
         throw new IllegalStateException("SocketAttach connector not found");
     }
 
-    /** Resolve once and pass the numeric address to SocketAttach so it uses the selected address. */
+    /**
+     * Resolves the destination and passes its numeric address to SocketAttach. For unspecified
+     * addresses, applies the socket's local-host substitution before connecting and keying.
+     * If the local hostname is also unspecified, uses loopback in that address family.
+     */
     static SocketAttachment attachSocket(AttachingConnector connector, String host, int port)
         throws IOException, IllegalConnectorArgumentsException {
-        final InetAddress address = host.isEmpty() || "*".equals(host)
-            ? InetAddress.getLoopbackAddress() : InetAddress.getByName(host);
+        final String unbracketed = stripHostBrackets(host);
+        final InetAddress resolved = unbracketed.isEmpty() || "*".equals(unbracketed)
+            ? InetAddress.getLoopbackAddress() : InetAddress.getByName(unbracketed);
+        final boolean wildcard = resolved.isAnyLocalAddress();
+        InetAddress address = wildcard ? InetAddress.getLocalHost() : resolved;
+        if (address.isAnyLocalAddress()) {
+            address = InetAddress.getByName(address instanceof Inet4Address ? "127.0.0.1" : "::1");
+        }
+        final String numericHost = address.getHostAddress();
+        final String endpointHost = wildcard ? numericHost : unbracketed;
         final Map<String, Connector.Argument> args = connector.defaultArguments();
         Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument")
-            .setValue(address.getHostAddress());
+            .setValue(numericHost);
         Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument")
             .setValue(String.valueOf(port));
-        return new SocketAttachment(connector.attach(args), new TargetEndpoint(host, port, address.isLoopbackAddress()));
+        return new SocketAttachment(connector.attach(args),
+            new TargetEndpoint(endpointHost, port, address.isLoopbackAddress()));
+    }
+
+    /** Removes one pair of address brackets without changing the enclosed address or its zone. */
+    private static String stripHostBrackets(String host) {
+        return host.startsWith("[") && host.endsWith("]") ? host.substring(1, host.length() - 1) : host;
     }
 
     /**

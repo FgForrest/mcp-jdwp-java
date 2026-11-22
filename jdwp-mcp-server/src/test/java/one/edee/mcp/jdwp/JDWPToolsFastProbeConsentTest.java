@@ -12,6 +12,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -105,6 +107,48 @@ class JDWPToolsFastProbeConsentTest {
 		assertThat(logpoint(null)).startsWith("[CONSENT REQUIRED]");
 	}
 
+	/** A pre-attach briefing must be renewed before an explicit approval can target a JVM. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	@DisplayName("an endpointless briefing must be renewed after attach")
+	void endpointlessBriefingRequiresNamedApproval(boolean breakpoint) throws Exception {
+		assertThat(setProbe(breakpoint, null, null)).startsWith("[CONSENT REQUIRED]")
+			.contains("Attach to the intended endpoint before asking for approval");
+
+		attach("localhost", 5005);
+		assertThat(setProbe(breakpoint, true, null)).startsWith("[CONSENT REQUIRED AGAIN]")
+			.contains("localhost:5005").doesNotContain("WAITING", "Standing approval used");
+		verify(connection, never()).getVM();
+		assertThat(tools.jdwp_overview(null, null, null)).doesNotContain("granted at");
+
+		assertThat(setProbe(breakpoint, true, null)).contains("WAITING");
+		assertThat(setProbe(breakpoint, null, null)).contains("Standing approval used");
+	}
+
+	/** The tools accept the exact name of a defined class whose name uses JVM-only syntax. */
+	@Test
+	@DisplayName("both fast tools accept an exact JVM binary name containing a hyphen")
+	void validJvmBinaryNameIsAccepted() throws Exception {
+		final String binaryName = "example.Order-item";
+		final ClassWriter writer = new ClassWriter(0);
+		writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, binaryName.replace('.', '/'), null, "java/lang/Object", null);
+		writer.visitEnd();
+		final byte[] bytes = writer.toByteArray();
+		final Class<?> target = new ClassLoader() {
+			/** Defines the class from its bytecode, independent of Java source naming rules. */
+			Class<?> loadTarget() {
+				return defineClass(binaryName, bytes, 0, bytes.length);
+			}
+		}.loadTarget();
+		assertThat(target.getName()).isEqualTo(binaryName);
+		attach("localhost", 5005);
+
+		assertThat(tools.jdwp_set_fast_logpoint(target.getName(), 42, "42", null, true, null, null))
+			.contains("WAITING");
+		assertThat(tools.jdwp_set_fast_breakpoint(target.getName(), 42, "false", true, null, null, null))
+			.contains("WAITING");
+	}
+
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	@DisplayName("an explicit retry must use the endpoint of the latest briefing")
@@ -162,9 +206,10 @@ class JDWPToolsFastProbeConsentTest {
 			.contains("Standing approval used");
 	}
 
+	/** Invalid binary names fail before a consent exchange or VM lookup. */
 	@ParameterizedTest
 	@ValueSource(strings = {"example.*", "example/Cart", "example..Cart", "example.Cart[]", "example.Cart ",
-		".example.Cart", "example.Cart.", ""})
+		".example.Cart", "example.Cart.", "", "example.Cart;item", "example.Order\u00a0item"})
 	@DisplayName("both fast tools reject non-binary class names before asking for consent")
 	void invalidClassNamesAreRejected(String className) throws Exception {
 		attach("localhost", 5005);

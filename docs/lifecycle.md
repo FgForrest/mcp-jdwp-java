@@ -59,7 +59,7 @@ The Spring context boots without any JDI activity. No `VirtualMachine`, no event
 2. Short-circuit if already attached to the same host:port (`JDIConnectionService.java:267-271`).
 3. Otherwise tear down any stale session via `cleanupSessionState()` (lines 276 and 281).
 4. Look up the `com.sun.jdi.SocketAttach` connector by name from `Bootstrap.virtualMachineManager().attachingConnectors()` (lines 284-292).
-5. Resolve the hostname once and pass the selected numeric address and port to `connector.attach(args)`. The same address determines whether the fast-probe approval endpoint is loopback.
+5. Strip outer address brackets, preserving any IPv6 zone, and resolve the host once. An unspecified address (`0.0.0.0` or `::`) uses the local host's resolved address, matching the socket connector's substitution. If that address is also unspecified, use loopback in its address family. Pass the selected numeric address and port to `connector.attach(args)`. The same address determines loopback classification and supplies the endpoint host for wildcard destinations.
 6. On success, store the `VirtualMachine`, record `lastHost` / `lastPort` and the approval endpoint, and start `JdiEventListener` via `eventListener.start(vm)`.
 
 The connector lookup is deliberate: the JDI implementation is plugged in via `ServiceLoader`, and on some runtimes the `dt_socket` connector is named differently. Selecting by exact name (`"com.sun.jdi.SocketAttach"`) fails fast if the runtime is missing JDI entirely (Java without `--add-modules jdk.jdi`), instead of silently picking the wrong connector.

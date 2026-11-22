@@ -24,7 +24,6 @@ import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Service;
 
-import javax.lang.model.SourceVersion;
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -3152,6 +3151,7 @@ public class JDWPTools {
         }
     }
 
+    /** Sets an in-target logpoint for an exact JVM class name after checking consent for the endpoint. */
     @McpTool(description = "RARE, SITUATIONAL — needs the user's explicit consent. A logpoint evaluated INSIDE the "
         + "target JVM: the class's bytecode is rewritten to call an injected probe that evaluates the condition and "
         + "expression on the application thread and appends the result to an in-target ring buffer, so hits never "
@@ -3174,7 +3174,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Set to true only after the user explicitly approves this exact fast logpoint at this host:port in this conversation, granting standing approval for this server run.") @Nullable Boolean userApproved,
         @McpToolParam(required = false, description = "Ring-buffer capacity: a power of two between 16 and 65536 (default 4096). Entries overwritten before jdwp_get_events reads them are reported as dropped.") @Nullable Integer bufferSize,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
-        if (className == null || !SourceVersion.isName(className)) {
+        if (!isFastProbeClassName(className)) {
             return FAST_PROBE_INVALID_CLASS_NAME;
         }
         final String effectiveCondition = condition == null || condition.isBlank() ? null : condition;
@@ -3202,7 +3202,7 @@ public class JDWPTools {
         if (key == null) {
             return "Error: No JDWP target endpoint. Use jdwp_connect first.";
         }
-        if (explicitlyApproved && fastProbeApprovals.briefedAtDifferentEndpoint(key)) {
+        if (explicitlyApproved && fastProbeApprovals.requiresNewBriefing(key)) {
             return FAST_PROBE_BRIEFING_TARGET_CHANGED + fastProbeBriefing(probe, key.endpoint());
         }
         try {
@@ -3283,6 +3283,7 @@ public class JDWPTools {
         }
     }
 
+    /** Sets or re-arms an in-target breakpoint for an exact JVM class name after checking endpoint consent. */
     @McpTool(description = "RARE, SITUATIONAL — needs the user's explicit consent. A conditional breakpoint whose "
         + "condition is evaluated INSIDE the target JVM: the class's bytecode is rewritten to call an injected probe that "
         + "evaluates the condition on the application thread and calls into the debugger only when it holds, so the "
@@ -3309,7 +3310,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Suspend policy of the stop: 'all' (default) or 'thread'") @Nullable String suspendPolicy,
         @McpToolParam(required = false, description = "If true (default), only the first hit that meets the condition stops — call again with the same arguments to re-arm. If false, every such hit stops.") @Nullable Boolean stopOnce,
         @McpToolParam(required = false, description = "If true, force-load the class when it is not loaded yet (runs its `<clinit>`; impossible at VM start, where no thread can run code). Default false — a class that is not loaded yet is waited for.") @Nullable Boolean forceLoad) {
-        if (className == null || !SourceVersion.isName(className)) {
+        if (!isFastProbeClassName(className)) {
             return FAST_PROBE_INVALID_CLASS_NAME;
         }
         // Arguments first: they need no VM, and the user should not be asked to approve a call that
@@ -3343,7 +3344,7 @@ public class JDWPTools {
         if (key == null) {
             return "Error: No JDWP target endpoint. Use jdwp_connect first.";
         }
-        if (explicitlyApproved && fastProbeApprovals.briefedAtDifferentEndpoint(key)) {
+        if (explicitlyApproved && fastProbeApprovals.requiresNewBriefing(key)) {
             return FAST_PROBE_BRIEFING_TARGET_CHANGED + fastProbeBriefing(probe, key.endpoint());
         }
         try {
@@ -3490,13 +3491,27 @@ public class JDWPTools {
         "Error: The JDWP connection changed before the probe could be set. Retry on the current target.";
     private static final String FAST_PROBE_TARGET_CHANGED =
         "[CONSENT REQUIRED AGAIN] Nothing was armed: the target endpoint changed during this call.\n\n";
+    /** Explains why a pre-attach or different-endpoint briefing needs to be renewed. */
     private static final String FAST_PROBE_BRIEFING_TARGET_CHANGED =
-        "[CONSENT REQUIRED AGAIN] Nothing was armed: the last briefing for this probe named a different endpoint.\n\n";
+        "[CONSENT REQUIRED AGAIN] Nothing was armed: the last briefing for this probe did not name this endpoint.\n\n";
     private static final String FAST_PROBE_INVALID_CLASS_NAME =
         "Error: className must be a binary class name, such as com.example.Outer$Inner. Wildcards are unsupported.";
 
     /**
-     * Renders the briefing and remembers the endpoint it names for the next explicit approval.
+     * Checks dot-separated JVM names, allowing characters Java source identifiers do not support.
+     * Whitespace and JDI's wildcard are excluded from exact fast-probe class names.
+     */
+    private static boolean isFastProbeClassName(@Nullable String className) {
+        if (className == null || className.isEmpty() || className.startsWith(".")
+            || className.endsWith(".") || className.contains("..")) {
+            return false;
+        }
+        return className.codePoints().noneMatch(c -> c == '*' || c == '/' || c == ';' || c == '['
+            || Character.isWhitespace(c) || Character.isSpaceChar(c));
+    }
+
+    /**
+     * Renders and remembers the latest briefing, even when it cannot name an endpoint yet.
      */
     private String fastProbeBriefing(FastProbeApprovals.Probe probe, @Nullable TargetEndpoint endpoint) {
         final String target = endpoint == null ? null : "the JVM attached at " + endpoint;
@@ -3505,9 +3520,7 @@ public class JDWPTools {
                 probe.condition(), probe.bufferSize(), probe.forceLoad(), target)
             : FastBreakpointRiskBriefing.render(probe.className(), probe.line(), Objects.requireNonNull(probe.condition()),
                 FastLogpointService.policyLabel(probe.suspendPolicy()), probe.stopOnce(), probe.forceLoad(), target);
-        if (endpoint != null) {
-            fastProbeApprovals.recordBriefing(probe, endpoint);
-        }
+        fastProbeApprovals.recordBriefing(probe, endpoint);
         return briefing;
     }
 

@@ -192,12 +192,12 @@ This is a situational tool, not an upgrade: `jdwp_set_logpoint` stays the defaul
 
 **Consent protocol — mandatory:**
 1. Call `jdwp_set_fast_logpoint(className, lineNumber, expression, condition?)` **without** `userApproved`. The server arms directly if it holds a standing approval for this exact probe at this host:port. Its reply gives the grant time.
-2. If the tool returns a risk briefing, relay it to the user **word for word** and ask whether to proceed.
+2. If the briefing has no endpoint yet, attach and request a named briefing. Relay the named risk briefing to the user **word for word** and ask whether to proceed.
 3. Only after the user has explicitly approved this exact probe at this endpoint **in this conversation**, call again with the same arguments and `userApproved=true`. If the server returns a fresh briefing after an endpoint change, relay it and ask again. Never infer consent. If the user declines, use `jdwp_set_logpoint`.
 4. For later JVMs at the same endpoint, make the same call without `userApproved`. The grant lasts for this MCP server process, including across JVM exit, disconnect, reconnect and reset. `jdwp_overview(types="fast_logpoint")` lists the grants.
 
 **Then:**
-- Use an exact binary class name such as `com.example.Outer$Inner`. The approval includes the effective `bufferSize` and `forceLoad` settings. Changing either requires approval for the new settings.
+- Use the JVM's exact binary class name, such as `com.example.Outer$Inner` or `example.Order-item`. The approval includes the effective `bufferSize` and `forceLoad` settings. Changing either requires approval for the new settings.
 - A class that is not loaded yet is waited for: the reply says `WAITING`, and `FAST_LOGPOINT_CLASS_LOADED` (or `FAST_LOGPOINT_ARM_FAILED`, when the line cannot host it) follows when it loads — no regular breakpoint or `forceLoad` first (`forceLoad` cannot load anything at VM start anyway). The next hit of the line arms the probe: that one thread pauses briefly, and that hit is logged through the debugger (`armingHit`).
 - Read hits with `jdwp_get_events` — `FAST_LOGPOINT` / `FAST_LOGPOINT_ERROR` entries carry the in-target thread, `seq` and `nanoTime`. Hits still unread when the target exits (a test JVM finishing) are read before it goes: `[VM_DEATH]` lists them, and `FAST_LOGPOINT_READ_AT_EXIT` says how many. The history keeps the last 500 entries — on a busy probe, read while it runs, or narrow the condition. `FAST_LOGPOINT_DROPPED` means entries were overwritten before you read them: read more often, raise `bufferSize` (power of two, ≤ 65536) or narrow the condition. `jdwp_overview(types="fast_logpoint")` shows the state and counters.
 - `FAST_LOGPOINT_ARM_FAILED` explains a refused arm — most often "the class bytes ... differ from the live bytecode": another agent (JaCoCo, Mockito inline mocks, an enhancer) rewrote the class. That refusal is the safety check working; fall back to `jdwp_set_logpoint`.

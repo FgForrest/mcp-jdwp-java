@@ -39,18 +39,24 @@ final class FastProbeApprovals {
     record Key(Probe probe, TargetEndpoint endpoint) {
     }
 
-    /** Grant time per approved probe; the first grant wins. */
-    private final ConcurrentMap<Key, Instant> grants = new ConcurrentHashMap<>();
-    /** Last named endpoint per probe, including briefings that have already led to a grant. */
-    private final ConcurrentMap<Probe, TargetEndpoint> briefedEndpoints = new ConcurrentHashMap<>();
-
-    void recordBriefing(Probe probe, TargetEndpoint endpoint) {
-        briefedEndpoints.put(probe, endpoint);
+    /** A rendered briefing, with a null endpoint when it preceded attachment. */
+    private record Briefing(@Nullable TargetEndpoint endpoint) {
     }
 
-    boolean briefedAtDifferentEndpoint(Key key) {
-        final TargetEndpoint briefed = briefedEndpoints.get(key.probe());
-        return briefed != null && !briefed.equals(key.endpoint());
+    /** Grant time per approved probe; the first grant wins. */
+    private final ConcurrentMap<Key, Instant> grants = new ConcurrentHashMap<>();
+    /** Latest briefing per probe, including pre-attach briefings and those that led to a grant. */
+    private final ConcurrentMap<Probe, Briefing> briefings = new ConcurrentHashMap<>();
+
+    /** Records a briefing even if it could not name an endpoint yet. */
+    void recordBriefing(Probe probe, @Nullable TargetEndpoint endpoint) {
+        briefings.put(probe, new Briefing(endpoint));
+    }
+
+    /** An explicit retry needs a fresh briefing when the previous one did not name this endpoint. */
+    boolean requiresNewBriefing(Key key) {
+        final Briefing briefing = briefings.get(key.probe());
+        return briefing != null && !key.endpoint().equals(briefing.endpoint());
     }
 
     /**

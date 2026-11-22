@@ -22,6 +22,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -131,6 +132,7 @@ class FastLogpointServiceArmingTest {
 			.isEqualTo(FastLogpointService.State.PENDING);
 	}
 
+	/** A rejected write does not advance its server generation and can be retried. */
 	@ParameterizedTest
 	@CsvSource({"true, true", "true, false", "false, true"})
 	@DisplayName("a rejected gate write is reported and leaves that gate at its previous generation")
@@ -143,7 +145,8 @@ class FastLogpointServiceArmingTest {
 		modelGate(probe, FastBreakpointProbeSource.ERROR_EPOCH_FIELD, targetError, rejectError);
 		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
 
-		final var result = service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+		final FastLogpointService.RearmResult result =
+			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
 
 		assertThat(result.rearmed()).isFalse();
 		assertThat(result.message()).doesNotContain("re-armed (ID:");
@@ -160,6 +163,7 @@ class FastLogpointServiceArmingTest {
 		assertThat(targetError.get()).isEqualTo(rejectError ? 2 : 3);
 	}
 
+	/** A retry starts from the target generation even if the previous reply could not confirm it. */
 	@Test
 	@DisplayName("a retry reconciles a gate whose first write landed without a readable reply")
 	void retryReadsTargetAfterAnUnconfirmedWrite() throws Exception {
@@ -187,7 +191,8 @@ class FastLogpointServiceArmingTest {
 		modelGate(probe, FastBreakpointProbeSource.ERROR_EPOCH_FIELD, new AtomicInteger(1), false);
 		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
 
-		final var result = service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+		final FastLogpointService.RearmResult result =
+			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
 		assertThat(result.rearmed()).isFalse();
 		assertThat(result.message()).contains("stop gate reopening could not be verified", "error gate reopened");
 		assertThat(targetStop.get()).isEqualTo(2);
@@ -198,17 +203,107 @@ class FastLogpointServiceArmingTest {
 		assertThat(readEpoch(entry, "epoch")).isEqualTo(3);
 	}
 
+	/** Checks visible and suppressed hits after an installed gate accepted an unconfirmed update. */
+	@ParameterizedTest
+	@CsvSource({
+		"false, 2, false, CURRENT",
+		"true, 2, false, CURRENT",
+		"false, 2, true, CURRENT",
+		"true, 1, false, STALE",
+		"false, 1, true, UNCERTAIN",
+		"true, 2, false, SUPPRESSED"
+	})
+	@DisplayName("stops are classified against the relevant gate after an unconfirmed generation write")
+	void stopsAfterUnconfirmedGeneration(boolean errorGate, int hitEpoch, boolean loseStopRead, String expected)
+		throws Exception {
+		final ClassType probe = mock(ClassType.class);
+		final Object entry = installProbeForRearm(probe);
+		final BreakpointRequest stopRequest = mock(BreakpointRequest.class);
+		indexStopRequest(entry, stopRequest);
+
+		final String updatedGate = errorGate ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD;
+		final String otherGate = errorGate ? FastBreakpointProbeSource.EPOCH_FIELD : FastBreakpointProbeSource.ERROR_EPOCH_FIELD;
+		modelGate(probe, otherGate, new AtomicInteger(1), false);
+		final Field gateField = mock(Field.class);
+		final AtomicInteger targetEpoch = new AtomicInteger(1);
+		final AtomicBoolean loseReply = new AtomicBoolean(true);
+		final AtomicBoolean loseRead = new AtomicBoolean();
+		when(probe.fieldByName(updatedGate)).thenReturn(gateField);
+		when(probe.getValue(gateField)).thenAnswer(invocation -> {
+			if (loseRead.getAndSet(false)) {
+				throw new InternalException("generation read-back failed");
+			}
+			return integerValue(targetEpoch.get());
+		});
+		doAnswer(invocation -> {
+			targetEpoch.set(invocation.<IntegerValue>getArgument(1).value());
+			if (loseReply.getAndSet(false)) {
+				loseRead.set(true);
+				throw new InternalException("could not confirm the write");
+			}
+			return null;
+		}).when(probe).setValue(eq(gateField), any());
+		when(vm.mirrorOf(anyInt())).thenAnswer(invocation -> integerValue(invocation.getArgument(0)));
+
+		final FastLogpointService.RearmResult result =
+			service.rearmBreakpoint(location, "total > 100", true, EventRequest.SUSPEND_ALL);
+		assertThat(result.rearmed()).isFalse();
+		assertThat(result.message()).contains("gate reopening could not be verified");
+		assertThat(targetEpoch.get()).isEqualTo(2);
+		loseRead.set(loseStopRead);
+
+		final BreakpointEvent event = mock(BreakpointEvent.class);
+		when(event.request()).thenReturn(stopRequest);
+		when(event.thread()).thenReturn(thread);
+		when(event.location()).thenReturn(location);
+		when(thread.frames()).thenReturn(List.of(frame));
+		final int kind = errorGate ? FastBreakpointProbeSource.STOP_CONDITION_ERROR : FastBreakpointProbeSource.STOP_CONDITION_TRUE;
+		final List<Value> arguments = Arrays.asList(integerValue(kind), integerValue(hitEpoch), null);
+		when(frame.getArgumentValues()).thenReturn(arguments);
+
+		if ("SUPPRESSED".equals(expected)) {
+			service.skipStopHit(event);
+			assertThat(targetEpoch.get()).isEqualTo(3);
+			return;
+		}
+		assertThat(service.handleStopHit(event)).isEqualTo(!"STALE".equals(expected));
+		if ("STALE".equals(expected)) {
+			assertThat(history.getRecent(10)).extracting(EventHistory.DebugEvent::type).contains("FAST_BREAKPOINT_STALE");
+		} else {
+			final String reason = service.stopReason(1);
+			assertThat(reason).startsWith(errorGate ? "condition failed" : "condition true");
+			if ("UNCERTAIN".equals(expected)) {
+				assertThat(reason).contains("gate generation uncertain");
+			} else {
+				assertThat(reason).doesNotContain("uncertain");
+				assertThat(readEpoch(entry, errorGate ? "errorEpoch" : "epoch")).isEqualTo(hitEpoch);
+			}
+		}
+	}
+
+	/** Locates the registered breakpoint and models the state after its probe was installed. */
 	private Object installProbeForRearm(ClassType probe) throws ReflectiveOperationException {
-		final var entries = FastLogpointService.class.getDeclaredField("logpoints");
+		final java.lang.reflect.Field entries = FastLogpointService.class.getDeclaredField("logpoints");
 		entries.setAccessible(true);
 		final Object entry = ((Map<?, ?>) entries.get(service)).values().iterator().next();
-		final var state = entry.getClass().getDeclaredField("state");
+		final java.lang.reflect.Field state = entry.getClass().getDeclaredField("state");
 		state.setAccessible(true);
 		state.set(entry, FastLogpointService.State.ARMED);
-		final var probeType = entry.getClass().getDeclaredField("probeType");
+		final java.lang.reflect.Field probeType = entry.getClass().getDeclaredField("probeType");
 		probeType.setAccessible(true);
 		probeType.set(entry, probe);
 		return entry;
+	}
+
+	/** Associates the installed probe's mock stop request with its registered entry. */
+	@SuppressWarnings("unchecked")
+	private void indexStopRequest(Object entry, BreakpointRequest request) throws ReflectiveOperationException {
+		final java.lang.reflect.Field stopRequest = entry.getClass().getDeclaredField("stopRequest");
+		stopRequest.setAccessible(true);
+		stopRequest.set(entry, request);
+		final java.lang.reflect.Field index = FastLogpointService.class.getDeclaredField("byStopRequest");
+		index.setAccessible(true);
+		((Map<BreakpointRequest, Object>) index.get(service)).put(request, entry);
 	}
 
 	private static void modelGate(ClassType probe, String name, AtomicInteger targetEpoch, boolean rejectFirst)
@@ -232,8 +327,9 @@ class FastLogpointServiceArmingTest {
 		return mirror;
 	}
 
+	/** Reads the service's last confirmed generation for the requested gate. */
 	private static int readEpoch(Object entry, String name) throws ReflectiveOperationException {
-		final var epoch = entry.getClass().getDeclaredField(name);
+		final java.lang.reflect.Field epoch = entry.getClass().getDeclaredField(name);
 		epoch.setAccessible(true);
 		return epoch.getInt(entry);
 	}

@@ -631,7 +631,9 @@ public class FastLogpointService {
     /**
      * Publishes the stop a fast breakpoint probe's {@code stop()} reports, unless it is stale: its
      * fast breakpoint was cleared, or (for a stop that claimed a gate) the gate was re-armed or
-     * cancelled since. Runs on the JDI event dispatcher thread. Never throws.
+     * cancelled since. After an unconfirmed write, reconciles the stop with the target gate and
+     * presents it with an uncertainty note if its generation still cannot be verified.
+     * Runs on the JDI event dispatcher thread. Never throws.
      *
      * @return whether the stop was published and its set stays suspended; otherwise the dispatcher
      * resumes it
@@ -650,7 +652,8 @@ public class FastLogpointService {
             if (logpoints.get(flp.id) != flp || flp.stopRequest != request) {
                 return false;
             }
-            if (stop != null && !isCurrent(flp, stop)) {
+            final StopGeneration generation = stop == null ? StopGeneration.CURRENT : classifyStop(flp, stop);
+            if (generation == StopGeneration.STALE) {
                 eventHistory.record(new EventHistory.DebugEvent("FAST_BREAKPOINT_STALE",
                     String.format("[FastBreakpoint %d] a stop claimed before the breakpoint was re-armed reached the "
                         + "debugger late on thread %s — resumed, not reported", flp.id, thread.name()),
@@ -667,7 +670,8 @@ public class FastLogpointService {
             } else {
                 reason = CONDITION_TRUE;
             }
-            publishStop(flp, thread, location, reason, false);
+            final String uncertainty = generation == StopGeneration.UNCERTAIN ? " (gate generation uncertain)" : "";
+            publishStop(flp, thread, location, reason + uncertainty, false);
             return true;
         }
     }
@@ -675,8 +679,8 @@ public class FastLogpointService {
     /**
      * Handles a stop raised by a thread inside an MCP-driven evaluation, on the JDI listener thread:
      * the listener resumes it without reporting it. The gate the suppressed stop claimed is opened
-     * again (its generation advances) unless it was re-armed meanwhile. Makes JDWP field reads and
-     * writes only, never a method invocation. Never throws.
+     * again (its generation advances) if it is still current, reconciling unconfirmed writes first.
+     * Makes JDWP field reads and writes only, never a method invocation. Never throws.
      */
     public void skipStopHit(BreakpointEvent event) {
         final EventRequest request = event.request();
@@ -705,7 +709,7 @@ public class FastLogpointService {
             }
             // A true stop in every-hit mode claimed no gate; anything else re-opens the gate it claimed.
             final boolean errorGate = stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR;
-            if ((errorGate || flp.stopOnce) && isCurrent(flp, stop)) {
+            if ((errorGate || flp.stopOnce) && classifyStop(flp, stop) == StopGeneration.CURRENT) {
                 advanceEpoch(flp, errorGate);
             }
         }
@@ -3335,20 +3339,55 @@ public class FastLogpointService {
                 "armingHit", "true")));
     }
 
+    /** How a reported stop relates to its gate's current generation. */
+    private enum StopGeneration {
+        /** The stop belongs to the current generation or did not claim a gate. */
+        CURRENT,
+        /** The stop belongs to an obsolete generation. */
+        STALE,
+        /** The stop may still be current, and the gate could not be read. */
+        UNCERTAIN
+    }
+
     /**
-     * Whether a stop the probe reported still belongs to its gate's current generation. A true stop
-     * in every-hit mode claims no gate and is always current.
+     * Classifies a stop against its own gate under the service monitor. A hit claiming the
+     * attempted generation proves the write landed. For other hits the target field settles the
+     * ambiguity, when readable. True hits in every-hit mode claim no gate.
      */
-    private static boolean isCurrent(FastLogpoint flp, StopArguments stop) {
-        if (stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR) {
-            return stop.epoch() == flp.errorEpoch;
+    private static StopGeneration classifyStop(FastLogpoint flp, StopArguments stop) {
+        final boolean errorGate = stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR;
+        if (!errorGate && !flp.stopOnce) {
+            return StopGeneration.CURRENT;
         }
-        return !flp.stopOnce || stop.epoch() == flp.epoch;
+        final int confirmed = errorGate ? flp.errorEpoch : flp.epoch;
+        final int attempted = errorGate ? flp.unconfirmedErrorEpoch : flp.unconfirmedEpoch;
+        if (attempted == 0) {
+            return stop.epoch() == confirmed ? StopGeneration.CURRENT : StopGeneration.STALE;
+        }
+        if (stop.epoch() == attempted) {
+            confirmEpoch(flp, errorGate, attempted);
+            return StopGeneration.CURRENT;
+        }
+        if (stop.epoch() < confirmed) {
+            return StopGeneration.STALE;
+        }
+        final ClassType probeType = flp.probeType;
+        if (probeType != null) {
+            try {
+                final int actual = readGateEpoch(probeType, gateEpochField(probeType, errorGate));
+                confirmEpoch(flp, errorGate, actual);
+                return stop.epoch() == actual ? StopGeneration.CURRENT : StopGeneration.STALE;
+            } catch (Exception e) {
+                log.debug("[FastBreakpoint] #{} gate generation could not be reconciled: {}", flp.id, describe(e));
+            }
+        }
+        return StopGeneration.UNCERTAIN;
     }
 
     /**
      * Opens the next generation of a gate and returns a failure reason if it could not be opened.
-     * The server acknowledges the generation once the target holds it. Caller holds the monitor.
+     * The server acknowledges the generation once the target holds it and remembers attempts
+     * whose write and read-back both failed. Caller holds the monitor.
      */
     private @Nullable String advanceEpoch(FastLogpoint flp, boolean errorGate) {
         final String gate = errorGate ? "error gate" : "stop gate";
@@ -3360,8 +3399,7 @@ public class FastLogpointService {
             current = errorGate ? flp.errorEpoch : flp.epoch;
         } else {
             try {
-                field = probeField(probeType, errorGate
-                    ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD);
+                field = gateEpochField(probeType, errorGate);
                 // A previous write may have landed even if its reply and read-back failed.
                 current = readGateEpoch(probeType, field);
                 confirmEpoch(flp, errorGate, current);
@@ -3382,6 +3420,11 @@ public class FastLogpointService {
                 try {
                     observed = readGateEpoch(probeType, field);
                 } catch (Exception readFailure) {
+                    if (errorGate) {
+                        flp.unconfirmedErrorEpoch = next;
+                    } else {
+                        flp.unconfirmedEpoch = next;
+                    }
                     return gateFailure(flp, gate + " reopening could not be verified (" + describe(writeFailure)
                         + "; read-back failed: " + describe(readFailure) + ")");
                 }
@@ -3404,14 +3447,22 @@ public class FastLogpointService {
     }
 
     /**
-     * Adopts the generation the target actually holds as the server's view of that gate.
+     * Adopts the target generation and clears the outstanding write for that gate.
      */
     private static void confirmEpoch(FastLogpoint flp, boolean errorGate, int generation) {
         if (errorGate) {
             flp.errorEpoch = generation;
+            flp.unconfirmedErrorEpoch = 0;
         } else {
             flp.epoch = generation;
+            flp.unconfirmedEpoch = 0;
         }
+    }
+
+    /** Finds the installed probe's generation field for the selected gate. */
+    private static Field gateEpochField(ClassType probeType, boolean errorGate) throws FastLogpointException {
+        return probeField(probeType, errorGate
+            ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD);
     }
 
     /**
@@ -3748,6 +3799,10 @@ public class FastLogpointService {
         // the generations claimed by arming hits.
         int epoch = 1;
         int errorEpoch = 1;
+        /** Attempted stop generation if the write outcome is unknown, or zero. Guarded by the service monitor. */
+        int unconfirmedEpoch;
+        /** Attempted error generation if the write outcome is unknown, or zero. Guarded by the service monitor. */
+        int unconfirmedErrorEpoch;
         int claimedEpoch;
         int errorClaimedEpoch;
         @Nullable
