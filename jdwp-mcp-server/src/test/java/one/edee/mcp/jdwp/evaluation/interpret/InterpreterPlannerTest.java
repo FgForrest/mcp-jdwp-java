@@ -152,6 +152,30 @@ class InterpreterPlannerTest {
             new SyntaxShape.Classification(SyntaxShape.Phase.COMPILED, "expression too deep to interpret"));
     }
 
+    /** Counts field selections hidden inside a single ECJ qualified-name node. */
+    @Test
+    void routesDeepQualifiedNamesToCompilation() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType node = type(vm, "app.Node", null);
+        final Field next = field(node, "next");
+        final ObjectReference receiver = mock(ObjectReference.class);
+        when(node.fields()).thenReturn(List.of(next));
+        when(next.type()).thenReturn(node);
+        when(receiver.type()).thenReturn(node);
+        when(receiver.referenceType()).thenReturn(node);
+        final Map<String, Value> bindings = Map.of("node", receiver);
+
+        assertThat(Planner.plan(vm, null, bindings, ExpressionParser.parse("node.next")).kind())
+            .isEqualTo(Planner.KindOfPlan.NAVIGATE);
+
+        final ExpressionParser.Parsed parsed = ExpressionParser.parse("node" + ".next".repeat(10_000));
+        assertThat(parsed.error()).isNull();
+        assertThat(Planner.plan(vm, null, bindings, parsed))
+            .isEqualTo(new Planner.Compile("expression too deep to interpret"));
+        assertThat(SyntaxShape.classify(parsed)).isEqualTo(
+            new SyntaxShape.Classification(SyntaxShape.Phase.COMPILED, "expression too deep to interpret"));
+    }
+
     /** Rejects isolated surrogate code units in either kind of literal before creating a mirror. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"\"\\uD800\"", "'\\uDC00'"})
@@ -194,6 +218,39 @@ class InterpreterPlannerTest {
         type(vm, "java.lang.Badge", null);
 
         assertThat(new JdiTypes(vm, owner).resolve("Badge")).isSameAs(inherited);
+    }
+
+    /** An unloaded declaration in the current or enclosing scope still hides a loaded inherited type. */
+    @ParameterizedTest
+    @CsvSource({"app.Example", "app.Example$Inner"})
+    void routesUnloadedHidingMemberTypesToCompilation(String frameType) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType base = type(vm, "app.Base", null);
+        final ClassType hidden = type(vm, "app.Base$Badge", null);
+        type(vm, "java.lang.Class", null);
+        when(owner.superclass()).thenReturn(base);
+        when(vm.canGetConstantPool()).thenReturn(true);
+        when(owner.constantPool()).thenReturn(pool("app/Example$Badge"));
+        when(owner.constantPoolCount()).thenReturn(3);
+
+        final Field limit = field(hidden, "LIMIT");
+        final IntegerType intType = mock(IntegerType.class);
+        when(intType.name()).thenReturn("int");
+        when(limit.type()).thenReturn(intType);
+        when(limit.isStatic()).thenReturn(true);
+        when(hidden.fields()).thenReturn(List.of(limit));
+        when(hidden.isInitialized()).thenReturn(true);
+
+        final ClassType declaring = frameType.equals("app.Example") ? owner : type(vm, frameType, null);
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        when(location.declaringType()).thenReturn(declaring);
+        when(frame.location()).thenReturn(location);
+
+        final Planner.Compile expected = new Planner.Compile("type is not loaded: app.Example$Badge");
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.class"))).isEqualTo(expected);
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Badge.LIMIT"))).isEqualTo(expected);
     }
 
     /** An inaccessible declaration in a supertype still hides a declaration above it. */

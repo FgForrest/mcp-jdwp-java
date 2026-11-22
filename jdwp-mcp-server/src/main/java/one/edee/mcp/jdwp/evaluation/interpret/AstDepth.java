@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.evaluation.interpret;
 
 import org.eclipse.jdt.internal.compiler.ast.ASTNode;
+import org.eclipse.jdt.internal.compiler.ast.QualifiedNameReference;
 import org.jspecify.annotations.Nullable;
 
 import java.lang.reflect.Field;
@@ -16,7 +17,7 @@ import java.util.Set;
 
 /** Bounds ECJ trees before either an ECJ visitor or navigation recurses through them. */
 final class AstDepth {
-    /** Maximum supported AST depth, measured in nodes along a path. */
+    /** Maximum supported depth, including each segment of a qualified name. */
     private static final int MAX_DEPTH = 256;
     /** Diagnostic shared by routing and syntax-only classification. */
     static final String REASON = "expression too deep to interpret";
@@ -88,9 +89,11 @@ final class AstDepth {
         return false;
     }
 
-    /** Queues AST children without descending into any of them. Arrays only group siblings. */
+    /** Queues AST children, counting qualified-name segments that become nested reads during planning. */
     private static void push(Deque<Visit> visits, @Nullable Object children, int depth) {
-        if (children instanceof ASTNode node) {
+        if (children instanceof QualifiedNameReference name) {
+            visits.push(new Visit(name, depth + name.tokens.length - 1, false));
+        } else if (children instanceof ASTNode node) {
             visits.push(new Visit(node, depth, false));
         } else if (children instanceof Object[] array) {
             for (Object child : array) {

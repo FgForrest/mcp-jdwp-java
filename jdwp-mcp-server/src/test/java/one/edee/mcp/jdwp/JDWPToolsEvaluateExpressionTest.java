@@ -343,7 +343,7 @@ class JDWPToolsEvaluateExpressionTest {
 		final BreakpointTracker tracker = new BreakpointTracker();
 		final EventHistory history = new EventHistory();
 		final EvaluationGuard guard = new EvaluationGuard();
-		tracker.openSuspensionSession(history).suspendThread(thread.ref);
+		tracker.openSuspensionSession(target.vm, history).suspendThread(thread.ref);
 		final JDIConnectionService connection = mock(JDIConnectionService.class);
 		when(connection.getVM()).thenReturn(target.vm);
 		final EvaluationRouter router = new EvaluationRouter(mock(JdiExpressionEvaluator.class), EvaluationRouter.Mode.COMPILER);

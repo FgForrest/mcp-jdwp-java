@@ -120,7 +120,7 @@ class FastLogpointServiceArmingTest {
 		when(counter.declaringType()).thenReturn(parent);
 		when(type.allFields()).thenReturn(knownField ? List.of(counter) : List.of());
 		when(thread.isSuspended()).thenReturn(true);
-		when(evaluator.evaluate(frame, "total > 100")).thenThrow(new JdiEvaluationException(
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any())).thenThrow(new JdiEvaluationException(
 			"Compilation failed:\nLine 7 (`return total > 100;`): total cannot be resolved to a variable"));
 		final BreakpointEvent event = mock(BreakpointEvent.class);
 		when(event.request()).thenReturn(armingRequest);

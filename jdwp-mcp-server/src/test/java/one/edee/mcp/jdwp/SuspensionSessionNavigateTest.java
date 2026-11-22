@@ -30,6 +30,7 @@ class SuspensionSessionNavigateTest {
         SuspensionSession.endProcessing();
     }
 
+    /** Checks that navigation on each supported hold preserves its suspend count. */
     @Test
     void toolsNavigateManualBystanderMonitorAndWaitHoldsWithoutBorrowingCounts() throws Exception {
         final var target = new FakeSuspendModel();
@@ -44,7 +45,7 @@ class SuspensionSessionNavigateTest {
         final var tracker = new BreakpointTracker();
         final var history = new EventHistory();
         final var guard = new EvaluationGuard();
-        final var session = tracker.openSuspensionSession(history);
+        final SuspensionSession session = tracker.openSuspensionSession(target.vm, history);
         guard.bind(session);
         final var connection = mock(JDIConnectionService.class);
         final var compiler = mock(JdiExpressionEvaluator.class);
@@ -127,7 +128,7 @@ class SuspensionSessionNavigateTest {
         final BreakpointTracker tracker = new BreakpointTracker();
         final EventHistory history = new EventHistory();
         final EvaluationGuard guard = new EvaluationGuard();
-        final SuspensionSession session = tracker.openSuspensionSession(history);
+        final SuspensionSession session = tracker.openSuspensionSession(target.vm, history);
         final SuspensionSession.Context context = session.route(target.breakpointEvent(event, EventRequest.SUSPEND_ALL), event.ref, true);
         session.begin(context);
 

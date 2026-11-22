@@ -139,6 +139,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
             case "private-field" -> this.secret;
             case "classpath-import-shadow" -> ProcessBuilder.class;
             case "inherited-type-shadow" -> StringBuilder.class;
+            case "unloaded-hiding-member" -> HiddenBadge.tag;
             case "super-field" -> super.hidden;
             case "erased-field-navigation" -> holder.element.inherited;
             case "nested-class-literal" -> State.class;
@@ -149,6 +150,12 @@ public class InterpreterTarget extends InterpreterTargetBase {
             case "super-call" -> super.dispatch();
             default -> throw new IllegalArgumentException(id);
         };
+    }
+
+    /** Hides the base class's member and stays unloaded until a debugger expression reads it. */
+    public static final class HiddenBadge {
+        /** Distinguishes this member from the loaded base class's member. */
+        public static String tag = "sub";
     }
 
     public static String genericGolden(Map<String, Session> sessions) {

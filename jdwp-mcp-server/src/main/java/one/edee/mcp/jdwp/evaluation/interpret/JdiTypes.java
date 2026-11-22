@@ -55,8 +55,8 @@ final class JdiTypes {
     private final @Nullable ReferenceType declaring;
     /** Lazily loaded classes visible to the declaring type's class loader. */
     private @Nullable Set<ReferenceType> visible;
-    /** Lazily read names of the classes the declaring type's constant pool refers to. */
-    private @Nullable Set<String> constantPoolClasses;
+    /** Lazily read names of the classes each inspected type's constant pool refers to. */
+    private final Map<ReferenceType, Set<String>> constantPoolClasses = new HashMap<>();
 
     /** Creates type lookup scoped to the declaring type. */
     JdiTypes(VirtualMachine vm, @Nullable ReferenceType declaring) {
@@ -180,7 +180,7 @@ final class JdiTypes {
         }
     }
 
-    /** Resolves declared or inherited members, respecting hiding and accessibility at each inheritance edge. */
+    /** Resolves declared or inherited members, refusing lookup past an unloaded hiding declaration. */
     private Set<ReferenceType> memberTypes(ReferenceType scope, String suffix,
                                            Map<ReferenceType, Set<ReferenceType>> known) {
         final Set<ReferenceType> cached = known.get(scope);
@@ -188,10 +188,14 @@ final class JdiTypes {
             return cached;
         }
         final Set<ReferenceType> result = new LinkedHashSet<>();
-        final ReferenceType declared = findExact(scope.name() + suffix);
+        final String binary = scope.name() + suffix;
+        final ReferenceType declared = findExact(binary);
         if (declared != null) {
             result.add(declared);
         } else {
+            if (classNames(scope).contains(binary)) {
+                throw Planner.compile("type is not loaded: " + binary);
+            }
             for (ReferenceType parent : parents(scope)) {
                 for (ReferenceType inherited : memberTypes(parent, suffix, known)) {
                     if (!inherited.isPrivate() && (!inherited.isPackagePrivate()
@@ -258,19 +262,16 @@ final class JdiTypes {
         return candidates.iterator().next();
     }
 
-    /** Returns the class names in the type's constant pool, reading them once. */
+    /** Returns the class names in the specified type's constant pool, reading each pool once. */
     private Set<String> classNames(ReferenceType type) {
-        if (constantPoolClasses == null) {
-            constantPoolClasses = readClassNames(type);
-        }
-        return constantPoolClasses;
+        return constantPoolClasses.computeIfAbsent(type, this::readClassNames);
     }
 
     /**
      * Parses the constant pool bytes and collects the names of the referenced classes, or none when the VM cannot supply it.
      */
-    private static Set<String> readClassNames(ReferenceType type) {
-        if (!type.virtualMachine().canGetConstantPool()) {
+    private Set<String> readClassNames(ReferenceType type) {
+        if (!vm.canGetConstantPool()) {
             return Set.of();
         }
         final byte[] bytes = type.constantPool();

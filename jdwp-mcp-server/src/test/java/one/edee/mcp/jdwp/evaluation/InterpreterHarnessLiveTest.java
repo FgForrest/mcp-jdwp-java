@@ -322,6 +322,33 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    /** Checks that an unloaded hiding member triggers the compiled fallback on each target JDK. */
+    @Test
+    void fallsBackForAnUnloadedHidingMemberType() throws Exception {
+        final Entry entry = mainRow("unloaded-hiding-member", "HiddenBadge.tag");
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final JdiExpressionEvaluator evaluator = fixture.evaluator(new InMemoryJavaCompiler());
+                final EvaluationRouter auto = new EvaluationRouter(evaluator, EvaluationRouter.Mode.AUTO);
+                final EvaluationRouter compiler = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+                return replay(fixture.vm(), List.of(entry), fixture.connection(), context -> {
+                    assertThat(fixture.vm().classesByName(TARGET + "$HiddenBadge")).isEmpty();
+                    assertThat(fixture.vm().classesByName(TARGET + "Base$HiddenBadge")).hasSize(1);
+                    final Planner.Plan plan = auto.prepare(auto.parse(entry.expression()), context.thread(),
+                        context::frame, context.bindings());
+                    final Outcome result = evaluationOutcome(() -> auto.evaluateEvent(entry.expression(),
+                        context.thread(), context.bindings(), context::render));
+                    final Outcome expected = evaluationOutcome(() -> compiler.evaluateEvent(entry.expression(),
+                        context.thread(), context.bindings(), context::render));
+                    assertThat(result).as("%s, %s", javaHome.getFileName(), plan).isEqualTo(expected);
+                    assertThat(plan).isEqualTo(new Planner.Compile("type is not loaded: " + TARGET + "$HiddenBadge"));
+                    assertThat(golden(context).rendered()).isEqualTo("\"sub\"");
+                    return result;
+                }, null, new StringBuilder(), null);
+            });
+        }
+    }
+
     /** Exercises the two String transport cases and both forms of type shadowing on each target JDK. */
     @Test
     void checksSurrogateTransportAndShadowedTypeNames() throws Exception {
