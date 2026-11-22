@@ -505,7 +505,7 @@ class FastBreakpointLiveTest {
 		assertThat(state(id)).isEqualTo(FastLogpointService.State.PENDING);
 
 		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, condition, true, null, null, null, null))
-			.contains("still waits for its first hit").contains("re-armed");
+			.contains("still waits to arm", "re-armed", "Arming can be deferred for local classpath discovery");
 		tools.jdwp_resume();
 		assertThat(waitForStop()).as("the reopened error gate stops the next failure")
 			.contains("fast_breakpoint=" + id + ", condition failed:");

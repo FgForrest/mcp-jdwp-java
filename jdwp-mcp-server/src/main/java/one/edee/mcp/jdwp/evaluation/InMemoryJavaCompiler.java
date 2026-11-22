@@ -2,6 +2,9 @@ package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.eclipse.jdt.core.compiler.IProblem;
+import org.eclipse.jdt.core.compiler.InvalidInputException;
+import org.eclipse.jdt.internal.compiler.parser.Scanner;
+import org.eclipse.jdt.internal.compiler.parser.TerminalToken;
 import org.eclipse.jdt.internal.compiler.tool.EclipseCompiler;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -18,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Compiles Java source for the expression-evaluation pipeline using Eclipse JDT (ECJ) via JSR-199.
@@ -60,10 +64,13 @@ public class InMemoryJavaCompiler {
         return configuration;
     }
 
-    /** ECJ could resolve these names or type references with additional classpath entries. */
+    /** Problem code shared by unresolved local values and prefixes of qualified names. */
+    private static final String UNRESOLVED_VARIABLE = Integer.toString(IProblem.UnresolvedVariable);
+
+    /** ECJ problem codes that can indicate a name or type resolvable by additional classpath entries. */
     private static final Set<String> MISSING_TYPE_CODES = Set.of(
         Integer.toString(IProblem.UndefinedType), Integer.toString(IProblem.UndefinedName),
-        Integer.toString(IProblem.UnresolvedVariable), Integer.toString(IProblem.ImportNotFound),
+        UNRESOLVED_VARIABLE, Integer.toString(IProblem.ImportNotFound),
         Integer.toString(IProblem.IsClassPathCorrect), Integer.toString(IProblem.IsClassPathCorrectWithReferencingType),
         Integer.toString(IProblem.MissingTypeInMethod),
         Integer.toString(IProblem.MissingTypeInConstructor), Integer.toString(IProblem.MissingTypeInLambda));
@@ -227,8 +234,8 @@ public class InMemoryJavaCompiler {
                 final long elapsed = System.currentTimeMillis() - startTime;
                 log.error("[Compiler] Compilation failed after {}ms:\n{}", elapsed, errors);
                 final String message = "Compilation failed:\n" + errors;
-                final boolean missingTypes = diagnostics.getDiagnostics().stream().anyMatch(d ->
-                    d.getKind() == Diagnostic.Kind.ERROR && MISSING_TYPE_CODES.contains(d.getCode()));
+                final boolean missingTypes = diagnostics.getDiagnostics().stream()
+                    .anyMatch(d -> mayResolveWithClasspath(d, sourceCode));
                 throw missingTypes ? new MissingClasspathTypes(message) : new JdiEvaluationException(message);
             }
 
@@ -243,7 +250,7 @@ public class InMemoryJavaCompiler {
         } finally {
             // 4. Clean up the temporary directory
             if (tempDir != null) {
-                try (var paths = Files.walk(tempDir)) {
+                try (Stream<Path> paths = Files.walk(tempDir)) {
                     //noinspection ResultOfMethodCallIgnored
                     paths.sorted(Comparator.reverseOrder())
                         .map(Path::toFile)
@@ -252,6 +259,34 @@ public class InMemoryJavaCompiler {
                     log.warn("[Compiler] Failed to delete temporary compilation directory: {}", tempDir, e);
                 }
             }
+        }
+    }
+
+    /** Returns whether adding classpath entries could resolve this ECJ error. */
+    private static boolean mayResolveWithClasspath(Diagnostic<? extends JavaFileObject> problem, String source) {
+        return problem.getKind() == Diagnostic.Kind.ERROR && MISSING_TYPE_CODES.contains(problem.getCode())
+            && !(UNRESOLVED_VARIABLE.equals(problem.getCode()) && isUnqualifiedName(problem, source));
+    }
+
+    /**
+     * Returns whether ECJ's inclusive range spans one identifier without a following dot.
+     * The ECJ scanner handles comments and Unicode escapes. An unreadable range keeps the existing classification.
+     */
+    private static boolean isUnqualifiedName(Diagnostic<? extends JavaFileObject> problem, String source) {
+        final long start = problem.getStartPosition();
+        final long end = problem.getEndPosition();
+        if (start < 0 || end < start || end >= source.length()) {
+            return false;
+        }
+        final Scanner scanner = new Scanner();
+        scanner.setSource(source.toCharArray());
+        scanner.resetTo((int) start, source.length() - 1);
+        try {
+            return scanner.getNextToken() == TerminalToken.TokenNameIdentifier
+                && scanner.getCurrentTokenEndPosition() == end
+                && scanner.getNextToken() != TerminalToken.TokenNameDOT;
+        } catch (InvalidInputException unreadableRange) {
+            return false;
         }
     }
 

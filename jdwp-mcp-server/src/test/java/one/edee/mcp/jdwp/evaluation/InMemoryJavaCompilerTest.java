@@ -2,15 +2,23 @@ package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.TestReflectionUtils;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import org.eclipse.jdt.internal.compiler.tool.EclipseCompiler;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
+import javax.tools.Diagnostic;
+import javax.tools.DiagnosticCollector;
+import javax.tools.JavaFileObject;
+import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -61,6 +69,56 @@ class InMemoryJavaCompilerTest {
 
 	@Nested
 	class Compilation {
+
+		/** Records ECJ's problem codes and exact source spans for the forms used in arming expressions. */
+		@ParameterizedTest
+		@CsvSource(delimiter = '|', textBlock = """
+			unknownLocal | 33554515 | unknownLocal
+			Missing.VALUE | 33554515 | Missing
+			com.acme.Missing.VALUE | 33554515 | com.acme
+			new Missing() | 16777218 | Missing
+			missing.call() | 570425394 | missing
+			""")
+		void ecjReportsMissingNameRanges(String expression, String code, String problemText, @TempDir Path project)
+			throws Exception {
+			final String source = "public class Probe { Object read() { return " + expression + "; } }";
+			final Path file = Files.writeString(project.resolve("Probe.java"), source);
+			final EclipseCompiler ecj = new EclipseCompiler();
+			final DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+			try (StandardJavaFileManager files = ecj.getStandardFileManager(diagnostics, null, null)) {
+				assertThat(ecj.getTask(null, files, diagnostics, List.of("--release", "17"), null,
+					files.getJavaFileObjects(file.toFile())).call()).isFalse();
+			}
+			assertThat(diagnostics.getDiagnostics().stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR))
+				.singleElement().satisfies(problem -> {
+					final int start = (int) problem.getStartPosition();
+					final int end = (int) problem.getEndPosition();
+					assertThat(List.of(problem.getCode(), source.substring(start, end + 1)))
+						.containsExactly(code, problemText);
+					assertThat(start).isEqualTo(source.indexOf(expression) + expression.indexOf(problemText));
+				});
+		}
+
+		/** Checks that a simple unresolved value stays permanent and other missing-type errors still qualify. */
+		@ParameterizedTest
+		@CsvSource(delimiter = '|', textBlock = """
+			return unknownLocal; | false
+			return unknownLocal /* comment. */; | false
+			return Missing.VALUE; | true
+			return Missing /* comment */ .VALUE; | true
+			return Missing\\u002eVALUE; | true
+			return com.acme.Missing.VALUE; | true
+			return new Missing(); | true
+			return missing.call(); | true
+			Object value = unknownLocal; return new Missing(); | true
+			""")
+		void classifiesMissingTypesSeparatelyFromSimpleUnresolvedValues(String body, boolean missingType) {
+			compiler.configure(System.getProperty("java.home"), "", 17);
+			final String source = "public class Probe { Object read() { " + body + " } }";
+			final Class<? extends JdiEvaluationException> expected = missingType
+				? InMemoryJavaCompiler.MissingClasspathTypes.class : JdiEvaluationException.class;
+			assertThatThrownBy(() -> compiler.compile("Probe", source)).isExactlyInstanceOf(expected);
+		}
 
 		@Test
 		void shouldCompileSimpleClass() throws JdiEvaluationException {

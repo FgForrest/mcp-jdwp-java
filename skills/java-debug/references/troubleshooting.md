@@ -65,7 +65,7 @@ Standing fast-probe approvals survive a target JVM restart at the same host:port
 
 ## A fast breakpoint stop has no capture text
 
-Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and probe state. If it reports a pending stop while capture runs, wait with `jdwp_resume_until_event`. A `PENDING, spent` breakpoint stopped on the arming hit. The debugger evaluates capture after a true condition, and the stop records the result or `capture failed: …`. When the same event set triggers an ordinary breakpoint, look for the fast-breakpoint ID on the capture line. A capture compiler error appears there even when the breakpoint arms successfully. If the probe could not be installed, look for `FAST_BREAKPOINT_ARM_FAILED` in `jdwp_get_events` for the compile or arming error.
+Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and probe state. `PENDING — waiting for local classpath discovery` means the probe will retry on a later hit. If it reports a pending stop while capture runs, wait with `jdwp_resume_until_event`. A `PENDING, spent` breakpoint stopped on the arming hit. The debugger evaluates capture after a true condition, and the stop records the result or `capture failed: …`. When the same event set triggers an ordinary breakpoint, look for the fast-breakpoint ID on the capture line. A capture compiler error appears there even when the breakpoint arms successfully. If the probe could not be installed, look for `FAST_BREAKPOINT_ARM_FAILED` in `jdwp_get_events` for the compile or arming error.
 
 ## Expression evaluation fails with "X cannot be resolved"
 

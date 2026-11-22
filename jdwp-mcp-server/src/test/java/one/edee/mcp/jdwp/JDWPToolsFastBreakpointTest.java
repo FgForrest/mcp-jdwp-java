@@ -115,16 +115,17 @@ class JDWPToolsFastBreakpointTest {
 			Instant.parse("2026-10-28T15:02:11Z"), "mcp-jdwp-java, session 3fa1c2d9", "AppClassLoader#12", 0);
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(3, "com.example.Cart", 42, "total", null, FastLogpointService.State.ARMED, null,
-				4096, 0, 0, 0, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
+				4096, 0, 0, 0, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false,
+				null, false),
 			new FastLogpointService.Info(5, "com.example.Cart", 50, "", "qty > 9", FastLogpointService.State.ARMED, null,
 				256, 0, 0, 0, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_ALL, true,
-				new FastLogpointService.BreakpointCounters(4, 1, 1, true, false)),
+				new FastLogpointService.BreakpointCounters(4, 1, 1, true, false), false),
 			new FastLogpointService.Info(6, "com.example.Cart", 60, "", "id == 0", FastLogpointService.State.PENDING, null,
 				256, 0, 0, -1, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, false,
-				new FastLogpointService.BreakpointCounters(-1, -1, -1, false, false)),
+				new FastLogpointService.BreakpointCounters(-1, -1, -1, false, false), false),
 			new FastLogpointService.Info(8, "com.example.Order", 7, "", "x", FastLogpointService.State.RECOVERED, null,
 				256, 0, 0, 0, true, provenance, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, true,
-				new FastLogpointService.BreakpointCounters(2, 0, 0, true, false))));
+				new FastLogpointService.BreakpointCounters(2, 0, 0, true, false), false)));
 
 		final String breakpoints = tools.jdwp_overview("fast_breakpoint", null, null);
 		assertThat(breakpoints)

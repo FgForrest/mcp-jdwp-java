@@ -3663,7 +3663,8 @@ public class JDWPTools {
         + "userApproved=true only after the user explicitly agrees in this conversation to this exact probe at this host:port. "
         + "A class that is not loaded yet is waited for: the fast breakpoint arms once it loads. "
         + "The next hit of the line evaluates the condition through the debugger: if it holds, that hit is the stop; "
-        + "otherwise the probe is installed then. Wait for the stop with jdwp_resume_until_event. stopOnce=true "
+        + "otherwise the probe is installed then. While local classpath discovery runs, arming can move to a later hit. "
+        + "Wait for the stop with jdwp_resume_until_event. stopOnce=true "
         + "(default) stops at the first hit that meets the condition; calling the tool again with the same arguments "
         + "re-arms it. A condition that throws stops once and is then only recorded (FAST_BREAKPOINT_ERROR "
         + "in jdwp_get_events). jdwp_clear_breakpoint(id), jdwp_reset, jdwp_disconnect and server shutdown restore "
@@ -3754,8 +3755,9 @@ public class JDWPTools {
                     final String approvalNote = fastProbeApprovals.afterArming(key, explicitlyApproved, standingApproval);
                     return String.format("Fast breakpoint set at %s:%d (ID: %d, condition: %s%s, %s, suspendPolicy: %s) — "
                             + "WAITING: %s is not loaded yet%s. The line is checked when it loads: the fast breakpoint "
-                            + "then arms on the next hit of the line (FAST_BREAKPOINT_CLASS_LOADED in jdwp_get_events, "
-                            + "or FAST_BREAKPOINT_ARM_FAILED when the line cannot host it). Wait for the stop with "
+                            + "then attempts to arm on the next hit (FAST_BREAKPOINT_CLASS_LOADED in jdwp_get_events, "
+                            + "or FAST_BREAKPOINT_ARM_FAILED when the line cannot host it). "
+                            + "Arming can be deferred for local classpath discovery. Wait for the stop with "
                             + "jdwp_resume_until_event; jdwp_overview shows the state; jdwp_clear_breakpoint(%d) removes "
                             + "it.",
                         className, lineNumber, waitingId, condition, captureLabel, FastLogpointService.modeLabel(effectiveStopOnce),
@@ -3795,7 +3797,8 @@ public class JDWPTools {
             return String.format("Fast breakpoint set at %s:%d (ID: %d, condition: %s%s, %s, suspendPolicy: %s%s) — "
                     + "PENDING: the next hit of the line is an ordinary debugger stop that evaluates the condition. If "
                     + "it holds, that hit is the stop. Otherwise the probe is compiled and installed while %s paused, "
-                    + "and from then on the condition runs in the target and only a hit that meets it stops. Threads "
+                    + "and from then on the condition runs in the target and only a hit that meets it stops. While local "
+                    + "classpath discovery runs, arming can move to a later hit. Threads "
                     + "already inside %s keep running the old code, without the condition, until they call it again. "
                     + "Wait for the stop with jdwp_resume_until_event; jdwp_get_events explains a refused arm "
                     + "(FAST_BREAKPOINT_ARM_FAILED) and records condition failures, jdwp_overview shows the counters, "
@@ -5357,7 +5360,7 @@ public class JDWPTools {
             final String switchState = info.enabled() ? "evaluating" : "kill switch set";
             final String state = switch (info.state()) {
                 case WAITING_FOR_CLASS -> "WAITING — the class is not loaded yet; arms on the first hit after it loads";
-                case PENDING -> "PENDING — arms on the next hit";
+                case PENDING -> fastProbePendingLabel(info);
                 case ARMED -> "ARMED — " + counters;
                 case DISABLED -> "DISABLED, still installed — " + info.failureReason();
                 case FAILED -> "FAILED: " + info.failureReason();
@@ -5408,10 +5411,11 @@ public class JDWPTools {
                     if (counters != null && counters.armingStopPending()) {
                         yield "PENDING — stop pending (stop gate claimed, capture in progress). Wait with jdwp_resume_until_event";
                     }
-                    yield spent
-                        ? "PENDING, spent — stopped before its probe was installed; call jdwp_set_fast_breakpoint again "
-                        + "with the same arguments to re-arm"
-                        : "PENDING — arms on the next hit";
+                    if (spent) {
+                        yield "PENDING, spent — stopped before its probe was installed; call jdwp_set_fast_breakpoint again "
+                            + "with the same arguments to re-arm";
+                    }
+                    yield fastProbePendingLabel(info);
                 }
                 case ARMED -> (spent ? "ARMED, spent — re-arm to stop again" : "ARMED") + " — " + counted;
                 case DISABLED -> "DISABLED, still installed — " + info.failureReason();
@@ -5441,6 +5445,12 @@ public class JDWPTools {
         rows.forEach(r -> out.append(r).append('\n'));
         appendFastProbeApprovals(out, approvals);
         return rows.size() + approvals.size();
+    }
+
+    /** Returns the overview status for a pending probe that has no stop in progress. */
+    private static String fastProbePendingLabel(FastLogpointService.Info info) {
+        return info.waitingForLocalClasspath() ? "PENDING — waiting for local classpath discovery"
+            : "PENDING — arms on the next hit";
     }
 
     /** Returns sorted overview rows for matching standing grants, with capture text for fast breakpoints. */

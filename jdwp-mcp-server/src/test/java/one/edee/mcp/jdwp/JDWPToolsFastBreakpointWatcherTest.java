@@ -91,7 +91,7 @@ class JDWPToolsFastBreakpointWatcherTest {
 		watcherManager.createWatcher("total", FAST_ID, "total");
 		when(fastLogpoints.list()).thenReturn(List.of(new FastLogpointService.Info(FAST_ID, "com.example.Cart", 42, "",
 			"total < 0", FastLogpointService.State.ARMED, null, 256, 0, 0, 0, true, null,
-			FastLogpointService.Kind.BREAKPOINT, 2, true, null)));
+			FastLogpointService.Kind.BREAKPOINT, 2, true, null, false)));
 		when(fastLogpoints.clear(FAST_ID)).thenReturn("Fast breakpoint 5 cleared");
 
 		assertThat(tools.jdwp_clear("fast_breakpoint", null)).contains("removed #5");

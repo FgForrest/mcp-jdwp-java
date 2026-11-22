@@ -568,9 +568,12 @@ public class FastLogpointService {
         // Each invocation of the arming takes its own lease, never one spanning the frame reads in
         // between: a lease may resume the thread (issue #45), which invalidates its frames.
         try {
-            if (flp.waitingForLocalClasspath && expressionEvaluator.localClasspathDiscoveryRunning()) {
-                rearm(flp);
-                return ArmingOutcome.RESUME;
+            if (flp.waitingForLocalClasspath) {
+                if (expressionEvaluator.localClasspathDiscoveryRunning()) {
+                    rearm(flp);
+                    return ArmingOutcome.RESUME;
+                }
+                flp.waitingForLocalClasspath = false;
             }
             return arm(flp, thread, setStops) ? ArmingOutcome.STOPPED : ArmingOutcome.RESUME;
         } catch (LocalClasspathPendingException pending) {
@@ -1075,12 +1078,12 @@ public class FastLogpointService {
             final BreakpointCounters counters = flp.kind == Kind.BREAKPOINT ? breakpointCounters(flp) : null;
             out.add(new Info(flp.id, flp.className(), flp.line, flp.expression, flp.condition, flp.state,
                 flp.failureReason, flp.bufferSize, flp.logged, flp.dropped, written, flp.enabled, provenance, flp.kind,
-                flp.suspendPolicy, flp.stopOnce, counters));
+                flp.suspendPolicy, flp.stopOnce, counters, flp.waitingForLocalClasspath));
         }
         for (WaitingProbe probe : waiting.values()) {
             out.add(new Info(probe.id(), probe.className(), probe.line(), probe.expression(), probe.condition(),
                 probe.failure() != null ? State.FAILED : State.WAITING_FOR_CLASS, probe.failure(), probe.bufferSize(),
-                0, 0, -1, true, null, probe.kind(), probe.suspendPolicy(), probe.stopOnce(), null));
+                0, 0, -1, true, null, probe.kind(), probe.suspendPolicy(), probe.stopOnce(), null, false));
         }
         out.sort(Comparator.comparingInt(Info::id));
         return out;
@@ -3101,10 +3104,9 @@ public class FastLogpointService {
                         return new RearmResult(message, true);
                     }
                     if (flp.armingRequest != null) {
-                        // An arming hit whose condition failed spent the error gate and left the request
-                        // in place; no probe exists yet, so opening both generations costs nothing.
-                        final String message = String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
-                            + "re-armed: the next true hit stops, and so does the next failure of the condition.",
+                        // With no installed probe, reopening the gates keeps the existing arming request.
+                        final String message = String.format("Fast breakpoint %d at %s:%d still waits to arm (ID: %d) — "
+                            + "re-armed: both stop gates are open. Arming can be deferred for local classpath discovery.",
                             flp.id, flp.className(), flp.line, flp.id);
                         return new RearmResult(message, true);
                     }
@@ -3114,7 +3116,7 @@ public class FastLogpointService {
                             flp.id, flp.failureReason), false);
                     }
                     final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
-                        + "was installed, so it arms again on the next hit of the line.", flp.id, flp.className(),
+                        + "was installed. It will try to arm on a later hit.", flp.id, flp.className(),
                         flp.line, flp.id);
                     return new RearmResult(message, true);
                 }
@@ -3773,11 +3775,12 @@ public class FastLogpointService {
      * @param written    live value of the probe's sequence counter, or {@code -1} when unavailable
      * @param enabled    whether the probe's kill switch lets it evaluate, as last set or read
      * @param provenance who armed it, for leftovers of an earlier session; {@code null} for this session's
+     * @param waitingForLocalClasspath whether the last attempt deferred for local types and has yet to retry
      */
     public record Info(int id, String className, int line, String expression, @Nullable String condition,
                        State state, @Nullable String failureReason, int bufferSize, long logged, long dropped,
                        long written, boolean enabled, @Nullable Provenance provenance, Kind kind, int suspendPolicy,
-                       boolean stopOnce, @Nullable BreakpointCounters counters) {
+                       boolean stopOnce, @Nullable BreakpointCounters counters, boolean waitingForLocalClasspath) {
     }
 
     /**
@@ -3870,8 +3873,8 @@ public class FastLogpointService {
      * Mutable state of one fast logpoint; guarded by the service monitor.
      */
     private static final class FastLogpoint {
-        /** Set by the dispatcher when an arming compile needs a local type. */
-        private boolean waitingForLocalClasspath;
+        /** Set by the dispatcher while arming waits for local types. Read without the monitor by overview. */
+        private volatile boolean waitingForLocalClasspath;
 
         final int id;
         final Kind kind;
