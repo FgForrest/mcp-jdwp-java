@@ -5,8 +5,8 @@ import com.sun.jdi.ObjectReference;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.VirtualMachine;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -24,7 +24,8 @@ public final class PinnedMirrors implements AutoCloseable {
      */
     private static final int PIN_ATTEMPTS = 3;
 
-    private final List<ObjectReference> pinned = new ArrayList<>(2);
+    /** Object mirrors pinned by this scope, in acquisition order. */
+    private final Set<ObjectReference> pinned = new LinkedHashSet<>(2);
 
     /**
      * A pinned {@code String} in the target ({@link VirtualMachine#mirrorOf(String)}).
@@ -42,18 +43,26 @@ public final class PinnedMirrors implements AutoCloseable {
         for (int attempt = 1; ; attempt++) {
             final T object = creation.get();
             try {
-                object.disableCollection();
-                this.pinned.add(object);
-                return object;
-            } catch (UnsupportedOperationException e) {
-                // The VM cannot pin: the object is used unpinned.
-                return object;
+                return keep(object);
             } catch (ObjectCollectedException e) {
                 if (attempt == PIN_ATTEMPTS) {
                     throw e;
                 }
             }
         }
+    }
+
+    /** Pins an existing mirror once, without retrying the operation that produced it. */
+    public <T extends ObjectReference> T keep(T object) {
+        if (!pinned.contains(object)) {
+            try {
+                object.disableCollection();
+                pinned.add(object);
+            } catch (UnsupportedOperationException ignored) {
+                // The target VM does not support disabling collection.
+            }
+        }
+        return object;
     }
 
     /**

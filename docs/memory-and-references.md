@@ -101,11 +101,11 @@ Marks are cleared on VM death (`JDIConnectionService.java:411`), explicit discon
 
 `MarkedInstanceRegistry.buildBindings()` (`MarkedInstanceRegistry.java:191`) returns a `Map<String, Value>` keyed `"$" + label`. The "$" sigil is a constant at `marks/MarkedInstanceRegistry.java:43`. Entries whose underlying ObjectReference has been collected since the mark are silently skipped (line 190) but stay in the registry so `jdwp_overview` can still surface them with a "(collected)" hint.
 
-The evaluation, assertion and watcher tools pass these marks to the router. Ordinary conditions and logpoints merge in event bindings before routing. Navigation resolves a mark alongside frame locals, and the compiled wrapper receives marks as method parameters. Reserved names keep marks distinct from bindings such as `$exception` and `$oldValue`.
+The evaluation, assertion and watcher tools pass these marks to the router. Ordinary conditions and logpoints merge in event bindings before routing. The interpreter resolves a mark alongside frame locals, and the compiled wrapper receives marks as method parameters. Reserved names keep marks distinct from bindings such as `$exception` and `$oldValue`.
 
 ## 5. Wrapper bytecode in the target — the permanent allocation
 
-Navigation avoids creating a wrapper class. String literals and concatenation can create target String mirrors, which are pinned during evaluation and formatting and released afterwards.
+Interpreted reads and method calls use existing target classes. String literals and concatenation can create target String mirrors. The interpreter pins those strings, boxed arguments and returned objects through result formatting and releases its pins afterwards.
 
 > **Background — when is a Java class actually unloaded?**
 >

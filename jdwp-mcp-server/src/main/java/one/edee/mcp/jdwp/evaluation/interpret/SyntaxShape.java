@@ -50,7 +50,7 @@ public final class SyntaxShape extends ASTVisitor {
         return new Classification(Phase.NAVIGATION, "navigation syntax");
     }
 
-    /** Returns the fallback plan, or null when the depth-checked expression may be navigated. */
+    /** Returns a syntax error or fallback, or null when the expression needs JDI planning. */
     static Planner.@Nullable Plan routing(ExpressionParser.Parsed parsed) {
         if (parsed.error() != null) {
             return new Planner.Error(parsed.error());
@@ -62,7 +62,7 @@ public final class SyntaxShape extends ASTVisitor {
         if (shape.compiled != null) {
             return new Planner.Compile(shape.compiled);
         }
-        return shape.calls == null ? null : new Planner.Invoke(shape.calls);
+        return null;
     }
 
     /** Checks depth before walking the parsed snippet to record the constructs it contains. */
@@ -101,10 +101,13 @@ public final class SyntaxShape extends ASTVisitor {
     }
 
     /**
-     * Allows only a few side-effect-free calls on an explicit receiver to stay in navigation; any other call needs invocation.
+     * In the syntax report, distinguishes likely target calls from possible read-only intrinsics.
      */
     @Override
     public boolean visit(MessageSend call, BlockScope scope) {
+        if (!sourceOnly) {
+            return true;
+        }
         final String name = new String(call.selector);
         final int count = call.arguments == null ? 0 : call.arguments.length;
         if (call.typeArguments == null && !call.receiver.isImplicitThis() && !call.receiver.isSuper()
@@ -137,10 +140,10 @@ public final class SyntaxShape extends ASTVisitor {
         return calls("object construction");
     }
 
-    /** Anonymous classes need the compiler; other qualified construction needs invocation. */
+    /** Anonymous classes and qualified construction need the compiler. */
     @Override
     public boolean visit(QualifiedAllocationExpression expression, BlockScope scope) {
-        return expression.anonymousType != null ? compiled("anonymous class") : calls("object construction");
+        return compiled(expression.anonymousType != null ? "anonymous class" : "qualified constructor");
     }
 
     /** Array creation needs the compiler. */
@@ -173,10 +176,10 @@ public final class SyntaxShape extends ASTVisitor {
         return compiled("increment or decrement");
     }
 
-    /** A plain instanceof stays in navigation; a pattern needs invocation. */
+    /** Type patterns and plain instanceof use reads only. */
     @Override
     public boolean visit(InstanceOfExpression expression, BlockScope scope) {
-        return expression.pattern == null || calls("instanceof pattern");
+        return expression.pattern == null || expression.pattern instanceof TypePattern || compiled("instanceof pattern");
     }
 
     /** Comparing a String constant by identity needs the compiler, because constants are interned. */

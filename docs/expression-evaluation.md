@@ -1,20 +1,34 @@
 # Expression evaluation
 
-Ordinary debugger expressions use `EvaluationRouter`. It can interpret read-only Java navigation over JDI or use Eclipse JDT (ECJ) to compile and inject a wrapper into the target JVM. Evaluation, assertions, watchers, and ordinary conditions and logpoints share the router. The threading and memory chapters describe the costs of each path. [Threading and safety](threading-and-safety.md) [Memory and references](memory-and-references.md)
+Ordinary debugger expressions use `EvaluationRouter`. It plans ordinary Java expressions as JDI reads (NAVIGATE), interpreted calls (INVOKE), or Eclipse JDT (ECJ) compilation (COMPILE). Evaluation, assertions, watchers, and ordinary conditions and logpoints share the router. The threading and memory chapters describe the costs of each path. [Threading and safety](threading-and-safety.md) [Memory and references](memory-and-references.md)
 
-## Navigation interpreter
+## JDI interpreter
 
-`ExpressionParser` parses a single expression or a balanced `{ ... }` statement body with ECJ, without consulting the target. `Planner` snapshots the frame's declaring type, `this`, locals and debugger bindings. It resolves fields from declared types and searches loaded types visible to the frame's loader. A read through an erased type variable can use the runtime class if the field name has a single declaration. A plan can run read-only, require compilation, or report an error before evaluation.
+`ExpressionParser` parses a single expression or a balanced `{ ... }` statement body with ECJ, without consulting the target. `Planner` snapshots the frame's declaring type, `this`, locals and debugger bindings. It resolves fields from declared types and searches loaded types visible to the frame's loader. Types and members bind before execution. A syntax error or an unresolved name that can only be a variable is reported directly.
 
 A simple type name can name the frame's class, an enclosing class, or a member type declared or inherited by one of those classes. It can also name a `java.lang` class if the frame's package has no loaded class with that name and the constant pools examined during lookup contain no conflicting name. Use a fully qualified name to interpret other types from the frame's package or from an import. A simple name that needs one of those bindings goes to the compiler. If a same-named class in the frame's package is still unloaded, both the interpreter and the compiled wrapper can resolve the name to `java.lang`.
 
 Each lexical scope's member types take precedence over its own simple name. At an unloaded enclosing type, lookup can select a loaded direct member only when it arrives from a member class. A lowercase first segment of a dotted name can still start package lookup. Other names route to compilation. Formal type parameters of the frame's method and of loaded lexical classes or their methods, possible local-class matches, and unreadable formal lists can also cause fallback. Constant-pool checks include reference array component names. Once the first segment of a dotted name binds to a type, each following segment must resolve as a member of the type bound so far.
 
-Navigation includes private and package-private fields, inherited and static fields, enum constants, outer instances, locals, marks, event bindings, arrays, class literals, casts, `instanceof`, primitive operators and lazy `&&`, `||` and `?:`. It also handles concatenation of strings, null, integers, characters and booleans. Supported intrinsics are `String.length/isEmpty/equals/charAt`, `Enum.name/ordinal/equals`, and the final primitive wrappers' value accessors and `equals`. The interpreter uses JDI reads and host-side primitive operations, so it works on a manually suspended thread, a bystander held by another thread's stop-all, or a suspended thread blocked on a monitor or in `wait()`. Newly mirrored strings stay pinned through result formatting. The interpreter checks the original frame after the reads and after formatting so a resume invalidates the result.
+Navigation includes private and package-private fields, inherited and static fields, enum constants, outer instances, locals, marks, event bindings, arrays, class literals, casts, `instanceof`, primitive operators and lazy `&&`, `||` and `?:`. A type pattern such as `value instanceof String text` binds `text` through the rest of an `&&` chain and in the true branch of `?:`. It also handles concatenation of strings, null, integers, characters and booleans. Supported intrinsics are `String.length/isEmpty/equals/charAt`, `Enum.name/ordinal/equals`, and the final primitive wrappers' value accessors and `equals`. The interpreter uses JDI reads and host-side primitive operations, so it works on a manually suspended thread, a bystander held by another thread's stop-all, or a suspended thread blocked on a monitor or in `wait()`. Newly mirrored strings stay pinned through result formatting. The interpreter checks the original frame after the reads and after formatting so a resume invalidates the result.
 
-Other calls, boxing, object or floating-point string concatenation, lambdas and blocks use compilation. AST paths deeper than 256 nodes and String or char literals with unpaired surrogates also use compilation. A String intrinsic falls back if JDWP returns the replacement character U+FFFD. Comparisons involving a String literal or possible String constant, parameterized casts and type tests, ambiguous or unavailable types, and static reads of uninitialized classes also go to the compiler. A syntax error or an unresolved name that can only be a variable is reported directly. Runtime failures such as a null dereference report the Java exception type and say that the interpreter raised it. A failed fallback includes the reason it needed compilation. Breakpoint conditions report `CONDITION_ERROR` and treat an error as true.
+### Method calls
 
-Set the server environment variable `JDWP_EVAL_ENGINE` to `auto` (default), `compiler` (skip interpretation), or `interpreter` (report the reason whenever navigation is unavailable). Successful replies use the same format in all modes. `jdwp_diagnose` shows ordinary evaluation counts and frequent fallback reasons. Fast probes and their arming-hit evaluations use the compiled engine.
+The interpreter can invoke private and package-private methods, including calls through private fields such as `store.map.size()`. It uses the static receiver type to find declared and inherited methods, including methods on interfaces. Phase 2 interprets a call when exactly one signature of the given name matches the argument count and the arguments' static types can convert to its parameters by identity, widening, boxing or unboxing. Overrides count as one signature. Ordinary virtual dispatch selects the implementation in the target.
+
+Unqualified calls use the frame's declaring class and its inherited methods. If that class has no method of the name, compilation handles enclosing classes and static imports. An unqualified instance call in a static frame reports an error. Static calls use the type-name rules above, and `super.m()` searches the superclass and dispatches non-virtually. Constructors use the same candidate and argument checks on an initialized, concrete class. Constructors of inner, local and anonymous classes, constructions with class type arguments or diamond inference, and static calls into uninitialized classes use compilation.
+
+Generic signatures on fields, locals and preceding results supply the receiver's type arguments. For example, `Map<String, Session>.get` yields the static type `Session`, so `map.get(key).role` binds the field on `Session`. When a return type remains imprecise through erasure or a wildcard, member lookup can use its runtime class. Multiple field declarations or method signatures with the name cause a refusal.
+
+Calls evaluate the receiver first and then the arguments left to right. Primitive widening and unboxing use debugger-side operations, and boxing invokes the target wrapper's `valueOf` to preserve its cache identity. Object concatenation invokes `String.valueOf(Object)`, including for arrays and null references. A null return from `toString()` contributes `"null"`. Floating-point operands use the target's `String.valueOf` so formatting matches its JDK. Integral, character and boolean formatting stays in the debugger.
+
+INVOKE snapshots the frame before acquiring one invocation lease. JDI runs each call with `INVOKE_SINGLE_THREADED` and invalidates frames as the thread resumes. Created strings, boxes and invocation results stay pinned through formatting. A target exception uses the same reply text as compilation. Interpreter-raised exceptions name the Java exception type. If a runtime lookup or read refuses the expression before any call, auto mode can compile it. If the refusal comes after a call, the error includes the refusal and the number of calls that ran.
+
+### Compiler fallback
+
+Calls with multiple same-arity candidates, no matching candidate, inapplicable arguments, variable arity or method type parameters use compilation. Unavailable or ambiguous type bindings, uninitialized classes and unsupported constructors can also require it. The compiler handles lambdas, method references, assignments, array creation, switch expressions and statement blocks. AST paths deeper than 256 nodes, literals with unpaired surrogates, String identity comparisons involving potential constants, parameterized casts and type tests, and String intrinsics whose result may have lost a code unit during JDWP transfer also use compilation. A failed fallback includes the interpreter's reason. Breakpoint conditions report `CONDITION_ERROR` and treat an error as true.
+
+Set `JDWP_EVAL_ENGINE` to `auto` (default routing), `compiler` (compile every expression), or `interpreter` (run supported reads and calls, or report the refusal). Replies share one value format. `jdwp_diagnose` counts interpreted evaluations with and without target calls, compiled evaluations and frequent fallback reasons. Fast probes and their arming-hit evaluations use the compiled engine.
 
 ## 1. Compiled pipeline overview
 
@@ -246,11 +260,11 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. Private fields can be read directly by the navigation interpreter. A private field inside a compiled block or ordinary method call still requires an access path legal in the wrapper.
+The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. The interpreter can read private fields and call supported private methods. A compiled expression needs a member access path that is legal in the wrapper.
 
 ### VMStart suspension
 
-At VMStart the JVM has yet to execute application code. Navigation can inspect marks and statics of loaded, initialized system classes. Compiled evaluation, `jdwp_to_string`, and force-loading require an invocation event later in the run. Set breakpoints at VMStart and resume to reach application frames. [Breakpoint class-prepare promotion](breakpoints.md#3-deferring-a-breakpoint-until-its-class-loads)
+At VMStart the JVM has yet to execute application code. Navigation can inspect marks and statics of loaded, initialized system classes. Interpreted calls, compiled evaluation, `jdwp_to_string` and force-loading require an invocation event later in the run. Set breakpoints at VMStart and resume to reach application frames. [Breakpoint class-prepare promotion](breakpoints.md#3-deferring-a-breakpoint-until-its-class-loads)
 
 ### Exception breakpoints on classes not loaded yet start as PENDING
 
@@ -262,7 +276,7 @@ Watchers are MCP-side expression bookmarks attached to breakpoints. They use the
 
 1. `jdwp_attach_watcher(breakpointId, label, expression)` — registers an expression to evaluate when a specific breakpoint hits.
 2. `jdwp_evaluate_watchers(threadId, scope, breakpointId?)` — evaluates all watchers for the current context.
-3. The router plans each watcher. An all-navigation batch runs as a frame inspection. A batch that needs compilation runs on the invocation worker and uses a fresh frame per watcher.
+3. The router plans each watcher. An all-navigation batch runs as a frame inspection. A batch that needs to invoke or compile runs on the invocation worker and uses a fresh frame per watcher.
 
 Watchers are dual-indexed by watcher UUID and breakpoint ID via `WatcherManager`. They are cleared on `jdwp_reset()` and on disconnect/reconnect.
 
@@ -275,7 +289,7 @@ Logpoints (`jdwp_set_logpoint`), exception logpoints (`jdwp_set_exception_logpoi
 
 Both exception tools bind `$exception` for their conditions. Optional throw-site class filters run in the target before an event reaches the expression evaluator. Regular logpoint history shows boxed primitives as values and prints the type for other object results.
 
-Both run on the event dispatcher. Navigation uses the held frame and JDI reads. Compilation uses the existing event invocation rules. Each hit still pays for the debugger pause and round trips. [Event pipeline](event-pipeline.md) [Breakpoints](breakpoints.md)
+Both run on the event dispatcher. Navigation uses the held frame and JDI reads. Interpreted calls and compilation use the event invocation rules. Each hit still pays for the debugger pause and round trips. [Event pipeline](event-pipeline.md) [Breakpoints](breakpoints.md)
 
 ### Synthetic bindings
 

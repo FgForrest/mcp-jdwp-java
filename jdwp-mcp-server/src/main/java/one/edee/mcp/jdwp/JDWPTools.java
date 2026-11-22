@@ -1383,7 +1383,7 @@ public class JDWPTools {
     }
 
 
-    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Private fields are reachable without compiling. Ordinary method calls and lambdas compile. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
+    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Supports private reads and single-candidate calls. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_expression(
         @McpToolParam(required = false, description = "Thread unique ID — defaults to the thread of the current stop") @Nullable Long threadId,
         @McpToolParam(description = "Java expression OR `{ ... }` block to evaluate. Examples: `order.getTotal()`, `x + y`, `{ try { return risky(); } catch (Exception e) { return e.getMessage(); } }`") String expression,
@@ -1458,8 +1458,8 @@ public class JDWPTools {
     }
 
     /**
-     * Evaluates the expression under a frame reservation when navigation is available. Forced
-     * compilation and fallback use the invocation guard and runner. {@code reply} renders the value.
+     * Evaluates navigation under a frame reservation and sends calls and compilation to the invocation runner.
+     * {@code reply} renders the value.
      */
     private String evaluateExpression(ThreadReference thread, int frameIndex, String expression,
                                       UnaryOperator<String> reply) throws Exception {
@@ -1481,7 +1481,7 @@ public class JDWPTools {
                 final Planner.Plan plan = evaluations.prepare(input, thread, frames, markedInstances.buildBindings());
                 return evaluations.readOnly(plan, value -> reply.apply(formatValue(value)));
             });
-        } catch (EvaluationRouter.NeedsCompiler fallback) {
+        } catch (EvaluationRouter.NeedsInvocation fallback) {
             final String invokeGuard = checkSafeToInvoke(thread);
             if (invokeGuard != null) {
                 return evaluations.refused(invokeGuard, fallback);
@@ -6197,7 +6197,7 @@ public class JDWPTools {
                 evaluations.requireReadOnlyMode();
                 return withFreshFrames(thread, "call again.", () ->
                     evaluateWatcherBatch(thread, effectiveScope, effectiveBreakpointId, null));
-            } catch (EvaluationRouter.NeedsCompiler fallback) {
+            } catch (EvaluationRouter.NeedsInvocation fallback) {
                 final String invokeGuard = checkSafeToInvoke(thread);
                 if (invokeGuard != null) {
                     return evaluations.refused(invokeGuard, fallback);
@@ -6221,7 +6221,7 @@ public class JDWPTools {
     private record WatcherGroup(int index, int breakpointId, Location location, List<Watcher> watchers) {}
 
     /**
-     * Evaluates the watchers of the scope and renders the report; interpreted when {@code job} is null, otherwise through the job's compiled fallback.
+     * Evaluates the watchers under a frame reservation or in the invocation job and renders the report.
      */
     private String evaluateWatcherBatch(ThreadReference thread, String scope, @Nullable Integer breakpointId,
                                         EvaluationRouter.@Nullable ToolJob job) throws Exception {
@@ -6263,7 +6263,7 @@ public class JDWPTools {
                         : evaluations.readOnly(plan.next(), this::formatValue);
                     result.append(String.format("    %s = %s\n\n", expression, value));
                     succeeded++;
-                } catch (EvaluationRouter.NeedsCompiler | InvalidStackFrameException e) {
+                } catch (EvaluationRouter.NeedsInvocation | InvalidStackFrameException e) {
                     throw e;
                 } catch (Exception e) {
                     if (isVmGone(e)) {

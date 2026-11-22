@@ -126,10 +126,9 @@ public final class RemoteCodeExecutor {
             throw new JdiEvaluationException("Failed to execute remote code: " + e.getMessage(), e);
         } catch (InvocationException e) {
             final long elapsed = System.currentTimeMillis() - startTime;
-            final ObjectReference exception = e.exception();
-            final String exceptionType = exception != null ? exception.type().name() : "unknown";
-            log.error("[Executor] Target VM threw exception after {}ms: {}", elapsed, exceptionType, e);
-            throw new JdiEvaluationException("Target VM threw exception: " + exceptionType, e);
+            final JdiEvaluationException failure = targetException(e);
+            log.error("[Executor] Remote execution failed after {}ms: {}", elapsed, failure.getMessage(), e);
+            throw failure;
         } catch (JdiEvaluationException e) {
             // Already classified by a lower phase (notably loadClass's JdiClassDefinitionException).
             // Propagate unchanged so the evaluator can act on the precise subtype — re-wrapping here
@@ -140,6 +139,13 @@ public final class RemoteCodeExecutor {
             log.error("[Executor] Unexpected exception after {}ms: {}", elapsed, e.getClass().getName(), e);
             throw new JdiEvaluationException("Unexpected exception during remote execution: " + e.getMessage(), e);
         }
+    }
+
+    /** Formats a target exception identically for compiled and interpreted Java. */
+    public static JdiEvaluationException targetException(InvocationException failure) {
+        final ObjectReference exception = failure.exception();
+        final String type = exception != null ? exception.type().name() : "unknown";
+        return new JdiEvaluationException("Target VM threw exception: " + type, failure);
     }
 
     /**

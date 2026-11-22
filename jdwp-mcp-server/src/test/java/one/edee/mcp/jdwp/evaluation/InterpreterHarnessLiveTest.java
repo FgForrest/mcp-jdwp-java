@@ -49,8 +49,11 @@ class InterpreterHarnessLiveTest {
     private static final int COLD_TRIALS = 5;
     private static final int HITS_PER_TRIAL = 5;
     private static final JsonMapper JSON = JsonMapper.builder().build();
+    /** Rows with an independent javac-compiled oracle in the fixture. */
     private static final Set<String> FIXTURE_GOLDENS = Set.of("private-field", "private-map", "private-map-call",
-        "private-session", "private-method", "super-call", "super-field", "erased-field-navigation", "generic-receiver", "outer-this", "outer-implicit", "nested-class-literal", "exception-detail");
+        "private-session", "private-method", "super-call", "super-field", "erased-field-navigation",
+        "generic-receiver", "outer-this", "outer-implicit", "nested-class-literal", "exception-detail",
+        "unqualified-instance", "concat-evaluation-order");
     private static final String COLD_CLASS = TARGET + "$Cold";
 
     /** A candidate engine can read a fresh frame and use the same bindings the oracle saw. */
@@ -79,7 +82,13 @@ class InterpreterHarnessLiveTest {
         Outcome evaluate(EvaluationContext context) throws Exception;
     }
 
+    /** One rendered result or Java exception observed during replay. */
     record Outcome(String kind, String javaClass, String rendered, @Nullable InterpreterValueFacts facts) {
+        /** Keeps the exact evaluator text for exceptions thrown by target code. */
+        static Outcome targetException(String javaClass, String reply) {
+            return new Outcome("exception", javaClass, reply, null);
+        }
+
         static Outcome targetException(String javaClass) {
             return new Outcome("exception", javaClass, javaClass, null);
         }
@@ -255,12 +264,13 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    /** Records the production compiler oracle and JDWP measurements for all three execution paths. */
     @Test
     void recordsCompiledOracleAndBaseline() throws Exception {
         Files.createDirectories(REPORTS);
-        final var vmStart = new StringBuilder();
+        final StringBuilder vmStart = new StringBuilder();
         final List<Entry> synthetic;
-        try (var reader = new InputStreamReader(
+        try (InputStreamReader reader = new InputStreamReader(
                 Objects.requireNonNull(getClass().getResourceAsStream("interpreter-corpus.jsonl")),
                 StandardCharsets.UTF_8)) {
             synthetic = InterpreterCorpus.read(reader, "interpreter-corpus.jsonl");
@@ -268,10 +278,10 @@ class InterpreterHarnessLiveTest {
         assertThat(synthetic).allSatisfy(entry -> {
             assertThat(entry.stop()).isIn(STOPS);
             assertThat(entry.expectedPlan()).as(entry.id()).isIn(Planner.KindOfPlan.NAVIGATE,
-                Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.ERROR);
+                Planner.KindOfPlan.INVOKE, Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.ERROR);
         });
 
-        final var entries = new ArrayList<>(synthetic);
+        final List<Entry> entries = new ArrayList<>(synthetic);
         final String external = System.getProperty("jdwp.live.corpus");
         if (external != null) {
             try (Reader reader = Files.newBufferedReader(Path.of(external))) {
@@ -282,32 +292,36 @@ class InterpreterHarnessLiveTest {
 
         final List<Path> javaHomes = InterpreterTargetVm.javaHomes();
         final Entry probe = synthetic.stream().filter(e -> BASELINE_ID.equals(e.id())).findFirst().orElseThrow();
-        final String baselineRows = baseline(javaHomes, probe, false);
-        final String navigationRows = baseline(javaHomes, probe, true);
+        final Entry callProbe = synthetic.stream().filter(e -> "private-map-call".equals(e.id())).findFirst().orElseThrow();
+        final String baselineRows = baseline(javaHomes, probe, Planner.KindOfPlan.COMPILE);
+        final String navigationRows = baseline(javaHomes, probe, Planner.KindOfPlan.NAVIGATE);
+        final String callRows = baseline(javaHomes, callProbe, Planner.KindOfPlan.INVOKE);
         for (Path javaHome : javaHomes) {
             final Path report = withFixture(javaHome, fixture -> writeOracle(fixture, entries, vmStart));
             assertThat(report).isRegularFile();
         }
-        InterpreterBaseline.write(REPORTS.resolve("interp-baseline.md"), baselineRows + navigationRows, vmStart.toString());
+        InterpreterBaseline.write(REPORTS.resolve("interp-baseline.md"), baselineRows + navigationRows + callRows, vmStart.toString());
     }
 
+    /** Compares results and call traces on each target JDK and checks every checked-in plan. */
     @Test
     void comparesTheRouterWithTheCompiledAndGoldenObservations() throws Exception {
         final List<Entry> entries;
-        try (var reader = new InputStreamReader(
+        try (InputStreamReader reader = new InputStreamReader(
                 Objects.requireNonNull(getClass().getResourceAsStream("interpreter-corpus.jsonl")),
                 StandardCharsets.UTF_8)) {
             entries = InterpreterCorpus.read(reader, "interpreter-corpus.jsonl");
         }
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
-            final var goldens = new LinkedHashMap<String, Observation>();
-            final var oracle = withFixture(javaHome, fixture -> replay(fixture.vm(), entries, fixture.connection(),
+            final Map<String, Observation> goldens = new LinkedHashMap<>();
+            final Map<String, Integer> reasons = new TreeMap<>();
+            final Map<String, Observation> oracle = withFixture(javaHome, fixture -> replay(fixture.vm(), entries, fixture.connection(),
                 compiledEngine(fixture.evaluator(new InMemoryJavaCompiler())), null, new StringBuilder(), goldens));
-            final var candidate = withFixture(javaHome, fixture -> {
-                final var compiler = fixture.evaluator(new InMemoryJavaCompiler());
-                final var strict = new EvaluationRouter(compiler, EvaluationRouter.Mode.INTERPRETER);
-                final var auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
-                return replay(fixture.vm(), entries, fixture.connection(), routerEngine(strict, auto),
+            final Map<String, Observation> candidate = withFixture(javaHome, fixture -> {
+                final JdiExpressionEvaluator compiler = fixture.evaluator(new InMemoryJavaCompiler());
+                final EvaluationRouter strict = new EvaluationRouter(compiler, EvaluationRouter.Mode.INTERPRETER);
+                final EvaluationRouter auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+                return replay(fixture.vm(), entries, fixture.connection(), routerEngine(strict, auto, reasons),
                     null, new StringBuilder(), null);
             });
             for (Entry entry : entries) {
@@ -315,14 +329,14 @@ class InterpreterHarnessLiveTest {
                 if (entry.expectedPlan() == Planner.KindOfPlan.ERROR) {
                     assertThat(result.outcome().kind()).as("%s: %s", javaHome, entry.id()).isEqualTo("planner error");
                 } else {
-                    final Observation expected = entry.expectedPlan() == Planner.KindOfPlan.NAVIGATE
-                        ? goldens.getOrDefault(entry.id(), oracle.get(entry.id())) : oracle.get(entry.id());
+                    final Observation expected = goldens.getOrDefault(entry.id(), oracle.get(entry.id()));
                     assertThat(result).as("%s: %s", javaHome, entry.id()).isEqualTo(expected);
                 }
             }
             System.out.printf("Differential %s: %s%n", javaHome.getFileName(),
                 entries.stream().collect(java.util.stream.Collectors.groupingBy(Entry::expectedPlan,
                     java.util.TreeMap::new, java.util.stream.Collectors.counting())));
+            System.out.printf("COMPILE reasons %s: %s%n", javaHome.getFileName(), reasons);
         }
     }
 
@@ -581,7 +595,7 @@ class InterpreterHarnessLiveTest {
     }
 
     /** Checks each expected plan and uses an isolated compiler mock for each planner-error row. */
-    private static Engine routerEngine(EvaluationRouter strict, EvaluationRouter auto) {
+    private static Engine routerEngine(EvaluationRouter strict, EvaluationRouter auto, Map<String, Integer> reasons) {
         return context -> {
             final Entry entry = context.entry();
             if (entry.expectedPlan() == Planner.KindOfPlan.ERROR) {
@@ -592,6 +606,11 @@ class InterpreterHarnessLiveTest {
                 context.bindings());
             assertThat(plan.kind()).as("%s: %s (%s)", entry.id(), entry.expression(), plan)
                 .isEqualTo(entry.expectedPlan());
+            if (plan instanceof Planner.Compile fallback) {
+                final int details = fallback.reason().indexOf(": ");
+                final String category = details < 0 ? fallback.reason() : fallback.reason().substring(0, details);
+                reasons.merge(category, 1, Integer::sum);
+            }
             return evaluationOutcome(() -> router.evaluateEvent(entry.expression(), context.thread(), context.bindings(),
                 context::render));
         };
@@ -785,58 +804,73 @@ class InterpreterHarnessLiveTest {
             ObjectReference.INVOKE_SINGLE_THREADED)).value()).isEqualTo(22);
     }
 
-    private static String baseline(List<Path> javaHomes, Entry probe, boolean navigate) throws Exception {
-        final var targets = new ArrayList<TargetSamples>();
+    /** Measures fresh and repeated evaluations on the same connection for each target. */
+    private static String baseline(List<Path> javaHomes, Entry probe, Planner.KindOfPlan kind) throws Exception {
+        final List<TargetSamples> targets = new ArrayList<>();
         // Finish warming ECJ and both target JDK images before collecting any sample.
         for (Path javaHome : javaHomes) {
-            final Trial warmup = withFixture(javaHome, fixture -> measureTrial(fixture, probe, navigate));
+            final Trial warmup = withFixture(javaHome, fixture -> measureTrial(fixture, probe, kind));
             targets.add(new TargetSamples(javaHome, warmup.version(), new ArrayList<>(), new ArrayList<>()));
         }
         for (int i = 0; i < COLD_TRIALS; i++) {
             for (TargetSamples target : targets) {
-                final Trial trial = withFixture(target.javaHome(), fixture -> measureTrial(fixture, probe, navigate));
+                final Trial trial = withFixture(target.javaHome(), fixture -> measureTrial(fixture, probe, kind));
                 assertThat(trial.version()).isEqualTo(target.version());
                 target.cold().add(trial.cold());
                 target.hits().addAll(trial.hits());
             }
         }
-        final var rows = new StringBuilder();
+        final String label = switch (kind) {
+            case COMPILE -> "compiled";
+            case NAVIGATE -> "navigate";
+            case INVOKE -> "invoke";
+            case ERROR -> throw new IllegalArgumentException("No benchmark for an error plan");
+        };
+        final StringBuilder rows = new StringBuilder();
         for (TargetSamples target : targets) {
-            rows.append(InterpreterBaseline.row(target.version(), navigate ? "navigate first" : "compiled first",
-                target.cold()));
-            rows.append(InterpreterBaseline.row(target.version(), navigate ? "navigate repeat" : "compiled hit",
-                target.hits()));
+            rows.append(InterpreterBaseline.row(target.version(), label + " first", target.cold()));
+            rows.append(InterpreterBaseline.row(target.version(), label + (kind == Planner.KindOfPlan.COMPILE
+                ? " hit" : " repeat"), target.hits()));
         }
         return rows.toString();
     }
 
-    private static Trial measureTrial(AttachedFixture fixture, Entry probe, boolean navigate) throws Exception {
-        final var compiler = new InterpreterBaseline.Compiler();
-        final var evaluator = fixture.evaluator(compiler);
-        final var samples = new ArrayList<InterpreterBaseline.Sample>();
+    /** Stops a fresh target at the benchmark frame and captures all samples. */
+    private static Trial measureTrial(AttachedFixture fixture, Entry probe, Planner.KindOfPlan kind) throws Exception {
+        final InterpreterBaseline.Compiler compiler = new InterpreterBaseline.Compiler();
+        final JdiExpressionEvaluator evaluator = fixture.evaluator(compiler);
+        final List<InterpreterBaseline.Sample> samples = new ArrayList<>();
         replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
-            final var context = new EvaluationContext(probe, thread, Map.of(), fixture.connection(), Map.of());
-            samples.addAll(navigate ? measureNavigation(evaluator, context, fixture.wire())
-                : measure(evaluator, compiler, context, fixture.wire()));
+            final EvaluationContext context = new EvaluationContext(probe, thread, Map.of(), fixture.connection(), Map.of());
+            samples.addAll(kind == Planner.KindOfPlan.COMPILE
+                ? measure(evaluator, compiler, context, fixture.wire())
+                : measureInterpreter(evaluator, context, fixture.wire(), kind));
         }, new StringBuilder(), null);
+        assertThat(compiler.compilations).isEqualTo(kind == Planner.KindOfPlan.COMPILE ? 1 : 0);
         assertThat(samples).hasSize(1 + HITS_PER_TRIAL);
         return new Trial(fixture.vm().version(), samples.get(0), List.copyOf(samples.subList(1, samples.size())));
     }
 
-    private static List<InterpreterBaseline.Sample> measureNavigation(JdiExpressionEvaluator evaluator,
-                                                                      EvaluationContext context,
-                                                                      CountingJdwpConnection wire) throws Exception {
-        final var router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.INTERPRETER);
-        final var samples = new ArrayList<InterpreterBaseline.Sample>();
+    /** Counts JDI commands through production formatting for an interpreted expression. */
+    private static List<InterpreterBaseline.Sample> measureInterpreter(JdiExpressionEvaluator evaluator,
+        EvaluationContext context, CountingJdwpConnection wire, Planner.KindOfPlan kind) throws Exception {
+        final EvaluationRouter router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.INTERPRETER);
+        final List<InterpreterBaseline.Sample> samples = new ArrayList<>();
         for (int i = 0; i <= HITS_PER_TRIAL; i++) {
-            final var before = wire.snapshot();
+            final Map<CountingJdwpConnection.Command, Long> before = wire.snapshot();
             final long start = System.nanoTime();
             final String rendered = router.evaluateEvent(context.entry().expression(), context.thread(),
                 context.bindings(), context.connection()::formatFieldValue);
             final long nanos = System.nanoTime() - start;
-            final var sample = new InterpreterBaseline.Sample(before, before, wire.snapshot(), 0, 0, nanos, 0);
-            sample.verifyNavigation();
-            assertThat(rendered).isEqualTo("3");
+            final InterpreterBaseline.Sample sample =
+                new InterpreterBaseline.Sample(before, before, wire.snapshot(), 0, 0, nanos, 0);
+            if (kind == Planner.KindOfPlan.INVOKE) {
+                sample.verifySingleInvocation();
+                assertThat(rendered).isEqualTo("1");
+            } else {
+                sample.verifyNavigation();
+                assertThat(rendered).isEqualTo("3");
+            }
             samples.add(sample);
         }
         return samples;
@@ -895,7 +929,10 @@ class InterpreterHarnessLiveTest {
             if (e.getMessage().startsWith("Target VM threw exception:")) {
                 for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
                     if (cause instanceof InvocationException invoked) {
-                        return Outcome.targetException(invoked.exception().referenceType().name());
+                        final String type = invoked.exception().referenceType().name();
+                        // Host-raised exceptions have their own text; the call fixture compares target text verbatim.
+                        return type.equals("java.lang.IllegalStateException")
+                            ? Outcome.targetException(type, e.getMessage()) : Outcome.targetException(type);
                     }
                 }
             }
@@ -974,10 +1011,25 @@ class InterpreterHarnessLiveTest {
             ((StringReference) fixture.getValue(trace)).value()), Map.of(COLD_CLASS, coldInitialized));
     }
 
+    /** Checks concrete call traces and values in addition to comparing both engines. */
     private static void verifyFixtureSemantics(String id, Observation observation) {
         switch (id) {
             case "short-circuit-and", "short-circuit-or" ->
                 assertThat(observation.calls()).as(id).isEqualTo(new Calls(0, ""));
+            case "target-exception" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo("Target VM threw exception: java.lang.IllegalStateException");
+                assertThat(observation.calls()).isEqualTo(new Calls(1, "E"));
+            }
+            case "boxing-cache-hit", "boxing-cache-miss" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo(Boolean.toString(id.equals("boxing-cache-hit")));
+                assertThat(observation.calls()).isEqualTo(new Calls(2, "BB"));
+            }
+            case "object-null-tostring" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo("\"null\"");
+                assertThat(observation.calls()).isEqualTo(new Calls(1, "N"));
+            }
+            case "single-constructor" -> assertThat(observation.calls()).isEqualTo(new Calls(1, "C"));
+            case "concat-evaluation-order" -> assertThat(observation.calls()).isEqualTo(new Calls(2, "NS"));
             case "lazy-ternary" -> assertThat(observation.calls()).isEqualTo(new Calls(1, "T"));
             case "receiver-and-arguments" -> assertThat(observation.calls()).isEqualTo(new Calls(4, "RABM"));
             case "call-future-stop" -> {

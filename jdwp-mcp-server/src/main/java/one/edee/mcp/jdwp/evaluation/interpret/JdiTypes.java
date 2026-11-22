@@ -18,7 +18,13 @@ final class JdiTypes {
      * Compile-time type of a plan node: a primitive kind, a reference type, the null type, or a deferred type whose erasure is imprecise. {@code bounds} lists the intersection bounds when there are several.
      */
     record StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
-                      List<ReferenceType> bounds) {
+                      List<ReferenceType> bounds, @Nullable String genericSignature) {
+        /** Creates a type without generic arguments. */
+        StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
+                   List<ReferenceType> bounds) {
+            this(kind, reference, imprecise, bounds, null);
+        }
+
         /** Creates a type without intersection bounds. */
         StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise) {
             this(kind, reference, imprecise, List.of());
@@ -84,7 +90,8 @@ final class JdiTypes {
      */
     static StaticType of(Type type, @Nullable String genericSignature) {
         if (type instanceof ReferenceType reference) {
-            return new StaticType(null, reference, genericSignature != null && genericSignature.startsWith("T"));
+            return new StaticType(null, reference, genericSignature != null && genericSignature.startsWith("T"),
+                List.of(), genericSignature);
         }
         return primitive(Kind.valueOf(type.name().toUpperCase(Locale.ROOT)));
     }
@@ -108,6 +115,15 @@ final class JdiTypes {
     /** Whether the type is the named class loaded by the bootstrap loader. */
     static boolean isBootstrap(@Nullable ReferenceType type, String name) {
         return type != null && name.equals(type.name()) && type.classLoader() == null;
+    }
+
+    /** Finds a type by its JVM name in the context of a member's declaration. */
+    @Nullable ReferenceType signatureType(String name, ReferenceType owner) {
+        final ReferenceType local = findExact(name);
+        if (local != null || (declaring != null && Objects.equals(owner.classLoader(), declaring.classLoader()))) {
+            return local;
+        }
+        return new JdiTypes(vm, owner).findExact(name);
     }
 
     /** Finds a loaded bootstrap class, or refuses the plan when it is not loaded. */
