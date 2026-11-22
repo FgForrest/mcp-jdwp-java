@@ -8,6 +8,7 @@ import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.BreakpointRequest;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
@@ -206,7 +207,8 @@ class JdiEventListenerLocalClasspathTest {
 	@Test
 	void failedReconnectLeavesDiscoveryStopped() throws Exception {
 		final JDIConnectionService service = new JDIConnectionService(listener, tracker, new EventHistory(),
-			new WatcherManager(), new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor());
+			new WatcherManager(), new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor(),
+			mock(JvmDiscoveryService.class));
 		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 		tracker.reset();
 		listener.start(vm);
