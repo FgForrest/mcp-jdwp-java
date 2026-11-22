@@ -29,6 +29,12 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 1. Check the server log if your installation writes one — the JDWP MCP server logs JDI operations and errors there.
 2. Reconnect the MCP server: run `/mcp` in Claude Code and reconnect `jdwp-inspector`. This spawns a fresh subprocess. In Codex, start a new session; Codex starts its MCP servers per session.
 
+## A resume reply reports a failed hold
+
+`jdwp_resume_until_event` returns `[RESUME_FAILED]` when a release or lease debt repayment fails before or during the wait. For unpaid lease debt or a failed automatic release, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. A set without an event thread has no targeted retry.
+
+`jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. The resume tools and `jdwp_reset` report successful releases alongside any failures. If a resume or reset reply reports a disconnect, attach to a live target.
+
 ## JDWP port is already in use
 
 Applies to any JDWP port — 5005 for build-system shortcuts, but also non-default ports (8003, 8000, 9009, …) used by already-running services.

@@ -148,6 +148,11 @@ Produced by `vmDisconnectedMessage` (`JDWPTools.java:654-657`). Returned by tool
 - `jdwp_evaluate_expression` (lines 771-772)
 - `jdwp_assert_expression` (lines 820-821)
 - `jdwp_evaluate_watchers` (lines 3634-3635)
+- `jdwp_resume` and `jdwp_resume_thread`. The reply includes any release progress before the disconnect.
+
+`jdwp_resume_until_event` also returns `[VM_DEATH]` if JDI reports a disconnect during its initial release pass or the session closes while it waits. It includes any release progress and the diagnostics available from the run.
+
+If `jdwp_reset` encounters a disconnect during release, its reset summary names the disconnect, preserves confirmed release progress and directs the agent to reattach.
 
 ### `[VM_GONE]`
 

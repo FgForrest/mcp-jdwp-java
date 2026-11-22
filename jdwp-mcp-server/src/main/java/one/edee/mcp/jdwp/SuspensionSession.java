@@ -1,8 +1,10 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.Location;
+import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.Event;
@@ -92,6 +94,10 @@ public final class SuspensionSession {
          */
         HELD,
         /**
+         * Finished without a stop, but still owns its suspension after its automatic resume failed.
+         */
+        RELEASE_FAILED,
+        /**
          * Its suspension has been released.
          */
         RELEASED
@@ -129,6 +135,20 @@ public final class SuspensionSession {
          * its lease's end, or is re-suspended before this context's own resume.
          */
         private final Set<ThreadReference> exempt = new LinkedHashSet<>();
+        /**
+         * Temporary re-suspensions for EventSet.resume(). Only those whose rollback also failed
+         * can survive a release attempt. The next attempt reuses or undoes them.
+         */
+        private final Set<ThreadReference> compensated = new LinkedHashSet<>();
+        /**
+         * The most recent failure to release this finished set, present in RELEASE_FAILED.
+         */
+        @Nullable
+        private RuntimeException automaticReleaseFailure;
+        /**
+         * Failed watchdog releases, keyed by the thread whose share was being released.
+         */
+        private final Map<ThreadReference, WatchdogReleaseFailure> watchdogFailures = new LinkedHashMap<>();
         /**
          * Threads the watchdog released from this stop-all so an evaluation could finish (A1); they
          * are in {@link #released} too. A stop published with any is partial.
@@ -182,33 +202,70 @@ public final class SuspensionSession {
     }
 
     /**
+     * One release that threw: the holder it tried to release and the JDI failure, with any failed
+     * rollback of temporary suspensions attached as suppressed exceptions.
+     *
+     * @param holder        the holder whose release failed, in words ("breakpoint 3 on thread main")
+     * @param cause         what JDI threw
+     * @param retryThreadId the event thread or debtor to target for recovery, if available
+     */
+    public record ReleaseFailure(String holder, RuntimeException cause, @Nullable Long retryThreadId) {
+        /** Records a failure without a thread-specific recovery hint. */
+        public ReleaseFailure(String holder, RuntimeException cause) {
+            this(holder, cause, null);
+        }
+
+        /**
+         * The holder, any retry thread ID, the exception and every failed rollback.
+         */
+        public String describe() {
+            final StringBuilder out = new StringBuilder(holder).append(" (");
+            if (retryThreadId != null) {
+                out.append("thread ID ").append(retryThreadId).append(", ");
+            }
+            out.append(brief(cause));
+            for (Throwable rollback : cause.getSuppressed()) {
+                out.append("; ").append(rollback.getMessage());
+            }
+            return out.append(')').toString();
+        }
+    }
+
+    /**
      * What a release did.
      *
      * @param released the stops released, oldest first
      * @param unseen   stops still held because no tool has presented them yet
      * @param pending  sets still waiting for or being processed; their threads stay parked
      * @param manual   threads whose manual hold was released
+     * @param recovered finished sets, watchdog releases and lease debts successfully retried
+     * @param failures attempted releases that threw
+     * @param closed   the session is closed
      */
     public record ReleaseResult(List<BreakpointTracker.LastBreakpoint> released,
                                 List<BreakpointTracker.LastBreakpoint> unseen, int pending,
-                                List<ThreadReference> manual) {
+                                List<ThreadReference> manual, List<String> recovered,
+                                List<ReleaseFailure> failures, boolean closed) {
         /**
          * Whether anything was released.
          */
         public boolean releasedAnything() {
-            return !released.isEmpty() || !manual.isEmpty();
+            return !released.isEmpty() || !manual.isEmpty() || !recovered.isEmpty();
         }
     }
 
     /**
      * What {@link #releaseThread} did.
      *
-     * @param refusal  why nothing was released, or {@code null} when it went ahead
+     * @param refusal  why ordinary holds could not be released, or {@code null} when they were eligible
      * @param holders  what it released, in words
+     * @param failures attempted releases that threw
+     * @param closed   the session is closed
      */
-    public record ThreadRelease(@Nullable String refusal, List<String> holders) {
+    public record ThreadRelease(@Nullable String refusal, List<String> holders, List<ReleaseFailure> failures,
+                                boolean closed) {
         public boolean released() {
-            return refusal == null && !holders.isEmpty();
+            return !holders.isEmpty();
         }
     }
 
@@ -217,9 +274,21 @@ public final class SuspensionSession {
      *
      * @param stops held stops, seen or not
      * @param holds {@code jdwp_suspend_thread} holds
+     * @param recovered finished sets, watchdog releases and lease debts successfully retried
+     * @param failures attempted releases that threw
+     * @param closed whether the session was closed by the end of the pass
      */
-    public record ResetResult(int stops, int holds) {
+    public record ResetResult(int stops, int holds, List<String> recovered, List<ReleaseFailure> failures,
+                              boolean closed) {
+        /** Result when there was no session to reset. */
         public static final ResetResult NONE = new ResetResult(0, 0);
+
+        /**
+         * A reset whose releases all succeeded.
+         */
+        public ResetResult(int stops, int holds) {
+            this(stops, holds, List.of(), List.of(), false);
+        }
     }
 
     /**
@@ -239,6 +308,10 @@ public final class SuspensionSession {
          */
         CLOSED,
         /**
+         * A release failed on the first pass or a recovery became necessary while waiting.
+         */
+        RESUME_FAILED,
+        /**
          * {@code jdwp_reset} ran while waiting.
          */
         RESET
@@ -248,8 +321,8 @@ public final class SuspensionSession {
      * Result of {@link #nextStop}.
      *
      * @param stop     the stop presented, for {@link Outcome#STOPPED}
-     * @param released what the call released before it waited ({@code null} when it released nothing
-     *                 because a stop was already waiting to be seen or a step was in flight)
+     * @param released the initial release progress and any failures found while waiting,
+     *                 or {@code null} when neither applies
      */
     public record NextStop(Outcome outcome, BreakpointTracker.@Nullable LastBreakpoint stop,
                            @Nullable ReleaseResult released) {
@@ -318,11 +391,27 @@ public final class SuspensionSession {
     public record Invocation(Object token, ThreadReference thread) {
     }
 
+    /**
+     * A failed attempt to free the monitor owner, with the original lease and monitor needed for
+     * revalidating a retry.
+     */
+    private record WatchdogReleaseFailure(Lease lease, ObjectReference monitor, RuntimeException cause) {
+    }
+
+    /**
+     * The lease's remaining suspension counts after a failed repayment. The hold ID stays stable
+     * until the last count is released.
+     */
+    private record LeaseDebt(long id, int count, RuntimeException cause) {
+    }
+
     private final BreakpointTracker tracker;
     private final EventHistory history;
     private final List<Context> contexts = new ArrayList<>();
     private final Set<ThreadReference> manual = new LinkedHashSet<>();
     private final Map<ThreadReference, Lease> leases = new LinkedHashMap<>();
+    /** Lease suspensions still owned by the session after their invocation ended. */
+    private final Map<ThreadReference, LeaseDebt> unpaidLeaseDebts = new LinkedHashMap<>();
     /**
      * Threads a frame tool works on, with how many tools: the watchdog never releases them (A2).
      */
@@ -494,6 +583,7 @@ public final class SuspensionSession {
      * suspends nothing, and a set routed as one that never stops never publish — the last not even
      * a handler's fail-safe stop: the redefinition rule did not count its thread, so the method it
      * stopped in may have been redefined meanwhile, its frame obsolete.
+     * A failed automatic release keeps the context for retry and wakes next-stop waiters.
      *
      * @return whether a stop was published
      */
@@ -517,7 +607,17 @@ public final class SuspensionSession {
             }
             log.warn("[Suspension] {} was routed as never stopping; its handler's fail-safe stop is dropped", context);
         }
-        release(context);
+        try {
+            release(context);
+        } catch (RuntimeException e) {
+            context.state = State.RELEASE_FAILED;
+            context.automaticReleaseFailure = e;
+            if (e instanceof VMDisconnectedException) {
+                close();
+            }
+            notifyAll();
+            log.warn("[Suspension] Releasing {} failed: {}", context, brief(e));
+        }
         if (context.vmStart) {
             notifyAll();
         }
@@ -589,7 +689,8 @@ public final class SuspensionSession {
      * {@code jdwp_resume_until_event}: presents the oldest unseen stop at once if there is one;
      * otherwise releases the presented stops (unless a step is in flight, whose landing it waits
      * for without releasing anything) and waits for the next stop. Every wake re-selects; a
-     * notification never implies that a particular stop exists.
+     * notification never implies that a particular stop exists. Outstanding recoveries are reported
+     * even while waiting for a step.
      */
     public synchronized NextStop nextStop(long timeoutMs) throws InterruptedException {
         final long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
@@ -600,23 +701,33 @@ public final class SuspensionSession {
             // A stop published just before the VM died is still shown: it explains the death.
             final Context unseen = oldestUnseen();
             if (unseen != null) {
-                return new NextStop(Outcome.STOPPED, present(unseen), released);
+                return endWait(Outcome.STOPPED, present(unseen), released, List.of());
             }
             if (closed) {
-                return new NextStop(Outcome.CLOSED, null, released);
+                return endWait(Outcome.CLOSED, null, released, List.of());
             }
             if (generation != startGeneration) {
-                return new NextStop(Outcome.RESET, null, released);
+                return endWait(Outcome.RESET, null, released, List.of());
             }
             if (first) {
                 first = false;
                 if (pendingSteps.isEmpty()) {
                     released = releaseAllLocked();
+                    if (released.closed()) {
+                        return endWait(Outcome.CLOSED, null, released, List.of());
+                    }
+                    if (!released.failures().isEmpty()) {
+                        return endWait(Outcome.RESUME_FAILED, null, released, List.of());
+                    }
                 }
+            }
+            final List<ReleaseFailure> recoveryFailures = waitingRecoveryFailures();
+            if (!recoveryFailures.isEmpty()) {
+                return endWait(Outcome.RESUME_FAILED, null, released, recoveryFailures);
             }
             final long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
             if (remainingMs <= 0) {
-                return new NextStop(Outcome.TIMEOUT, null, released);
+                return endWait(Outcome.TIMEOUT, null, released, List.of());
             }
             wait(remainingMs);
         }
@@ -626,57 +737,87 @@ public final class SuspensionSession {
 
     /**
      * {@code jdwp_resume}: releases every presented stop and every manual hold. Stops not yet
-     * presented stay held; sets still queued or processed are not touched.
+     * presented stay held. Retries failed automatic releases, lease debts, and eligible failed
+     * watchdog releases.
      */
     public synchronized ReleaseResult releaseAll() {
-        return closed ? new ReleaseResult(List.of(), List.of(), 0, List.of()) : releaseAllLocked();
+        return closed ? new ReleaseResult(List.of(), List.of(), 0, List.of(), List.of(), List.of(), true)
+            : releaseAllLocked();
     }
 
+    /** Releases eligible holds in context order and records the confirmed releases and failures. */
     private ReleaseResult releaseAllLocked() {
         final List<BreakpointTracker.LastBreakpoint> releasedStops = new ArrayList<>();
         final List<BreakpointTracker.LastBreakpoint> unseen = new ArrayList<>();
+        final List<String> recovered = new ArrayList<>();
+        final List<ReleaseFailure> failures = new ArrayList<>();
         int pending = 0;
         for (Context context : new ArrayList<>(contexts)) {
+            if (closed) {
+                break;
+            }
             switch (context.state) {
                 case HELD -> {
+                    final BreakpointTracker.LastBreakpoint stop = Objects.requireNonNull(context.report);
                     if (context.reported) {
-                        releasedStops.add(Objects.requireNonNull(context.report));
-                        release(context);
+                        if (attemptRelease(() -> release(context), () -> describeStop(stop), failures)) {
+                            releasedStops.add(stop);
+                        }
                     } else {
-                        unseen.add(Objects.requireNonNull(context.report));
+                        unseen.add(stop);
                     }
                 }
-                case QUEUED, PROCESSING -> pending++;
+                case RELEASE_FAILED -> retryAutomaticRelease(context, recovered, failures);
+                case QUEUED, PROCESSING -> {
+                    retryWatchdogReleases(context, null, recovered, failures);
+                    if (context.state != State.RELEASED) {
+                        pending++;
+                    }
+                }
                 case RELEASED -> {
                 }
             }
         }
-        final List<ThreadReference> manualReleased = new ArrayList<>(manual);
-        for (ThreadReference thread : manualReleased) {
-            releaseManual(thread);
-        }
-        manual.clear();
-        return new ReleaseResult(releasedStops, unseen, pending, manualReleased);
+        final List<ThreadReference> manualReleased = releaseManualHolds(failures);
+        retryLeaseDebts(recovered, failures);
+        return new ReleaseResult(releasedStops, unseen, pending, manualReleased, recovered, failures, closed);
     }
 
     /**
      * {@code jdwp_resume_thread}: releases what the user holds on {@code thread} — its manual hold,
      * its own presented stop, and its share of presented stop-all stops. Refuses while a set
      * covering the thread is still queued or processed, or while it holds a stop nobody has seen.
+     * Retries failed automatic releases on their event thread, eligible watchdog releases and
+     * unpaid lease debt before checking for ordinary release blockers.
      */
     public synchronized ThreadRelease releaseThread(ThreadReference thread) {
         if (closed) {
-            return new ThreadRelease("the debugging session is closed", List.of());
+            return new ThreadRelease("the debugging session is closed", List.of(), List.of(), true);
+        }
+        final List<String> holders = new ArrayList<>();
+        final List<ReleaseFailure> failures = new ArrayList<>();
+        for (Context context : List.copyOf(contexts)) {
+            if (closed) {
+                break;
+            }
+            if (context.state == State.RELEASE_FAILED && thread.equals(context.thread)) {
+                retryAutomaticRelease(context, holders, failures);
+            } else {
+                retryWatchdogReleases(context, thread, holders, failures);
+            }
+        }
+        retryLeaseDebt(thread, holders, failures);
+        if (closed) {
+            return new ThreadRelease(null, holders, failures, true);
         }
         final String refusal = releaseRefusal(thread);
         if (refusal != null) {
-            return new ThreadRelease(refusal, List.of());
+            return new ThreadRelease(refusal, holders, failures, false);
         }
-        final List<String> holders = releaseHolders(thread);
-        return holders.isEmpty()
-            ? new ThreadRelease("nothing holds thread " + safeName(thread) + " — it was not suspended by this "
-            + "debugging session's stops or jdwp_suspend_thread", List.of())
-            : new ThreadRelease(null, holders);
+        final ThreadRelease result = releaseHolders(thread, holders, failures);
+        return result.released() || !result.failures().isEmpty() ? result
+            : new ThreadRelease("nothing holds thread " + safeName(thread) + " — it was not suspended by this "
+                + "debugging session's stops or jdwp_suspend_thread", List.of(), List.of(), false);
     }
 
     /**
@@ -704,16 +845,28 @@ public final class SuspensionSession {
      * @param remainingHolders the other thread-specific holds, grouped by holder kind
      * @param remainingStopAlls summaries of stop-alls still in effect, grouped and counted
      *                          even if JDI lists no other threads
+     * @param recoveryPending whether any recovery hold remains after starting the step
+     * @param releaseFailure the full release outcome when the step request was removed after a failure
      */
-    public record StepResult(@Nullable String refusal, List<String> remainingHolders, List<String> remainingStopAlls) {
+    public record StepResult(@Nullable String refusal, List<String> remainingHolders, List<String> remainingStopAlls,
+                             boolean recoveryPending, @Nullable ThreadRelease releaseFailure) {
+        /** Refuses a step before any release is attempted. */
         private static StepResult refused(String reason) {
-            return new StepResult(reason, List.of(), List.of());
+            return new StepResult(reason, List.of(), List.of(), false, null);
+        }
+
+        /** Refuses a step and preserves everything its release pass confirmed. */
+        private static StepResult refused(ThreadRelease release) {
+            return new StepResult("the thread's holds could not all be released", List.of(), List.of(), false, release);
         }
     }
 
     /**
      * A step on {@code thread}, atomically: admission, installing the request, then releasing the
-     * thread. A refused or failed step leaves no request behind.
+     * thread. A refused or failed step leaves no request behind. A failed lease repayment must be
+     * retried before stepping. A refused release includes all its successes and failures.
+     *
+     * @return the started step's remaining holds, or a refusal saying why it did not start
      */
     public synchronized StepResult step(ThreadReference thread, Supplier<List<ThreadReference>> allThreads,
                                         StepInstaller installer) throws Exception {
@@ -723,6 +876,9 @@ public final class SuspensionSession {
         final String refusal = releaseRefusal(thread);
         if (refusal != null) {
             return StepResult.refused(refusal);
+        }
+        if (unpaidLeaseDebts.containsKey(thread)) {
+            return StepResult.refused("thread " + safeName(thread) + " has unpaid lease debt — retry with jdwp_resume_thread");
         }
         if (!holds(thread)) {
             return StepResult.refused("nothing holds thread " + safeName(thread)
@@ -735,7 +891,12 @@ public final class SuspensionSession {
         stamp(request);
         try {
             pendingSteps.put(thread, request);
-            releaseHolders(thread);
+            final ThreadRelease release = releaseHolders(thread, new ArrayList<>(), new ArrayList<>());
+            if (!release.failures().isEmpty()) {
+                pendingSteps.remove(thread);
+                deleteQuietly(request);
+                return StepResult.refused(release);
+            }
         } catch (RuntimeException e) {
             pendingSteps.remove(thread);
             deleteQuietly(request);
@@ -747,6 +908,7 @@ public final class SuspensionSession {
     /**
      * Summarizes the remaining holds under the session monitor. Equivalent stop-alls share their
      * state and origin. The displayed sample covers the union of JDI-enumerated threads they hold.
+     * Recovery holds share the name budget with the ordinary hold groups.
      *
      * @param vmThreads threads enumerated by JDI, which can omit virtual threads
      * @return the grouped stop-all and thread-specific holds, with one display budget
@@ -754,27 +916,37 @@ public final class SuspensionSession {
     private StepResult describeRemainingHolders(List<ThreadReference> vmThreads) {
         final Map<String, Set<ThreadReference>> groups = new LinkedHashMap<>();
         final Map<StopAllGroup, StopAllSummary> stopAlls = new LinkedHashMap<>();
+        boolean recoveryPending = !unpaidLeaseDebts.isEmpty();
         for (Context context : contexts) {
             final ThreadReference eventThread = context.thread;
+            recoveryPending |= context.state == State.RELEASE_FAILED;
             if (context.policy == EventRequest.SUSPEND_ALL) {
-                final String state = context.state == State.HELD ? seenWord(context) : "in-progress";
+                final String state = switch (context.state) {
+                    case HELD -> seenWord(context);
+                    case RELEASE_FAILED -> "failed automatic release";
+                    default -> "in-progress";
+                };
                 stopAlls.computeIfAbsent(new StopAllGroup(state, eventThread), ignored -> new StopAllSummary())
                     .add(context, vmThreads);
             } else if (context.policy == EventRequest.SUSPEND_EVENT_THREAD
                 && eventThread != null && covers(context, eventThread)) {
-                final String label = context.state == State.HELD
-                    ? seenWord(context) + " thread stops" : "events still being processed";
+                final String label = switch (context.state) {
+                    case HELD -> seenWord(context) + " thread stops";
+                    case RELEASE_FAILED -> "failed automatic releases";
+                    default -> "events still being processed";
+                };
                 groups.computeIfAbsent(label, ignored -> new LinkedHashSet<>()).add(eventThread);
             }
         }
         groups.put("jdwp_suspend_thread holds", manual);
+        groups.put("lease debt", unpaidLeaseDebts.keySet());
         final StepThreadNames names = new StepThreadNames();
         final List<String> stopAllDescriptions = describeStopAlls(stopAlls, names);
         final List<String> threadHolds = groups.entrySet().stream()
             .filter(entry -> !entry.getValue().isEmpty())
             .map(entry -> entry.getKey() + ": " + names.describeGroup(entry.getValue()))
             .toList();
-        return new StepResult(null, threadHolds, stopAllDescriptions);
+        return new StepResult(null, threadHolds, stopAllDescriptions, recoveryPending, null);
     }
 
     /** Combines stop-alls with the same presentation state and originating thread. */
@@ -813,19 +985,29 @@ public final class SuspensionSession {
             final String origin = thread == null ? "" : " from thread " + names.take(thread);
             final String sample = group.listed.isEmpty() ? "" : " (JDI lists " + names.describeGroup(group.listed) + ')';
             if (group.count == 1) {
-                descriptions.add("The " + key.state() + " stop-all" + origin + " still covers other threads" + sample + '.');
+                descriptions.add("The " + stopAllLabel(key.state(), 1) + origin + " still covers other threads" + sample + '.');
             } else {
-                descriptions.add(group.count + " " + key.state() + " stop-alls" + origin + " still cover other threads" + sample + '.');
+                descriptions.add(group.count + " " + stopAllLabel(key.state(), group.count) + origin
+                    + " still cover other threads" + sample + '.');
             }
         }
         additional.forEach((state, count) -> {
             if (count == 1) {
-                descriptions.add("One additional " + state + " stop-all still covers other threads.");
+                descriptions.add("One additional " + stopAllLabel(state, count) + " still covers other threads.");
             } else {
-                descriptions.add(count + " additional " + state + " stop-alls still cover other threads.");
+                descriptions.add(count + " additional " + stopAllLabel(state, count) + " still cover other threads.");
             }
         });
         return List.copyOf(descriptions);
+    }
+
+    /** Names an ordinary or failed stop-all without adding another thread to the sample. */
+    private static String stopAllLabel(String state, int count) {
+        final String noun = count == 1 ? "stop-all" : "stop-alls";
+        if ("failed automatic release".equals(state)) {
+            return noun + " with a failed automatic release";
+        }
+        return state + " " + noun;
     }
 
     /**
@@ -870,8 +1052,8 @@ public final class SuspensionSession {
     }
 
     /**
-     * The holds this session knows on {@code thread}: the ids of the contexts holding it, and
-     * {@link #MANUAL_HOLD} for a manual hold. A lease's exemption still counts — its invocation
+     * The holds this session knows on {@code thread}: the ids of its contexts and unpaid lease debt,
+     * and {@link #MANUAL_HOLD} for a manual hold. A lease's exemption still counts — its invocation
      * returns to the same frames. While one hold lasts, the thread cannot run past its stop, so a
      * hold present in two snapshots proves its frames belong to the same activations in between
      * (an {@link InvocationRunner} job's admission). Context ids are never reused.
@@ -882,7 +1064,7 @@ public final class SuspensionSession {
 
     /**
      * {@link #holdsOn}, limited to the holds only a tool ends: the published stops holding
-     * {@code thread} and a manual hold. Nothing else releases those — the dispatcher releases only
+     * {@code thread}, a manual hold or unpaid lease debt. Nothing else releases those — the dispatcher releases only
      * the sets it processes, the watchdog never touches a published stop or a manual hold, and tools
      * run one at a time — so one of them found by a tool still holds the thread when the tool next
      * reads its frames. A set still queued or processed does not vouch for that: the dispatcher may
@@ -892,6 +1074,7 @@ public final class SuspensionSession {
         return holdsOn(thread, true);
     }
 
+    /** Collects stable hold IDs, optionally excluding contexts that a tool did not present. */
     private Set<Long> holdsOn(ThreadReference thread, boolean publishedOnly) {
         if (closed) {
             return Set.of();
@@ -905,6 +1088,10 @@ public final class SuspensionSession {
         if (manual.contains(thread)) {
             holds.add(MANUAL_HOLD);
         }
+        final LeaseDebt debt = unpaidLeaseDebts.get(thread);
+        if (debt != null) {
+            holds.add(debt.id());
+        }
         return holds;
     }
 
@@ -913,7 +1100,7 @@ public final class SuspensionSession {
      * proposal § 6): a method a held thread has a frame in is never redefined, or the frame would
      * turn obsolete and lose its locals. A hold is a context that is shown or may still be (HELD, or
      * QUEUED or PROCESSING in the current generation, not cancelled, and able to stop), a manual hold
-     * ({@link #MANUAL_HOLD}), a step in flight ({@link #STEP_HOLD}), or a suspension nothing here
+     * ({@link #MANUAL_HOLD}), unpaid lease debt, a step in flight ({@link #STEP_HOLD}), or a suspension nothing here
      * accounts for ({@link #UNKNOWN_HOLD}: a set raised but not routed yet). As in {@link #holdsOn},
      * a lease's exemption still counts. The set the calling thread processes counts only with
      * {@code countProcessing} — an arming hit's own set, which resumes without being shown unless
@@ -938,6 +1125,7 @@ public final class SuspensionSession {
             }
         }
         candidates.addAll(manual);
+        candidates.addAll(unpaidLeaseDebts.keySet());
         candidates.addAll(leases.keySet());
         candidates.addAll(pendingSteps.keySet());
         final Map<ThreadReference, Set<Long>> held = new LinkedHashMap<>();
@@ -956,6 +1144,11 @@ public final class SuspensionSession {
             if (manual.contains(thread)) {
                 holds.add(MANUAL_HOLD);
                 suspensions++;
+            }
+            final LeaseDebt debt = unpaidLeaseDebts.get(thread);
+            if (debt != null) {
+                holds.add(debt.id());
+                suspensions += debt.count();
             }
             if (pendingSteps.containsKey(thread)) {
                 holds.add(STEP_HOLD);
@@ -1035,13 +1228,17 @@ public final class SuspensionSession {
      * lease waits for it: the invocation would run the thread under the tool, and the frames the tool
      * reads next would be the invoked code's (#47 § 4).
      *
-     * @throws EvaluationRefusedException when the invocation is not admitted, or a frame tool still
+     * @throws EvaluationRefusedException when the invocation is not admitted, including unpaid lease debt, or a frame tool still
      *                                    reads the thread after {@link #RESERVATION_WAIT_MS}
      */
     public synchronized void lease(ThreadReference thread) {
         awaitUnreserved(thread);
         if (closed) {
             return;
+        }
+        if (unpaidLeaseDebts.containsKey(thread)) {
+            throw new EvaluationRefusedException("thread " + safeName(thread)
+                + " has unpaid lease debt — retry with jdwp_resume_thread");
         }
         // A job that outlived its tool's wait runs only at the stop it was started at: once none of
         // its holds is left, the thread may have run on, and a later stop at the same place is
@@ -1055,6 +1252,10 @@ public final class SuspensionSession {
         final Context anchor = leaseAnchor(thread);
         final List<Context> others = new ArrayList<>();
         for (Context context : contexts) {
+            if (context.compensated.contains(thread)) {
+                throw new EvaluationRefusedException("a failed resume left a temporary suspension on thread "
+                    + safeName(thread) + " — retry jdwp_resume");
+            }
             if (context != anchor && covers(context, thread)) {
                 others.add(context);
             }
@@ -1103,7 +1304,9 @@ public final class SuspensionSession {
 
     /**
      * Ends the invocation chain on {@code thread}: it goes back into each context it was taken out
-     * of that still holds. A context released meanwhile has re-suspended it already.
+     * of that still holds. A context released meanwhile has re-suspended it already. If restoring
+     * an exemption fails, an available debt count can fund the hold. The session repays only the
+     * remaining debt.
      */
     public synchronized void unlease(ThreadReference thread) {
         final Lease lease = leases.remove(thread);
@@ -1111,17 +1314,43 @@ public final class SuspensionSession {
             return;
         }
         for (Context context : lease.exemptFrom) {
-            if (context.state != State.RELEASED && context.exempt.remove(thread)) {
-                suspendQuietly(thread);
+            if (closed) {
+                return;
+            }
+            if (context.state != State.RELEASED && context.exempt.contains(thread)
+                && (context.compensated.remove(thread) || restoreLeaseCount(thread, lease))) {
+                context.exempt.remove(thread);
             }
         }
-        if (lease.manualExempt && manual.contains(thread)) {
-            suspendQuietly(thread);
+        if (!closed && lease.manualExempt && manual.contains(thread)) {
+            restoreLeaseCount(thread, lease);
         }
         // Last: the shares released contexts handed over (the invocation's restore put them back).
-        for (int i = 0; i < lease.debt; i++) {
-            resumeQuietly(thread);
+        if (!closed && lease.debt > 0) {
+            repayLeaseDebt(thread, lease.debt);
         }
+    }
+
+    /**
+     * Restores one count by suspending the thread or retaining one count of the lease's debt.
+     * If neither succeeds, logs the failure and leaves the exemption uncommitted.
+     *
+     * @return whether a confirmed count backs the hold
+     */
+    private boolean restoreLeaseCount(ThreadReference thread, Lease lease) {
+        try {
+            thread.suspend();
+            return true;
+        } catch (VMDisconnectedException e) {
+            close();
+        } catch (RuntimeException e) {
+            if (lease.debt > 0) {
+                lease.debt--;
+                return true;
+            }
+            log.debug("[Suspension] Restoring suspension on {} failed: {}", safeName(thread), brief(e));
+        }
+        return false;
     }
 
     // ── Watchdog (A1) and reservations (A2) ──
@@ -1191,40 +1420,83 @@ public final class SuspensionSession {
      * {@code monitor} — not a monitor it left before it stopped at a new event. The caller keeps the
      * invoking thread suspended meanwhile, so the invocation still waits for that monitor. A
      * bystander of a stop-all joins its {@code released} and makes the stop partial; the event thread
-     * of a queued set cancels it ({@link #cancel}).
+     * of a queued set cancels it ({@link #cancel}). Each failed resume keeps the original owner and
+     * can be retried after the same ownership checks.
      *
      * @return what was released, or {@code null} when nothing was
      */
     @Nullable
     public synchronized String unblock(Object token, ThreadReference owner, ObjectReference monitor) {
-        if (closed || !(token instanceof Lease lease) || leases.get(lease.thread) != lease || !lease.dispatcher
-            || leases.containsKey(owner) || reserved.containsKey(owner) || manual.contains(owner)) {
+        if (!(token instanceof Lease lease)) {
             return null;
+        }
+        final List<String> from = new ArrayList<>();
+        for (Context context : watchdogHolds(lease, owner, monitor)) {
+            if (closed) {
+                break;
+            }
+            final String released = attemptWatchdogRelease(context, owner, lease, monitor);
+            if (released != null) {
+                from.add(released);
+            }
+        }
+        if (from.isEmpty()) {
+            return null;
+        }
+        return recordWatchdogRelease(lease, owner, from);
+    }
+
+    /** Checks that the monitor owner has only the verified holds eligible for watchdog release. */
+    private List<Context> watchdogHolds(Lease lease, ThreadReference owner, ObjectReference monitor) {
+        if (closed || leases.get(lease.thread) != lease || !lease.dispatcher || leases.containsKey(owner)
+            || reserved.containsKey(owner) || manual.contains(owner) || unpaidLeaseDebts.containsKey(owner)) {
+            return List.of();
         }
         final List<Context> holding = new ArrayList<>();
         for (Context context : contexts) {
             if (!covers(context, owner)) {
                 continue;
             }
-            if (context.state == State.HELD || (owner.equals(context.thread) && !cancellable(context))) {
-                return null;
+            if (context.state == State.HELD || context.state == State.RELEASE_FAILED
+                || (owner.equals(context.thread) && !cancellable(context))) {
+                return List.of();
             }
             holding.add(context);
         }
         if (holding.isEmpty() || suspendCountOf(owner) != holding.size() || !owner.equals(owningThreadOf(monitor))) {
-            return null;
+            return List.of();
         }
-        final List<String> from = new ArrayList<>();
-        for (Context context : holding) {
+        return holding;
+    }
+
+    /** Attempts one authorized watchdog release and remembers the failure if JDI rejects it. */
+    @Nullable
+    private String attemptWatchdogRelease(Context context, ThreadReference owner, Lease lease, ObjectReference monitor) {
+        try {
+            final String released;
             if (owner.equals(context.thread)) {
-                from.add(cancel(context, lease.thread));
+                released = cancel(context, lease.thread);
             } else {
-                resumeQuietly(owner);
+                final String set = describeSet(context);
+                owner.resume();
                 context.released.add(owner);
                 context.unblocked.add(owner);
-                from.add(describeSet(context) + " (its other threads stay parked)");
+                released = set + " (its other threads stay parked)";
             }
+            context.watchdogFailures.remove(owner);
+            return released;
+        } catch (RuntimeException e) {
+            context.watchdogFailures.put(owner, new WatchdogReleaseFailure(lease, monitor, e));
+            if (e instanceof VMDisconnectedException) {
+                close();
+            }
+            log.debug("[Suspension] Watchdog release of context #{} failed: {}", context.id, brief(e));
+            return null;
         }
+    }
+
+    /** Records the watchdog releases that actually succeeded. */
+    private String recordWatchdogRelease(Lease lease, ThreadReference owner, List<String> from) {
         final String summary = String.format("thread %s, which holds the monitor the evaluation on thread %s waits "
             + "for, from %s", safeName(owner), safeName(lease.thread), String.join("; ", from));
         history.record(new EventHistory.DebugEvent("EVALUATION_UNBLOCKED", "The watchdog released " + summary,
@@ -1264,30 +1536,26 @@ public final class SuspensionSession {
      * set's own release — so its later processing has nothing left to release and cannot spend the
      * count of a stop the thread reaches meanwhile (§ 19 review, finding 5). A stop-all keeps
      * holding its other threads until it is processed; the thread joins its {@code released}.
+     * Cancellation and step cleanup commit only after the resume succeeds.
      *
      * @return what was cancelled
      */
     private String cancel(Context context, ThreadReference evaluating) {
         final ThreadReference thread = Objects.requireNonNull(context.thread);
-        context.cancelled = true;
         final String what = describeSet(context);
         final StepRequest step = pendingSteps.get(thread);
-        if (step != null && reports(context, step)) {
+        final boolean landsStep = step != null && reports(context, step);
+        if (context.policy == EventRequest.SUSPEND_ALL) {
+            thread.resume();
+            context.released.add(thread);
+        } else {
+            release(context);
+        }
+        context.cancelled = true;
+        if (step != null && landsStep) {
             // The step's landing: it never lands now.
             pendingSteps.remove(thread);
             deleteQuietly(step);
-        }
-        if (context.policy == EventRequest.SUSPEND_ALL) {
-            resumeQuietly(thread);
-            context.released.add(thread);
-        } else {
-            context.state = State.RELEASED;
-            try {
-                context.eventSet.resume();
-            } catch (RuntimeException e) {
-                log.debug("[Suspension] Releasing cancelled {} failed: {}", context, e.toString());
-            }
-            contexts.remove(context);
         }
         history.record(new EventHistory.DebugEvent("EVENT_CANCELLED", String.format("%s was cancelled before it was "
                 + "processed — no condition, logpoint or stop for it: its thread held the monitor the evaluation on "
@@ -1367,33 +1635,43 @@ public final class SuspensionSession {
     /**
      * {@code jdwp_reset}: a new generation — sets of the old one can no longer publish — then every
      * held stop (seen or not) and every manual hold is released and pending steps are dropped.
+     * Retries outstanding recoveries and records completed releases even if the VM disconnects.
      *
-     * @return how many stops and manual holds were released
+     * @return released stops, manual holds, successful retries, failures and connection state
      */
     public synchronized ResetResult reset() {
         if (closed) {
-            return ResetResult.NONE;
+            return new ResetResult(0, 0, List.of(), List.of(), true);
         }
         generation++;
         int released = 0;
+        final List<String> recovered = new ArrayList<>();
+        final List<ReleaseFailure> failures = new ArrayList<>();
         for (Context context : new ArrayList<>(contexts)) {
-            if (context.state == State.HELD) {
-                release(context);
-                released++;
+            if (closed) {
+                break;
+            }
+            switch (context.state) {
+                case HELD -> {
+                    if (attemptRelease(() -> release(context), () -> releaseLabel(context), failures)) {
+                        released++;
+                    }
+                }
+                case RELEASE_FAILED -> retryAutomaticRelease(context, recovered, failures);
+                case QUEUED, PROCESSING -> retryWatchdogReleases(context, null, recovered, failures);
+                case RELEASED -> {
+                }
             }
         }
-        final int holds = manual.size();
-        for (ThreadReference thread : manual) {
-            releaseManual(thread);
-        }
-        manual.clear();
+        final int holds = releaseManualHolds(failures).size();
+        retryLeaseDebts(recovered, failures);
         for (StepRequest request : pendingSteps.values()) {
             deleteQuietly(request);
         }
         pendingSteps.clear();
         current = null;
         notifyAll();
-        return new ResetResult(released, holds);
+        return new ResetResult(released, holds, recovered, failures, closed);
     }
 
     /**
@@ -1432,6 +1710,7 @@ public final class SuspensionSession {
 
     // ── Internals (caller holds the monitor) ──
 
+    /** Explains why ordinary holds of the thread are ineligible for a user release or step. */
     @Nullable
     private String releaseRefusal(ThreadReference thread) {
         if (leases.containsKey(thread)) {
@@ -1447,6 +1726,9 @@ public final class SuspensionSession {
                 }
                 case PROCESSING -> {
                     return "an event of thread " + safeName(thread) + " is being processed — try again";
+                }
+                case RELEASE_FAILED -> {
+                    return automaticReleaseFailure(context).describe() + " — retry with jdwp_resume";
                 }
                 case HELD -> {
                     if (!context.reported) {
@@ -1473,77 +1755,272 @@ public final class SuspensionSession {
         return false;
     }
 
-    private List<String> releaseHolders(ThreadReference thread) {
-        final List<String> holders = new ArrayList<>();
-        if (manual.remove(thread)) {
-            releaseManual(thread);
-            holders.add("its jdwp_suspend_thread hold");
+    /** Releases ordinary thread holds and appends their outcomes after any recovery attempts. */
+    private ThreadRelease releaseHolders(ThreadReference thread, List<String> holders, List<ReleaseFailure> failures) {
+        final String manualHold = "its jdwp_suspend_thread hold";
+        if (manual.contains(thread) && attemptRelease(() -> releaseManual(thread), () -> manualHold, failures)) {
+            holders.add(manualHold);
         }
         for (Context context : new ArrayList<>(contexts)) {
-            if (context.state != State.HELD || !covers(context, thread)) {
+            if (closed) {
+                break;
+            }
+            if (context.state != State.HELD) {
+                continue;
+            }
+            if (context.compensated.contains(thread)) {
+                final String label = "temporary suspension from releasing " + describe(context);
+                if (attemptRelease(() -> undoCompensation(context, thread), () -> label, failures)) {
+                    holders.add(label);
+                }
+            }
+            if (closed || !covers(context, thread)) {
                 continue;
             }
             final String label = describe(context);
             if (context.policy == EventRequest.SUSPEND_ALL) {
-                resumeQuietly(thread);
-                context.released.add(thread);
-                if (context == current && thread.equals(context.thread)) {
-                    current = null;
+                if (attemptRelease(() -> thread.resume(), () -> "its share of " + label, failures)) {
+                    context.released.add(thread);
+                    if (context == current && thread.equals(context.thread)) {
+                        current = null;
+                    }
+                    holders.add(label + " (the other threads stay parked)");
                 }
-                holders.add(label + " (the other threads stay parked)");
-            } else {
-                release(context);
+            } else if (attemptRelease(() -> release(context), () -> label, failures)) {
                 holders.add(label);
             }
         }
-        return holders;
+        return new ThreadRelease(null, holders, failures, closed);
     }
 
+    /** Resumes the set and commits its release, or leaves it owned by the context on failure. */
     private void release(Context context) {
         if (context.state == State.RELEASED) {
             return;
-        }
-        context.state = State.RELEASED;
-        if (context == current) {
-            current = null;
         }
         // An invocation borrowing this context's suspension keeps its thread's share: resumed now, at
         // count 0 mid-invocation, the resume would be lost and the invocation's restore would leave
         // the thread suspended with no owner. The share moves to the lease, which resumes it at its end.
         final Lease borrower = borrowerOf(context);
-        try {
-            if (borrower != null && context.policy != EventRequest.SUSPEND_ALL) {
-                // The borrower's own stop of its thread alone: nothing else to release, and no thread
-                // is exempt from it (a lease never takes its thread out of its own anchor).
-                log.debug("[Suspension] {} released; its suspension of {} now belongs to the running "
-                    + "evaluation", context, safeName(borrower.thread));
-            } else {
-                if (context.policy == EventRequest.SUSPEND_ALL) {
-                    // Re-suspend the threads a user release took out, so the set's vm.resume() nets
-                    // zero on them. Relative: a thread that has stopped again keeps its new stop.
-                    for (ThreadReference thread : context.released) {
-                        suspendQuietly(thread);
-                    }
-                    if (borrower != null) {
-                        suspendQuietly(borrower.thread);
-                    }
-                }
-                // Likewise the leased threads taken out of it; their leases find it released.
-                for (ThreadReference thread : context.exempt) {
-                    suspendQuietly(thread);
-                }
-                context.eventSet.resume();
-            }
-        } catch (RuntimeException e) {
-            // VM gone or dying: the session is about to close.
-            log.debug("[Suspension] Releasing {} failed: {}", context, e.toString());
+        if (borrower == null || context.policy == EventRequest.SUSPEND_ALL) {
+            resumeSet(context, borrower);
+        }
+        context.state = State.RELEASED;
+        if (context == current) {
+            current = null;
         }
         if (borrower != null) {
             borrower.debt++;
         }
         context.released.clear();
         context.exempt.clear();
+        context.compensated.clear();
+        context.automaticReleaseFailure = null;
+        context.watchdogFailures.clear();
         contexts.remove(context);
+    }
+
+    /** Names a finished set whose automatic release failed and identifies its event thread when available. */
+    private static ReleaseFailure automaticReleaseFailure(Context context) {
+        final ThreadReference thread = context.thread;
+        final String scope = context.policy == EventRequest.SUSPEND_ALL ? " (stop-all, VM-wide suspension)" : "";
+        final String holder = "failed automatic release of event set #" + context.id + scope
+            + (thread == null ? "" : " on thread " + safeName(thread));
+        return new ReleaseFailure(holder, Objects.requireNonNull(context.automaticReleaseFailure), retryThreadId(thread));
+    }
+
+    /** Lists recoveries that can keep the target parked while a tool waits for a stop. */
+    private List<ReleaseFailure> waitingRecoveryFailures() {
+        final List<ReleaseFailure> failures = new ArrayList<>();
+        for (Context context : contexts) {
+            if (context.state == State.RELEASE_FAILED) {
+                failures.add(automaticReleaseFailure(context));
+            }
+        }
+        unpaidLeaseDebts.forEach((thread, debt) -> failures.add(leaseDebtFailure(thread, debt)));
+        return failures;
+    }
+
+    /** Keeps initial release progress and samples pending sets when the wait ends. */
+    private NextStop endWait(Outcome outcome, BreakpointTracker.@Nullable LastBreakpoint stop,
+                             @Nullable ReleaseResult released, List<ReleaseFailure> laterFailures) {
+        if (released == null && laterFailures.isEmpty()) {
+            return new NextStop(outcome, stop, null);
+        }
+        final int pending = closed ? 0 : (int) contexts.stream()
+            .filter(context -> context.state == State.QUEUED || context.state == State.PROCESSING).count();
+        if (released == null) {
+            return new NextStop(outcome, stop,
+                new ReleaseResult(List.of(), List.of(), pending, List.of(), List.of(), laterFailures, closed));
+        }
+        final List<ReleaseFailure> failures = new ArrayList<>(released.failures());
+        failures.addAll(laterFailures);
+        return new NextStop(outcome, stop, new ReleaseResult(released.released(), released.unseen(), pending,
+            released.manual(), released.recovered(), failures, closed));
+    }
+
+    /** Retries a finished set and retains the latest failure and retry thread ID if its resume still throws. */
+    private void retryAutomaticRelease(Context context, List<String> recovered, List<ReleaseFailure> failures) {
+        final ReleaseFailure previous = automaticReleaseFailure(context);
+        if (attemptRelease(() -> release(context), previous::holder, failures, previous.retryThreadId())) {
+            recovered.add("retry of " + previous.describe());
+        } else {
+            context.automaticReleaseFailure = failures.get(failures.size() - 1).cause();
+        }
+    }
+
+    /** Retries only the recorded watchdog releases whose original liveness checks still pass. */
+    private void retryWatchdogReleases(Context context, @Nullable ThreadReference onlyThread, List<String> recovered,
+                                        List<ReleaseFailure> failures) {
+        if (context.state != State.QUEUED && context.state != State.PROCESSING) {
+            return;
+        }
+        for (ThreadReference owner : List.copyOf(context.watchdogFailures.keySet())) {
+            final WatchdogReleaseFailure previous = context.watchdogFailures.get(owner);
+            if (previous == null || (onlyThread != null && !onlyThread.equals(owner))
+                || !watchdogHolds(previous.lease(), owner, previous.monitor()).contains(context)) {
+                continue;
+            }
+            final String label = "failed watchdog release of thread " + safeName(owner)
+                + " from event set #" + context.id;
+            final String released = attemptWatchdogRelease(context, owner, previous.lease(), previous.monitor());
+            if (released == null) {
+                failures.add(new ReleaseFailure(label, Objects.requireNonNull(context.watchdogFailures.get(owner)).cause()));
+            } else {
+                recovered.add("retry of " + new ReleaseFailure(label, previous.cause()).describe());
+                recordWatchdogRelease(previous.lease(), owner, List.of(released));
+            }
+        }
+    }
+
+    /** Repays confirmed counts and keeps the rest if JDI rejects a resume. */
+    private int repayLeaseDebt(ThreadReference thread, int count) {
+        int remaining = count;
+        try {
+            while (remaining > 0) {
+                thread.resume();
+                remaining--;
+            }
+            unpaidLeaseDebts.remove(thread);
+        } catch (RuntimeException e) {
+            final LeaseDebt previous = unpaidLeaseDebts.get(thread);
+            final long id = previous == null ? nextId++ : previous.id();
+            unpaidLeaseDebts.put(thread, new LeaseDebt(id, remaining, e));
+            if (e instanceof VMDisconnectedException) {
+                close();
+            } else {
+                notifyAll();
+            }
+            log.debug("[Suspension] Repaying lease debt on thread {} failed: {}", safeName(thread), brief(e));
+        }
+        return count - remaining;
+    }
+
+    /** Retries one thread's unpaid lease debt and reports any progress before a failure. */
+    private void retryLeaseDebt(ThreadReference thread, List<String> recovered, List<ReleaseFailure> failures) {
+        final LeaseDebt debt = unpaidLeaseDebts.get(thread);
+        if (closed || debt == null) {
+            return;
+        }
+        final int repaid = repayLeaseDebt(thread, debt.count());
+        final String label = "lease debt on thread " + safeName(thread);
+        if (repaid > 0) {
+            recovered.add(label + " (" + repaid + " suspension count(s), previously " + brief(debt.cause()) + ")");
+        }
+        final LeaseDebt unpaid = unpaidLeaseDebts.get(thread);
+        if (unpaid != null) {
+            failures.add(leaseDebtFailure(thread, unpaid));
+        }
+    }
+
+    /** Names the thread, its ID, the count and the failure of an unpaid lease debt. */
+    private static ReleaseFailure leaseDebtFailure(ThreadReference thread, LeaseDebt debt) {
+        return new ReleaseFailure("lease debt on thread " + safeName(thread)
+            + " (" + debt.count() + " suspension count(s) unpaid)", debt.cause(), retryThreadId(thread));
+    }
+
+    /** Reads a retry thread ID when available without masking the original release failure. */
+    @Nullable
+    private static Long retryThreadId(@Nullable ThreadReference thread) {
+        if (thread == null) {
+            return null;
+        }
+        try {
+            return thread.uniqueID();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Retries each unpaid lease debt in the session. */
+    private void retryLeaseDebts(List<String> recovered, List<ReleaseFailure> failures) {
+        for (ThreadReference thread : List.copyOf(unpaidLeaseDebts.keySet())) {
+            retryLeaseDebt(thread, recovered, failures);
+        }
+    }
+
+    /**
+     * Resumes a context's event set so that it nets zero on threads that already left it (user
+     * releases, exempt leases, a borrower's share): each is suspended once more first and recorded as
+     * compensated. If the resume throws, the compensations are rolled back; a rollback that fails too
+     * stays recorded, so the next attempt reuses or undoes it instead of adding another count.
+     *
+     * @throws RuntimeException what JDI threw; the context stays unreleased
+     */
+    private static void resumeSet(Context context, @Nullable Lease borrower) {
+        final Set<ThreadReference> needed = new LinkedHashSet<>(context.released);
+        needed.addAll(context.exempt);
+        if (borrower != null) {
+            needed.add(borrower.thread);
+        }
+        for (ThreadReference thread : List.copyOf(context.compensated)) {
+            if (!needed.contains(thread)) {
+                // A lease may have ended since an earlier rollback failed.
+                undoCompensation(context, thread);
+            }
+        }
+        try {
+            // A set-wide resume must net zero on threads that already left the set, even if they
+            // stopped somewhere else meanwhile. The same net applies to a borrower's share.
+            for (ThreadReference thread : needed) {
+                if (!context.compensated.contains(thread)) {
+                    try {
+                        thread.suspend();
+                        context.compensated.add(thread);
+                    } catch (ObjectCollectedException ignored) {
+                        // There is no longer a thread for EventSet.resume() to touch.
+                    }
+                }
+            }
+            context.eventSet.resume();
+        } catch (VMDisconnectedException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            for (ThreadReference thread : List.copyOf(context.compensated)) {
+                try {
+                    undoCompensation(context, thread);
+                } catch (VMDisconnectedException disconnected) {
+                    throw disconnected;
+                } catch (RuntimeException rollback) {
+                    e.addSuppressed(new IllegalStateException("could not undo temporary suspension on "
+                        + safeName(thread) + " (" + brief(rollback) + ")", rollback));
+                }
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Resumes one temporary suspension that {@link #resumeSet} added and forgets it. A collected
+     * thread has nothing left to undo.
+     */
+    private static void undoCompensation(Context context, ThreadReference thread) {
+        try {
+            thread.resume();
+        } catch (ObjectCollectedException ignored) {
+            // The thread and the temporary suspension are gone.
+        }
+        context.compensated.remove(thread);
     }
 
     @Nullable
@@ -1564,9 +2041,58 @@ public final class SuspensionSession {
         final Lease lease = leases.get(thread);
         if (lease != null && lease.manualExempt) {
             lease.manualExempt = false;
-            return;
+        } else {
+            thread.resume();
         }
-        resumeQuietly(thread);
+        manual.remove(thread);
+    }
+
+    /**
+     * Releases every {@code jdwp_suspend_thread} hold, stopping early when the session closes.
+     *
+     * @param failures collects the holds whose release threw; they stay held
+     * @return the threads whose hold was released
+     */
+    private List<ThreadReference> releaseManualHolds(List<ReleaseFailure> failures) {
+        final List<ThreadReference> released = new ArrayList<>();
+        for (ThreadReference thread : List.copyOf(manual)) {
+            if (closed) {
+                break;
+            }
+            if (attemptRelease(() -> releaseManual(thread), () -> "the jdwp_suspend_thread hold of "
+                + safeName(thread), failures)) {
+                released.add(thread);
+            }
+        }
+        return released;
+    }
+
+    /**
+     * Runs one release and records its failure instead of propagating it. A disconnect closes the
+     * session, so the callers stop at the next holder.
+     *
+     * @param action   the release
+     * @param holder   the holder in words, computed only on failure
+     * @param failures collects the failure
+     * @return whether the release succeeded
+     */
+    private boolean attemptRelease(Runnable action, Supplier<String> holder, List<ReleaseFailure> failures) {
+        return attemptRelease(action, holder, failures, null);
+    }
+
+    /** Records the retry thread ID along with a failed release when there is a targeted recovery. */
+    private boolean attemptRelease(Runnable action, Supplier<String> holder, List<ReleaseFailure> failures,
+                                   @Nullable Long retryThreadId) {
+        try {
+            action.run();
+            return true;
+        } catch (RuntimeException e) {
+            if (e instanceof VMDisconnectedException) {
+                close();
+            }
+            failures.add(new ReleaseFailure(holder.get(), e, retryThreadId));
+            return false;
+        }
     }
 
     /**
@@ -1663,7 +2189,7 @@ public final class SuspensionSession {
             case HELD -> true;
             case QUEUED, PROCESSING -> context.mayStop && context.generation == generation && !context.staleAtRouting
                 && !context.cancelled && context.policy != EventRequest.SUSPEND_NONE;
-            case RELEASED -> false;
+            case RELEASE_FAILED, RELEASED -> false;
         };
     }
 
@@ -1704,19 +2230,41 @@ public final class SuspensionSession {
         };
     }
 
+    /**
+     * A context in words for a release failure: its stop when it has one, else the context itself.
+     */
+    private static String releaseLabel(Context context) {
+        final BreakpointTracker.LastBreakpoint stop = context.report;
+        return stop == null ? context.toString() : describeStop(stop);
+    }
+
+    /**
+     * One stop in words: "breakpoint 3 on thread main".
+     */
+    static String describeStop(BreakpointTracker.LastBreakpoint stop) {
+        return switch (stop.kind()) {
+            case BREAKPOINT -> (stop.id() != null ? "breakpoint " + stop.id() : "untracked breakpoint")
+                + " on thread " + safeName(stop.thread());
+            case STEP -> "step on thread " + safeName(stop.thread());
+            case EXCEPTION -> "exception on thread " + safeName(stop.thread());
+            case VM_START -> "the VM-start suspension";
+        };
+    }
+
+    /**
+     * The exception's simple class name and the first line of its message, for a one-line reply.
+     */
+    private static String brief(Throwable failure) {
+        final String type = failure.getClass().getSimpleName();
+        final String message = failure.getMessage();
+        return message == null || message.isBlank() ? type : type + ": " + message.lines().findFirst().orElse("");
+    }
+
     private static void resumeQuietly(ThreadReference thread) {
         try {
             thread.resume();
         } catch (RuntimeException e) {
             log.debug("[Suspension] Resuming {} failed: {}", safeName(thread), e.toString());
-        }
-    }
-
-    private static void suspendQuietly(ThreadReference thread) {
-        try {
-            thread.suspend();
-        } catch (RuntimeException e) {
-            log.debug("[Suspension] Suspending {} failed: {}", safeName(thread), e.toString());
         }
     }
 
@@ -1737,7 +2285,7 @@ public final class SuspensionSession {
     }
 
     /**
-     * The contexts, manual holds and pending steps, for diagnostics.
+     * The contexts, manual holds, unpaid lease debts and pending steps, for diagnostics.
      */
     public synchronized String describeState() {
         final List<String> leased = new ArrayList<>();
@@ -1746,7 +2294,8 @@ public final class SuspensionSession {
         }
         return "generation=" + generation + (closed ? ", closed" : "") + ", contexts=" + contexts + ", manual="
             + manual.size() + ", pendingSteps=" + pendingSteps.size() + ", leases=" + leased + ", reserved="
-            + reserved.size() + ", routeExemptions=" + routeExemptions + ", current=" + current;
+            + reserved.size() + ", unpaidLeaseDebts=" + unpaidLeaseDebts.size() + ", routeExemptions="
+            + routeExemptions + ", current=" + current;
     }
 
     /**

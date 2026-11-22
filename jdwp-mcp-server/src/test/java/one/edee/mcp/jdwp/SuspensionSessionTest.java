@@ -1,5 +1,8 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.InternalException;
+import com.sun.jdi.ObjectCollectedException;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
@@ -19,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -247,6 +251,204 @@ class SuspensionSessionTest {
 		assertThat(session.releaseAll().manual()).containsExactly(u.ref);
 		assertThat(u.count).isZero();
 		assertThat(session.releaseThread(u.ref).refusal()).contains("nothing holds");
+	}
+
+	@Test
+	void failedManualResumeKeepsTheHoldForRetry() {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		doThrow(new ObjectCollectedException()).doAnswer(call -> --t.count).when(t.ref).resume();
+
+		assertThat(session.releaseThread(t.ref).released()).isFalse();
+		assertThat(t.count).isEqualTo(1);
+		assertThat(session.holdsOn(t.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
+
+		assertThat(session.releaseThread(t.ref).released()).isTrue();
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	void failedThreadStopResumeKeepsThePresentedStop() throws Exception {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD);
+		doAnswer(call -> {
+			t.ref.resume();
+			return null;
+		}).when(set).resume();
+		doThrow(new InternalException()).doAnswer(call -> --t.count).when(t.ref).resume();
+		final SuspensionSession.Context stop = presented(stopOn(t, set, 1));
+
+		assertThat(session.releaseThread(t.ref).released()).isFalse();
+		assertThat(session.stateOf(stop)).isEqualTo(SuspensionSession.State.HELD);
+		assertThat(session.currentStop()).isNotNull();
+		assertThat(t.count).isEqualTo(1);
+
+		assertThat(session.releaseThread(t.ref).released()).isTrue();
+		assertThat(t.count).isZero();
+	}
+
+	@Test
+	void failedStopAllShareResumeKeepsTheShareAndCurrentStop() throws Exception {
+		final SuspensionSession.Context stop = presented(stopOn(t, EventRequest.SUSPEND_ALL, 1));
+		doThrow(new IllegalThreadStateException()).doAnswer(call -> --t.count).when(t.ref).resume();
+
+		assertThat(session.releaseThread(t.ref).released()).isFalse();
+		assertThat(session.holdsOn(t.ref)).containsExactly(stop.id());
+		assertThat(session.currentStop()).isNotNull();
+		assertThat(t.count).isEqualTo(1);
+
+		assertThat(session.releaseThread(t.ref).released()).isTrue();
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 1);
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0);
+	}
+
+	@Test
+	void failedSetResumeRollsBackCompensationAndPreservesOtherStops() throws Exception {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_ALL);
+		failFirstSetResume(set);
+		final SuspensionSession.Context stop = presented(stopOn(t, set, 1));
+		assertThat(session.releaseThread(u.ref).released()).isTrue();
+		final SuspensionSession.Context unseen = stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 2);
+
+		assertThat(session.releaseAll().released()).isEmpty();
+		assertThat(session.stateOf(stop)).isEqualTo(SuspensionSession.State.HELD);
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 1);
+		assertThat(model.suspendAllCount).isEqualTo(1);
+
+		assertThat(session.releaseAll().released()).extracting(BreakpointTracker.LastBreakpoint::id).containsExactly(1);
+		assertThat(session.stateOf(unseen)).isEqualTo(SuspensionSession.State.HELD);
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 1);
+		assertThat(model.suspendAllCount).isZero();
+	}
+
+	@Test
+	void failedCompensationSuspendRollsBackEarlierCompensation() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_ALL, 1));
+		assertThat(session.releaseThread(u.ref).released()).isTrue();
+		assertThat(session.releaseThread(w.ref).released()).isTrue();
+		// A newer, unseen stop must survive the stop-all's release.
+		stopOn(w, EventRequest.SUSPEND_EVENT_THREAD, 2);
+		doThrow(new InternalException("suspend failed")).doAnswer(call -> ++w.count).when(w.ref).suspend();
+
+		assertThat(session.releaseAll().released()).isEmpty();
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 0).containsEntry("w", 1);
+		assertThat(model.suspendAllCount).isEqualTo(1);
+
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 1);
+	}
+
+	@Test
+	void failedRollbackDoesNotDoubleCompensateOnRetry() throws Exception {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_ALL);
+		failFirstSetResume(set);
+		presented(stopOn(t, set, 1));
+		assertThat(session.releaseThread(u.ref).released()).isTrue();
+		doThrow(new InternalException("rollback failed")).when(u.ref).resume();
+
+		assertThat(session.releaseAll().released()).isEmpty();
+		assertThat(model.counts()).containsEntry("u", 1).containsEntry("t", 1);
+
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).containsEntry("u", 0).containsEntry("t", 0);
+	}
+
+	@Test
+	void failedSetResumeLeavesTheBorrowedShareWithItsAnchor() throws Exception {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_ALL);
+		failFirstSetResume(set);
+		presented(stopOn(t, set, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+
+		assertThat(session.releaseAll().released()).isEmpty();
+		assertThat(model.invocationRuns(t)).isTrue();
+		model.completeInvocation(t);
+		session.unlease(t.ref);
+		assertThat(t.count).isEqualTo(1);
+
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
+	@Test
+	void releaseAllKeepsPartialProgressAcrossStopsAndManualHolds() throws Exception {
+		final EventSet failed = model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException()).when(failed).resume();
+		presented(stopOn(t, failed, 1));
+		presented(stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 2));
+		assertThat(session.suspendThread(w.ref)).isNull();
+
+		final SuspensionSession.ReleaseResult result = session.releaseAll();
+
+		assertThat(result.released()).extracting(BreakpointTracker.LastBreakpoint::id).containsExactly(2);
+		assertThat(result.manual()).containsExactly(w.ref);
+		assertThat(model.counts()).containsEntry("t", 1).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	@Test
+	void disconnectDuringFirstReleaseClosesTheSession() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		doThrow(new VMDisconnectedException("transport closed")).when(t.ref).resume();
+
+		final SuspensionSession.NextStop next = session.nextStop(0);
+
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.CLOSED);
+		assertThat(session.isClosed()).isTrue();
+	}
+
+	/** Keeps the hold and the JDI failure after cleaning up the unsuccessful step. */
+	@Test
+	void failedStepReleaseKeepsTheHoldAndDeletesTheRequest() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		doThrow(new InternalException()).when(t.ref).resume();
+		final StepRequest request = stepRequest();
+		final EventRequestManager manager = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(manager);
+
+		final SuspensionSession.StepResult step = session.step(t.ref, List::of, () -> request);
+		assertThat(step.refusal()).isNotNull();
+		assertThat(step.releaseFailure()).isNotNull().satisfies(release ->
+			assertThat(release.failures()).singleElement().satisfies(failure ->
+				assertThat(failure.cause()).isInstanceOf(InternalException.class)));
+		assertThat(session.stepPending(t.ref)).isFalse();
+		verify(manager).deleteEventRequest(request);
+		assertThat(session.holdsOn(t.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
+		assertThat(t.count).isEqualTo(1);
+	}
+
+	/** Reset retries a finished set and preserves any manual hold whose resume still throws. */
+	@Test
+	void resetRetriesAFailedAutomaticReleaseAndKeepsFailedManualHolds() {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_ALL);
+		failFirstSetResume(set);
+		final SuspensionSession.Context context = session.route(set, t.ref, false);
+		session.begin(context);
+		session.finish(context);
+		assertThat(session.stateOf(context)).isEqualTo(SuspensionSession.State.RELEASE_FAILED);
+		assertThat(model.suspendAllCount).isEqualTo(1);
+
+		final FakeSuspendModel.FakeThread manual = model.thread("manual");
+		// A new thread inherits the stop-all; first release it through the set.
+		final SuspensionSession.ResetResult reset = session.reset();
+		assertThat(reset.stops()).isZero();
+		assertThat(reset.recovered()).singleElement().asString().contains("failed automatic release");
+		assertThat(manual.count).isZero();
+		assertThat(model.suspendAllCount).isZero();
+		assertThat(session.stateOf(context)).isEqualTo(SuspensionSession.State.RELEASED);
+
+		assertThat(session.suspendThread(manual.ref)).isNull();
+		doThrow(new InternalException()).doAnswer(call -> --manual.count).when(manual.ref).resume();
+		assertThat(session.reset().holds()).isZero();
+		assertThat(session.holdsOn(manual.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
+		assertThat(session.reset().holds()).isEqualTo(1);
+		assertThat(manual.count).isZero();
+	}
+
+	private void failFirstSetResume(EventSet set) {
+		doThrow(new InternalException("resume failed")).doAnswer(call -> {
+			model.vm.resume();
+			return null;
+		}).when(set).resume();
 	}
 
 	@Test
@@ -664,6 +866,28 @@ class SuspensionSessionTest {
 		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
 	}
 
+	/** A failed restoration can spend the returned anchor count on the unseen stop-all. */
+	@Test
+	void failedExemptionRestorationTakesTheReleasedAnchorsCount() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		final SuspensionSession.Context unseen = stopOn(u, EventRequest.SUSPEND_ALL, 2);
+		assertThat(session.releaseAll().released()).extracting(BreakpointTracker.LastBreakpoint::id).containsExactly(1);
+		model.completeInvocation(t);
+		doThrow(new InternalException("exemption restore rejected")).when(t.ref).suspend();
+
+		session.unlease(t.ref);
+
+		assertThat(session.holdsOn(t.ref)).containsExactly(unseen.id());
+		assertThat(t.count).isEqualTo(1);
+		assertThat(session.releaseAll().unseen()).hasSize(1);
+		assertThat(t.count).isEqualTo(1);
+		presented(unseen);
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
 	@Test
 	@DisplayName("resume_thread and a step are refused on a thread an evaluation is running on")
 	void releaseAndStepRefusedOnALeasedThread() throws Exception {
@@ -694,7 +918,11 @@ class SuspensionSessionTest {
 	}
 
 	private SuspensionSession.Context stopOn(FakeSuspendModel.FakeThread thread, int policy, int breakpointId) {
-		final SuspensionSession.Context context = session.route(model.breakpointEvent(thread, policy), thread.ref, false);
+		return stopOn(thread, model.breakpointEvent(thread, policy), breakpointId);
+	}
+
+	private SuspensionSession.Context stopOn(FakeSuspendModel.FakeThread thread, EventSet set, int breakpointId) {
+		final SuspensionSession.Context context = session.route(set, thread.ref, false);
 		session.begin(context);
 		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread.ref, breakpointId));
 		session.finish(context);

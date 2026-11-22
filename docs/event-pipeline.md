@@ -20,7 +20,7 @@ The listener only drains and routes. Processing an event set can call into the t
 - a set whose thread is inside an MCP-driven evaluation (it holds a lease, § 14) is **suppressed** on the listener thread at once (`suppress`): it is routed as a context and finished immediately. In between, each event is recorded as `*_SUPPRESSED` (a step's request is deleted too); a fast-logpoint arming hit is re-armed and a fast breakpoint's stop skipped instead; a class prepare still promotes its deferred breakpoints. With no stop candidate, `finish` releases the set, which lets the waiting invocation finish. This path never evaluates, arms or pre-warms — not even if the evaluation has ended by the time the set is handled — so the listener thread never calls into the target;
 - every other set is routed as a QUEUED context (`SuspensionSession.route`) and handed to the dispatcher.
 
-Only a set's own context releases its suspension. The dispatcher's `finish` ends each set's processing: it publishes the set's first stop candidate as a **held stop**, or it releases the set. A held stop belongs to the user: a tool releases it, and only after a presenting tool has shown it. A set still queued or being processed is out of every tool's reach. So no tool resume can spend a waiting set's suspension, and a set's own release can never free a newer stop of the same thread. § 14 has the full model.
+Only a set's own context releases its suspension. The dispatcher's `finish` ends each set's processing. It publishes the set's first stop candidate as a **held stop**, or attempts to release the set. A tool releases a published stop after presentation. Tools can also recover a failed automatic release or retry an eligible watchdog release. Every retry still spends only the suspension its context owns. § 14 has the full model.
 
 Because a set can wait on the dispatcher, the handlers re-apply the rule JDI applies when a set leaves its queue to one case: an event whose request was **deleted** meanwhile (a cleared logpoint, a class redefined by a fast logpoint) is dropped and does not keep its set suspended — otherwise the stale hit would be untracked and park its thread for good. An event whose tracked request was merely **disabled** meanwhile still counts as a hit — it was one when it happened.
 
@@ -260,14 +260,17 @@ The list is what production code emits (`new EventHistory.DebugEvent(` across th
 1. **An unseen stop exists** → present the oldest (it becomes the current stop) and return `STOPPED`. Nothing is released. This holds on a closed session too: a stop published just before the VM died explains the death.
 2. **The session is closed** (disconnect, death, reconnect) → `CLOSED`.
 3. **`jdwp_reset` ran since the call started** (the generation changed) → `RESET`.
-4. **First pass only:** unless a step is in flight on some thread, release what the user holds — the same release as `jdwp_resume` (§ 14). While a step is pending, nothing is released; the call only waits for the landing.
-5. **Deadline passed** → `TIMEOUT`. Otherwise wait for the remaining time and select again. A notification never implies that a particular stop exists.
+4. **First pass only:** unless a step is in flight, release eligible holds and retry failed releases as `jdwp_resume` does (§ 14). A failed attempt returns `RESUME_FAILED`, or `CLOSED` if JDI reported a disconnect.
+5. **An automatic release or lease debt repayment still needs a retry** → `RESUME_FAILED`. These failures wake an active wait, including one waiting for a step to land. The reply names the affected hold and its thread ID when available and includes progress from the initial pass.
+6. **Deadline passed** → `TIMEOUT`. Otherwise wait for the remaining time and select again. A notification never implies that a particular stop exists.
 
 While a step is in flight, the step reply’s remaining holds stay under their original owners.
 
-The tool renders the outcomes as `Event fired …` (the stop's location, and a note when the watchdog made the stop partial), `[VM_DEATH] …`, `[NO_EVENT] …` (reset) and the `[TIMEOUT]` soft-wait envelope with a diagnostic report. What the call released before it waited is appended as a trailing line.
+To retry unpaid lease debt or a failed automatic release, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on.
 
-Ordering guarantee: short of `jdwp_reset` (which releases every stop) and a closed session, every stop is either presented as new or released after it was presented — never both, never neither.
+The tool renders the outcomes as `Event fired …` (the stop's location, with a note when the watchdog made the stop partial), `[VM_DEATH] …`, `[RESUME_FAILED] …`, `[NO_EVENT] …` (reset), or the `[TIMEOUT]` soft-wait envelope with a diagnostic report. Release successes and failures are included when applicable. Pending sets are counted when the wait ends. The reset reply lists any holds whose release failed.
+
+Ordering guarantee: apart from `jdwp_reset` and session closure, a stop stays held until a tool presents it. After presentation it remains held until its release succeeds.
 
 ## 10. `EventKind` — what kind of event the snapshot was
 
@@ -310,10 +313,11 @@ Beyond the per-connection handles it starts and stops — the dispatcher, the se
 
 | Suspension | Owner | Released by |
 |---|---|---|
-| A routed event set | its context | the dispatcher's `finish` when it publishes no stop; once published and presented, a user release |
-| A set raised inside an evaluation | its context | the listener, at once (`suppress`) |
+| A routed event set | its context | `finish` when it publishes no stop, or a user release after presentation or a failed automatic release |
+| A set raised inside an evaluation | its context | the listener (`suppress`), or a user retry if that release fails |
 | `jdwp_suspend_thread` | a manual hold | `jdwp_resume`, `jdwp_resume_until_event`, `jdwp_resume_thread`, a step, `jdwp_reset` |
 | An invocation's borrowed count | the JDWP agent | the agent, when the invocation completes |
+| Unpaid lease debt | the session | the resume tools or `jdwp_reset` |
 | The `jdwp_dump_locks` snapshot | the tool | the tool: `vm.suspend()` … `vm.resume()` in `finally` |
 
 One monitor guards all session state. It spans the session's short JDWP commands — suspend, resume, a step's request creation — but never event processing, an invocation or a wait (waits use the monitor's own condition, which releases it). A closed session ignores every call, so a late completion from an old dispatcher cannot touch the next connection's state.
@@ -326,11 +330,13 @@ Every routed set becomes a `SuspensionSession.Context`: an id (never reused), th
 QUEUED ──begin──▶ PROCESSING ──finish──▶ HELD ──user release / reset──▶ RELEASED
    │                  │
    └──────────────────┴──finish (no stop), cancel──▶ RELEASED
+                      └──finish (resume failed)──▶ RELEASE_FAILED ──retry──▶ RELEASED
 ```
 
 - **QUEUED** — routed, waiting for the dispatcher.
 - **PROCESSING** — the dispatcher runs its handlers.
 - **HELD** — published as a stop; the user owns it. It is *unseen* until a presenting tool shows it.
+- **RELEASE_FAILED** — processing ended without publishing. The context still owns the suspension and carries the exception from its failed automatic release.
 - **RELEASED** — its suspension has been released; it leaves the session.
 
 A context **claims** thread T when it is not RELEASED, T is not in its `released` set, and its policy is ALL, or EVENT_THREAD with T as its event thread. A `none` context claims nothing. It **covers** T when it claims T and T is not in its `exempt` set (a lease's exemption, below). `released` holds the threads a user release or the watchdog took out of a stop-all; `unblocked` the subset the watchdog took.
@@ -346,15 +352,19 @@ The current stop is a live context, not a thread. It stops being current once it
 
 ### Releases
 
-- **`releaseAll()`** — `jdwp_resume`, and the first pass of `nextStop`. Releases every *presented* held stop, oldest first, and every manual hold. Unseen stops stay held and are listed ("not yet seen"); queued and processing sets are not touched and are counted ("still being processed"). With nothing to release the reply says so.
-- **`releaseThread(T)`** — `jdwp_resume_thread`. Refuses, naming the blocker, when an evaluation runs on T, when a context covering T is QUEUED or PROCESSING, or when T is held by a stop not yet seen. Otherwise it releases what holds T: its manual hold, its own presented thread stop, and its share of a presented stop-all — T alone is resumed and joins that context's `released`; the other threads stay parked. If nothing holds T, it says so and resumes nothing.
+- **`releaseAll()`** — `jdwp_resume`, and the first pass of `nextStop`. Releases presented stops, oldest first, and manual holds. It retries failed automatic releases, unpaid lease debts and eligible failed watchdog releases. Unseen stops stay held and are listed as "not yet seen". Queued and processing sets otherwise stay parked and count as "still being processed".
+- **`releaseThread(T)`** — `jdwp_resume_thread`. Retries T's unpaid lease debt, eligible failed watchdog releases on T, and failed automatic releases of sets whose event thread is T. An automatic retry releases the whole finished set. The reply names the VM-wide suspension for a stop-all. Ordinary releases cover T's manual hold, its presented thread stop and T's share of a presented stop-all. An active evaluation, a queued or processing context, an unseen stop or a failed automatic release on another event thread can block the ordinary release.
 - **`suspendThread(T)`** — `jdwp_suspend_thread`. Refuses a thread that is already suspended; otherwise `T.suspend()` and a manual hold. Holds do not stack.
+
+Each ownership change commits after its JDI resume succeeds. A failed attempt leaves the stop, share, or manual hold available for retry. The resume replies list the successful releases and identify each failed hold with its JDI exception. A `VMDisconnectedException` closes the session and stops the release pass.
 
 Releasing a context (`release`) is compensated:
 
-- **Stop-all:** every thread in `released` and `exempt` is suspended once more before the set's own `EventSet.resume()` (a `vm.resume()`), so the release nets zero on them. The compensation is relative: a released thread that has stopped again since keeps its new stop. JDI errors on dead threads are caught per thread.
+- **Stop-all.** Every thread in `released` and `exempt` is suspended once more before the set's own `EventSet.resume()` (a `vm.resume()`), so the release nets zero on them. A released thread that has stopped again keeps its new stop. Compensation skips a collected thread.
 - **Thread or `none` set:** `EventSet.resume()` (nothing for `none`).
 - **The anchor of a running invocation** (below) keeps the borrower's share: a stop-all suspends the borrowing thread once more before its `vm.resume()`; a thread stop of the borrower alone skips its resume. Either way the share becomes the lease's *debt*, resumed when the lease ends. Every other thread is released at once.
+
+If compensation or the set resume fails while the VM is reachable, the session undoes the temporary suspensions it added. If an undo also fails, the context keeps ownership of that extra suspension. A retry reuses it if compensation is still needed, or removes it when the original hold needs no compensation. A lease that ends can use an existing temporary suspension to restore its share of a context it was taken out of.
 
 ### Steps
 
@@ -365,9 +375,9 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 3. the request is stamped with the generation and recorded as T's pending step;
 4. T's holders are released as `releaseThread` would.
 
-If the release fails, the request is deleted and the pending entry dropped, so a failed step leaves nothing armed.
+If a release fails, the session deletes the step request and drops its pending entry. The reply reports earlier successful releases and all failures. A disconnect returns `[VM_DEATH]` and directs the user to reattach.
 
-With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release. It reports remaining stop-alls independently of JDI enumeration, which can omit virtual threads. Stop-alls with the same state and origin are counted together. The whole step reply shows up to five thread names across the stepping thread, stop-all origins and samples, and other hold groups. Further groups are summarized by count. The reply says all remaining threads run only when no stop-all remains. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step: its request is deleted and `STEP_INTERRUPTED` recorded. While any step is pending, `nextStop` releases nothing and only waits (§ 9).
+With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The step reply reports the session’s ownership immediately after release, including failed automatic releases and unpaid lease debt. It reports remaining stop-alls independently of JDI enumeration, which can omit virtual threads. Stop-alls with the same state and origin are counted together. The whole step reply shows up to five thread names across the stepping thread, stop-all origins and samples, and other hold groups. Further groups are summarized by count. The reply says all remaining threads run only when there are no stop-alls or outstanding recoveries. The landing publishes as a `STEP` stop and clears the pending entry. Any other stop published on the stepping thread ends the step. Its request is deleted and `STEP_INTERRUPTED` recorded. While a step is pending, `nextStop` leaves ordinary holds alone and can end with `[RESUME_FAILED]` if an automatic release or lease debt repayment needs a retry (§ 9).
 
 Example, from stop-all hold B (every thread at count 1):
 
@@ -381,11 +391,13 @@ Example, from stop-all hold B (every thread at count 1):
 `jdwp_reset` deletes every breakpoint and step request first — a thread the release lets run can then no longer leave a stop behind — and then calls `SuspensionSession.reset()`:
 
 - the generation advances;
-- every held stop, seen or not, and every manual hold is released;
+- the session attempts to release every held stop and manual hold. It retries failed automatic releases, unpaid lease debts and eligible failed watchdog releases. The reply counts recovered releases and reports any failures;
 - pending step requests are deleted;
 - the current stop is cleared and waiters wake (`nextStop` returns `RESET`).
 
 Queued and processing sets of the old generation finish normally but cannot publish: `finish` releases them and drops their buffered history. Step requests carry their generation (request property `mcp.generation`), so a step event of an earlier generation routed after the reset is stale and its set is released too. Other requests are not stamped; an event of a request the reset deleted is dropped by the deleted-request rule (§ 1).
+
+If the release pass disconnects, the reply keeps the progress already made and directs the user to reattach.
 
 ### Leases and admission
 
@@ -395,7 +407,7 @@ Every invocation the server makes in the target runs inside an `EvaluationGuard`
 - **Refusals.** An evaluation already running on T; a context covering T that is queued, processing or unseen; T only a bystander of another thread's stop-all; T held only by `jdwp_suspend_thread`; T not stopped by this session at all. Each is refused with its reason.
 - **Count check.** T's suspend count must carry every hold the session knows: the anchor, every other covering context, and a manual hold. A count below that means a hold was undone outside the session — refused, nothing is resumed. A count above it is a set not routed yet, which routing exempts.
 - **Exemptions.** T is resumed once out of every other context covering it and joins that context's `exempt`; a manual hold of T is resumed too. The borrowed count is then T's only one, and the invocation can run. A stop-all routed while leases are active exempts every leased thread other than its own event thread (`route`).
-- **End (`unlease`).** T is suspended once back into each exempting context that still holds — one released meanwhile has compensated T already. A manual hold still present is put back. Last, the debt is resumed.
+- **End (`unlease`).** The session clears an event-set exemption after its count is restored, using an existing compensation, a successful suspend or an available lease debt count. If a suspend fails and there is no debt to use, the session logs the failure and continues. The session repays any remaining lease debt last. A rejected repayment leaves the count session-owned and wakes next-stop waiters.
 - **Frame tools first.** While a frame tool reads T (`reserve`), a lease of T waits until it is done — at most 2 s, then it is refused — or the invocation would run T under the tool ([threading-and-safety.md](threading-and-safety.md) § 5).
 - **Transfer.** If the anchor is released while its invocation runs (`jdwp_resume`, `jdwp_reset`, `nextStop`'s release), the borrower keeps its share (see Releases). `jdwp_resume_thread` and a step on a leased thread are refused ("an evaluation is running on T").
 
@@ -403,7 +415,7 @@ Every invocation the server makes in the target runs inside an `EvaluationGuard`
 
 ### The watchdog
 
-A dispatcher invocation — a condition, a logpoint, a fast-logpoint arming — can block on a monitor owned by a thread that a set queued behind it keeps parked. The dispatcher never reaches that set, and no tool releases a set before it is processed. (A tool's own invocation has a bounded wait instead: `InvocationRunner`, [threading-and-safety.md](threading-and-safety.md) § 5.)
+A dispatcher invocation — a condition, a logpoint, a fast-logpoint arming — can block on a monitor owned by a thread that a set queued behind it keeps parked. The dispatcher never reaches that set, so the watchdog can release the monitor owner's share under the checks below. A tool's own invocation has a bounded wait through `InvocationRunner` ([threading-and-safety.md](threading-and-safety.md) § 5).
 
 `SuspensionWatchdog` runs per session on the daemon thread `jdi-suspension-watchdog`; the listener starts it with the session, and it stops once the session is closed. Every 500 ms it samples the session's dispatcher leases (`dispatcherInvocations()`). The lease object is the sample's token, so samples never carry over to a later invocation on the same thread. An invocation is aged from the sample that first sees its thread running; a sample that finds the thread suspended — host-side work between two invocations of the lease — starts the next invocation afresh (#47 § 2). A thread JDWP shows as blocked (MONITOR) or running is asked for the monitor it waits for, during a balanced suspension; running is asked too because JDWP shows a thread that invokes from inside its event's handling as running even while it waits for a monitor (#47 § 4). An invocation older than 3 s that waits for the same monitor in two consecutive samples has its monitor's owner looked up, and the decision made, during one balanced suspension of the invoking thread: suspend → `currentContendedMonitor().owningThread()` → `unblock(token, owner, monitor)` → resume. Suspended, the invoking thread cannot take the monitor and move on before the decision. `unblock` re-checks everything under the session monitor and releases nothing unless:
 
@@ -419,6 +431,8 @@ Then, for each context covering the owner:
 - **The event thread** of a queued set cancels that set (`cancel`). A thread set is settled at once — its `EventSet.resume()` is the thread's resume, and the context is RELEASED — so its later processing has nothing left to release and cannot spend the count of a stop the thread reaches meanwhile. A stop-all resumes only the event thread, which joins `released`; the set keeps its other threads until `finish` releases it with compensation. A cancelled set never publishes, and a pending step it would have landed is dropped. On the dispatcher, `begin` returns `false` and `settleCancelled` runs only what needs no stopped thread: an arming hit re-arms, a step's request is deleted, a class prepare still promotes its deferred breakpoints. Conditions, logpoints and stops are dropped.
 
 A set with a fast breakpoint's stop event is never cancelled: its request carries `KEEPS_THREAD_PROPERTY`, because handling it, even to skip it, reads the stop's arguments from the frame.
+
+A failed watchdog resume leaves the context's ownership and any pending step intact. The watchdog can retry on a later tick. A resume tool or reset can retry the same release if the original lease is still active, the same thread still owns the monitor, and the current sets and suspend count still qualify. Success is recorded only after the resume completes.
 
 Records: `EVALUATION_UNBLOCKED` (the owner, the evaluating thread, the sets) and `EVENT_CANCELLED`.
 

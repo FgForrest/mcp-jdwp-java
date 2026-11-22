@@ -1,8 +1,12 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.InternalException;
+import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.VMDisconnectedException;
-import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -12,9 +16,11 @@ import org.junit.jupiter.api.Test;
 
 import java.net.SocketException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -52,16 +58,15 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		model = new FakeSuspendModel();
 		main = model.thread("main");
 		session = breakpointTracker.openSuspensionSession(eventHistory);
-		final VirtualMachine vm = mock(VirtualMachine.class);
-		when(jdiService.getVM()).thenReturn(vm);
+		when(jdiService.getVM()).thenReturn(model.vm);
 	}
 
 	/**
-	 * Publishes a stop of {@code main} with {@code policy}, as the dispatcher does once a set is
-	 * processed.
+	 * Publishes a stop with {@code policy}, as the dispatcher does once a set is processed.
 	 */
 	private SuspensionSession.Context publish(BreakpointTracker.LastBreakpoint stop, int policy) {
-		final SuspensionSession.Context context = session.route(model.breakpointEvent(main, policy), main.ref, false);
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(model.of(stop.thread()), policy), stop.thread(), false);
 		session.begin(context);
 		session.candidate(context, stop);
 		session.finish(context);
@@ -105,6 +110,270 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 
 		assertThat(waiting.get(5, TimeUnit.SECONDS)).contains("breakpoint=12")
 			.contains("Released before waiting: breakpoint 11 on thread main");
+	}
+
+	@Test
+	void resumeReportsReleasedAndFailedHolds() {
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		assertThat(session.suspendThread(worker.ref)).isNull();
+		assertThat(session.suspendThread(main.ref)).isNull();
+		doThrow(new InternalException("resume rejected")).when(main.ref).resume();
+
+		assertThat(tools.jdwp_resume())
+			.contains("Resumed: the jdwp_suspend_thread hold of worker")
+			.contains("Resume failed", "the jdwp_suspend_thread hold of main", "InternalException: resume rejected")
+			.doesNotContain("Nothing to release");
+		assertThat(model.counts()).containsEntry("worker", 0).containsEntry("main", 1);
+	}
+
+	/** A failed lease repayment is reported by the next resume, which can release the saved count. */
+	@Test
+	void resumeRetriesUnpaidLeaseDebt() throws Exception {
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(main.ref);
+		model.beginInvocation(main);
+		assertThat(tools.jdwp_resume()).contains("Resumed: breakpoint 11 on thread main");
+
+		model.completeInvocation(main);
+		doThrow(new InternalException("lease repayment failed"))
+			.doThrow(new InternalException("lease retry rejected"))
+			.doAnswer(call -> --main.count).when(main.ref).resume();
+		session.unlease(main.ref);
+
+		assertThat(main.count).isEqualTo(1);
+		assertThat(tools.jdwp_resume()).contains("lease debt", "InternalException: lease retry rejected");
+		assertThat(main.count).isEqualTo(1);
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID())).contains("released:", "lease debt");
+		assertThat(main.count).isZero();
+	}
+
+	/** Both resume tools name a failed automatic release and can retry the finished set. */
+	@Test
+	void resumeReportsThenRecoversFailedAutomaticRelease() {
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_ALL);
+		doThrow(new InternalException("automatic release rejected"))
+			.doThrow(new InternalException("automatic release retry rejected")).doAnswer(call -> {
+				model.vm.resume();
+				return null;
+			}).when(set).resume();
+		finishWithoutStop(set);
+
+		assertThat(tools.jdwp_resume()).contains("failed automatic release", "main", "automatic release retry rejected")
+			.doesNotContain("still being processed");
+		assertThat(model.counts()).containsEntry("main", 1).containsEntry("worker", 1);
+
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID()))
+			.contains("failed automatic release", "released:", "VM-wide suspension");
+		assertThat(model.counts()).containsEntry("main", 0).containsEntry("worker", 0);
+	}
+
+	/** The event thread can retry a suppressed set while its original invocation still holds a lease. */
+	@Test
+	void targetedResumeRetriesFailedSuppressionDuringInvocation() throws Exception {
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(main.ref);
+		model.beginInvocation(main);
+		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException("suppressed release rejected")).doAnswer(call -> {
+			main.ref.resume();
+			return null;
+		}).when(set).resume();
+		session.finish(session.route(set, main.ref, false));
+
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID())).contains("Released from thread",
+			"failed automatic release", "an evaluation is running");
+		assertThat(model.invocationRuns(main)).isTrue();
+		model.completeInvocation(main);
+		session.unlease(main.ref);
+		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** An automatic release failure wakes a waiter that already finished its initial release pass. */
+	@Test
+	void resumeUntilEventWakesWhenAutomaticReleaseFailsDuringWait() throws Exception {
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException("automatic release rejected during wait")).when(set).resume();
+		final SuspensionSession.Context context = session.route(set, main.ref, false, false);
+		session.begin(context);
+		final CompletableFuture<String> waiting = startWaitReleasing(worker);
+		session.finish(context);
+
+		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
+			.contains("the jdwp_suspend_thread hold of worker", "failed automatic release",
+				"automatic release rejected during wait", "thread ID " + main.ref.uniqueID(),
+				"jdwp_resume_thread(threadId=" + main.ref.uniqueID() + ")")
+			.doesNotContain("still being processed");
+		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** An invocation ending after the first pass can leave debt that prevents another stop. */
+	@Test
+	void resumeUntilEventReportsLateLeaseDebtAndEarlierProgress() throws Exception {
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(main.ref);
+		model.beginInvocation(main);
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final CompletableFuture<String> waiting = startWaitReleasing(worker);
+		model.completeInvocation(main);
+		doThrow(new InternalException("lease repayment rejected")).when(main.ref).resume();
+
+		session.unlease(main.ref);
+
+		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
+			.contains("breakpoint 11", "the jdwp_suspend_thread hold of worker", "lease debt", "lease repayment rejected");
+		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** The advised debt retry leaves the pending step and the bystander's stop-all share in place. */
+	@Test
+	void targetedDebtRetryKeepsBystanderParkedDuringStep() throws Exception {
+		final FakeSuspendModel.FakeThread debtor = model.thread("debtor");
+		final FakeSuspendModel.FakeThread bystander = model.thread("bystander");
+		final EventRequestManager requests = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(requests);
+		when(requests.createStepRequest(main.ref, StepRequest.STEP_LINE, StepRequest.STEP_OVER))
+			.thenReturn(mock(StepRequest.class));
+
+		publish(new BreakpointTracker.LastBreakpoint(debtor.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(debtor.ref);
+		model.beginInvocation(debtor);
+		assertThat(tools.jdwp_resume()).contains("breakpoint 11 on thread debtor");
+
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 12), EventRequest.SUSPEND_ALL);
+		session.presentCurrent();
+		assertThat(tools.jdwp_step_over(main.ref.uniqueID())).contains("Step over started", "stop-all");
+		model.completeInvocation(debtor);
+		doThrow(new InternalException("debt repayment rejected"))
+			.doAnswer(call -> --debtor.count).when(debtor.ref).resume();
+		session.unlease(debtor.ref);
+		assertThat(debtor.count).isEqualTo(2);
+
+		final long debtorId = debtor.ref.uniqueID();
+		final String reply = tools.jdwp_resume_until_event(50);
+
+		assertThat(reply).startsWith("[RESUME_FAILED]").contains("lease debt on thread debtor",
+			"thread ID " + debtorId, "jdwp_resume_thread(threadId=" + debtorId + ")",
+			"jdwp_resume also releases every other presented stop", "jdwp_suspend_thread hold",
+			"stop-all a pending step relies on");
+		assertThat(bystander.count).isEqualTo(1);
+		assertThat(tools.jdwp_resume_thread(debtorId)).contains("lease debt on thread debtor");
+		assertThat(debtor.count).isZero();
+		assertThat(bystander.count).isEqualTo(1);
+		assertThat(session.stepPending(main.ref)).isTrue();
+	}
+
+	/** A closed wait keeps confirmed earlier releases and omits obsolete pending-set counts. */
+	@Test
+	void closedWaitKeepsProgressWithoutReportingPendingSets() throws Exception {
+		final SuspensionSession.Context context =
+			session.route(model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD), main.ref, false);
+		session.begin(context);
+		final CompletableFuture<String> waiting = startWaitReleasing(model.thread("worker"));
+		session.close();
+
+		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[VM_DEATH]")
+			.contains("the jdwp_suspend_thread hold of worker").doesNotContain("still being processed");
+	}
+
+	/** Starts a wait and signals after its first release pass reaches the given manual hold. */
+	private CompletableFuture<String> startWaitReleasing(FakeSuspendModel.FakeThread thread) throws Exception {
+		assertThat(session.suspendThread(thread.ref)).isNull();
+		final CountDownLatch resumed = new CountDownLatch(1);
+		doAnswer(call -> {
+			thread.count--;
+			resumed.countDown();
+			return null;
+		}).when(thread.ref).resume();
+		final CompletableFuture<String> waiting = CompletableFuture.supplyAsync(() -> tools.jdwp_resume_until_event(5_000));
+		assertThat(resumed.await(5, TimeUnit.SECONDS)).isTrue();
+		return waiting;
+	}
+
+	/** An automatic resume that fails again on the initial pass still gives the event thread's ID. */
+	@Test
+	void resumeUntilEventReportsFailedAutomaticReleaseBeforeWaiting() {
+		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException("automatic release rejected")).when(set).resume();
+		finishWithoutStop(set);
+
+		assertThat(tools.jdwp_resume_until_event(50)).startsWith("[RESUME_FAILED]")
+			.contains("failed automatic release", "automatic release rejected", "thread ID " + main.ref.uniqueID(),
+				"jdwp_resume_thread(threadId=" + main.ref.uniqueID() + ")");
+	}
+
+	/** Processes a non-stopping event set so finish attempts its automatic release. */
+	private void finishWithoutStop(EventSet set) {
+		final SuspensionSession.Context context = session.route(set, main.ref, false, false);
+		session.begin(context);
+		session.finish(context);
+	}
+
+	@Test
+	void resumeThreadReportsFailureWithoutClaimingTheThreadResumed() {
+		assertThat(session.suspendThread(main.ref)).isNull();
+		doThrow(new ObjectCollectedException()).when(main.ref).resume();
+
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID()))
+			.contains("Resume failed", "its jdwp_suspend_thread hold", "ObjectCollectedException")
+			.doesNotContain("resumed (released:", "nothing holds", ": null");
+	}
+
+	@Test
+	void resumeThreadReportsPartialProgressOnTheSameThread() {
+		assertThat(session.suspendThread(main.ref)).isNull();
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_ALL);
+		session.presentCurrent();
+		doThrow(new InternalException()).doAnswer(call -> --main.count).when(main.ref).resume();
+
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID()))
+			.contains("Released from thread", "breakpoint 11 stop", "Resume failed",
+				"its jdwp_suspend_thread hold", "InternalException")
+			.doesNotContain("resumed (released:");
+		assertThat(main.count).isEqualTo(1);
+	}
+
+	@Test
+	void resumeUntilEventReportsPartialProgressWithoutWaitingOnFailedRelease() {
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		assertThat(session.suspendThread(worker.ref)).isNull();
+		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException("resume rejected")).when(set).resume();
+		final SuspensionSession.Context context = session.route(set, main.ref, false);
+		session.begin(context);
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(main.ref, 11));
+		session.finish(context);
+		session.presentCurrent();
+
+		assertThat(tools.jdwp_resume_until_event(50)).startsWith("[RESUME_FAILED]")
+			.contains("the jdwp_suspend_thread hold of worker", "breakpoint 11 on thread main",
+				"InternalException: resume rejected");
+		assertThat(model.counts()).containsEntry("worker", 0).containsEntry("main", 1);
+	}
+
+	@Test
+	void resumeToolsReportDisconnectDuringRelease() {
+		for (String tool : new String[]{"jdwp_resume", "jdwp_resume_thread", "jdwp_resume_until_event"}) {
+			final FakeSuspendModel.FakeThread thread = model.thread(tool);
+			session = breakpointTracker.openSuspensionSession(eventHistory);
+			assertThat(session.suspendThread(thread.ref)).isNull();
+			doThrow(new VMDisconnectedException("transport closed")).when(thread.ref).resume();
+
+			final String reply = switch (tool) {
+				case "jdwp_resume" -> tools.jdwp_resume();
+				case "jdwp_resume_thread" -> tools.jdwp_resume_thread(thread.ref.uniqueID());
+				default -> tools.jdwp_resume_until_event(50);
+			};
+
+			assertThat(reply).as(tool).startsWith("[VM_DEATH]").contains("disconnect")
+				.doesNotContain("Resumed:", "resumed (released:");
+			assertThat(session.isClosed()).isTrue();
+		}
 	}
 
 	@Test

@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.InternalException;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
@@ -24,6 +26,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -131,6 +134,76 @@ class JDWPToolsStepTest {
 		assertThat(tools.jdwp_step_over(1L)).contains("released", "presented thread stops: thread-2",
 			"unseen thread stops: unseen-worker", "jdwp_suspend_thread holds: manual-worker",
 			"All remaining threads run.");
+	}
+
+	/** A failed release reports all attempts and preserves a confirmed manual release on disconnect. */
+	@Test
+	void shouldReportStepReleaseProgressAndDisconnect() throws Exception {
+		final FakeSuspendModel model = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread stepping = model.thread("stepping");
+		when(model.vm.eventRequestManager()).thenReturn(erm);
+		when(jdiService.getVM()).thenReturn(model.vm);
+		assertThat(session.suspendThread(stepping.ref)).isNull();
+		final EventSet first = model.breakpointEvent(stepping, EventRequest.SUSPEND_EVENT_THREAD);
+		publish(stepping, first, 11);
+		doThrow(new InternalException("first resume rejected")).when(first).resume();
+		final EventSet second = model.breakpointEvent(stepping, EventRequest.SUSPEND_EVENT_THREAD);
+		publish(stepping, second, 12);
+		doThrow(new VMDisconnectedException("transport closed")).when(second).resume();
+		final StepRequest request = stubStepRequestCreation(stepping.ref, StepRequest.STEP_OVER);
+		when(request.virtualMachine()).thenReturn(model.vm);
+
+		assertThat(tools.jdwp_step_over(stepping.ref.uniqueID())).startsWith("[VM_DEATH]")
+			.contains("jdwp_suspend_thread hold", "first resume rejected", "VMDisconnectedException", "jdwp_wait_for_attach");
+		assertThat(session.isClosed()).isTrue();
+		assertThat(session.stepPending(stepping.ref)).isFalse();
+		assertThat(stepping.count).isEqualTo(2);
+		verify(erm).deleteEventRequest(request);
+	}
+
+	/** Recovery holds have distinct labels and use the existing shared thread-name budget. */
+	@Test
+	void shouldGroupAutomaticReleaseFailuresAndLeaseDebts() throws Exception {
+		final FakeSuspendModel model = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread stepping = model.thread("recover-stepping");
+		when(model.vm.eventRequestManager()).thenReturn(erm);
+		when(jdiService.getVM()).thenReturn(model.vm);
+		for (int i = 0; i < 5; i++) {
+			final FakeSuspendModel.FakeThread debtor = model.thread("recover-debtor-" + i);
+			publish(debtor, model.breakpointEvent(debtor, EventRequest.SUSPEND_EVENT_THREAD), 10 + i);
+			session.lease(debtor.ref);
+			model.beginInvocation(debtor);
+			assertThat(session.releaseAll().released()).hasSize(1);
+			model.completeInvocation(debtor);
+			doThrow(new InternalException("lease repayment rejected")).when(debtor.ref).resume();
+			session.unlease(debtor.ref);
+		}
+		final FakeSuspendModel.FakeThread worker = model.thread("recover-worker");
+		final EventSet failed = model.breakpointEvent(worker, EventRequest.SUSPEND_EVENT_THREAD);
+		doThrow(new InternalException("automatic release rejected")).when(failed).resume();
+		final SuspensionSession.Context context = session.route(failed, worker.ref, false, false);
+		session.begin(context);
+		session.finish(context);
+		assertThat(session.suspendThread(stepping.ref)).isNull();
+		stubStepRequestCreation(stepping.ref, StepRequest.STEP_OVER);
+
+		final String reply = tools.jdwp_step_over(stepping.ref.uniqueID());
+
+		assertThat(reply).contains("Step over started", "failed automatic release", "recover-worker", "lease debt",
+			"recover-debtor-0", "and 2 more").doesNotContain("still being processed", "All remaining threads run");
+		assertThat(java.util.regex.Pattern.compile("recover-[\\w-]+").matcher(reply).results().count())
+			.isLessThanOrEqualTo(5);
+		assertThat(stepping.count).isZero();
+		assertThat(worker.count).isEqualTo(1);
+	}
+
+	/** Publishes and presents a modeled breakpoint suspension. */
+	private void publish(FakeSuspendModel.FakeThread thread, EventSet set, int id) throws InterruptedException {
+		final SuspensionSession.Context context = session.route(set, thread.ref, false);
+		session.begin(context);
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread.ref, id));
+		session.finish(context);
+		assertThat(session.nextStop(0).outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
 	}
 
 	/** Reserves space for the stepping thread and stop-all origin in the shared name cap. */
