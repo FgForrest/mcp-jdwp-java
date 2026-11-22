@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp.evaluation;
 import org.jspecify.annotations.Nullable;
 
 import java.util.List;
+import java.util.stream.IntStream;
 import java.util.stream.Collectors;
 
 /**
@@ -138,43 +139,44 @@ public final class FastLogpointProbeSource {
         final int lastDot = className.lastIndexOf('.');
         final String packageName = lastDot < 0 ? "" : className.substring(0, lastDot);
         final String simpleName = lastDot < 0 ? className : className.substring(lastDot + 1);
+        final List<Parameter> forwarded = forwardedParameters(parameters);
         final String declaredParameters = declaredParameters(parameters);
-        final String arguments = arguments(parameters);
+        final String arguments = arguments(forwarded);
 
         final StringBuilder source = new StringBuilder();
         appendClassStart(source, packageName, simpleName, "jdwp_set_fast_logpoint");
         appendCommonFields(source, simpleName, bufferSize, metadata, ABOUT);
-        source.append("    public static void ").append(HIT_METHOD).append('(').append(declaredParameters).append(") {\n")
+        source.append("    public static void ").append(HIT_METHOD).append('(').append(declaredParameters(forwarded)).append(") {\n")
             .append("        if (!").append(ENABLED_FIELD).append(") {\n")
             .append("            return;\n")
             .append("        }\n");
         if (condition != null) {
             source.append("        try {\n")
-                .append("            final Object __mcpPassed = __mcpCondition(").append(arguments).append(");\n")
-                .append("            if (!(__mcpPassed instanceof Boolean)) {\n")
+                .append("            final java.lang.Object __mcpPassed = __mcpCondition(").append(arguments).append(");\n")
+                .append("            if (!(__mcpPassed instanceof java.lang.Boolean)) {\n")
                 .append("                __mcpRecord('C', \"condition did not evaluate to a boolean: \" + __mcpRender(__mcpPassed));\n")
                 .append("                return;\n")
                 .append("            }\n")
-                .append("            if (!((Boolean) __mcpPassed).booleanValue()) {\n")
+                .append("            if (!((java.lang.Boolean) __mcpPassed).booleanValue()) {\n")
                 .append("                return;\n")
                 .append("            }\n")
-                .append("        } catch (Throwable __mcpFailure) {\n")
+                .append("        } catch (java.lang.Throwable __mcpFailure) {\n")
                 .append("            __mcpRecordFailure('C', __mcpFailure);\n")
                 .append("            return;\n")
                 .append("        }\n");
         }
         source.append("        try {\n")
             .append("            __mcpRecord('V', __mcpRender(__mcpExpression(").append(arguments).append(")));\n")
-            .append("        } catch (Throwable __mcpFailure) {\n")
+            .append("        } catch (java.lang.Throwable __mcpFailure) {\n")
             .append("            __mcpRecordFailure('E', __mcpFailure);\n")
             .append("        }\n")
             .append("    }\n\n");
         if (condition != null) {
-            source.append("    private static Object __mcpCondition(").append(declaredParameters).append(") throws Throwable {\n")
+            source.append("    private static java.lang.Object __mcpCondition(").append(declaredParameters).append(") throws java.lang.Throwable {\n")
                 .append(JdiExpressionEvaluator.generateMethodBody(condition))
                 .append("    }\n\n");
         }
-        source.append("    private static Object __mcpExpression(").append(declaredParameters).append(") throws Throwable {\n")
+        source.append("    private static java.lang.Object __mcpExpression(").append(declaredParameters).append(") throws java.lang.Throwable {\n")
             .append(JdiExpressionEvaluator.generateMethodBody(expression))
             .append("    }\n\n");
         appendRecorder(source);
@@ -209,6 +211,16 @@ public final class FastLogpointProbeSource {
     }
 
     /**
+     * The generated forwarding methods only need positional arguments. Keep application names
+     * in the methods that contain user code, where they cannot shadow forwarding locals or fields.
+     */
+    static List<Parameter> forwardedParameters(List<Parameter> parameters) {
+        return IntStream.range(0, parameters.size())
+            .mapToObj(index -> new Parameter("__mcpArg" + index, parameters.get(index).type()))
+            .toList();
+    }
+
+    /**
      * Appends the package declaration, the generated-by comment naming {@code tool}, and the class
      * declaration.
      */
@@ -229,29 +241,29 @@ public final class FastLogpointProbeSource {
         source.append("    public static volatile boolean ").append(ENABLED_FIELD).append(" = false;\n")
             .append("    public static volatile byte[] ").append(IMAGE_FIELD).append(";\n")
             .append("    public static final int ").append(FORMAT_FIELD).append(" = ").append(FORMAT).append(";\n")
-            .append("    public static final String ").append(TARGET_CLASS_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(TARGET_CLASS_FIELD).append(" = ")
             .append(literal(metadata.targetClass())).append(";\n")
-            .append("    public static final String ").append(TARGET_METHOD_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(TARGET_METHOD_FIELD).append(" = ")
             .append(literal(metadata.targetMethod())).append(";\n")
-            .append("    public static final String ").append(TARGET_DESCRIPTOR_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(TARGET_DESCRIPTOR_FIELD).append(" = ")
             .append(literal(metadata.targetDescriptor())).append(";\n")
             .append("    public static final int ").append(TARGET_LINE_FIELD).append(" = ")
             .append(metadata.targetLine()).append(";\n")
-            .append("    public static final String ").append(EXPRESSION_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(EXPRESSION_FIELD).append(" = ")
             .append(literal(metadata.expression())).append(";\n")
-            .append("    public static final String ").append(CONDITION_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(CONDITION_FIELD).append(" = ")
             .append(literal(metadata.condition() != null ? metadata.condition() : "")).append(";\n")
             .append("    public static final long ").append(ARMED_AT_FIELD).append(" = ")
             .append(metadata.armedAt()).append("L;\n")
-            .append("    public static final String ").append(ARMED_BY_FIELD).append(" = ")
+            .append("    public static final java.lang.String ").append(ARMED_BY_FIELD).append(" = ")
             .append(literal(metadata.armedBy())).append(";\n")
-            .append("    public static final String ").append(ABOUT_FIELD).append(" = ").append(literal(about)).append(";\n")
+            .append("    public static final java.lang.String ").append(ABOUT_FIELD).append(" = ").append(literal(about)).append(";\n")
             .append("    public static final java.util.concurrent.atomic.AtomicLong ").append(SEQ_FIELD)
             .append(" = new java.util.concurrent.atomic.AtomicLong();\n")
             .append("    public static final java.util.concurrent.atomic.AtomicInteger ").append(WRITERS_FIELD)
             .append(" = new java.util.concurrent.atomic.AtomicInteger();\n")
-            .append("    public static final String[] ").append(RING_FIELD)
-            .append(" = new String[").append(bufferSize).append("];\n")
+            .append("    public static final java.lang.String[] ").append(RING_FIELD)
+            .append(" = new java.lang.String[").append(bufferSize).append("];\n")
             .append("    private static final long __MCP_MASK = ").append(bufferSize - 1).append("L;\n\n")
             .append("    private ").append(simpleName).append("() {\n    }\n\n");
     }
@@ -261,52 +273,62 @@ public final class FastLogpointProbeSource {
      * {@code __mcpRecord} and {@code __mcpRender}.
      */
     static void appendRecorder(StringBuilder source) {
+        appendFailureRenderer(source);
         // Recording a failure must not fail in turn (e.g. OutOfMemoryError while concatenating).
-        // JDK throwables print their message; an application's own Throwable may override
-        // toString()/getMessage(), so only its class name is recorded.
-        source.append("    private static String __mcpDescribe(Throwable failure) {\n")
-            .append("        final String type = failure.getClass().getName();\n")
-            .append("        return type.startsWith(\"java.\") || type.startsWith(\"javax.\")\n")
-            .append("            ? String.valueOf(failure) : type + \" (message not rendered: application exception type)\";\n")
-            .append("    }\n\n")
-            .append("    private static void __mcpRecordFailure(char kind, Throwable failure) {\n")
+        source.append("    private static void __mcpRecordFailure(char kind, java.lang.Throwable failure) {\n")
             .append("        try {\n")
             .append("            __mcpRecord(kind, __mcpDescribe(failure));\n")
-            .append("        } catch (Throwable ignored) {\n")
+            .append("        } catch (java.lang.Throwable ignored) {\n")
             .append("        }\n")
             .append("    }\n\n")
             // Counted in, then the kill switch again: a hit that passed the switch at the top of hit()
             // before the server set it writes nothing once it is set (see WRITERS_FIELD).
-            .append("    private static void __mcpRecord(char kind, String value) {\n")
+            .append("    private static void __mcpRecord(char kind, java.lang.String value) {\n")
             .append("        ").append(WRITERS_FIELD).append(".incrementAndGet();\n")
             .append("        try {\n")
             .append("            if (!").append(ENABLED_FIELD).append(") {\n")
             .append("                return;\n")
             .append("            }\n")
             .append("            final long seq = ").append(SEQ_FIELD).append(".getAndIncrement();\n")
-            .append("            ").append(RING_FIELD).append("[(int) (seq & __MCP_MASK)] = seq + \"\\0\" + System.currentTimeMillis()")
-            .append(" + \"\\0\" + System.nanoTime() + \"\\0\" + kind + \"\\0\" + Thread.currentThread().getName()")
+            .append("            ").append(RING_FIELD).append("[(int) (seq & __MCP_MASK)] = seq + \"\\0\" + java.lang.System.currentTimeMillis()")
+            .append(" + \"\\0\" + java.lang.System.nanoTime() + \"\\0\" + kind + \"\\0\" + java.lang.Thread.currentThread().getName()")
             .append(" + \"\\0\" + value;\n")
             .append("        } finally {\n")
             .append("            ").append(WRITERS_FIELD).append(".decrementAndGet();\n")
             .append("        }\n")
-            .append("    }\n\n")
-            .append("    private static String __mcpRender(Object value) {\n")
+            .append("    }\n\n");
+        appendValueRenderer(source);
+    }
+
+    /** Appends the shared throwable renderer used by the generated probes and arming capture wrapper. */
+    static void appendFailureRenderer(StringBuilder source) {
+        // JDK throwables print their message; an application's own Throwable may override
+        // toString()/getMessage(), so only its class name is recorded.
+        source.append("    private static java.lang.String __mcpDescribe(java.lang.Throwable failure) {\n")
+            .append("        final java.lang.String type = failure.getClass().getName();\n")
+            .append("        return type.startsWith(\"java.\") || type.startsWith(\"javax.\")\n")
+            .append("            ? java.lang.String.valueOf(failure) : type + \" (message not rendered: application exception type)\";\n")
+            .append("    }\n\n");
+    }
+
+    /** Appends the shared value renderer, which describes application objects by type and identity. */
+    static void appendValueRenderer(StringBuilder source) {
+        source.append("    private static java.lang.String __mcpRender(java.lang.Object value) {\n")
             .append("        if (value == null) {\n")
             .append("            return \"null\";\n")
             .append("        }\n")
             // Exact JDK value types only: an application subclass of Number could override toString().
-            .append("        final Class<?> type = value.getClass();\n")
-            .append("        if (type == String.class || type == Integer.class || type == Long.class || type == Short.class\n")
-            .append("            || type == Byte.class || type == Double.class || type == Float.class || type == Boolean.class\n")
-            .append("            || type == Character.class || type == java.math.BigDecimal.class\n")
+            .append("        final java.lang.Class<?> type = value.getClass();\n")
+            .append("        if (type == java.lang.String.class || type == java.lang.Integer.class || type == java.lang.Long.class || type == java.lang.Short.class\n")
+            .append("            || type == java.lang.Byte.class || type == java.lang.Double.class || type == java.lang.Float.class || type == java.lang.Boolean.class\n")
+            .append("            || type == java.lang.Character.class || type == java.math.BigDecimal.class\n")
             .append("            || type == java.math.BigInteger.class) {\n")
-            .append("            return String.valueOf(value);\n")
+            .append("            return java.lang.String.valueOf(value);\n")
             .append("        }\n")
-            .append("        if (value instanceof Enum) {\n")
-            .append("            return ((Enum<?>) value).name();\n")
+            .append("        if (value instanceof java.lang.Enum) {\n")
+            .append("            return ((java.lang.Enum<?>) value).name();\n")
             .append("        }\n")
-            .append("        return type.getName() + '@' + Integer.toHexString(System.identityHashCode(value));\n")
+            .append("        return type.getName() + '@' + java.lang.Integer.toHexString(java.lang.System.identityHashCode(value));\n")
             .append("    }\n");
     }
 
@@ -317,14 +339,7 @@ public final class FastLogpointProbeSource {
      * a following digit cannot extend them.
      */
     static String literal(String text) {
-        String bounded = text;
-        if (text.length() > MAX_METADATA_CHARS) {
-            int end = MAX_METADATA_CHARS;
-            if (Character.isHighSurrogate(text.charAt(end - 1))) {
-                end--;
-            }
-            bounded = text.substring(0, end) + TRUNCATION_MARKER;
-        }
+        final String bounded = boundText(text);
         final StringBuilder out = new StringBuilder(bounded.length() + 2).append('"');
         for (int i = 0; i < bounded.length(); i++) {
             final char c = bounded.charAt(i);
@@ -340,6 +355,18 @@ public final class FastLogpointProbeSource {
             }
         }
         return out.append('"').toString();
+    }
+
+    /** Returns the original text or its capped prefix plus a marker, preserving UTF-16 surrogate pairs. */
+    static String boundText(String text) {
+        if (text.length() <= MAX_METADATA_CHARS) {
+            return text;
+        }
+        int end = MAX_METADATA_CHARS;
+        if (Character.isHighSurrogate(text.charAt(end - 1))) {
+            end--;
+        }
+        return text.substring(0, end) + TRUNCATION_MARKER;
     }
 
     /**

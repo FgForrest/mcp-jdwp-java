@@ -1,6 +1,8 @@
 package one.edee.mcp.jdwp.fastlogpoint;
 
+import com.sun.jdi.ClassType;
 import com.sun.jdi.ReferenceType;
+import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.evaluation.ProcessBuilderMavenRunner;
@@ -12,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.tools.ToolProvider;
@@ -122,10 +125,13 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
-	/** Verifies that a pending fast probe retries the same ID when discovery supplies the missing type. */
+	/** Selects the probe expression and the stage that first needs the local classpath. */
+	private enum ClasspathUse { LOGPOINT, BREAKPOINT_CONDITION, ARMING_CAPTURE, INSTALLED_CAPTURE }
+
+	/** Checks overview during discovery and verifies that a deferred probe retries under the same ID. */
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void fastProbeRetriesWhenItsTypeBecomesAvailable(boolean breakpoint, @TempDir Path project) throws Exception {
+	@EnumSource(ClasspathUse.class)
+	void fastProbeRetriesWhenItsTypeBecomesAvailable(ClasspathUse use, @TempDir Path project) throws Exception {
 		Files.writeString(project.resolve("pom.xml"), "<project/>");
 		final Path classes = Files.createDirectory(project.resolve("maven-dependency"));
 		final Path source = Files.writeString(project.resolve("BuildConstant.java"), """
@@ -149,29 +155,136 @@ class DispatcherMavenLiveTest {
 				assertThat(mavenStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 				final int line = LiveSession.lineOf("MARK: label");
 				final String constant = "probeclasspath.BuildConstant.VALUE";
-				final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
-				final int probe = LiveSession.idOf(breakpoint
-					? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, constant + " < 0",
-						true, "thread", true, null)
-					: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, constant + " + i",
-						null, true, null, null));
+				final String prefix = use == ClasspathUse.LOGPOINT ? "FAST_LOGPOINT" : "FAST_BREAKPOINT";
+				final String registration = switch (use) {
+					case LOGPOINT -> session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, constant + " + i",
+						null, true, null, null);
+					case BREAKPOINT_CONDITION -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						constant + " < 0", true, "thread", true, null, null);
+					case ARMING_CAPTURE -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						"true", true, "thread", true, null, constant);
+					case INSTALLED_CAPTURE -> session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line,
+						LiveSession.TARGET + ".captureTestStop", true, "thread", true, null, constant);
+				};
+				final int probe = LiveSession.idOf(registration);
 				await("arming attempt", () -> hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED")
-					|| hasProbeEvent(session, probe, prefix + "_ARM_FAILED"));
+					|| hasProbeEvent(session, probe, prefix + "_ARM_FAILED")
+					|| hasProbeEvent(session, probe, prefix + "_ARMED")
+					|| hasProbeEvent(session, probe, "FAST_BREAKPOINT"));
+				assertThat(hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED")).isTrue();
 				assertThat(hasProbeEvent(session, probe, prefix + "_ARM_FAILED")).isFalse();
 				assertThat(hasProbeEvent(session, probe, prefix + "_ARMED")).isFalse();
 				assertThat(hasProbeEvent(session, probe, "FAST_BREAKPOINT")).isFalse();
+				final String kind = use == ClasspathUse.LOGPOINT ? "fast_logpoint" : "fast_breakpoint";
+				final String waiting = "PENDING — waiting for local classpath discovery";
+				assertThat(session.tools.jdwp_overview(kind, null, null))
+					.contains("#" + probe + "  " + LiveSession.TARGET + ":" + line + "  [" + waiting + "]");
+				if (use == ClasspathUse.ARMING_CAPTURE || use == ClasspathUse.INSTALLED_CAPTURE) {
+					assertThat(registration).contains("While local classpath discovery runs, arming can move to a later hit");
+				}
 
 				releaseMaven.countDown();
 				assertThat(provider.discover()).containsExactly(classes.toString());
-				await("the original probe to arm", () -> hasProbeEvent(session, probe, prefix + "_ARMED"));
+				if (use != ClasspathUse.ARMING_CAPTURE) {
+					await("the original probe to arm", () -> hasProbeEvent(session, probe, prefix + "_ARMED"));
+				}
+				if (use == ClasspathUse.INSTALLED_CAPTURE) {
+					final VirtualMachine vm = session.connection.getVM();
+					final ClassType target = (ClassType) vm.classesByName(LiveSession.TARGET).get(0);
+					target.setValue(target.fieldByName("captureTestStop"), vm.mirrorOf(true));
+				}
+				if (use == ClasspathUse.ARMING_CAPTURE || use == ClasspathUse.INSTALLED_CAPTURE) {
+					assertThat(session.tools.jdwp_resume_until_event(SIGNAL_TIMEOUT_SECONDS * 1_000))
+						.contains("fast_breakpoint=" + probe + ", condition true", "Captured at the hit: 42");
+				}
+				await("overview to clear the discovery notice", () ->
+					!session.tools.jdwp_overview(kind, null, null).contains(waiting));
 				session.tools.jdwp_clear_breakpoint(probe);
 
-				if (!breakpoint) {
+				if (use == ClasspathUse.LOGPOINT) {
 					final int invalid = LiveSession.idOf(session.tools.jdwp_set_fast_logpoint(
 						LiveSession.TARGET, line, "unknownType.unknownField + i", null, true, null, null));
 					await("permanent failure after discovery", () ->
 						hasProbeEvent(session, invalid, "FAST_LOGPOINT_ARM_FAILED"));
 				}
+			} finally {
+				releaseMaven.countDown();
+			}
+		}
+	}
+
+	/** A misspelled capture local reports a failure on either stop while Maven is still running. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void captureTypoDoesNotWaitForMaven(boolean install, @TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final CountDownLatch mavenStarted = new CountDownLatch(1);
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				mavenStarted.countDown();
+				releaseMaven.await();
+				return List.of();
+			});
+		try (LiveSession session = LiveSession.start(List.of(), provider)) {
+			try {
+				assertThat(mavenStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+				final String condition = install ? LiveSession.TARGET + ".captureTestStop" : "true";
+				final int probe = LiveSession.idOf(session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET,
+					LiveSession.lineOf("MARK: label"), condition, true, "thread", true, null,
+					"{ return unknownCaptureLocal; }"));
+				final String expected = install ? "FAST_BREAKPOINT_ARMED" : "FAST_BREAKPOINT";
+				await("probe arming outcome", () -> hasProbeEvent(session, probe, expected)
+					|| hasProbeEvent(session, probe, "FAST_BREAKPOINT_ARMING_DEFERRED")
+					|| hasProbeEvent(session, probe, "FAST_BREAKPOINT_ARM_FAILED"));
+				assertThat(hasProbeEvent(session, probe, expected)).as(expected).isTrue();
+				if (install) {
+					final VirtualMachine vm = session.connection.getVM();
+					final ClassType target = (ClassType) vm.classesByName(LiveSession.TARGET).get(0);
+					target.setValue(target.fieldByName("captureTestStop"), vm.mirrorOf(true));
+				}
+				assertThat(session.tools.jdwp_resume_until_event(SIGNAL_TIMEOUT_SECONDS * 1_000))
+					.contains("fast_breakpoint=" + probe + ", condition true",
+						"Captured at the hit: capture failed:", "unknownCaptureLocal");
+				assertThat(provider.discoveryStatus().running()).isTrue();
+				assertThat(hasProbeEvent(session, probe, "FAST_BREAKPOINT_ARMING_DEFERRED")).isFalse();
+			} finally {
+				releaseMaven.countDown();
+			}
+		}
+	}
+
+	/** Checks that clearing or resetting a deferred probe removes its discovery notice immediately. */
+	@Test
+	void clearingAndResettingForgetDeferredProbes(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final CountDownLatch mavenStarted = new CountDownLatch(1);
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				mavenStarted.countDown();
+				releaseMaven.await();
+				return List.of();
+			});
+		try (LiveSession session = LiveSession.start(List.of(), provider)) {
+			try {
+				assertThat(mavenStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+				final int line = LiveSession.lineOf("MARK: label");
+				final String waiting = "PENDING — waiting for local classpath discovery";
+				for (boolean reset : new boolean[]{false, true}) {
+					final int probe = LiveSession.idOf(session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line,
+						"probeclasspath.BuildConstant.VALUE", null, true, null, null));
+					await("arming to defer", () -> hasProbeEvent(session, probe, "FAST_LOGPOINT_ARMING_DEFERRED"));
+					assertThat(session.tools.jdwp_overview("fast_logpoint", null, null)).contains(waiting);
+					if (reset) {
+						session.tools.jdwp_reset();
+					} else {
+						session.tools.jdwp_clear_breakpoint(probe);
+					}
+					assertThat(session.tools.jdwp_overview("fast_logpoint", null, null))
+						.doesNotContain("#" + probe + "  " + LiveSession.TARGET + ":" + line, waiting);
+				}
+				assertThat(provider.discoveryStatus().running()).isTrue();
 			} finally {
 				releaseMaven.countDown();
 			}
@@ -222,7 +335,10 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
-	/** Reports the compiler's typo after a live probe's initial discovery deferral. */
+	/**
+	 * Reports the compiler's error after a live probe's initial discovery deferral. The unresolved name is qualified,
+	 * so a classpath entry could still supply it; a bare misspelled local fails at once instead.
+	 */
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	void invalidProbeReportsCompilerErrorOnceDiscoveryFinishes(boolean breakpoint, @TempDir Path project)
@@ -237,9 +353,9 @@ class DispatcherMavenLiveTest {
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
 			final int line = LiveSession.lineOf("MARK: label");
 			final int probe = LiveSession.idOf(breakpoint
-				? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, "unknownLocal < i",
-					true, "all", true, null)
-				: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, "unknownLocal + i",
+				? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, "UnknownType.VALUE < i",
+					true, "all", true, null, null)
+				: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, "UnknownType.VALUE + i",
 					null, true, null, null));
 			final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
 			await("discovery deferral", () -> hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED"));
@@ -248,13 +364,13 @@ class DispatcherMavenLiveTest {
 			assertThat(provider.discoverWithBreakdown().failure()).isNull();
 			if (breakpoint) {
 				assertThat(session.tools.jdwp_resume_until_event(30_000))
-					.contains("condition failed", "unknownLocal cannot be resolved");
+					.contains("condition failed", "UnknownType cannot be resolved");
 				session.tools.jdwp_resume();
 			}
 			await("compiler error", () -> session.history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(event ->
 				event.type().equals(prefix + "_ARM_FAILED")
 					&& Integer.toString(probe).equals(event.details().get("breakpointId"))
-					&& event.summary().contains("unknownLocal cannot be resolved")));
+					&& event.summary().contains("UnknownType cannot be resolved")));
 		} finally {
 			releaseMaven.countDown();
 		}
@@ -296,8 +412,7 @@ class DispatcherMavenLiveTest {
 	/** Returns whether the live session recorded the given event type for the probe ID. */
 	private static boolean hasProbeEvent(LiveSession session, int id, String type) {
 		return session.history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(event ->
-			event.type().equals(type) && (event.summary().contains("[FastLogpoint " + id + "]")
-				|| event.summary().contains("[FastBreakpoint " + id + "]")));
+			event.type().equals(type) && String.valueOf(id).equals(event.details().get("breakpointId")));
 	}
 
 	private static Set<String> evaluatorWrappers(LiveSession session) throws Exception {

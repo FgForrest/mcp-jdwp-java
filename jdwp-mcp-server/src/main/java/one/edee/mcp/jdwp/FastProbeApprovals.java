@@ -24,7 +24,7 @@ final class FastProbeApprovals {
      * @param kind          fast logpoint or fast breakpoint
      * @param className     fully qualified class of the probed line
      * @param line          the probed line
-     * @param expression    the logpoint's expression; {@code null} for a fast breakpoint
+     * @param expression    the logpoint expression or breakpoint capture; {@code null} when omitted
      * @param condition     the condition, or {@code null} when the probe has none
      * @param suspendPolicy JDI suspend policy of the probe's stop
      * @param stopOnce      fast breakpoint stop mode (once per generation, or every hit)

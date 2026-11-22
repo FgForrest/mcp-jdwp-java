@@ -1735,9 +1735,11 @@ public class BreakpointTracker {
         publishOrCandidate(new LastBreakpoint(thread, breakpointId));
     }
 
-    /** Proposes a breakpoint stop with a user-code site already resolved by its handler. */
-    public void setLastBreakpointThread(ThreadReference thread, int breakpointId, String sourceSite) {
-        publishOrCandidate(new LastBreakpoint(thread, breakpointId, EventKind.BREAKPOINT, sourceSite));
+    /** Proposes a fast stop on the dispatcher with the handler's user-code site and any captured text. */
+    public void setLastBreakpointThread(ThreadReference thread, int breakpointId, String sourceSite,
+                                        @Nullable String captured) {
+        publishOrCandidate(new LastBreakpoint(thread, breakpointId, EventKind.BREAKPOINT, sourceSite,
+            captured == null ? Map.of() : Map.of(breakpointId, captured)));
     }
 
     /**
@@ -1966,10 +1968,8 @@ public class BreakpointTracker {
     }
 
     /**
-     * Immutable {@code (thread, id, kind)} triple published atomically in {@link #lastBreakpoint}.
-     * Using a record means readers either see a complete value from one write or no value at all
-     * — never a crossed triple from two different writes. The {@code id} is the synthetic
-     * breakpoint id when {@code kind == BREAKPOINT}; {@code null} for STEP / EXCEPTION snapshots.
+     * Immutable stop snapshot published atomically in {@link #lastBreakpoint}.
+     * Keeps the event identity, source site and capture values together for concurrent readers.
      *
      * @param thread the thread that hit the suspending event
      * @param id     synthetic BP id for {@link EventKind#BREAKPOINT}; inherited from the prior
@@ -1977,22 +1977,28 @@ public class BreakpointTracker {
      *               {@link EventKind#EXCEPTION} (normalised by the canonical constructor)
      * @param kind   the {@link EventKind} that produced the suspension
      * @param sourceSite the handler's user-code location, when different from the event location
+     * @param captures rendered fast-breakpoint captures from the event set, by breakpoint ID
      */
     public record LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind,
-                                 @Nullable String sourceSite) {
+                                 @Nullable String sourceSite, Map<Integer, String> captures) {
         /**
-         * Canonical constructor. Normalises {@code (kind, id)} consistency: EXCEPTION snapshots
-         * always carry {@code id=null} because there is no associated BP context. BREAKPOINT and
-         * STEP can carry an id (BREAKPOINT for the BP that fired; STEP for the BP the user
-         * stepped FROM, inherited by {@link #setLastSuspendingEvent}).
+         * Copies the captures by breakpoint ID and clears the ID for exception and VM-start stops.
+         * Breakpoint and step stops retain the supplied ID.
          */
         public LastBreakpoint {
+            captures = Map.copyOf(captures);
             if (kind == EventKind.EXCEPTION || kind == EventKind.VM_START) {
                 id = null;
             }
         }
 
-        /** A stop whose location comes from the event set. */
+        /** Creates a stop snapshot with a handler-supplied source site and no captures. */
+        public LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind,
+                              @Nullable String sourceSite) {
+            this(thread, id, kind, sourceSite, Map.of());
+        }
+
+        /** Creates a stop snapshot whose site comes from the event set and whose capture map is empty. */
         public LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind) {
             this(thread, id, kind, null);
         }

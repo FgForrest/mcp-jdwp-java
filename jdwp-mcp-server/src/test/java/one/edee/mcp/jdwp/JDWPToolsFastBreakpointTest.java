@@ -53,11 +53,12 @@ class JDWPToolsFastBreakpointTest {
 		tools = JDWPToolsTestSupport.newTools(jdiService, tracker, new EventHistory(), fastLogpoints);
 	}
 
+	/** Checks that an unapproved fast breakpoint returns the briefing before accessing the target VM. */
 	@Test
 	@DisplayName("missing or false userApproved returns the risk briefing for the requested policy and mode")
 	void consentGate() throws Exception {
 		for (Boolean approval : new Boolean[]{null, false}) {
-			assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", approval, "thread", false, null))
+			assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", approval, "thread", false, null, null))
 				.startsWith("[CONSENT REQUIRED] Nothing was armed.")
 				.contains("com.example.Cart:42 — condition: total < 0 — stops on every hit — suspendPolicy: thread")
 				.contains("the JVM attached at localhost:5005")
@@ -67,17 +68,19 @@ class JDWPToolsFastBreakpointTest {
 		verifyNoInteractions(fastLogpoints);
 	}
 
+	/** Checks that invalid conditions and suspend policies are reported before consent is requested. */
 	@Test
 	@DisplayName("a blank condition or a policy that does not suspend is refused before the briefing")
 	void invalidArgumentsBeforeTheGate() throws Exception {
-		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, " ", null, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, " ", null, null, null, null, null))
 			.startsWith("Error: condition is required");
-		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", null, "none", null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", null, "none", null, null, null))
 			.startsWith("Error: Invalid suspend policy 'none'");
 		verify(jdiService, never()).getVM();
 		verifyNoInteractions(fastLogpoints);
 	}
 
+	/** Checks that an approved call at an existing breakpoint location routes to re-arm. */
 	@Test
 	@DisplayName("a call matching a fast breakpoint already set at the line is answered by the re-arm, not registered again")
 	void sameLineGoesToReArm() throws Exception {
@@ -95,15 +98,16 @@ class JDWPToolsFastBreakpointTest {
 		when(type.classLoader()).thenReturn(mock(com.sun.jdi.ClassLoaderReference.class));
 		when(type.locationsOfLine(42)).thenReturn(List.of(location));
 		when(location.method()).thenReturn(method);
-		when(fastLogpoints.rearmBreakpoint(location, "total < 0", true, EventRequest.SUSPEND_ALL))
+		when(fastLogpoints.rearmBreakpoint(location, "total < 0", null, true, EventRequest.SUSPEND_ALL))
 			.thenReturn(new FastLogpointService.RearmResult("Fast breakpoint 7 at com.example.Cart:42 re-armed (ID: 7)",
 				true));
 
-		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", true, null, null, null, null))
 			.isEqualTo("Fast breakpoint 7 at com.example.Cart:42 re-armed (ID: 7)");
-		verify(fastLogpoints, never()).registerBreakpoint(any(), any(), anyString(), anyBoolean(), anyInt(), anyInt());
+		verify(fastLogpoints, never()).registerBreakpoint(any(), any(), anyString(), any(), anyBoolean(), anyInt(), anyInt());
 	}
 
+	/** Verifies overview grouping and status text for pending, armed and recovered probes. */
 	@Test
 	@DisplayName("jdwp_overview lists fast breakpoints in their own section, fast logpoints in theirs")
 	void overviewSeparatesKinds() {
@@ -111,16 +115,17 @@ class JDWPToolsFastBreakpointTest {
 			Instant.parse("2026-10-28T15:02:11Z"), "mcp-jdwp-java, session 3fa1c2d9", "AppClassLoader#12", 0);
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(3, "com.example.Cart", 42, "total", null, FastLogpointService.State.ARMED, null,
-				4096, 0, 0, 0, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
+				4096, 0, 0, 0, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false,
+				null, false),
 			new FastLogpointService.Info(5, "com.example.Cart", 50, "", "qty > 9", FastLogpointService.State.ARMED, null,
 				256, 0, 0, 0, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_ALL, true,
-				new FastLogpointService.BreakpointCounters(4, 1, 1, true)),
+				new FastLogpointService.BreakpointCounters(4, 1, 1, true, false), false),
 			new FastLogpointService.Info(6, "com.example.Cart", 60, "", "id == 0", FastLogpointService.State.PENDING, null,
 				256, 0, 0, -1, true, null, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, false,
-				new FastLogpointService.BreakpointCounters(-1, -1, -1, false)),
+				new FastLogpointService.BreakpointCounters(-1, -1, -1, false, false), false),
 			new FastLogpointService.Info(8, "com.example.Order", 7, "", "x", FastLogpointService.State.RECOVERED, null,
 				256, 0, 0, 0, true, provenance, FastLogpointService.Kind.BREAKPOINT, EventRequest.SUSPEND_EVENT_THREAD, true,
-				new FastLogpointService.BreakpointCounters(2, 0, 0, true))));
+				new FastLogpointService.BreakpointCounters(2, 0, 0, true, false), false)));
 
 		final String breakpoints = tools.jdwp_overview("fast_breakpoint", null, null);
 		assertThat(breakpoints)

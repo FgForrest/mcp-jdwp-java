@@ -5,6 +5,7 @@ import com.sun.jdi.Location;
 import com.sun.jdi.Method;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
+import com.sun.jdi.Value;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
@@ -17,12 +18,14 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -53,7 +56,7 @@ class FastLogpointRedefinitionRuleTest {
 	 */
 	private final List<BreakpointRequest> created = new ArrayList<>();
 
-	/** Binds the suspension fixture to the simulated VM. */
+	/** Binds the session to the simulated VM and prepares the arming and held frames in the same method. */
 	@BeforeEach
 	void setUp() throws Exception {
 		model = new FakeSuspendModel();
@@ -91,12 +94,14 @@ class FastLogpointRedefinitionRuleTest {
 		when(armer.ref.frames()).thenReturn(List.of(frame));
 		when(inspected.ref.frames()).thenReturn(List.of(frame));
 		final BooleanValue falseValue = mock(BooleanValue.class);
-		when(evaluator.evaluate(frame, "total > 100")).thenReturn(falseValue);
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any()))
+			.thenAnswer(call -> call.<Function<Value, ?>>getArgument(2).apply(falseValue));
 
-		service.registerBreakpoint(model.vm, location, "total > 100", true, EventRequest.SUSPEND_EVENT_THREAD,
+		service.registerBreakpoint(model.vm, location, "total > 100", null, true, EventRequest.SUSPEND_EVENT_THREAD,
 			FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
 	}
 
+	/** Checks that arming waits while the user can inspect a frame in the target method. */
 	@Test
 	@DisplayName("a stopped thread in the method defers arming before anything is compiled, recorded once per hold")
 	void stoppedThreadDefersArming() throws Exception {
@@ -109,7 +114,7 @@ class FastLogpointRedefinitionRuleTest {
 		assertThat(service.list().get(0).state()).isEqualTo(FastLogpointService.State.PENDING);
 		assertThat(deferrals()).as("once per hold").hasSize(1).first().asString()
 			.contains("thread inspected is stopped in total");
-		verify(evaluator, never()).compileFastBreakpointProbe(any(), anyBoolean(), anyString(), anyString(),
+		verify(evaluator, never()).compileFastBreakpointProbe(any(), anyBoolean(), anyString(), anyString(), any(),
 			anyBoolean(), anyInt(), any());
 	}
 

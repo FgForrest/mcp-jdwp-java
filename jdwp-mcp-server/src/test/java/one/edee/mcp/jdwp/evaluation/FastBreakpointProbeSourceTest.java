@@ -4,6 +4,8 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -195,6 +197,72 @@ class FastBreakpointProbeSourceTest {
 		assertThat(stop.getReturnType()).isEqualTo(void.class);
 	}
 
+	/** Checks rendering, capture metadata and the stop signature of a compiled probe. */
+	@ParameterizedTest
+	@CsvSource({
+		"i, 7", "Long.valueOf(i), 7", "label, text", "null, null",
+		"new Object(), java.lang.Object@", "{ return i + label; }, 7text",
+		"java.math.BigInteger.TEN, 10", "Thread.State.NEW, NEW"
+	})
+	@DisplayName("capture uses the probe's value renderer for expressions and blocks")
+	void rendersCapture(String expression, String expected) throws Exception {
+		final Probe probe = compileCapture("true", expression, false);
+		final String rendered = probe.capture(7, "text");
+		if (expected.endsWith("@")) {
+			assertThat(rendered).matches("java\\.lang\\.Object@[0-9a-f]+");
+		} else {
+			assertThat(rendered).isEqualTo(expected);
+		}
+		assertThat(probe.field(FastLogpointProbeSource.EXPRESSION_FIELD)).isEqualTo(expression);
+		assertThat(probe.type().getMethod(FastBreakpointProbeSource.STOP_METHOD, int.class, int.class,
+			String.class, String.class).getReturnType()).isEqualTo(void.class);
+	}
+
+	/** Checks that the capture display limit preserves surrogate pairs at the cutoff. */
+	@Test
+	@DisplayName("capture bounds the text without splitting a surrogate pair")
+	void boundsCapture() throws Exception {
+		final Probe probe = compileCapture("true", "label", false);
+		final String prefix = "x".repeat(FastLogpointProbeSource.MAX_METADATA_CHARS - 1);
+		assertThat(probe.capture(0, prefix + "😀!"))
+			.isEqualTo(prefix + FastLogpointProbeSource.TRUNCATION_MARKER);
+	}
+
+	/** Uses a capture side effect to count evaluations in both stop modes. */
+	@Test
+	@DisplayName("capture runs only after a true hit has passed its stop gate")
+	void capturesOnlyAcceptedTrueHits() throws Exception {
+		for (boolean once : new boolean[] {true, false}) {
+			final Probe probe = compileCapture("i >= 0 && label.isEmpty()",
+				"{ STOPS.addAndGet(10); return i; }", once);
+			probe.setEnabled(true);
+			probe.hit(-1, "");
+			assertThat(probe.stops()).isZero();
+			probe.hit(0, null);
+			assertThat(probe.stops()).isEqualTo(1);
+			probe.hit(1, "");
+			assertThat(probe.stops()).isEqualTo(12);
+			probe.hit(2, "");
+			assertThat(probe.stops()).isEqualTo(once ? 12 : 23);
+			probe.setInt(FastBreakpointProbeSource.EPOCH_FIELD, 2);
+			probe.hit(3, "");
+			assertThat(probe.stops()).isEqualTo(once ? 23 : 34);
+		}
+	}
+
+	/** Checks that advancing the epoch during condition evaluation suppresses the old capture. */
+	@Test
+	@DisplayName("a once-mode hit superseded during its condition skips capture")
+	void skipsCaptureOfSupersededHit() throws Exception {
+		final Probe probe = compileCapture("{ if (i == 1) EPOCH = 2; return true; }",
+			"{ STOPS.addAndGet(10); return i; }", true);
+		probe.setEnabled(true);
+		probe.hit(1, "");
+		assertThat(probe.stops()).isZero();
+		probe.hit(2, "");
+		assertThat(probe.stops()).isEqualTo(11);
+	}
+
 	@Test
 	@DisplayName("once mode lets exactly one of many concurrent true hits through per epoch")
 	void exactlyOnceUnderContention() throws Exception {
@@ -226,10 +294,11 @@ class FastBreakpointProbeSourceTest {
 		}
 	}
 
+	/** Checks that the probe generator rejects an invalid ring capacity. */
 	@Test
 	@DisplayName("bufferSize must be a power of two")
 	void rejectsNonPowerOfTwo() {
-		assertThatThrownBy(() -> FastBreakpointProbeSource.generate("p.Probe", PARAMETERS, "true", true, 100,
+		assertThatThrownBy(() -> FastBreakpointProbeSource.generate("p.Probe", PARAMETERS, "true", null, true, 100,
 			metadata("true")))
 			.isInstanceOf(IllegalArgumentException.class);
 	}
@@ -239,16 +308,79 @@ class FastBreakpointProbeSourceTest {
 			System.currentTimeMillis(), "mcp-jdwp-java test, session 00000000");
 	}
 
+	/** Compiles and executes expressions and blocks with trailing line comments. */
+	@Test
+	void conditionAndCaptureAllowTrailingLineComments() throws Exception {
+		final Probe probe = compileCapture("i == 7 // condition", "label // capture", true);
+		probe.setEnabled(true);
+		probe.hit(7, "text");
+		assertThat(probe.stops()).isEqualTo(1);
+		assertThat(probe.capture(7, "text")).isEqualTo("text");
+
+		final Probe blockProbe = compileCapture("{ return i == 7; } // condition", "{ return label; } // capture", true);
+		blockProbe.setEnabled(true);
+		blockProbe.hit(7, "text");
+		assertThat(blockProbe.stops()).isEqualTo(1);
+		assertThat(blockProbe.capture(7, "text")).isEqualTo("text");
+	}
+
+	/** Checks that application locals remain accessible when their names match generated bindings. */
+	@Test
+	void generatedBindingsDoNotShadowApplicationLocals() throws Exception {
+		final String className = "probe.test.McpFastBreakpoint_Collisions";
+		final List<FastLogpointProbeSource.Parameter> parameters = List.of("ignored", "__mcpCaptured", "__mcpEpoch",
+				"__mcpErrorEpoch", "__mcpFailure", "__mcpPassed", "__mcpFallthroughGuard", "ENABLED", "STOPS")
+			.stream().map(name -> new FastLogpointProbeSource.Parameter(name, "int")).toList();
+		final String condition = "{ return __mcpFallthroughGuard == 7 && ENABLED == 7; }";
+		final String capture = "{ return ignored + __mcpCaptured + __mcpPassed + STOPS; }";
+		final Probe probe = compileSource(className, FastBreakpointProbeSource.generate(
+			className, parameters, condition, capture, true, 16, metadata(condition)));
+		final Class<?>[] types = parameters.stream().map(parameter -> int.class).toArray(Class<?>[]::new);
+		final Object[] values = parameters.stream().map(parameter -> 7).toArray();
+		probe.setEnabled(true);
+		probe.type().getMethod("hit", types).invoke(null, values);
+		assertThat(probe.stops()).isEqualTo(1);
+		final Method captureMethod = probe.type().getDeclaredMethod("__mcpCapture", types);
+		captureMethod.setAccessible(true);
+		assertThat(captureMethod.invoke(null, values)).isEqualTo("28");
+	}
+
+	/** Compiles the probe beside application classes named after the JDK types it uses. */
+	@Test
+	void generatedHelpersUseJdkTypesEvenWhenTheApplicationShadowsThem() throws Exception {
+		final String className = "probe.test.McpFastBreakpoint_ShadowedTypes";
+		final String shadowingTypes = "\nclass Character {}\nclass String {}\nclass Boolean {}\n"
+			+ "class Throwable {}\nclass Object {}\nclass System {}\nclass Integer {}\nclass Class {}\nclass Thread {}\n";
+		final String source = FastBreakpointProbeSource.generate(className, PARAMETERS, "true", "'x'", true, 16,
+			metadata("true"));
+		assertThat(compiler.compile(className, source + shadowingTypes)).containsKey(className.replace('.', '/'));
+	}
+
 	private Probe compile(String condition, boolean stopOnce) throws Exception {
 		final Probe probe = compileDisabled(condition, stopOnce);
 		probe.setEnabled(true);
 		return probe;
 	}
 
+	/** Compiles and loads a capture-free probe with its initial kill switch set. */
 	private Probe compileDisabled(String condition, boolean stopOnce) throws Exception {
 		final String className = "probe.test." + FastBreakpointProbeSource.CLASS_PREFIX + System.nanoTime();
-		final String source = FastBreakpointProbeSource.generate(className, PARAMETERS, condition, stopOnce, 16,
+		final String source = FastBreakpointProbeSource.generate(className, PARAMETERS, condition, null, stopOnce, 16,
 			metadata(condition));
+		return compileSource(className, source);
+	}
+
+	/** Returns a compiled, initially disabled probe with the supplied capture and condition. */
+	private Probe compileCapture(String condition, String capture, boolean stopOnce) throws Exception {
+		final String className = "probe.test." + FastBreakpointProbeSource.CLASS_PREFIX + System.nanoTime();
+		final FastLogpointProbeSource.Metadata metadata = new FastLogpointProbeSource.Metadata(
+			"com.acme.Foo", "compute", "(I)I", 42, capture, condition, 0, "test");
+		return compileSource(className, FastBreakpointProbeSource.generate(
+			className, PARAMETERS, condition, capture, stopOnce, 16, metadata));
+	}
+
+	/** Compiles one probe class and returns its reflective handle, propagating compiler errors. */
+	private Probe compileSource(String className, String source) throws Exception {
 		final Map<String, byte[]> compiled = compiler.compile(className, source);
 		assertThat(compiled).as(source).hasSize(1);
 		final byte[] bytecode = compiled.values().iterator().next();
@@ -264,6 +396,13 @@ class FastBreakpointProbeSourceTest {
 	 * Reflective handle on a compiled probe class.
 	 */
 	private record Probe(Class<?> type) {
+
+		/** Invokes the generated capture method with the supplied locals and returns its display text. */
+		String capture(int i, String label) throws Exception {
+			final Method capture = type.getDeclaredMethod("__mcpCapture", int.class, String.class);
+			capture.setAccessible(true);
+			return (String) capture.invoke(null, i, label);
+		}
 
 		Method hitMethod() throws Exception {
 			return type.getMethod(FastLogpointProbeSource.HIT_METHOD, int.class, String.class);

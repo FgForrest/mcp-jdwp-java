@@ -138,6 +138,7 @@ class SuspensionSessionTest {
 		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
 	}
 
+	/** Checks that one stop keeps the first candidate ID and captures from all accepted candidates. */
 	@Test
 	@DisplayName("a set with two stopping events publishes one stop, after processing")
 	void compositeSetPublishesOnce() {
@@ -146,11 +147,20 @@ class SuspensionSessionTest {
 		session.begin(context);
 		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 1));
 		assertThat(session.unseenCount()).as("not published mid-set").isZero();
-		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 2));
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 2,
+			BreakpointTracker.EventKind.BREAKPOINT, null, Map.of(2, "first capture")));
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 3,
+			BreakpointTracker.EventKind.BREAKPOINT, null, Map.of(3, "second capture")));
+		session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 4,
+			BreakpointTracker.EventKind.BREAKPOINT, null, Map.of(4, "withdrawn")));
+		session.dropCandidatesAfter(context, 3);
 		assertThat(session.finish(context)).isTrue();
 
 		assertThat(session.unseenCount()).isEqualTo(1);
-		assertThat(session.presentCurrent()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(1));
+		assertThat(session.presentCurrent()).isNotNull().satisfies(stop -> {
+			assertThat(stop.id()).isEqualTo(1);
+			assertThat(stop.captures()).containsExactlyInAnyOrderEntriesOf(Map.of(2, "first capture", 3, "second capture"));
+		});
 	}
 
 	@Test

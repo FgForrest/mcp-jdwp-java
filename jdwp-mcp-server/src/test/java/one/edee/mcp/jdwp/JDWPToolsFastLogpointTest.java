@@ -273,9 +273,11 @@ class JDWPToolsFastLogpointTest {
 	void overviewListsFastLogpoints() {
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(3, "com.example.Cart", 42, "total", "total < 0",
-				FastLogpointService.State.ARMED, null, 4096, 10, 2, 15, true, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
+				FastLogpointService.State.ARMED, null, 4096, 10, 2, 15, true, null, FastLogpointService.Kind.LOGPOINT,
+				EventRequest.SUSPEND_EVENT_THREAD, false, null, false),
 			new FastLogpointService.Info(4, "com.example.Order", 7, "id", null,
-				FastLogpointService.State.FAILED, "refusing to arm: ...", 4096, 0, 0, -1, false, null, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null)));
+				FastLogpointService.State.FAILED, "refusing to arm: ...", 4096, 0, 0, -1, false, null,
+				FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null, false)));
 
 		final String all = tools.jdwp_overview("fast_logpoint", null, null);
 		assertThat(all)
@@ -294,9 +296,11 @@ class JDWPToolsFastLogpointTest {
 			Instant.parse("2026-10-28T15:02:11Z"), "mcp-jdwp-java, session 3fa1c2d9", "AppClassLoader#12", 4096);
 		when(fastLogpoints.list()).thenReturn(List.of(
 			new FastLogpointService.Info(7, "com.example.Cart", 42, "total", null,
-				FastLogpointService.State.RECOVERED, null, 4096, 3, 0, 18342, false, provenance, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null),
+				FastLogpointService.State.RECOVERED, null, 4096, 3, 0, 18342, false, provenance,
+				FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null, false),
 			new FastLogpointService.Info(8, "com.example.Cart", 50, "qty", null,
-				FastLogpointService.State.STRANDED, "the class's bytecode differs", 4096, 0, 0, 9, true, provenance, FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null)));
+				FastLogpointService.State.STRANDED, "the class's bytecode differs", 4096, 0, 0, 9, true, provenance,
+				FastLogpointService.Kind.LOGPOINT, EventRequest.SUSPEND_EVENT_THREAD, false, null, false)));
 
 		assertThat(tools.jdwp_overview("fast_logpoint", null, null))
 			.contains("#7  com.example.Cart:42  [RECOVERED, kill switch set — written=18342 read=3 dropped=0 buffer=4096; "

@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * Injects compiled bytecode into a target JVM and invokes a static method on the resulting class.
@@ -26,6 +27,8 @@ import java.util.List;
  */
 public final class RemoteCodeExecutor {
     private static final Logger log = LoggerFactory.getLogger(RemoteCodeExecutor.class);
+    /** Generated static field that keeps an arming result reachable during the debugger read. */
+    static final String ARMING_RESULT_FIELD = "__mcpArmingResult";
 
     /**
      * JDI method name for `ClassLoader.defineClass`.
@@ -56,7 +59,19 @@ public final class RemoteCodeExecutor {
     public static Value execute(VirtualMachine vm, ThreadReference thread, ClassLoaderReference classLoader,
                                 String className, byte[] bytecode, String methodName, List<Value> methodArgs)
         throws JdiEvaluationException {
+        return execute(vm, thread, classLoader, className, bytecode, methodName, methodArgs, false, value -> value);
+    }
 
+    /**
+     * Invokes the wrapper on the caller's leased target thread and returns the result reader's value.
+     * For arming calls, clears the wrapper's retained result after the dispatcher has read it.
+     * @throws JdiEvaluationException if wrapper loading, invocation, or the result read fails
+     */
+    static <T extends @Nullable Object> T execute(VirtualMachine vm, ThreadReference thread,
+                                                  ClassLoaderReference classLoader, String className,
+                                                  byte[] bytecode, String methodName, List<Value> methodArgs,
+                                                  boolean retainResult, Function<@Nullable Value, T> readResult)
+        throws JdiEvaluationException {
         final long startTime = System.currentTimeMillis();
 
         try {
@@ -82,14 +97,28 @@ public final class RemoteCodeExecutor {
 
             log.debug("[Executor] Found static method {}", methodName);
 
-            // 4. Invoke the method
-            final Value result = loadedClass.invokeMethod(thread, methodToInvoke, methodArgs, ClassType.INVOKE_SINGLE_THREADED);
-
-            final long elapsed = System.currentTimeMillis() - startTime;
-            final String resultType = result != null ? result.type().name() : "null";
-            log.info("[Executor] Remote method invoked successfully in {}ms, returned: {}", elapsed, resultType);
-
-            return result;
+            final Field retained = retainResult ? loadedClass.fieldByName(ARMING_RESULT_FIELD) : null;
+            if (retainResult && retained == null) {
+                throw new JdiEvaluationException("arming wrapper is missing its result field");
+            }
+            try {
+                final Value result = loadedClass.invokeMethod(thread, methodToInvoke, methodArgs,
+                    ClassType.INVOKE_SINGLE_THREADED);
+                final long elapsed = System.currentTimeMillis() - startTime;
+                final String resultType = result != null ? result.type().name() : "null";
+                log.info("[Executor] Remote method invoked successfully in {}ms, returned: {}", elapsed, resultType);
+                return readResult.apply(result);
+            } finally {
+                if (retained != null) {
+                    // The arming wrapper keeps the result strongly reachable from before invokeMethod
+                    // returns until the debugger finishes copying it, even with other threads running.
+                    try {
+                        loadedClass.setValue(retained, null);
+                    } catch (Exception e) {
+                        log.debug("[Executor] Could not clear the arming result field: {}", e.toString());
+                    }
+                }
+            }
 
         } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException e) {
             final long elapsed = System.currentTimeMillis() - startTime;

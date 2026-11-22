@@ -22,6 +22,7 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -128,6 +129,28 @@ final class LiveSession implements AutoCloseable {
 		final LiveSession session = new LiveSession(process, port, localClasspath);
 		session.connection.connect("127.0.0.1", port);
 		return session;
+	}
+
+	/**
+	 * Re-attaches after a detach. The target's JDWP agent takes a moment to listen again, and an
+	 * attach that lands while it is still tearing down the previous session is dropped right away —
+	 * so a connection only counts once it is still answering a little later.
+	 */
+	void reattach() throws Exception {
+		final long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+		while (true) {
+			try {
+				connection.connect("127.0.0.1", port);
+				Thread.sleep(300);
+				connection.getVM().allThreads();
+				return;
+			} catch (Exception notYet) {
+				if (System.nanoTime() > deadline) {
+					throw notYet;
+				}
+				Thread.sleep(100);
+			}
+		}
 	}
 
 	@Override

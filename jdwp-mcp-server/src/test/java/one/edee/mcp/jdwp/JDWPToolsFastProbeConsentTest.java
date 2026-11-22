@@ -82,6 +82,7 @@ class JDWPToolsFastProbeConsentTest {
 			.startsWith("[CONSENT REQUIRED]");
 	}
 
+	/** Checks that changing probe settings or the endpoint requires separate consent. */
 	@Test
 	@DisplayName("a changed probe or endpoint requires its own approval")
 	void changedProbeOrEndpoint() throws Exception {
@@ -96,7 +97,7 @@ class JDWPToolsFastProbeConsentTest {
 			.startsWith("[CONSENT REQUIRED]");
 		assertThat(tools.jdwp_set_fast_logpoint("com.example.Order", 42, "total", "total < 0", null, null, null))
 			.startsWith("[CONSENT REQUIRED]");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", false, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", false, null, null))
 			.startsWith("[CONSENT REQUIRED]");
 		assertThat(tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", null,
 			FastLogpointService.DEFAULT_BUFFER_SIZE, null)).contains("Standing approval used");
@@ -145,7 +146,7 @@ class JDWPToolsFastProbeConsentTest {
 
 		assertThat(tools.jdwp_set_fast_logpoint(target.getName(), 42, "42", null, true, null, null))
 			.contains("WAITING");
-		assertThat(tools.jdwp_set_fast_breakpoint(target.getName(), 42, "false", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(target.getName(), 42, "false", true, null, null, null, null))
 			.contains("WAITING");
 	}
 
@@ -216,31 +217,60 @@ class JDWPToolsFastProbeConsentTest {
 		for (Boolean approval : new Boolean[]{null, true}) {
 			assertThat(tools.jdwp_set_fast_logpoint(className, 42, "total", null, approval, null, null))
 				.startsWith("Error:").contains("binary class name");
-			assertThat(tools.jdwp_set_fast_breakpoint(className, 42, "total < 0", approval, null, null, null))
+			assertThat(tools.jdwp_set_fast_breakpoint(className, 42, "total < 0", approval, null, null, null, null))
 				.startsWith("Error:").contains("binary class name");
 		}
 		verify(connection, never()).getVM();
 		verifyNoInteractions(probes);
 	}
 
+	/** Checks that stop mode and suspend policy are part of fast-breakpoint approval. */
 	@Test
 	@DisplayName("fast breakpoint approvals match effective policy and stop mode")
 	void breakpointPolicyAndMode() throws Exception {
 		attach("localhost", 5005);
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, null))
 			.startsWith("[CONSENT REQUIRED]").contains("later JVMs at the same host:port while this MCP server runs");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null)).contains("WAITING");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, null)).contains("WAITING");
 
 		attach("127.0.0.1", 5005);
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "ALL", true, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "ALL", true, null, null))
 			.contains("WAITING", "Standing approval used");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", true, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "thread", true, null, null))
 			.startsWith("[CONSENT REQUIRED]");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "all", false, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, "all", false, null, null))
 			.startsWith("[CONSENT REQUIRED]");
 		assertThat(tools.jdwp_overview("fast_breakpoint", null, null))
 			.contains("fast breakpoint " + CART + ":42", "total < 0", "stops once", "suspendPolicy=all",
 				"localhost:5005", "granted at");
+	}
+
+	/** Checks that fast-breakpoint approval binds the capture expression, force-load setting and endpoint. */
+	@Test
+	@DisplayName("a fast breakpoint approval covers its exact capture expression")
+	void breakpointCaptureApproval() throws Exception {
+		attach("localhost", 5005);
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, null))
+			.contains("WAITING");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, "total + 1"))
+			.startsWith("[CONSENT REQUIRED]").contains("condition: total < 0", "capture: total + 1");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, "total + 1"))
+			.contains("WAITING").doesNotContain("Standing approval used");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, " "))
+			.startsWith("Error: capture");
+
+		attach("127.0.0.1", 5005);
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, "total + 1"))
+			.contains("WAITING", "Standing approval used");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, "total + 2"))
+			.startsWith("[CONSENT REQUIRED]");
+		assertThat(tools.jdwp_overview("fast_breakpoint", "total + 1", null))
+			.contains("capture=\"total + 1\"", "forceLoad=false", "granted at");
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, true, "total + 1"))
+			.startsWith("[CONSENT REQUIRED]").contains("capture: total + 1", "forceLoad=true", "localhost:5005");
+		attach("localhost", 5006);
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, true, "total + 1"))
+			.startsWith("[CONSENT REQUIRED AGAIN]").contains("capture: total + 1", "forceLoad=true", "localhost:5006");
 	}
 
 	@Test
@@ -277,6 +307,7 @@ class JDWPToolsFastProbeConsentTest {
 			anyInt(), anyString(), any(), anyInt(), anyInt(), anyBoolean());
 	}
 
+	/** Checks that an explicit approval becomes a standing grant after a successful re-arm. */
 	@Test
 	@DisplayName("a breakpoint successfully re-armed with explicit approval grants consent, a refusal does not")
 	void rearmGrantsOnlyOnSuccess() throws Exception {
@@ -288,21 +319,21 @@ class JDWPToolsFastProbeConsentTest {
 		when(type.classLoader()).thenReturn(mock(ClassLoaderReference.class));
 		when(type.locationsOfLine(42)).thenReturn(List.of(location));
 		when(location.method()).thenReturn(mock(Method.class));
-		when(probes.rearmBreakpoint(location, "total < 0", true, EventRequest.SUSPEND_ALL))
+		when(probes.rearmBreakpoint(location, "total < 0", null, true, EventRequest.SUSPEND_ALL))
 			.thenReturn(new FastLogpointService.RearmResult("Error: fast breakpoint with other parameters", false),
 				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true),
 				new FastLogpointService.RearmResult("Fast breakpoint re-armed", true),
 				new FastLogpointService.RearmResult("Error: stop gate did not reopen. Error gate reopened.", false));
 
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, null))
 			.startsWith("Error:");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, null))
 			.startsWith("[CONSENT REQUIRED]");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", true, null, null, null, null))
 			.contains("re-armed");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, null))
 			.contains("re-armed", "Standing approval used");
-		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null))
+		assertThat(tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", null, null, null, null, null))
 			.contains("stop gate did not reopen").doesNotContain("Standing approval used");
 	}
 
@@ -310,9 +341,10 @@ class JDWPToolsFastProbeConsentTest {
 		return tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", approval, null, null);
 	}
 
+	/** Calls the selected fast-probe tool with the requested consent and force-load settings and returns its reply. */
 	private String setProbe(boolean breakpoint, Boolean approval, Boolean forceLoad) {
 		return breakpoint
-			? tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", approval, null, null, forceLoad)
+			? tools.jdwp_set_fast_breakpoint(CART, 42, "total < 0", approval, null, null, forceLoad, null)
 			: tools.jdwp_set_fast_logpoint(CART, 42, "total", "total < 0", approval, null, forceLoad);
 	}
 
