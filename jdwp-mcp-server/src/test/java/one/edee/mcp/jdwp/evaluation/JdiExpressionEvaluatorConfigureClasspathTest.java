@@ -226,7 +226,10 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		return evaluator.compileFastLogpointProbe(frame, false, "fixture", expression, null, 16, metadata);
 	}
 
-	/** Completes discovery during ECJ's first attempt, then checks a typo or a newly available type. */
+	/**
+	 * Completes discovery during ECJ's first attempt, then checks an unknown qualified name or a newly available type.
+	 * The unknown name is qualified because a bare misspelled local is a permanent error without any retry.
+	 */
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	void probeRetriesOnceIfDiscoveryFinishesDuringCompilation(boolean typo, @TempDir Path project) throws Exception {
@@ -265,7 +268,7 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		when(jdiService.discoverClasspath(thread)).thenReturn(project.toString());
 		final JdiExpressionEvaluator withLocal = new JdiExpressionEvaluator(
 			finishingCompiler, jdiService, new EvaluationGuard(), provider);
-		final String expression = typo ? "unknownVariable" : "fixture.Late.VALUE";
+		final String expression = typo ? "Missing.VALUE" : "fixture.Late.VALUE";
 		final FastLogpointProbeSource.Metadata metadata = new FastLogpointProbeSource.Metadata(
 			"fixture.Target", "work", "()V", 10, expression, null, 0, "test");
 		withLocal.startLocalClasspathDiscovery(vm);
@@ -276,7 +279,7 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 				assertThatThrownBy(() -> withLocal.compileFastLogpointProbe(
 					frame, false, "fixture", expression, null, 16, metadata))
 					.isInstanceOf(JdiEvaluationException.class).isNotInstanceOf(LocalClasspathPendingException.class)
-					.hasMessageContaining("unknownVariable cannot be resolved");
+					.hasMessageContaining("Missing cannot be resolved");
 			} else {
 				assertThat(withLocal.compileFastLogpointProbe(frame, false, "fixture", expression, null, 16, metadata))
 					.isNotNull();

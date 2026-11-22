@@ -335,7 +335,10 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
-	/** Reports the compiler's typo after a live probe's initial discovery deferral. */
+	/**
+	 * Reports the compiler's error after a live probe's initial discovery deferral. The unresolved name is qualified,
+	 * so a classpath entry could still supply it; a bare misspelled local fails at once instead.
+	 */
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	void invalidProbeReportsCompilerErrorOnceDiscoveryFinishes(boolean breakpoint, @TempDir Path project)
@@ -350,9 +353,9 @@ class DispatcherMavenLiveTest {
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
 			final int line = LiveSession.lineOf("MARK: label");
 			final int probe = LiveSession.idOf(breakpoint
-				? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, "unknownLocal < i",
-					true, "all", true, null)
-				: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, "unknownLocal + i",
+				? session.tools.jdwp_set_fast_breakpoint(LiveSession.TARGET, line, "UnknownType.VALUE < i",
+					true, "all", true, null, null)
+				: session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET, line, "UnknownType.VALUE + i",
 					null, true, null, null));
 			final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
 			await("discovery deferral", () -> hasProbeEvent(session, probe, prefix + "_ARMING_DEFERRED"));
@@ -361,13 +364,13 @@ class DispatcherMavenLiveTest {
 			assertThat(provider.discoverWithBreakdown().failure()).isNull();
 			if (breakpoint) {
 				assertThat(session.tools.jdwp_resume_until_event(30_000))
-					.contains("condition failed", "unknownLocal cannot be resolved");
+					.contains("condition failed", "UnknownType cannot be resolved");
 				session.tools.jdwp_resume();
 			}
 			await("compiler error", () -> session.history.getRecent(EventHistory.MAX_EVENTS).stream().anyMatch(event ->
 				event.type().equals(prefix + "_ARM_FAILED")
 					&& Integer.toString(probe).equals(event.details().get("breakpointId"))
-					&& event.summary().contains("unknownLocal cannot be resolved")));
+					&& event.summary().contains("UnknownType cannot be resolved")));
 		} finally {
 			releaseMaven.countDown();
 		}
