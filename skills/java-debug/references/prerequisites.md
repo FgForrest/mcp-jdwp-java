@@ -31,6 +31,9 @@ ps -ef | grep "agentlib:jdwp"
 
 The `address=*:<port>` (or `address=<port>`) field tells you what to pass to `jdwp_wait_for_attach`.
 
+
+At the VM-start hold, set breakpoints and resume to reach application frames. Before the application runs, navigation can read initialized system statics. Compiled expressions require a later invocation event.
+
 ## Maven Surefire Tests
 
 ```bash

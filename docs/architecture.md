@@ -106,7 +106,7 @@ A per-session daemon, `jdi-suspension-watchdog`, that frees a dispatcher evaluat
 
 ### `InvocationRunner`
 
-Runs a tool's invoking work — an evaluation, `toString()`, force-loading a class — on the `jdi-invoker-N` pool and waits at most 20 s, so a blocked invocation never takes the serialized MCP worker with it. Past the wait the tool answers `[STILL_RUNNING]`, naming what blocks the thread when JDI can tell; the job keeps running and its result lands in the event history as `EVALUATION_COMPLETED_LATE`. A target thread with a job still running refuses another. See [threading-and-safety.md](threading-and-safety.md) § 5.
+Runs a tool's invoking work — a compiled evaluation, `toString()`, force-loading a class — on the `jdi-invoker-N` pool and waits at most 20 s, so a blocked invocation never takes the serialized MCP worker with it. Past the wait the tool answers `[STILL_RUNNING]`, naming what blocks the thread when JDI can tell; the job keeps running and its result lands in the event history as `EVALUATION_COMPLETED_LATE`. A target thread with a job still running refuses another. See [threading-and-safety.md](threading-and-safety.md) § 5.
 
 ### `EvaluationGuard`
 
@@ -120,7 +120,7 @@ A 500-entry FIFO ring buffer (`EventHistory.java`) of every JDWP event the pipel
 
 Around the core, four packages each own a small focused concern:
 
-- **`evaluation/`** — the compile-and-inject pipeline. Takes a Java expression string, generates a wrapper class, compiles it with Eclipse JDT, ships the bytecode to the target via `ClassLoader.defineClass`, and invokes the static `evaluate()` method on the suspended thread. Documented in [expression-evaluation.md](expression-evaluation.md).
+- **`evaluation/`** — the compiled evaluator generates an ECJ wrapper, defines it in the target with `ClassLoader.defineClass` and invokes it on the suspended thread. **`evaluation/interpret/`** routes ordinary expressions and interprets read-only plans over JDI. This path uses frame and object reads and takes no invocation lease. Fast probes depend directly on the compiled evaluator. [Expression evaluation](expression-evaluation.md)
 - **`watchers/`** — MCP-side expression bookmarks. A watcher is an `(id, label, breakpointId, expression)` record that the agent can attach to a breakpoint; on a hit, the agent asks `jdwp_evaluate_watchers` and the server replays every attached expression through the evaluation pipeline. Pure server-side state — the target JVM knows nothing about watchers.
 - **`marks/`** — labelled object pins. `jdwp_mark_instance` registers an `ObjectReference` under a `$label` name and calls `disableCollection()` on it so the target VM cannot GC the object out from under the next expression. Marks are exposed as `$label` bindings to every expression evaluation.
 - **`discovery/`** — local-JVM enumeration. Combines `com.sun.tools.attach.VirtualMachine.list()` with a `/proc/<pid>/cmdline` scan (Linux) and an opt-in JDWP handshake probe so `jdwp_diagnose` can tell you "this PID is a Java process listening on port 5005 right now" without ever calling `VirtualMachine.attach()`. Documented in [diagnostics.md](diagnostics.md).

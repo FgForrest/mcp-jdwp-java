@@ -69,6 +69,8 @@ Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and pr
 
 ## Expression evaluation fails with "X cannot be resolved"
 
+Ordinary expressions can read private fields on a suspended frame, including manual holds and blocked threads. If a reply includes `not interpreted`, its reason explains why the expression needed compilation. Method calls, lambdas and blocks use the compiled path. Check `jdwp_diagnose` for engine counts, common fallback reasons and classpath discovery status.
+
 Symptoms: `jdwp_evaluate_expression`, `jdwp_assert_expression`, a logpoint, or a conditional breakpoint returns a JDT compile diagnostic like `X cannot be resolved to a type` / `cannot be resolved to a variable`, or `configureCompilerClasspath` throws `Classpath discovery failed for the current connection: neither the target VM classloader hierarchy nor the local project yielded any classpath entries`.
 
 The target type is visible to the running JVM but invisible to the wrapper compile. This happens when the target's classloader hierarchy hides JARs from `getURLs()` — Tomcat's `WebappClassLoaderBase`, Spring Boot's `LaunchedClassLoader`, dev-tools `RestartClassLoader`, or any custom `URLClassLoader`. The MCP server augments the discovered classpath with entries from the local project (`target/classes`, `target/test-classes`, Maven-resolved dependencies) to plug those gaps. The project is the directory the agent session runs in: Claude Code starts the server there, and Codex, which starts the server in the plugin's own directory, reports it with every tool call. If the local sources are empty too, the compile breaks.

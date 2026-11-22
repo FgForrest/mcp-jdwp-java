@@ -52,8 +52,10 @@ class DispatcherMavenLiveTest {
 			});
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
 			try {
+				// A loop is never interpreted, so this logpoint exercises the compiled path and its classpath.
 				final int logpoint = LiveSession.idOf(session.tools.jdwp_set_logpoint(
-					LiveSession.TARGET, LiveSession.lineOf("MARK: label"), "i", null, null));
+					LiveSession.TARGET, LiveSession.lineOf("MARK: label"),
+					"{ int sum = 0; for (int k = 0; k < 1; k++) { sum += i; } return sum; }", null, null));
 				final Thread mavenThread = mavenStarted.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 				// Either target worker can reach the plain breakpoint first. Observe a logpoint
 				// evaluation before arming the stop that could park both workers.

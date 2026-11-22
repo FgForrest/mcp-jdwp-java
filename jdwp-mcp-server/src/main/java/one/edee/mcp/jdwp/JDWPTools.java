@@ -8,6 +8,8 @@ import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
+import one.edee.mcp.jdwp.evaluation.interpret.Planner;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.fastlogpoint.FastBreakpointRiskBriefing;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointRiskBriefing;
@@ -37,6 +39,7 @@ import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -134,7 +137,8 @@ public class JDWPTools {
     private final JDIConnectionService jdiService;
     private final BreakpointTracker breakpointTracker;
     private final WatcherManager watcherManager;
-    private final JdiExpressionEvaluator expressionEvaluator;
+    /** Routes expression evaluation between the interpreter and the compiler. */
+    private final EvaluationRouter evaluations;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
     private final JvmDiscoveryService jvmDiscoveryService;
@@ -162,8 +166,23 @@ public class JDWPTools {
      */
     private final InvocationRunner invocations;
 
+    /** Creates the tools with a default {@link EvaluationRouter} built on the given compiled evaluator. */
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
+                     EventHistory eventHistory, EvaluationGuard evaluationGuard,
+                     JvmDiscoveryService jvmDiscoveryService,
+                     MarkedInstanceRegistry markedInstances,
+                     JdiHealthMonitor healthMonitor,
+                     LocalProjectClasspathProvider localClasspathProvider,
+                     FastLogpointService fastLogpoints) {
+        this(jdiService, breakpointTracker, watcherManager, new EvaluationRouter(expressionEvaluator), eventHistory,
+            evaluationGuard, jvmDiscoveryService, markedInstances, healthMonitor, localClasspathProvider, fastLogpoints);
+    }
+
+    /** Creates the tools with the given evaluation router. */
+    @org.springframework.beans.factory.annotation.Autowired
+    public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
+                     WatcherManager watcherManager, EvaluationRouter evaluations,
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
                      JvmDiscoveryService jvmDiscoveryService,
                      MarkedInstanceRegistry markedInstances,
@@ -173,7 +192,7 @@ public class JDWPTools {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
-        this.expressionEvaluator = expressionEvaluator;
+        this.evaluations = evaluations;
         this.eventHistory = eventHistory;
         this.evaluationGuard = evaluationGuard;
         this.jvmDiscoveryService = jvmDiscoveryService;
@@ -1364,7 +1383,7 @@ public class JDWPTools {
     }
 
 
-    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
+    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Private fields are reachable without compiling. Ordinary method calls and lambdas compile. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_expression(
         @McpToolParam(required = false, description = "Thread unique ID — defaults to the thread of the current stop") @Nullable Long threadId,
         @McpToolParam(description = "Java expression OR `{ ... }` block to evaluate. Examples: `order.getTotal()`, `x + y`, `{ try { return risky(); } catch (Exception e) { return e.getMessage(); } }`") String expression,
@@ -1389,20 +1408,8 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
-            final String invokeGuard = checkSafeToInvoke(thread);
-            if (invokeGuard != null) {
-                return invokeGuard;
-            }
-
-            final Value result = invocations.run(thread, "evaluating " + expression, () -> {
-                expressionEvaluator.configureCompilerClasspath(thread);
-                final StackFrame frame = FrameView.of(thread).frame(frameIndex != null ? frameIndex : 0);
-                return expressionEvaluator.evaluate(frame, expression, markedInstances.buildBindings());
-            });
-
-            // P3-5: echo the expression so the agent can attribute results when several evals are
-            // batched in one turn ("Result of foo.bar(): 42" instead of just "Result: 42").
-            return String.format("Result of %s: %s", echoed(expression), formatValue(result));
+            return evaluateExpression(thread, frameIndex == null ? 0 : frameIndex, expression,
+                actual -> String.format("Result of %s: %s", echoed(expression), actual));
         } catch (InvocationRunner.StillRunning e) {
             return e.report();
         } catch (Exception e) {
@@ -1439,28 +1446,7 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
-            final String invokeGuard = checkSafeToInvoke(thread);
-            if (invokeGuard != null) {
-                return invokeGuard;
-            }
-
-            final Value result = invocations.run(thread, "evaluating " + expression, () -> {
-                expressionEvaluator.configureCompilerClasspath(thread);
-                final StackFrame stackFrame = FrameView.of(thread).frame(frame);
-                return expressionEvaluator.evaluate(stackFrame, expression, markedInstances.buildBindings());
-            });
-            final String actual = formatValue(result);
-
-            // Strip wrapping quotes from formatted strings so users can pass `expected="hello"` or `expected=hello`.
-            String compareActual = actual;
-            if (compareActual.length() >= 2 && compareActual.startsWith("\"") && compareActual.endsWith("\"")) {
-                compareActual = compareActual.substring(1, compareActual.length() - 1);
-            }
-
-            if (compareActual.equals(expected)) {
-                return String.format("OK — %s = %s", echoed(expression), actual);
-            }
-            return String.format("MISMATCH — %s\n  expected: %s\n  actual:   %s", echoed(expression), expected, actual);
+            return evaluateExpression(thread, frame, expression, actual -> renderAssertion(expression, expected, actual));
         } catch (InvocationRunner.StillRunning e) {
             return e.report();
         } catch (Exception e) {
@@ -1472,10 +1458,64 @@ public class JDWPTools {
     }
 
     /**
-     * If the evaluator's error message looks like "X cannot be resolved" and X matches a field on
-     * {@code this}'s declared type, append a hint explaining the package-private wrapper-class
-     * limitation and pointing the user at {@code jdwp_get_fields(thisObjectId)}.
+     * Evaluates the expression in the frame, first by interpretation under fresh frames, then by the compiled evaluator when the interpreter declines; {@code reply} renders the formatted value.
      */
+    private String evaluateExpression(ThreadReference thread, int frameIndex, String expression,
+                                      UnaryOperator<String> reply) throws Exception {
+        final EvaluationRouter.Input input = evaluations.parse(expression);
+        final EvaluationRouter.FrameSource frames = () -> {
+            try {
+                return FrameView.of(thread).frame(frameIndex);
+            } catch (IndexOutOfBoundsException empty) {
+                if (frameIndex == 0 && thread.frameCount() == 0) {
+                    return null;
+                }
+                throw empty;
+            }
+        };
+        final String actual;
+        try {
+            return withFreshFrames(thread, "call again.", () -> {
+                final Planner.Plan plan = evaluations.prepare(input, thread, frames, markedInstances.buildBindings());
+                return evaluations.readOnly(plan, value -> reply.apply(formatValue(value)));
+            });
+        } catch (EvaluationRouter.NeedsCompiler fallback) {
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return evaluations.refused(invokeGuard, fallback);
+            }
+            final EvaluationRouter.ToolJob job = evaluationJob(thread);
+            actual = invocations.run(thread, "evaluating " + expression, () ->
+                job.evaluate(input, frames, markedInstances.buildBindings(), this::formatValue));
+        }
+        return reply.apply(actual);
+    }
+
+    /**
+     * Creates an evaluation job whose compiled fallback runs only while the stop the tool started at still holds the thread.
+     */
+    private EvaluationRouter.ToolJob evaluationJob(ThreadReference thread) {
+        final SuspensionSession session = breakpointTracker.suspensionSession();
+        return evaluations.toolJob(thread, () -> {
+            if (session != null) {
+                session.requireAdmittedStop(thread);
+            }
+        });
+    }
+
+    /**
+     * Compares the actual result with the expected text, ignoring wrapping quotes of a string result, and renders the verdict.
+     */
+    private static String renderAssertion(String expression, String expected, String actual) {
+        // Strip wrapping quotes so a string result can be compared with the raw expected value.
+        final String compared = actual.length() >= 2 && actual.startsWith("\"") && actual.endsWith("\"")
+            ? actual.substring(1, actual.length() - 1) : actual;
+        if (compared.equals(expected)) {
+            return String.format("OK — %s = %s", echoed(expression), actual);
+        }
+        return String.format("MISMATCH — %s\n  expected: %s\n  actual:   %s", echoed(expression), expected, actual);
+    }
+
     /**
      * The expression as a reply echoes it: whitespace collapsed, and cut after 80 characters — a
      * {@code { … }} block is attributed by its start, not repeated whole.
@@ -1485,6 +1525,7 @@ public class JDWPTools {
         return flat.length() <= 80 ? flat : flat.substring(0, 79) + "…";
     }
 
+    /** Adds a field-inspection hint to a compiled unresolved-name diagnostic. */
     private String enrichEvaluationError(String originalMessage, long threadId, @Nullable Integer frameIndex) {
         final String unresolved = parseUnresolvedFieldName(originalMessage);
         if (unresolved == null) {
@@ -2381,6 +2422,7 @@ public class JDWPTools {
         // any long-waiting tool. Surfaces silence interval, last active probe outcome, and a
         // recommended action when the watchdog has classified the connection as wedged.
         out.append(renderJdiHealthBlock(healthMonitor.snapshot()));
+        out.append(evaluations.diagnostics());
         // Capabilities block — only meaningful when connected (the renderer collapses to empty
         // string when both are false). We probe the live VM defensively because the call can
         // race with a VM-death event; failure degrades to "no capabilities reported".
@@ -6147,39 +6189,21 @@ public class JDWPTools {
 
                     Thread must be stopped at a breakpoint to evaluate watchers.""", threadId);
             }
-            final String invokeGuard = checkSafeToInvoke(thread);
-            if (invokeGuard != null) {
-                return invokeGuard;
-            }
-
             final String effectiveScope = scope.isBlank() ? "current_frame" : scope;
             final Integer effectiveBreakpointId = breakpointId;
-            return invocations.run(thread, "evaluating the watchers", () -> {
-                // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.
-                expressionEvaluator.configureCompilerClasspath(thread);
-
-                final StringBuilder result = new StringBuilder();
-                result.append(String.format("=== Watcher Evaluation for Thread %d (Scope: %s) ===\n\n", threadId,
-                    effectiveScope));
-                result.append(String.format("Thread: %s (frames: %d)\n\n", thread.name(), FrameView.of(thread).count()));
-
-                final int watchersEvaluated;
-                if ("full_stack".equalsIgnoreCase(effectiveScope)) {
-                    watchersEvaluated = evaluateWatchersFullStack(thread, result);
-                } else {
-                    watchersEvaluated = evaluateWatchersCurrentFrame(thread, effectiveBreakpointId, result);
+            try {
+                evaluations.requireReadOnlyMode();
+                return withFreshFrames(thread, "call again.", () ->
+                    evaluateWatcherBatch(thread, effectiveScope, effectiveBreakpointId, null));
+            } catch (EvaluationRouter.NeedsCompiler fallback) {
+                final String invokeGuard = checkSafeToInvoke(thread);
+                if (invokeGuard != null) {
+                    return evaluations.refused(invokeGuard, fallback);
                 }
-
-                if (watchersEvaluated == 0) {
-                    result.append("No watchers found or evaluated for the given scope.\n");
-                }
-                // Per-call tally (split into succeeded/errored on partial failure) is appended inside
-                // the evaluator helpers via appendWatcherTally — the outer "Evaluated N expression(s)"
-                // line was double-counting when both halves emitted their own totals.
-
-                return result.toString();
-            });
-
+                final EvaluationRouter.ToolJob job = evaluationJob(thread);
+                return invocations.run(thread, "evaluating the watchers", () ->
+                    evaluateWatcherBatch(thread, effectiveScope, effectiveBreakpointId, job));
+            }
         } catch (InvocationRunner.StillRunning e) {
             return e.report();
         } catch (Exception e) {
@@ -6191,123 +6215,107 @@ public class JDWPTools {
         }
     }
 
+    /** The watchers of one breakpoint, evaluated in the stack frame at {@code index}. */
+    private record WatcherGroup(int index, int breakpointId, Location location, List<Watcher> watchers) {}
+
     /**
-     * Evaluates watchers for the current (topmost) stack frame only.
-     *
-     * @param thread       the suspended thread whose frame 0 will be inspected
-     * @param breakpointId the breakpoint ID to look up watchers for
-     * @param result       accumulator for formatted evaluation output
-     * @return number of watchers successfully evaluated
+     * Evaluates the watchers of the scope and renders the report; interpreted when {@code job} is null, otherwise through the job's compiled fallback.
      */
-    private int evaluateWatchersCurrentFrame(
-        ThreadReference thread, @Nullable Integer breakpointId, StringBuilder result) throws Exception {
+    private String evaluateWatcherBatch(ThreadReference thread, String scope, @Nullable Integer breakpointId,
+                                        EvaluationRouter.@Nullable ToolJob job) throws Exception {
         final FrameView view = FrameView.of(thread);
-        if (view.count() == 0) {
-            return 0;
-        }
-
-        // Capture an initial frame just to read the location for the header — we MUST NOT reuse
-        // this reference inside the per-watcher loop. JDI invalidates every StackFrame on the
-        // thread the moment invokeMethod returns, so a reused frame would throw
-        // InvalidStackFrameException("Thread has been resumed") on every watcher after the first.
-        final Location location = view.frame(0).location();
-        int succeeded = 0;
-        int errored = 0;
-
-        if (breakpointId == null) {
-            result.append("No breakpoint ID available — cannot resolve watchers for current frame.\n");
-            return 0;
-        }
-
-        final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(breakpointId);
-        if (watchers.isEmpty()) {
-            return 0;
-        }
-
-        result.append(String.format("─── Current Frame #0: %s:%d (Breakpoint ID: %d) ───\n\n",
-            location.declaringType().name(), location.lineNumber(), breakpointId));
-
-        final Map<String, Value> markBindings = markedInstances.buildBindings();
-        for (Watcher watcher : watchers) {
-            result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
-            try {
-                // Re-fetch the frame on every iteration — see comment at top of method.
-                final StackFrame freshFrame = view.frame(0);
-                final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
-                result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
-                succeeded++;
-            } catch (Exception e) {
-                result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
-                errored++;
+        final int count = view.count();
+        final StringBuilder result = new StringBuilder(String.format(
+            "=== Watcher Evaluation for Thread %d (Scope: %s) ===\n\nThread: %s (frames: %d)\n\n",
+            thread.uniqueID(), scope, thread.name(), count));
+        final boolean fullStack = "full_stack".equalsIgnoreCase(scope);
+        final List<WatcherGroup> groups = watcherGroups(view, count, breakpointId, fullStack, result);
+        final Map<String, Value> marks = markedInstances.buildBindings();
+        final List<Planner.Plan> plans = new ArrayList<>();
+        if (job == null) {
+            for (WatcherGroup group : groups) {
+                for (Watcher watcher : group.watchers()) {
+                    final Planner.Plan plan = evaluations.prepare(evaluations.parse(watcher.getExpression()), thread,
+                        () -> view.frame(group.index()), marks);
+                    evaluations.requireReadOnly(plan);
+                    plans.add(plan);
+                }
             }
         }
+
+        int succeeded = 0;
+        int errored = 0;
+        final Iterator<Planner.Plan> plan = plans.iterator();
+        for (WatcherGroup group : groups) {
+            final Location location = group.location();
+            result.append(String.format("─── %s #%d: %s:%d (Breakpoint ID: %d) ───\n\n",
+                fullStack ? "Frame" : "Current Frame", group.index(), location.declaringType().name(),
+                location.lineNumber(), group.breakpointId()));
+            for (Watcher watcher : group.watchers()) {
+                final String expression = watcher.getExpression();
+                result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
+                try {
+                    final String value = job != null
+                        ? job.evaluate(evaluations.parse(expression), () -> view.frame(group.index()),
+                            marks, this::formatValue)
+                        : evaluations.readOnly(plan.next(), this::formatValue);
+                    result.append(String.format("    %s = %s\n\n", expression, value));
+                    succeeded++;
+                } catch (EvaluationRouter.NeedsCompiler | InvalidStackFrameException e) {
+                    throw e;
+                } catch (Exception e) {
+                    if (isVmGone(e)) {
+                        throw e;
+                    }
+                    result.append(String.format("    %s = [ERROR: %s]\n\n", expression, e.getMessage()));
+                    errored++;
+                }
+            }
+        }
+        if (succeeded + errored == 0) {
+            result.append("No watchers found or evaluated for the given scope.\n");
+        }
         appendWatcherTally(result, succeeded, errored);
-        return succeeded + errored;
+        return result.toString();
     }
 
     /**
-     * Evaluates watchers across the entire call stack by scanning each frame's location against
-     * the breakpoint location map. Only frames that match a known breakpoint have their watchers
-     * evaluated — the watchers of every breakpoint at that line, ordinary and fast.
-     *
-     * @param thread the suspended thread whose full stack will be scanned
-     * @param result accumulator for formatted evaluation output
-     * @return total number of watchers successfully evaluated across all matching frames
+     * Collects the watcher groups of the current frame, or of every frame matching a breakpoint when {@code fullStack}; explains an empty result in {@code result}.
      */
-    private int evaluateWatchersFullStack(ThreadReference thread, StringBuilder result) throws Exception {
-        final Map<String, List<Integer>> breakpointIdsByLocation = breakpointIdsByLocation();
-        if (breakpointIdsByLocation.isEmpty()) {
+    private List<WatcherGroup> watcherGroups(FrameView view, int count, @Nullable Integer breakpointId,
+                                             boolean fullStack, StringBuilder result) throws Exception {
+        final List<WatcherGroup> groups = new ArrayList<>();
+        if (!fullStack) {
+            if (count == 0) {
+                return groups;
+            }
+            final Location location = view.frame(0).location();
+            if (breakpointId == null) {
+                result.append("No breakpoint ID available — cannot resolve watchers for current frame.\n");
+                return groups;
+            }
+            final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(breakpointId);
+            if (!watchers.isEmpty()) {
+                groups.add(new WatcherGroup(0, breakpointId, location, watchers));
+            }
+            return groups;
+        }
+        final Map<String, List<Integer>> byLocation = breakpointIdsByLocation();
+        if (byLocation.isEmpty()) {
             result.append("No breakpoints found. Cannot evaluate watchers.\n");
-            return 0;
+            return groups;
         }
-
-        int succeeded = 0;
-        int errored = 0;
-        // Snapshot the frame count + matching frame metadata up front so we can re-fetch each
-        // frame fresh from the thread inside the loop. Capturing StackFrame references in advance
-        // and re-using them after an invokeMethod would throw InvalidStackFrameException
-        // ("Thread has been resumed") — same root cause as the current-frame variant above.
-        final FrameView view = FrameView.of(thread);
-        final int frameCount = view.count();
-        final Map<String, Value> markBindings = markedInstances.buildBindings();
-
-        for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
-            // Probe the location once per outer iteration; SAFE because no invokeMethod has run
-            // since the previous probe in this iteration.
-            final Location location = view.frame(frameIndex).location();
-            final String locationKey = location.declaringType().name() + ':' + location.lineNumber();
-
-            final List<Integer> breakpointIds = breakpointIdsByLocation.get(locationKey);
-            if (breakpointIds == null) {
-                continue;
-            }
-
-            for (int breakpointId : breakpointIds) {
-                final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(breakpointId);
-                if (watchers.isEmpty()) {
-                    continue;
-                }
-
-                result.append(String.format("─── Frame #%d: %s:%d (Breakpoint ID: %d) ───\n\n",
-                    frameIndex, location.declaringType().name(), location.lineNumber(), breakpointId));
-
-                for (Watcher watcher : watchers) {
-                    result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
-                    try {
-                        // Fresh frame per watcher — see comment above.
-                        final StackFrame freshFrame = view.frame(frameIndex);
-                        final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
-                        result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
-                        succeeded++;
-                    } catch (Exception e) {
-                        result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
-                        errored++;
-                    }
+        for (int index = 0; index < count; index++) {
+            final Location location = view.frame(index).location();
+            final String key = location.declaringType().name() + ':' + location.lineNumber();
+            for (int id : byLocation.getOrDefault(key, List.of())) {
+                final List<Watcher> watchers = watcherManager.getWatchersForBreakpoint(id);
+                if (!watchers.isEmpty()) {
+                    groups.add(new WatcherGroup(index, id, location, watchers));
                 }
             }
         }
-        appendWatcherTally(result, succeeded, errored);
-        return succeeded + errored;
+        return groups;
     }
 
     /**

@@ -41,7 +41,7 @@ Claude Code ──MCP/STDIO──> Spring Boot MCP Server ──JDI──> Targe
 
 ### Expression Evaluation Pipeline (`evaluation/` package)
 
-Evaluates arbitrary Java expressions at breakpoints by compiling and injecting bytecode into the target JVM:
+Ordinary expressions enter through **EvaluationRouter** in `evaluation/interpret/`. ECJ parses the source and **Planner** snapshots the frame, resolves names and types, and selects a path. **Interpreter** reads private fields, arrays and other supported expressions over JDI without invoking, including on manually suspended and blocked threads. Other expressions use the compiled pipeline below. Fast-probe arming depends directly on **JdiExpressionEvaluator**.
 
 1. **JdiExpressionEvaluator** — Orchestrator. Analyzes the stack frame, generates a wrapper class with a unique UUID name, delegates compilation, and caches results.
 2. **ClasspathDiscoverer** — Walks the target JVM's classloader hierarchy (including Tomcat/container classloaders) to discover all JARs. Also uses **JdkDiscoveryService** to find a local JDK matching the target JVM version.

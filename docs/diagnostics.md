@@ -37,6 +37,9 @@ This section shows the current project directory, whether the client reported it
 
 The discovery sources are covered in § 2; the port-reachability classification is in § 3.
 
+
+The expression evaluation line shows counts of ordinary interpreted and compiled evaluations since the server started, the selected `JDWP_EVAL_ENGINE` mode, and up to five reasons expressions needed compilation.
+
 ## 2. JVM discovery — Attach API + `/proc`
 
 `JvmDiscoveryService.discover()` (`discovery/JvmDiscoveryService.java:137-144`) runs two strategies and merges by PID:

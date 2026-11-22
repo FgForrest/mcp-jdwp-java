@@ -198,6 +198,10 @@ class SuspensionSessionTest {
 			session.lease(t.ref);
 			return null;
 		})).isInstanceOf(EvaluationRefusedException.class).hasMessageContaining("was released from the stop");
+		assertThatThrownBy(() -> SuspensionSession.admittedUnder(t.ref, holds, () -> {
+			session.requireAdmittedStop(t.ref);
+			return null;
+		})).isInstanceOf(EvaluationRefusedException.class).hasMessageContaining("was released from the stop");
 		assertThat(t.count).isEqualTo(1);
 
 		// A new tool call is admitted at the new stop.

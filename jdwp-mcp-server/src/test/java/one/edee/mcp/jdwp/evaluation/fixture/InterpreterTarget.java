@@ -15,6 +15,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
 
     public int hidden = 20;
     private final Store store = new Store();
+    private final Holder<InterpreterTargetBase> holder = new Holder<>(new InterpreterTargetBase());
     private final int secret = 21;
 
     public static void main(String[] args) throws Exception {
@@ -123,6 +124,9 @@ public class InterpreterTarget extends InterpreterTargetBase {
     public Object golden(String id) {
         return switch (id) {
             case "private-field" -> this.secret;
+            case "super-field" -> super.hidden;
+            case "erased-field-navigation" -> holder.element.inherited;
+            case "nested-class-literal" -> State.class;
             case "private-map" -> store.map;
             case "private-map-call" -> store.map.size();
             case "private-session" -> store.map.get("key").role;
@@ -139,6 +143,14 @@ public class InterpreterTarget extends InterpreterTargetBase {
     public static String exceptionGolden(Throwable exception) {
         // This fixture throws IllegalArgumentException, which inherits this accessor unchanged.
         return exception.getMessage();
+    }
+
+    private static final class Holder<T> {
+        private final T element;
+
+        Holder(T element) {
+            this.element = element;
+        }
     }
 
     private static final class Store {

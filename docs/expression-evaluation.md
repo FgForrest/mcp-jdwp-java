@@ -1,8 +1,18 @@
 # Expression evaluation
 
-How the server compiles, injects, and executes arbitrary Java expressions against a live target JVM suspended at an invocation event. This is the heaviest subsystem in the codebase. The safety story (recursive-breakpoint protection, the `EvaluationGuard`) is in [threading-and-safety.md](threading-and-safety.md); the memory story (object cache, compilation cache, byte-array mirroring) is in [memory-and-references.md](memory-and-references.md); this chapter focuses on the compile-and-inject pipeline itself.
+Ordinary debugger expressions use `EvaluationRouter`. It can interpret read-only Java navigation over JDI or use Eclipse JDT (ECJ) to compile and inject a wrapper into the target JVM. Evaluation, assertions, watchers, and ordinary conditions and logpoints share the router. The threading and memory chapters describe the costs of each path. [Threading and safety](threading-and-safety.md) [Memory and references](memory-and-references.md)
 
-## 1. Pipeline overview
+## Navigation interpreter
+
+`ExpressionParser` parses a single expression or a balanced `{ ... }` statement body with ECJ, without consulting the target. `Planner` snapshots the frame's declaring type, `this`, locals and debugger bindings. It resolves fields from declared types and searches loaded types visible to the frame's loader. A read through an erased type variable can use the runtime class if the field name has a single declaration. The lookup includes enclosing types, the frame's package, `java.lang`, class references in the declaring type's constant pool and qualified names. A plan can run read-only, require compilation, or report an error before evaluation.
+
+Navigation includes private and package-private fields, inherited and static fields, enum constants, outer instances, locals, marks, event bindings, arrays, class literals, casts, `instanceof`, primitive operators and lazy `&&`, `||` and `?:`. It also handles concatenation of strings, null, integers, characters and booleans. Supported intrinsics are `String.length/isEmpty/equals/charAt`, `Enum.name/ordinal/equals`, and the final primitive wrappers' value accessors and `equals`. The interpreter uses JDI reads and host-side primitive operations, so it works on a manually suspended thread, a bystander held by another thread's stop-all, or a suspended thread blocked on a monitor or in `wait()`. Newly mirrored strings stay pinned through result formatting.
+
+Other calls, boxing, object or floating-point string concatenation, lambdas and blocks use compilation. Comparisons involving a String literal or possible String constant, parameterized casts and type tests, ambiguous or unavailable types, and static reads of uninitialized classes also go to the compiler. A syntax error or an unresolved name that can only be a variable is reported directly. Runtime failures such as a null dereference report the Java exception type and say that the interpreter raised it. A failed fallback includes the reason it needed compilation. Breakpoint conditions report `CONDITION_ERROR` and treat an error as true.
+
+Set the server environment variable `JDWP_EVAL_ENGINE` to `auto` (default), `compiler` (skip interpretation), or `interpreter` (report the reason whenever navigation is unavailable). Successful replies use the same format in all modes. `jdwp_diagnose` shows ordinary evaluation counts and frequent fallback reasons. Fast probes and their arming-hit evaluations use the compiled engine.
+
+## 1. Compiled pipeline overview
 
 ```
 User expression  e.g.  order.getTotal()
@@ -26,7 +36,7 @@ RemoteCodeExecutor.execute(vm, thread, classLoader,
 JDI Value  → MCP tool layer for formatting
 ```
 
-Every successful evaluation produces a permanent class in the target classloader (see [memory-and-references.md](memory-and-references.md) § 5 for the lifecycle). Every invocation runs under an `EvaluationGuard` lease: the connection's `SuspensionSession` admits the thread first, and every recursive hit during the in-VM call is suppressed (see [threading-and-safety.md](threading-and-safety.md) § 5).
+A compilation cache miss can add a permanent class to the target classloader (see [memory-and-references.md](memory-and-references.md) § 5 for the lifecycle). Every invocation runs under an `EvaluationGuard` lease: the connection's `SuspensionSession` admits the thread first, and every recursive hit during the in-VM call is suppressed (see [threading-and-safety.md](threading-and-safety.md) § 5).
 
 ## 2. Component responsibilities
 
@@ -90,7 +100,7 @@ The project directory is the directory the agent session runs in. Claude Code st
 
 Each connection starts local discovery on its own `jdi-local-classpath` daemon thread. Disconnect, target exit, and reconnect teardown cancel the departing connection's discovery. A fresh attach or directory change can start a new scan while the old one is still unwinding. Where `setsid` is available, an owned supervisor runs Maven in a private process group and signals its own group at the end of every run, including on timeout or cancellation. On hosts without `setsid`, the runner polls for descendants. A helper reparented between polls may outlive a cancelled or timed-out run, and `jdwp_diagnose` reports that limitation.
 
-The first suspending stop still prewarms remote classpath discovery and JDK detection. Dispatcher evaluations can use the remote classpath while the scan runs. If local discovery finishes during the remote classloader walk, publication retries with the ready result using the same remote classpath. The compiler checks the connection, directory, and local result before publishing options and their wrapper cache. If remote-only compilation reports a possibly missing type, the evaluator checks the current workspace for that connection. It retries once with ready entries and discards the retry result if the workspace changes during compilation. A fast probe stays pending for a later hit if discovery is still running or its retry result was superseded. Tool evaluations can wait for discovery for up to 180 seconds. If the tool deadline expires during that wait, `[STILL_RUNNING]` names local discovery and points to `jdwp_diagnose`.
+The first suspending stop still prewarms remote classpath discovery and JDK detection. Compiled dispatcher evaluations can use the remote classpath while the scan runs. If local discovery finishes during the remote classloader walk, publication retries with the ready result using the same remote classpath. The compiler checks the connection, directory, and local result before publishing options and their wrapper cache. If remote-only compilation reports a possibly missing type, the evaluator checks the current workspace for that connection. It retries once with ready entries and discards the retry result if the workspace changes during compilation. A fast probe stays pending for a later hit if discovery is still running or its retry result was superseded. Compiled tool evaluations can wait for discovery for up to 180 seconds. If the tool deadline expires during that wait, `[STILL_RUNNING]` names local discovery and points to `jdwp_diagnose`.
 
 **Limitations.**
 
@@ -179,15 +189,11 @@ Solution: detect the `$$` pattern and walk up the superclass chain to find the r
 
 ### Non-public type visibility
 
-The wrapper class lives in package `mcp.jdi.evaluation`. It can only reference public types. When `this` (or a local variable) has a package-private type, `getDeclaredType()` walks up the superclass chain to find the first public ancestor, falling back to `java.lang.Object`.
+The compiled evaluator normally uses `mcp.jdi.evaluation`. For a non-public `this` in an addressable package it emits the wrapper into that package, where Java permits access to the type and its package-accessible members. If the target refuses the definition, it retries in the isolated wrapper package. Types unavailable to the wrapper are represented by an accessible supertype or `Object`.
 
 ### `this` field auto-rewriting
 
-Users naturally write `sessions.containsKey(k)` when they mean `this.sessions.containsKey(k)`. The evaluator auto-rewrites bare field references to `_this.field` when:
-
-- The enclosing class (`this`) is public.
-- The specific field is public.
-- No local variable shadows the field name.
+The compiled evaluator rewrites an unqualified field name to `_this.field` in single-expression mode when the wrapper can access the member and a visible local or binding does not shadow it. This includes public fields on a public `this` and package-accessible fields in the wrapper's own package.
 
 The rewriter is a hand-rolled tokenizer (not regex) that correctly handles:
 
@@ -204,9 +210,9 @@ Same tokenizer technique for `this` → `_this`. The wrapper's `evaluate()` is a
 
 ### Compilation cache
 
-Key: `contextSignature + "###" + expression`, where `contextSignature` is the concatenated `type name` pairs of all visible variables. Two frames with the same local types/names sharing the same expression hit the same compiled class.
+The cache key includes the wrapper package, the ordered frame and binding types and names, and the expression source.
 
-Eviction: full flush at 100 entries. LRU bookkeeping is not worth the complexity when the miss cost (compile + inject) dwarfs the cost of recompiling a few hot entries. The cache is also cleared on every `configureCompilerClasspath` call (new connections may invalidate old bytecode). Full discussion in [memory-and-references.md](memory-and-references.md) § 6.
+Eviction: full flush at 100 entries. LRU bookkeeping is not worth the complexity when the miss cost (compile + inject) dwarfs the cost of recompiling a few hot entries. A connection reset or a change to the compiler classpath also replaces the cache. Full discussion in [memory-and-references.md](memory-and-references.md) § 6.
 
 ### `INVOKE_SINGLE_THREADED`
 
@@ -216,37 +222,31 @@ All JDI method invocations use `INVOKE_SINGLE_THREADED`. This requires the threa
 
 Dynamically derived from the target JVM's major version: `1.8` for Java 8, the bare number for Java 9+. The `-g` flag is always passed to preserve local variable names in the compiled bytecode.
 
-## 4. Constraints and edge cases
+## 4. Compiled evaluation constraints and edge cases
 
 ### Thread must be suspended at an invocation event
 
 `INVOKE_SINGLE_THREADED` requires a thread stopped at a breakpoint, step, or exception event. A thread suspended via `ThreadReference.suspend()` (manual suspension) is **not** at an invocation event — method calls would throw `IncompatibleThreadStateException`. The lease's admission refuses such a thread before anything is invoked and names the reason: a `jdwp_suspend_thread` hold, a bystander of another thread's stop-all, a VM-start stop, or a thread this session did not stop.
 
-### Classpath configuration must precede evaluation
+### Classpath configuration precedes compiled evaluation
 
-`configureCompilerClasspath(thread)` issues its own `invokeMethod` calls (to discover JARs via the classloader hierarchy). Calling it from inside `evaluate()` would nest JDI invocations, risking deadlocks or `IncompatibleThreadStateException`. The caller is responsible for calling `configureCompilerClasspath` **before** `evaluate`. The guard lets the same invocation chain lease the thread again (the nested lease ends nothing), but `ClasspathDiscoverer` needs a thread that is genuinely at an invocation event.
+`configureCompilerClasspath(thread)` issues its own `invokeMethod` calls (to discover JARs via the classloader hierarchy). Calling it from inside `evaluate()` would nest JDI invocations, risking deadlocks or `IncompatibleThreadStateException`. The router configures the classpath before fetching the compiled evaluation frame. Fast probes configure it through the compiled evaluator. The guard lets the same invocation chain lease the thread again (the nested lease ends nothing), but `ClasspathDiscoverer` needs a thread that is genuinely at an invocation event.
 
 ### Injected classes persist in the target JVM
 
 Classes loaded via `defineClass()` remain in the target classloader for the lifetime of that classloader. They are **not** cleaned up per evaluation. The idempotent check in `loadClass` (checking `vm.classesByName` before defining) is what makes cache reuse safe — it returns the existing definition instead of double-defining. The aggregate cost is bounded in [memory-and-references.md](memory-and-references.md) § 5.
 
-### Byte-array mirroring is expensive
+### Uploading and defining wrapper bytecode
 
-`RemoteCodeExecutor.createRemoteByteArray()` mirrors bytecode into the target VM byte-by-byte — one JDWP round-trip per `vm.mirrorOf(byte)` call. This O(n) cost is unavoidable without cooperating native code in the target VM, since `ArrayReference.setValues` requires already-mirrored values. See [memory-and-references.md](memory-and-references.md) § 7.
+Primitive byte mirrors are host-side objects. The server uploads the wrapper bytes with a single `ArrayReference.setValues` call and invokes the target classloader to define the class. [Byte-array mirroring](memory-and-references.md#7-byte-array-mirroring--the-on-cost)
 
-### Package-private enclosing class blocks field rewriting
+### Compiled member access
 
-When `this`'s declared type is package-private, the wrapper class (in `mcp.jdi.evaluation`) can't reference the type at all. In this case:
+The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. Private fields can be read directly by the navigation interpreter. A private field inside a compiled block or ordinary method call still requires an access path legal in the wrapper.
 
-- The `this` field auto-rewrite is skipped entirely.
-- The `this` parameter is typed as the first public ancestor (or `Object`).
-- Users must use `jdwp_get_fields(<thisObjectId>)` to inspect fields instead.
+### VMStart suspension
 
-The error message names the field and suggests the workaround.
-
-### VMStart suspension is special
-
-When connecting to a JVM started with `suspend=y`, all threads are suspended at `VMStart` but no thread is at a method-invocation event yet. This means everything that uses `invokeMethod` — `evaluate_expression`, `to_string`, watcher evaluation, and `forceLoad=true` on the set-breakpoint tools (`Class.forName`) — cannot work until at least one breakpoint has been hit. Setting breakpoints needs no invocation: line BPs, logpoints, exception and field BPs on classes that are not loaded yet are deferred and promoted on `ClassPrepareEvent` ([breakpoints.md](breakpoints.md) § 3), and a `forceLoad=true` that cannot load falls back to deferring. Set breakpoints first, then resume, then inspect.
+At VMStart the JVM has yet to execute application code. Navigation can inspect marks and statics of loaded, initialized system classes. Compiled evaluation, `jdwp_to_string`, and force-loading require an invocation event later in the run. Set breakpoints at VMStart and resume to reach application frames. [Breakpoint class-prepare promotion](breakpoints.md#3-deferring-a-breakpoint-until-its-class-loads)
 
 ### Exception breakpoints on classes not loaded yet start as PENDING
 
@@ -258,7 +258,7 @@ Watchers are MCP-side expression bookmarks attached to breakpoints. They use the
 
 1. `jdwp_attach_watcher(breakpointId, label, expression)` — registers an expression to evaluate when a specific breakpoint hits.
 2. `jdwp_evaluate_watchers(threadId, scope, breakpointId?)` — evaluates all watchers for the current context.
-3. The watcher's expression goes through the same `JdiExpressionEvaluator.evaluate()` pipeline.
+3. The router plans each watcher. An all-navigation batch runs as a frame inspection. A batch that needs compilation runs on the invocation worker and uses a fresh frame per watcher.
 
 Watchers are dual-indexed by watcher UUID and breakpoint ID via `WatcherManager`. They are cleared on `jdwp_reset()` and on disconnect/reconnect.
 
@@ -271,22 +271,22 @@ Logpoints (`jdwp_set_logpoint`), exception logpoints (`jdwp_set_exception_logpoi
 
 Both exception tools bind `$exception` for their conditions. Optional throw-site class filters run in the target before an event reaches the expression evaluator. Regular logpoint history shows boxed primitives as values and prints the type for other object results.
 
-Both are subject to the same constraints: the expression must compile against the frame's visible types, and each evaluation incurs the `invokeMethod` cost. Placing a logpoint inside a tight loop with millions of iterations will be expensive. The listener-side dispatch is documented in [event-pipeline.md](event-pipeline.md) and [breakpoints.md](breakpoints.md).
+Both run on the event dispatcher. Navigation uses the held frame and JDI reads. Compilation uses the existing event invocation rules. Each hit still pays for the debugger pause and round trips. [Event pipeline](event-pipeline.md) [Breakpoints](breakpoints.md)
 
 ### Synthetic bindings
 
-Several breakpoint kinds inject extra named values into the expression scope. These bindings appear as ordinary local variables in the wrapper class generated for the expression — reference them with their `$`-prefixed name.
+Several breakpoint kinds inject extra named values into the expression scope. Both engines expose these bindings under their `$`-prefixed names.
 
 | Binding       | Available in                                       | Type / Description                                                                                  |
 |---------------|----------------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | `$exception`  | exception breakpoints, exception logpoints         | The thrown `Throwable`. Always non-null.                                                            |
-| `$oldValue`   | field breakpoints, field logpoints                 | Value before the event — the value being read (access) or about to be overwritten (modification). Omitted when the JDI value is Java-null. |
-| `$newValue`   | field breakpoints, field logpoints (modification)  | Value about to be written. Modification events only; absent on access events.                       |
+| `$oldValue`   | field breakpoints, field logpoints                 | Value being read or about to be overwritten, including Java null. |
+| `$newValue`   | field breakpoints, field logpoints                 | Value about to be written, or null on access events. |
 | `$object`     | field breakpoints, field logpoints                 | The instance the field belongs to. Omitted (key absent) for static fields.                          |
 | `$fieldName`  | field breakpoints, field logpoints                 | String mirror of the watched field's simple name.                                                   |
 | `$mode`       | field breakpoints, field logpoints                 | String mirror — `"access"` or `"modification"` — identifying which direction fired. Useful in BOTH-mode handlers. |
 
-Bindings are passed as the third argument to `JdiExpressionEvaluator.evaluate(frame, expression, extraBindings)`. The evaluator merges them with the frame's visible locals, so an expression like `$oldValue.equals(currentLocal)` resolves both names. Conditional bindings (e.g. `$object` for instance vs static fields) are intentionally **absent from the map** rather than bound to a null sentinel — referencing them on the wrong event kind yields a compile-time error from JDT, not a misleading NPE at evaluation time.
+The router supplies these names alongside frame locals. A binding that applies only to some events can be absent. For example, `$object` is only available for instance fields.
 
 User-defined marks (`$label`) flow through the same `extraBindings` map. See [memory-and-references.md](memory-and-references.md) § 4.
 
@@ -296,8 +296,8 @@ The `EvaluationGuard` is the key mechanism preventing deadlocks during evaluatio
 
 Covered invocation sites:
 
-- `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`.
-- Logpoint evaluation, conditional-breakpoint evaluation, exception-logpoint evaluation, field-logpoint evaluation.
+- Compiled evaluations from `jdwp_evaluate_expression`, `jdwp_assert_expression` and `jdwp_evaluate_watchers`.
+- Compiled conditions and logpoint expressions for line, exception and field events.
 - `jdwp_to_string`.
 - Classpath discovery (`ClasspathDiscoverer` calls via the evaluator's `configureCompilerClasspath`).
 - Deferred class loading via `Class.forName`.

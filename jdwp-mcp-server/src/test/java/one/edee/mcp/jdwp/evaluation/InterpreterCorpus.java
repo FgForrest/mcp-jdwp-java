@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import one.edee.mcp.jdwp.evaluation.interpret.Planner.KindOfPlan;
 import org.jspecify.annotations.Nullable;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
@@ -17,7 +18,11 @@ final class InterpreterCorpus {
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     record Entry(String id, String tool, String param, String expression, @Nullable String stop,
-                 @Nullable String expectedClass, @Nullable String notes) {
+                 @Nullable String expectedClass, @Nullable String notes, @Nullable KindOfPlan expectedPlan) {
+        Entry(String id, String tool, String param, String expression, @Nullable String stop,
+              @Nullable String expectedClass, @Nullable String notes) {
+            this(id, tool, param, expression, stop, expectedClass, notes, null);
+        }
     }
 
     static List<Entry> read(Reader source, String name) throws IOException {
@@ -42,12 +47,17 @@ final class InterpreterCorpus {
                 }
                 entries.add(new Entry(id, requiredText(row, "tool"), requiredText(row, "param"),
                     requiredText(row, "expression"), optionalText(row, "stop"),
-                    optionalText(row, "expected_class"), optionalText(row, "notes")));
+                    optionalText(row, "expected_class"), optionalText(row, "notes"), expectedPlan(row)));
             } catch (IllegalArgumentException | JacksonException e) {
                 throw new IllegalArgumentException(name + ":" + lineNumber + ": " + e.getMessage(), e);
             }
         }
         return List.copyOf(entries);
+    }
+
+    private static @Nullable KindOfPlan expectedPlan(JsonNode row) {
+        final String plan = optionalText(row, "expected_plan");
+        return plan == null ? null : KindOfPlan.valueOf(plan);
     }
 
     private static String requiredText(JsonNode row, String field) {

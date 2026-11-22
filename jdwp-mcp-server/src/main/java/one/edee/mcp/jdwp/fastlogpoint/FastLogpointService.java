@@ -176,6 +176,7 @@ public class FastLogpointService {
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
+    /** The same compiled engine serves arming-hit evaluations and in-target probe generation. */
     private final JdiExpressionEvaluator expressionEvaluator;
     /**
      * Written into every probe this server arms ({@code MCP_ARMED_BY}): the product and an opaque
@@ -580,7 +581,7 @@ public class FastLogpointService {
             deferForLocalClasspath(flp);
             return ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
-            markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
+            markFailed(flp, describeProbeFailure(flp.kind, e), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
         }
     }
@@ -1803,7 +1804,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describe(e), context, thread);
+            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describeProbeFailure(flp.kind, e), context, thread);
         }
         log.debug("[FastLogpoint] #{} arming hit at {}", flp.id, location);
     }
@@ -3053,6 +3054,20 @@ public class FastLogpointService {
         return message != null && !message.isBlank() ? message : e.getClass().getSimpleName();
     }
 
+    /**
+     * Describes a probe failure, adding the fallback tool's hint when compilation failed because a member is not visible.
+     */
+    static String describeProbeFailure(Kind kind, Throwable failure) {
+        final String message = describe(failure);
+        if (failure instanceof JdiEvaluationException && message.startsWith("Compilation failed:")
+            && message.contains(" is not visible")) {
+            return message + "\n" + kind.fallbackTool
+                + " can interpret the same navigation expression and reach private members, "
+                + "at the cost of a debugger round trip per hit.";
+        }
+        return message;
+    }
+
     // ── Fast breakpoints ──
 
     /**
@@ -3263,7 +3278,7 @@ public class FastLogpointService {
     }
 
     /**
-     * On the dispatcher, evaluates the condition and any admitted capture outside the monitor.
+     * Runs the condition and any admitted capture through the compiled evaluator outside the monitor.
      * This execution runs the old code, so the probe never sees it. A hit that stops (the condition
      * holds or fails, and its gate is open) is published at once and installs nothing — redefining the
      * method now would leave this stopped frame in an obsolete method without locals. A true stop
@@ -3282,7 +3297,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            condition = new ArmingCondition(false, describe(e));
+            condition = new ArmingCondition(false, describeProbeFailure(flp.kind, e));
         }
         final String error = condition.error();
         final int epoch;
@@ -3344,8 +3359,9 @@ public class FastLogpointService {
     }
 
     /**
-     * Evaluates the capture of a true arming hit through the debugger, on the dispatcher, with the same
-     * rendering as the installed probe. Returns the value or {@code capture failed: …} text.
+     * Evaluates a true arming hit's capture through the compiled evaluator on the dispatcher, with
+     * the same value rendering as the installed probe. A compiler visibility failure can also
+     * include a hint to use an ordinary logpoint for the capture expression.
      * Throws if local discovery is pending or the event thread has resumed.
      */
     private String evaluateArmingCapture(FastLogpoint flp, ThreadReference thread)
@@ -3357,7 +3373,10 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception | LinkageError e) {
             requireStillSuspended(thread, e);
-            return FastBreakpointProbeSource.captureFailure(describe(e));
+            final String diagnostic = describe(e);
+            final String withHint = describeProbeFailure(Kind.LOGPOINT, e);
+            // Cap the diagnostic before appending the debugger hint.
+            return FastBreakpointProbeSource.captureFailure(diagnostic) + withHint.substring(diagnostic.length());
         }
     }
 
