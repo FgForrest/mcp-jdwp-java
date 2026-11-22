@@ -5,6 +5,158 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.13.0] — 2026-11-22
+
+### New — expressions that only read are interpreted over JDI, without compiling or invoking
+
+Every expression used to be compiled, injected into the target and invoked. A first
+evaluation cost 229 JDWP round trips (about 65 ms), and every one needed a thread
+that could run code. So a private field such as `store.map`, a condition on a thread
+held by `jdwp_suspend_thread`, or a read on a thread blocked on a monitor failed or
+was refused. Now an expression that only reads is evaluated directly over JDI: 4
+round trips (about 0.7 ms) on JDK 17 and 21, with no compile, no injected class and
+no invocation. Everything else still goes to the compiled pipeline, unchanged.
+
+- **What is interpreted** — locals, `this` and `Outer.this`, marks and event bindings
+  (`$exception`); instance, static, inherited and private fields; array reads and
+  `length`; class literals and literals; operators, `&&`, `||`, `?:`, `instanceof` and
+  casts; String concatenation of strings, integers, `char` and `boolean`; and
+  `String.length/isEmpty/equals/charAt`, `Enum.name/ordinal/equals` and the primitive
+  wrappers' value accessors.
+- **Where** — `jdwp_evaluate_expression`, `jdwp_assert_expression`,
+  `jdwp_evaluate_watchers`, breakpoint conditions and logpoint expressions. Replies
+  keep their shape. Fast logpoints and fast breakpoints keep the compiled engine.
+- **What goes to the compiler** — method calls, `new`, lambdas, blocks and loops,
+  `float`/`double` concatenation, a class that is not initialized yet, and type names
+  the interpreter cannot bind for certain. Method calls are planned for a later
+  release.
+- **Type names** — expressions see no imports. A simple type name is interpreted when
+  it names the current class, an enclosing class, one of their nested types, or a
+  `java.lang` class. Write other application types fully qualified
+  (`com.acme.Status.ACTIVE`, not `Status.ACTIVE`); the compiled path has no imports
+  either. The `java-debug` skill says so.
+- **A switch** — set `JDWP_EVAL_ENGINE=compiler` in the server environment to get
+  exactly the previous behaviour, or `interpreter` to see why an expression is not
+  interpreted. `jdwp_diagnose` counts evaluations per engine and lists the most
+  frequent reasons for compiling.
+- **A read never mixes states** — if the thread is resumed while the interpreter
+  reads, the result is discarded instead of combining values from before and after.
+
+### New — wait for one thread's next stop; a step can wait for its landing (#60)
+
+- **`jdwp_resume_until_event(threadId=T)`** releases only what holds thread T and
+  presents T's oldest unseen stop. Other threads' stops stay held, and the reply
+  counts them. Real blockers, such as another thread's unseen stop-all, are refused
+  and named.
+- **`jdwp_step_over` / `step_into` / `step_out` take `wait=true`** and block up to 30 s
+  for the stop that ended this very step: its landing, or the stop that interrupted it.
+  On timeout the step stays pending, and the reply says how to continue.
+- **Thread IDs from an earlier connection** are refused with `[CONNECTION_CHANGED]`
+  instead of reaching a reused ID in the new JVM. Thread lookups also find virtual
+  threads that the VM's thread list omits.
+- **A JVM that exits during the wait** gives `[VM_DEATH]` naming the stop it had
+  captured.
+
+Without `threadId` and `wait`, both tools behave as before.
+
+### New — a fast breakpoint can capture values when its condition holds (#62)
+
+A fast breakpoint evaluates its condition in the target, but by the time the agent
+reads values, other threads may have changed them. `jdwp_set_fast_breakpoint` now
+takes an optional `capture` expression. The probe evaluates it on the same thread, in
+the same pass as the condition, and every stop reply shows `Captured at the hit: …`.
+It also appears in `jdwp_get_breakpoint_context` and the event history. A capture that
+fails to compile or throws never prevents the stop; the reply says
+`capture failed: …`. The risk briefing names the capture, and a standing approval
+covers it.
+
+### New — a fast probe's approval covers later JVMs on the same host:port (#61)
+
+`jdwp_set_fast_logpoint` and `jdwp_set_fast_breakpoint` used to ask again on every
+new JVM, so re-running a test repeated the consent for an identical probe. An
+approved call now creates a standing approval for that exact probe at that endpoint.
+A later call with the same arguments arms without asking, and the reply says which
+approval it used. Approvals last as long as the MCP server process and are never
+saved. `jdwp_overview` lists them. The briefing says up front what an approval
+covers. `jdwp_restore_fast_logpoints` still asks every time.
+
+- **What must match** — the kind, class, line, expression, condition, suspend policy,
+  stop mode, `forceLoad`, and a fast logpoint's buffer size.
+- **Endpoints** — `localhost`, `127.0.0.1` and `::1` count as one. An approved call
+  on a different endpoint from the one its briefing named gets a fresh briefing
+  instead.
+- **Class names** — fast tools accept exact JVM binary names and reject wildcards.
+
+### New — agents can tell a fresh test JVM from a leftover one
+
+JDWP with `server=y` listens again after a detach, so the next attach could silently
+land on a test JVM left over from the previous run.
+
+- **`jdwp_wait_for_attach(requireVmStart=true)`** accepts only a JVM parked at its
+  start. Anything else gets `[NOT_FRESH]`: the tool detaches and leaves that JVM
+  running.
+- **Target identity** — attach, reconnect and disconnect replies name the local
+  target process: PID, start time, uptime and command. Only a verified target comes
+  with `kill` advice. The command shows the main class or JAR, never application
+  arguments.
+- **Between test runs** — the skill and the sandbox rules no longer recommend
+  `jdwp_reset`. Disconnect, make sure the old test JVM has ended, launch the next
+  test, and attach with `requireVmStart=true`. The sandbox requires plugin 2.13.0
+  or later.
+- **Exception filters** — `jdwp_set_exception_breakpoint` takes a `condition` with
+  `$exception`. Both exception tools take opt-in throw-site filters: `thrownIn` (one
+  class pattern) and `notThrownIn` (comma-separated exclusions).
+- **Logpoint values** — boxed primitives show as values. Other objects show as
+  `Object (type)` instead of an `Object#N` that could not be looked up.
+- **Step replies** — they name the thread the step released and what still holds
+  the others, including stop-alls over virtual threads on JDK 21.
+
+### Fixed — local classpath discovery no longer freezes the target (#63)
+
+The first breakpoint condition, logpoint or fast-probe arming on a connection ran
+local classpath discovery on the thread that processes JDI events. With a `pom.xml`
+in the project, that is `mvn dependency:build-classpath`, which can take up to
+180 s. No other stop was processed meanwhile, and a stop-all breakpoint froze the
+whole target. Discovery now starts in the background at attach. Breakpoints never
+wait for it; tool evaluations wait for it, bounded by the Maven timeout.
+
+- **Discovery belongs to its connection** — disconnect, VM exit and a failed
+  reconnect cancel it, and a superseded result is never used.
+- **No leftover Maven processes** — on Linux, Maven runs in its own process group,
+  and cancelling kills the whole group.
+- **Nothing is written into the project** — Maven writes its classpath files to a
+  private directory, which is deleted afterwards. Before, it wrote them into each
+  module's `target`, and a module the cleanup walk missed (deeply nested, symlinked,
+  outside the working directory) lost its classpath entries silently and kept the
+  file.
+- **A typo is not deferred** — when a type is missing and discovery has finished, the
+  compile is retried at once with the local classpath, so a misspelled name fails at
+  once instead of waiting for a later hit.
+- **Clearer failures** — `jdwp_diagnose` and evaluation errors say when discovery is
+  still running or failed. A Maven that cannot be started (exit codes 126 and 127)
+  is explained.
+
+### Fixed — a failed resume is reported, never shown as released (#68)
+
+When JDI's `resume()` threw, the session had already dropped its hold. The thread
+stayed suspended in the target, the reply said it was released, and no later call
+could free it. Each release now completes only after the resume succeeded. A hold
+whose resume failed stays owned and can be retried.
+
+- `jdwp_resume`, `jdwp_resume_thread` and `jdwp_reset` list what was released, what
+  failed and why, and what a retry recovered.
+- `jdwp_resume_until_event` ends with `[RESUME_FAILED]` naming each affected thread.
+  It points to `jdwp_resume_thread`, and warns that `jdwp_resume` releases every other
+  hold too.
+- A reset that lost the connection says so and asks to reattach.
+
+### Docs
+
+- **`AGENTS.md`** now holds the project instructions, which Codex reads. `CLAUDE.md`
+  imports it.
+- **The `java-debug` skill** covers the new tool parameters, writing application
+  types fully qualified in expressions, and the new steps between test runs.
+
 ## [2.12.1] — 2026-11-21
 
 ### Fixed — under Codex, the server JAR survives Codex reinstalling the plugin (#58)
