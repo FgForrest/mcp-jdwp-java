@@ -147,7 +147,7 @@ final class JdiTypes {
         return qualifier;
     }
 
-    /** Binds a simple name lexically, allowing a package prefix past an unloaded enclosing scope. */
+    /** Binds a simple name lexically while respecting unavailable enclosing types and methods. */
     private @Nullable ReferenceType resolveSimple(String name, boolean packagePrefix) {
         final ReferenceType owner = declaring;
         if (owner == null) {
@@ -165,9 +165,17 @@ final class JdiTypes {
         }
         final String suffix = "$" + name;
         final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
-        for (LexicalScope scope : lexicalScopes) {
+        for (int index = 0; index < lexicalScopes.size(); index++) {
+            final LexicalScope scope = lexicalScopes.get(index);
             final ReferenceType type = scope.type();
             if (type == null) {
+                // The declaring type is loaded, so an unloaded scope always has a scope just inside it.
+                if (crossesEnclosingMethod(lexicalScopes.get(index - 1).binary(), scope.binary())) {
+                    if (packagePrefix) {
+                        return null;
+                    }
+                    throw Planner.compile("enclosing method is not visible: " + scope.binary());
+                }
                 final ReferenceType declared = findExact(scope.binary() + suffix);
                 if (declared != null || packagePrefix) {
                     return declared;
@@ -183,6 +191,12 @@ final class JdiTypes {
             }
         }
         return resolveNonLexicalType(name);
+    }
+
+    /** Detects the digit that starts a local or anonymous class's binary suffix. */
+    private static boolean crossesEnclosingMethod(String inner, String enclosing) {
+        final int start = enclosing.length() + 1;
+        return start < inner.length() && inner.charAt(start) >= '0' && inner.charAt(start) <= '9';
     }
 
     /** Checks for an uncontested java.lang binding when lexical lookup found no type. */

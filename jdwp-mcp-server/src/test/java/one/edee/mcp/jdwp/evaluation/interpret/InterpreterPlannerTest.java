@@ -4,6 +4,7 @@ import com.sun.jdi.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -180,7 +181,7 @@ class InterpreterPlannerTest {
 
     /** Rejects isolated surrogate code units in either kind of literal before creating a mirror. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"\"\\uD800\"", "'\\uDC00'"})
+    @ValueSource(strings = {"\"\\uD800\"", "'\\uDC00'"})
     void routesUnpairedSurrogateLiteralsToCompilation(String source) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         type(vm, "java.lang.String", null);
@@ -190,7 +191,7 @@ class InterpreterPlannerTest {
 
     /** Defers package bindings and ambiguous java.lang bindings for simple and dotted names. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"app", "java.lang"})
+    @ValueSource(strings = {"app", "java.lang"})
     void rejectsConflictingConstantPoolAndDefaultTypes(String defaultPackage) throws Exception {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Example", null);
@@ -214,7 +215,7 @@ class InterpreterPlannerTest {
 
     /** Defers a loaded package type even if it would shadow a loaded java.lang type. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {true, false})
     void defersSimplePackageTypes(boolean javaLangLoaded) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Example", null);
@@ -405,7 +406,7 @@ class InterpreterPlannerTest {
 
     /** A loaded member can be selected from an unloaded enclosing type, but lookup cannot skip that scope. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {true, false})
     void stopsLookupAtAnUnloadedEnclosingType(boolean memberLoaded) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Outer$Frame", null);
@@ -419,6 +420,51 @@ class InterpreterPlannerTest {
                 ExpressionParser.parse("Marker.class")))
                 .isEqualTo(new Planner.Compile("enclosing type is not loaded: app.Outer"));
         }
+    }
+
+    /** A local or anonymous scope cannot bypass its unavailable enclosing method. */
+    @ParameterizedTest
+    @ValueSource(strings = {"Outer$1Frame", "Outer$1", "Outer$1Frame$Inner"})
+    void defersLocalClassBindingsAtAnUnloadedEnclosingType(String binary) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app." + binary, null);
+        if (binary.endsWith("$Inner")) {
+            type(vm, "app.Outer$1Frame", null);
+        }
+        type(vm, "app.Outer$Marker", null);
+        type(vm, "java.lang.Class", null);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Marker.class")))
+            .isEqualTo(new Planner.Compile("enclosing method is not visible: app.Outer"));
+        verify(vm, never()).classesByName("app.Outer$Marker");
+    }
+
+    /** A package prefix can bypass the unloaded enclosing scope of a local class. */
+    @Test
+    void navigatesPackageQualifiedTypesFromADetachedLocalClass() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Outer$1Frame", null);
+        type(vm, "app.Outer$java", null);
+        type(vm, "java.lang.String", null);
+        type(vm, "java.lang.Class", null);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("java.lang.String.class")).kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+        verify(vm, never()).classesByName("app.Outer$java");
+    }
+
+    /** A member-class frame can still bind a loaded sibling of its unloaded enclosing type. */
+    @Test
+    void navigatesLoadedSiblingMembersOfAnUnloadedEnclosingType() {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Outer$Builder", null);
+        final ClassType sibling = type(vm, "app.Outer$Kind", null);
+        type(vm, "java.lang.Class", null);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Kind.class")).kind()).isEqualTo(Planner.KindOfPlan.NAVIGATE);
+        assertThat(new JdiTypes(vm, owner).resolve("Kind")).isSameAs(sibling);
     }
 
     /** Allows package-qualified navigation while simple and uppercase qualifiers still require lexical metadata. */
@@ -450,7 +496,7 @@ class InterpreterPlannerTest {
 
     /** Finds formal names after nested generic and interface-only bounds in all three supported scopes. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"method", "declaring", "enclosing"})
+    @ValueSource(strings = {"method", "declaring", "enclosing"})
     void defersTypeParametersThatShadowLoadedTypes(String scope) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType enclosing = type(vm, "app.Outer", null);
@@ -474,7 +520,7 @@ class InterpreterPlannerTest {
 
     /** Detects possible type parameters of another declared method from ordinary and synthetic frames. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {true, false})
     void defersTypeParametersOfOtherMethods(boolean synthetic) {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType owner = type(vm, "app.Example", null);
@@ -493,7 +539,7 @@ class InterpreterPlannerTest {
 
     /** A malformed formal list defers lookup even if its apparent first name does not match. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {
+    @ValueSource(strings = {
         "<Other:Ljava/util/List<Ljava/lang/String;>;()V", "<Other:I>()V", "<Other::>()V", "<Other>()V"
     })
     void defersTypeLookupWhenTheFormalListIsMalformed(String signature) {
@@ -510,7 +556,7 @@ class InterpreterPlannerTest {
 
     /** Defers a possible local class found in the declaring or enclosing type's constant pool. */
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {true, false})
     void defersLocalClassesThatShadowLoadedTypes(boolean declaredHere) throws Exception {
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ClassType enclosing = type(vm, "app.Outer", null);

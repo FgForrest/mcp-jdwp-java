@@ -8,8 +8,8 @@ public final class TypeBindingFixture {
     /** This class supplies fixture stops only. */
     private TypeBindingFixture() {}
 
-    /** Loads the competing types and visits each frame without loading its missing enclosing scopes. */
-    static void run() {
+    /** Loads the competing types and visits the frames, including local classes opened reflectively. */
+    static void run() throws ReflectiveOperationException {
         sink = new Object[]{new Marker(), new EnclosingOuter(), new EnclosingOuter.Shared(),
             new EnclosingBase.Shared(), new HiddenOuter.Scope.Token(), new Scope(), new Scope.Token()};
         HiddenOuter.Frame.inspect("fixture");
@@ -22,6 +22,16 @@ public final class TypeBindingFixture {
         TypeBindingArrayFrame.inspect();
         GenericOuter.enter();
         SelfNameFrame.inspect();
+        final String detached = TypeBindingFixture.class.getPackageName() + ".DetachedOuter$";
+        inspectDetachedFrame(detached + "1Frame", new DetachedOuter.Actual());
+        final Object siblingMarker = Class.forName(detached + "1Marker").getDeclaredConstructor().newInstance();
+        inspectDetachedFrame(detached + "1SiblingFrame", siblingMarker);
+    }
+
+    /** Instantiates the local class without calling the method in its enclosing class. */
+    private static void inspectDetachedFrame(String binary, Object value) throws ReflectiveOperationException {
+        final Class<?> frame = Class.forName(binary);
+        frame.getDeclaredMethod("inspect", Object.class).invoke(frame.getDeclaredConstructor().newInstance(), value);
     }
 
     /** Stops after a local class has shadowed the package's marker. */
@@ -165,5 +175,61 @@ final class SelfNameFrame extends SelfNameBase {
             case "SelfNameFrame.CONSTANT" -> SelfNameFrame.CONSTANT;
             default -> throw new IllegalArgumentException(source);
         };
+    }
+}
+
+/** Supplies local classes that can run before the class declaring their methods is loaded. */
+final class DetachedOuter {
+    /** The loaded member whose name is shadowed in the local frames. */
+    static class Marker {
+        /** The instance value an incorrect member binding would read. */
+        public int code = 61;
+        /** The static value an incorrect member binding would read. */
+        public static final int CONSTANT = 71;
+    }
+
+    /** The bound of the enclosing method's type parameter. */
+    static final class Actual extends Marker {
+        /** The instance value selected through the type parameter. */
+        public int code = 62;
+        /** The static value selected through the type parameter. */
+        public static final int CONSTANT = 72;
+    }
+
+    /** Declares a local frame where a formal type parameter shadows the loaded member. */
+    static <Marker extends Actual> Object makeFrame() {
+        /** Stops in the scope of the enclosing method's type parameter. */
+        class Frame {
+            /** Records the bindings javac gives to the casts in this frame. */
+            int inspect(Object value) {
+                return ((Marker) value).code + ((Marker) null).CONSTANT;
+            }
+
+            /** Supplies the javac value of the package-qualified control. */
+            static Object golden(String source, Object unused) {
+                if (source.equals("java.lang.Integer.MAX_VALUE")) {
+                    return java.lang.Integer.MAX_VALUE;
+                }
+                throw new IllegalArgumentException(source);
+            }
+        }
+        return new Frame();
+    }
+
+    /** Declares a local type that shadows the loaded member in its sibling frame. */
+    static Object makeSiblingFrame() {
+        /** The locally declared type visible to the sibling class. */
+        class Marker extends DetachedOuter.Marker {
+            /** Distinguishes a sibling-local read from a read through the loaded member. */
+            public int code = 63;
+        }
+        /** Stops in the lexical scope shared with the local marker. */
+        class SiblingFrame {
+            /** Keeps the local marker out of this frame's constant pool. */
+            void inspect(Object value) {
+                TypeBindingFixture.sink = value;
+            }
+        }
+        return new SiblingFrame();
     }
 }

@@ -418,11 +418,12 @@ class InterpreterHarnessLiveTest {
         }
     }
 
-    /** Checks lexical bindings and fallback plans, comparing navigated results with javac. */
+    /** Checks lexical bindings, including detached local frames, and compares navigated results with javac. */
     @Test
     void checksLexicalTypeBindings() throws Exception {
         final String pkg = TypeBindingFixture.class.getPackageName() + ".";
         final String localFrame = TypeBindingFixture.class.getName() + "$LocalFrame";
+        final String detached = pkg + "DetachedOuter";
         final Map<String, List<String>> expressions = Map.of(
             pkg + "HiddenOuter$Frame", List.of("Scope.Token.class", "String.class",
                 "java.lang.String.class", "java.lang.Integer.MAX_VALUE", "(java.lang.String) x"),
@@ -431,7 +432,10 @@ class InterpreterHarnessLiveTest {
             TypeBindingFixture.class.getName() + "$GenericFrame", List.of("((Marker) value).code"),
             pkg + "TypeBindingArrayFrame", List.of("Integer.class", "Integer.MAX_VALUE", "Integer[][].class"),
             pkg + "GenericOuter$1Frame", List.of("((Marker) value).code"),
-            pkg + "SelfNameFrame", List.of("SelfNameFrame.class", "SelfNameFrame.CONSTANT"));
+            pkg + "SelfNameFrame", List.of("SelfNameFrame.class", "SelfNameFrame.CONSTANT"),
+            detached + "$1Frame", List.of("((Marker) value).code", "((Marker) null).CONSTANT",
+                "java.lang.Integer.MAX_VALUE"),
+            detached + "$1SiblingFrame", List.of("((Marker) value).code"));
         final Set<String> navigate = Set.of("java.lang.String.class", "java.lang.Integer.MAX_VALUE",
             "(java.lang.String) x", "SelfNameFrame.class", "SelfNameFrame.CONSTANT");
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
@@ -476,6 +480,14 @@ class InterpreterHarnessLiveTest {
                                     assertThat(vm.classesByName(pkg + "EnclosingOuter")).hasSize(1);
                                 } else if (owner.equals(localFrame)) {
                                     assertThat(vm.classesByName(localFrame + "$1Marker")).hasSize(1);
+                                } else if (owner.startsWith(detached + "$1")) {
+                                    assertThat(vm.classesByName(detached)).as("enclosing class at %s", owner).isEmpty();
+                                    assertThat(vm.classesByName(detached + "$Marker")).hasSize(1);
+                                    if (owner.endsWith("SiblingFrame")) {
+                                        assertThat(vm.classesByName(detached + "$1Marker")).hasSize(1);
+                                    } else {
+                                        assertThat(vm.classesByName(detached + "$Actual")).hasSize(1);
+                                    }
                                 }
                                 for (String source : Objects.requireNonNull(expressions.get(owner))) {
                                     checkLexicalBinding(router, hit, source, navigate.contains(source), checks);
