@@ -31,9 +31,16 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 
 ## A resume reply reports a failed hold
 
-`jdwp_resume_until_event` returns `[RESUME_FAILED]` when a release or lease debt repayment fails before or during the wait. For unpaid lease debt or a failed automatic release, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. A set without an event thread has no targeted retry.
+`jdwp_resume_until_event` returns `[RESUME_FAILED]` when a release or lease debt repayment fails before or during the wait. In a targeted wait, a recovery ends the wait only if it holds the selected thread. Use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. A set without an event thread has no targeted retry.
 
 `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. The resume tools and `jdwp_reset` report successful releases alongside any failures. If a resume or reset reply reports a disconnect, attach to a live target.
+
+## A thread-targeted wait was refused or a step timed out
+
+- If an unseen stop-all holds the selected thread, use `jdwp_resume_until_event()` to inspect unseen stops in order until you reach the named blocker. Then retry with `threadId`.
+- If a targeted resume or wait returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying.
+- If a covering event set is queued or processing, let the dispatcher settle it and retry.
+- If a step with `wait=true` times out, continue with `jdwp_resume_until_event(threadId=T)`. If either wait reports another thread's unseen stop-all, present that stop first, then use `jdwp_resume_thread(threadId=T)` to free T before continuing the wait.
 
 ## JDWP port is already in use
 

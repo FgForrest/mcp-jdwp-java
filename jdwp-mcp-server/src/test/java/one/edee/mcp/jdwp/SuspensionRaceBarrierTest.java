@@ -66,6 +66,7 @@ class SuspensionRaceBarrierTest {
 	 */
 	private ExecutorService dispatcher;
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() throws Exception {
 		model = new FakeSuspendModel();
@@ -73,7 +74,7 @@ class SuspensionRaceBarrierTest {
 		u = model.thread("u");
 		history = new EventHistory();
 		final BreakpointTracker tracker = new BreakpointTracker();
-		session = tracker.openSuspensionSession(history);
+		session = tracker.openSuspensionSession(model.vm, history);
 		guard = new EvaluationGuard();
 		guard.bind(session);
 		evaluator = mock(JdiExpressionEvaluator.class);

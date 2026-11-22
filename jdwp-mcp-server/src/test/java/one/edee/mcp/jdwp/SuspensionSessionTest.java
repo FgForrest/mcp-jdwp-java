@@ -12,9 +12,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -42,6 +45,7 @@ class SuspensionSessionTest {
 	private EventHistory history;
 	private SuspensionSession session;
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() {
 		model = new FakeSuspendModel();
@@ -50,7 +54,7 @@ class SuspensionSessionTest {
 		w = model.thread("w");
 		tracker = new BreakpointTracker();
 		history = new EventHistory();
-		session = tracker.openSuspensionSession(history);
+		session = tracker.openSuspensionSession(model.vm, history);
 	}
 
 	@Test
@@ -511,6 +515,160 @@ class SuspensionSessionTest {
 	}
 
 	@Test
+	@DisplayName("a thread-targeted wait presents that thread's oldest stop and leaves earlier foreign stops unseen")
+	void filteredWaitPresentsOnlyMatchingStop() throws Exception {
+		stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 1);
+		stopOn(w, EventRequest.SUSPEND_EVENT_THREAD, 2);
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 3);
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 4);
+
+		final SuspensionSession.NextStop next = session.nextStop(0, t.ref);
+		assertThat(next.stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(3));
+		assertThat(next.otherUnseen()).isEqualTo(2);
+		assertThat(session.unseenCount()).isEqualTo(3);
+		assertThat(model.counts()).isEqualTo(Map.of("t", 2, "u", 1, "w", 1));
+
+		assertThat(session.releaseAll().unseen()).extracting(BreakpointTracker.LastBreakpoint::id)
+			.containsExactly(1, 2, 4);
+		assertThat(session.nextStop(0).stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(1));
+	}
+
+	@Test
+	@DisplayName("the first pass releases only the selected thread's manual hold, thread stop and stop-all share")
+	void filteredWaitReleasesOnlyItsThread() throws Exception {
+		presented(stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		assertThat(session.suspendThread(t.ref)).isNull();
+		assertThat(session.suspendThread(w.ref)).isNull();
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 2));
+		presented(stopOn(u, EventRequest.SUSPEND_ALL, 3));
+		stopOn(w, EventRequest.SUSPEND_EVENT_THREAD, 4);
+
+		final SuspensionSession.NextStop next = session.nextStop(0, t.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(next.threadRelease()).isNotNull().satisfies(release -> assertThat(release.holders()).hasSize(3));
+		assertThat(next.otherUnseen()).isEqualTo(1);
+		assertThat(model.counts()).isEqualTo(Map.of("t", 0, "u", 2, "w", 3));
+
+		session.releaseAll();
+		assertThat(model.counts()).isEqualTo(Map.of("t", 0, "u", 0, "w", 1));
+		assertThat(session.nextStop(0).stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(4));
+	}
+
+	@Test
+	@DisplayName("another thread's unseen stop-all refuses a targeted release and identifies the stop")
+	void filteredWaitRefusesUnseenStopAll() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		stopOn(u, EventRequest.SUSPEND_ALL, 2);
+
+		final SuspensionSession.NextStop next = session.nextStop(0, t.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(next.refusal()).contains("breakpoint 2", "thread u", "not seen yet");
+		assertThat(model.counts()).isEqualTo(Map.of("t", 2, "u", 1, "w", 1));
+		assertThat(session.unseenCount()).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("a covering queued or processing context refuses a targeted release and identifies the event")
+	void filteredWaitRefusesCoveringUnfinishedSet() throws Exception {
+		final SuspensionSession.Context blocker = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
+			u.ref, false);
+
+		final SuspensionSession.NextStop queued = session.nextStop(0, t.ref);
+		assertThat(queued.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(queued.refusal()).contains("context#" + blocker.id(), "breakpoint", "thread u",
+			"waiting to be processed");
+
+		session.begin(blocker);
+		final SuspensionSession.NextStop processing = session.nextStop(0, t.ref);
+		assertThat(processing.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(processing.refusal()).contains("context#" + blocker.id(), "breakpoint", "thread u",
+			"being processed");
+		assertThat(model.counts()).isEqualTo(Map.of("t", 1, "u", 1, "w", 1));
+	}
+
+	/** Distinguishes a targeted resume's refusal from the step waiter's own landing exception. */
+	@Test
+	@DisplayName("a pending step skips release and lets its own step waiter await publication")
+	void filteredWaitOnlyWaitsForPendingStep() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final SuspensionSession.ArmedStep step = Objects.requireNonNull(
+			session.step(t.ref, List::of, this::stepRequest).armed());
+		stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 2);
+		final SuspensionSession.NextStop waiting = session.nextStop(0, t.ref);
+		assertThat(waiting.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(waiting.threadRelease()).isNull();
+
+		final SuspensionSession.Context landing = session.route(
+			model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false);
+		session.begin(landing);
+		assertThat(session.nextStop(0, t.ref).outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(session.awaitStepStop(0, step).outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(session.stepPending(t.ref)).isTrue();
+		assertThat(model.counts()).isEqualTo(Map.of("t", 1, "u", 1, "w", 0));
+
+		session.candidate(landing, new BreakpointTracker.LastBreakpoint(t.ref, null, BreakpointTracker.EventKind.STEP));
+		session.finish(landing);
+		final SuspensionSession.NextStop landed = session.nextStop(0, t.ref);
+		assertThat(landed.stop()).isNotNull().satisfies(stop ->
+			assertThat(stop.kind()).isEqualTo(BreakpointTracker.EventKind.STEP));
+		assertThat(landed.otherUnseen()).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("a foreign stop-all blocks a targeted wait even with a pending step")
+	void filteredWaitRefusesForeignStopAllDuringPendingStep() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		assertThat(session.step(t.ref, List::of, this::stepRequest).refusal()).isNull();
+		stopOn(u, EventRequest.SUSPEND_ALL, 20);
+
+		final SuspensionSession.NextStop blocked = session.nextStop(0, t.ref);
+		assertThat(blocked.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(blocked.refusal()).contains("breakpoint 20", "thread u");
+		assertThat(session.stepPending(t.ref)).isTrue();
+		assertThat(session.unseenCount()).isEqualTo(1);
+		assertThat(t.count).isEqualTo(1);
+	}
+
+	/** A reset cuts off an old completion even after a competing tool presented it. */
+	@Test
+	void resetWinsOverAnAlreadyPresentedStepCompletion() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.ArmedStep step = Objects.requireNonNull(
+			session.step(t.ref, List::of, this::stepRequest).armed());
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 30));
+		session.reset();
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 31);
+
+		assertThat(session.awaitStepStop(0, step).outcome()).isEqualTo(SuspensionSession.Outcome.RESET);
+		assertThat(session.unseenCount()).isOne();
+	}
+
+	@Test
+	@DisplayName("an unseen matching stop takes priority over a foreign stop-all")
+	void filteredWaitPrefersMatchingStopOverForeignBlocker() throws Exception {
+		stopOn(u, EventRequest.SUSPEND_ALL, 20);
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 21);
+
+		final SuspensionSession.NextStop next = session.nextStop(0, t.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
+		assertThat(next.stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(21));
+		assertThat(session.unseenCount()).isEqualTo(1);
+		assertThat(t.count).isEqualTo(2);
+	}
+
+	@Test
+	@DisplayName("a pending step on a different thread does not block the selected thread's release")
+	void filteredWaitIgnoresOtherPendingStep() throws Exception {
+		presented(stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		assertThat(session.step(u.ref, List::of, this::stepRequest).refusal()).isNull();
+		assertThat(session.suspendThread(t.ref)).isNull();
+
+		assertThat(session.nextStop(0, t.ref).outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(t.count).isZero();
+		assertThat(session.stepPending(u.ref)).isTrue();
+	}
+
+	@Test
 	@DisplayName("a closed session ignores a late finish and wakes its waiters")
 	void closeIsTerminal() throws Exception {
 		final SuspensionSession.Context context = session.route(
@@ -522,6 +680,26 @@ class SuspensionSessionTest {
 		assertThat(session.finish(context)).isFalse();
 		assertThat(session.nextStop(10_000).outcome()).isEqualTo(SuspensionSession.Outcome.CLOSED);
 		assertThat(t.count).as("dispose releases it; the session does not").isEqualTo(1);
+	}
+
+	/** The session's VM identity cannot retain a disposed mirror, including on an empty close. */
+	@Test
+	void emptyClosedSessionDoesNotOwnAStrongVmReference() throws Exception {
+		session.close();
+
+		final Field binding = SuspensionSession.class.getDeclaredField("vm");
+		binding.setAccessible(true);
+		assertThat(binding.get(session)).isInstanceOf(WeakReference.class);
+	}
+
+	/** Closed sessions refuse to resolve a live thread even when they retain a report naming it. */
+	@Test
+	void closedSessionDoesNotResolveItsStopThread() {
+		stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 30);
+		assertThat(session.knownThread(t.ref.uniqueID())).isSameAs(t.ref);
+		session.close();
+
+		assertThat(session.knownThread(t.ref.uniqueID())).isNull();
 	}
 
 	/**
@@ -896,6 +1074,9 @@ class SuspensionSessionTest {
 
 		assertThat(session.releaseThread(t.ref).refusal()).contains("an evaluation is running");
 		assertThat(session.step(t.ref, List::of, this::stepRequest).refusal()).contains("an evaluation is running");
+		final SuspensionSession.NextStop next = session.nextStop(0, t.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		assertThat(next.refusal()).contains("an evaluation is running");
 		assertThat(t.count).isEqualTo(1);
 		session.unlease(t.ref);
 	}

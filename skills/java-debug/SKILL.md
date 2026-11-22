@@ -69,14 +69,14 @@ Every debug session follows this sequence:
 1. **Launch the target** in a separate shell with `suspend=y` — *or skip this step if the JVM is already running with JDWP open*. The JVM blocks until step 2.
 2. **Attach** following the port-resolution priority above. `jdwp_wait_for_attach` polls until the JVM is listening, then attaches. For a test launched with `suspend=y`, pass `requireVmStart=true` to check that it is the fresh test JVM.
 3. **Set breakpoints** at suspected bug locations: `jdwp_set_breakpoint(className, lineNumber)`. Add exception breakpoints or logpoints as needed.
-4. **Resume and wait:** `jdwp_resume_until_event()` — releases the JVM and BLOCKS until the next BP/step/exception fires (30s default). Returns the suspended thread info.
+4. **Resume and wait** with `jdwp_resume_until_event()`. It presents an unseen stop immediately or releases presented stops and manual holds before waiting (30 seconds by default). Pass `threadId=T` when you want to resume and wait on one thread.
 5. **Inspect in one call:** `jdwp_get_breakpoint_context()` — returns thread, top frames, locals (incl. `this`), and `this` field dump.
 6. **Form a hypothesis,** test it: step through, `jdwp_assert_expression(...)` to check invariants, `jdwp_set_local`/`jdwp_set_field` to mutate state and ask "would the test pass if X were Y?"
 7. **Resume to next event** with `jdwp_resume_until_event`. When done with a test run, disconnect and check that the test JVM and background build shell have ended. Use the cleanup steps under Critical Gotchas if either is still running. Launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
 **On `[TIMEOUT]`:** the response includes a structured diagnostic — *read it*. If your breakpoints are `PENDING` (target class not loaded), the code path is not executing and a larger timeout will not help — verify the entry point or class name. If a pending BP shows `[FAILED]`, the line/class is invalid. If recent events show `LOGPOINT` or `BREAKPOINT_SUPPRESSED` hits, your BP *is* firing but auto-resuming (logpoint or false condition). Do **not** blindly retry with a bigger timeout. Call `jdwp_diagnose()` any time for the same snapshot without resuming — useful as a sanity check before waiting on a long path.
 
-**On `[RESUME_FAILED]`:** read which holds were released and which need recovery. For unpaid lease debt or a failed automatic release, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on.
+**On `[RESUME_FAILED]`:** read which holds were released and which need recovery. Use `jdwp_resume_thread(threadId=…)` with the retry ID in the reply when available. That ID can be the event thread of a failed automatic stop-all covering the thread you were waiting on. Retrying that release lifts its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on.
 
 For follow-up investigations in the same long-running JVM, use `jdwp_reset` to clear session state, then set new breakpoints.
 
@@ -88,9 +88,9 @@ A value looks correct before a method call and wrong after. The method appears t
 
 1. BP at the call site, *before* the suspicious call.
 2. `jdwp_evaluate_expression` on the value -> correct.
-3. `jdwp_step_over` followed by `jdwp_resume_until_event` (the step resumes the thread; the latch fires when the STEP event lands).
+3. `jdwp_step_over(wait=true)` to step and collect the thread's next stop.
 4. `jdwp_evaluate_expression` again -> wrong! The call mutates.
-5. Restart, BP at the same site, `jdwp_step_into` to land inside the suspicious method, then a small number of `jdwp_step_over` + `jdwp_resume_until_event` cycles, eval after each — find the exact mutation point. If you find yourself stepping more than ~3 lines, set a breakpoint at the suspect line and resume to it instead.
+5. Restart with a BP at the same site. Use `jdwp_step_into(wait=true)` to enter the suspicious method, then use `jdwp_step_over(wait=true)` a few times and evaluate after each stop. If the suspect line is more than about three steps away, set a breakpoint there and resume to it.
 
 ### "Race / partial init / observable intermediate state"
 
@@ -350,7 +350,9 @@ Each step is a JDWP round-trip — slow and token-expensive. Default to a breakp
 - **`jdwp_step_out`** — an exception or early-abort dropped you in a frame you don't care about and finding the right caller line for a breakpoint would be awkward. One call escapes the frame.
 - **`jdwp_step_over`** — only for the *single* next statement, when observing a state mutation is faster than predicting it. More than ~3 `step_over`s in a row means "I should have set a breakpoint."
 
-A step releases the selected thread and reports any remaining stop-all, thread stops, and manual holds. A stop-all can still cover virtual threads that JDI omits from the displayed list. Call `jdwp_resume_until_event` to wait for the landing. Omit `threadId` to step the thread of the current stop.
+A step releases the selected thread and reports any remaining stop-all, thread stops, and manual holds. A stop-all can still cover virtual threads that JDI omits from the displayed list. Omit `threadId` to step the thread of the current stop. When other threads can stop too, prefer `jdwp_step_over(threadId=T, wait=true)` or the equivalent step into or out. The reply identifies that step's landing or interrupting stop, even if another call already presented it. Stops on other threads stay held and unseen.
+
+`wait` defaults to false. To collect the stop from an asynchronous step or continue after a 30-second waiting-step timeout, use `jdwp_resume_until_event(threadId=T)`.
 
 ## Anti-patterns
 
@@ -383,8 +385,14 @@ When you land at a breakpoint and don't know what to look at:
 
 ## When the [VM_DEATH] message lists FAILED breakpoints
 
-`jdwp_resume_until_event` returning `[VM_DEATH]` always means "the target VM is gone — nothing more to wait on." It lists what the run recorded (`Recorded before the exit (jdwp_get_events): …` — read it before you conclude nothing happened) and every field breakpoint with its hit count: one with `0 hits` while the value provably changed is the reflection / `Unsafe` blind spot (see Gotchas). After the exit, `jdwp_reset` and `jdwp_disconnect` say the target exited and what went with it. If the response includes a `Note: deferred breakpoint(s) were promoted but failed to install: #N at Class:line (reason)` line, that BP was set on a non-executable position (comment, blank line, method signature, or a class with no debug info). Re-set the BP on a real statement line and re-attach.
+`jdwp_resume_until_event` returning `[VM_DEATH]` means the connection you waited on has ended. When available for that connection, the reply lists what the run recorded and the field breakpoints with their hit counts. A field breakpoint with `0 hits` while the value provably changed points to the reflection / `Unsafe` blind spot (see Gotchas). After the exit, `jdwp_reset` and `jdwp_disconnect` say the target exited and what went with it. If the response includes a `Note: deferred breakpoint(s) were promoted but failed to install: #N at Class:line (reason)` line, that BP was set on a non-executable position (comment, blank line, method signature, or a class with no debug info). Re-set the BP on a real statement line and re-attach.
 
 ## State-checking semantics of resume_until_event
 
-`jdwp_resume_until_event` is state-aware, not just signal-driven. If a BP / STEP / exception event has fired since your last call, it returns immediately with the captured snapshot rather than re-resuming the thread (which would overshoot the suspended location). So `jdwp_step_over` → any number of intervening tool calls → `jdwp_resume_until_event` is safe — you'll land on the STEP event, not the BP after it.
+`jdwp_resume_until_event(threadId=T)` presents T's oldest unseen stop immediately and reports how many unseen stops from other threads remain held (when there are any). It can find a thread the session holds or is stepping, including a virtual thread omitted from the VM's enumeration. If T is already running or has a pending step, the call waits without releasing anything. Otherwise it releases only T before waiting.
+
+If either targeted tool returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying. A replacement JVM can reuse an old ID.
+
+The wait can return a blocker even after it starts, including an event on T that is queued for processing. Retry a queued event once the dispatcher has processed it. A step with `wait=true` waits through processing of its own landing. If another thread has an unseen stop-all holding T, use unfiltered `jdwp_resume_until_event()` to present that stop in order. If a step is pending on T, use `jdwp_resume_thread(threadId=T)` to free T from the presented hold, then continue the targeted wait. That resume resolves session-owned virtual threads by ID too. A blocker leaves the step armed. If a selected stop coincides with a disconnect, the VM-death or VM-gone reply identifies that stop.
+
+When live thread or frame reads fail, a wait or presenting getter can still identify the selected stop from the saved report. A reset during a waiting step returns `[NO_EVENT]`, even if another call already presented the ending stop.

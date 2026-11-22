@@ -3295,8 +3295,8 @@ public class FastLogpointService {
 
     /**
      * Publishes a fast-breakpoint stop the way the listener publishes a breakpoint hit: the tracker
-     * snapshot, then the {@code FAST_BREAKPOINT} history entry, then the next-event latch. Caller
-     * holds the monitor.
+     * snapshot with the user-code location, then the {@code FAST_BREAKPOINT} history entry, then
+     * the next-event latch. Caller holds the monitor.
      *
      * @param location   the user's location (the first frame below the probe's)
      * @param reason     why it stopped, as the stop report shows it
@@ -3311,7 +3311,7 @@ public class FastLogpointService {
         // Per stop, not per entry: two threads held at stops of this ID at once can stop for
         // different reasons (#47 § 1).
         breakpointTracker.recordStopDetail(thread, BreakpointTracker.EventKind.BREAKPOINT, flp.id, reason);
-        breakpointTracker.setLastBreakpointThread(thread, flp.id);
+        breakpointTracker.setLastBreakpointThread(thread, flp.id, className + ':' + line);
         final Map<String, String> details = new LinkedHashMap<>();
         details.put("breakpointId", String.valueOf(flp.id));
         details.put("class", className);

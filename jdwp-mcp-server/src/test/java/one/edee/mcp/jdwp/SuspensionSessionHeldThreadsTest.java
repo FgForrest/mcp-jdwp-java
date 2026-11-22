@@ -29,13 +29,14 @@ class SuspensionSessionHeldThreadsTest {
 	private FakeSuspendModel.FakeThread w;
 	private SuspensionSession session;
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() {
 		model = new FakeSuspendModel();
 		t = model.thread("t");
 		u = model.thread("u");
 		w = model.thread("w");
-		session = new BreakpointTracker().openSuspensionSession(new EventHistory());
+		session = new BreakpointTracker().openSuspensionSession(model.vm, new EventHistory());
 	}
 
 	@Test

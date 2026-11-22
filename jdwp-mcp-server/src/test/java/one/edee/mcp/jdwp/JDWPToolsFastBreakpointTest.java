@@ -177,6 +177,7 @@ class JDWPToolsFastBreakpointTest {
 		assertThat(tools.jdwp_get_current_thread()).contains("fast_breakpoint=7, condition failed: NullPointerException");
 	}
 
+	/** Publishes the fast stop on the same VM that receives the step request. */
 	@Test
 	@DisplayName("a step from a fast breakpoint's stop excludes every probe class before its count filter")
 	void stepFromFastStopExcludesProbes() throws Exception {
@@ -200,7 +201,7 @@ class JDWPToolsFastBreakpointTest {
 		final StepRequest step = mock(StepRequest.class);
 		when(erm.createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER)).thenReturn(step);
 		// The fast stop, published and shown, holds the thread (issue #45).
-		final SuspensionSession session = tracker.openSuspensionSession(new EventHistory());
+		final SuspensionSession session = tracker.openSuspensionSession(vm, new EventHistory());
 		final EventSet stopSet = mock(EventSet.class);
 		when(stopSet.suspendPolicy()).thenReturn(EventRequest.SUSPEND_ALL);
 		when(stopSet.iterator()).thenAnswer(invocation -> java.util.Collections.emptyIterator());
@@ -236,12 +237,13 @@ class JDWPToolsFastBreakpointTest {
 		return frame;
 	}
 
+	/** Checks release ownership on the simulated VM. */
 	@Test
 	@DisplayName("jdwp_resume releases only the stops a tool has shown, never a thread nobody holds")
 	void resumeReleasesOnlySeenStops() throws Exception {
-		when(jdiService.getVM()).thenReturn(mock(VirtualMachine.class));
-		final SuspensionSession session = tracker.openSuspensionSession(new EventHistory());
 		final FakeSuspendModel model = new FakeSuspendModel();
+		when(jdiService.getVM()).thenReturn(model.vm);
+		final SuspensionSession session = tracker.openSuspensionSession(model.vm, new EventHistory());
 		final FakeSuspendModel.FakeThread seen = model.thread("seen");
 		final FakeSuspendModel.FakeThread unseen = model.thread("unseen");
 		for (FakeSuspendModel.FakeThread thread : List.of(seen, unseen)) {

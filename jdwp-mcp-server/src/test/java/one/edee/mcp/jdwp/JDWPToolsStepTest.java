@@ -1,9 +1,15 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.InternalException;
+import com.sun.jdi.Location;
+import com.sun.jdi.ObjectCollectedException;
+import com.sun.jdi.ReferenceType;
+import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
@@ -15,6 +21,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -22,14 +30,22 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -49,14 +65,16 @@ class JDWPToolsStepTest {
 	private JDWPTools tools;
 	private VirtualMachine vm;
 	private EventRequestManager erm;
+	private EventHistory eventHistory;
 
+	/** Wires the step tools and suspension session to the same mock VM. */
 	@BeforeEach
 	void setUp() throws Exception {
 		jdiService = mock(JDIConnectionService.class);
-		breakpointTracker = new BreakpointTracker();
+		breakpointTracker = spy(new BreakpointTracker());
 		final WatcherManager watcherManager = mock(WatcherManager.class);
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final EventHistory eventHistory = new EventHistory();
+		eventHistory = new EventHistory();
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, breakpointTracker, watcherManager, evaluator,
 			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
@@ -64,7 +82,7 @@ class JDWPToolsStepTest {
 		erm = mock(EventRequestManager.class);
 		when(vm.eventRequestManager()).thenReturn(erm);
 		when(erm.stepRequests()).thenReturn(List.of());
-		session = breakpointTracker.openSuspensionSession(eventHistory);
+		session = breakpointTracker.openSuspensionSession(vm, eventHistory);
 	}
 
 	private SuspensionSession session;
@@ -82,17 +100,27 @@ class JDWPToolsStepTest {
 	}
 
 	private void holdStop(ThreadReference thread, int breakpointId, int policy, boolean present) throws Exception {
+		holdStop(new BreakpointTracker.LastBreakpoint(thread, breakpointId), policy, present);
+	}
+
+	/** Publishes a synthetic stop without a locatable JDI event. */
+	private void holdStop(BreakpointTracker.LastBreakpoint stop, int policy, boolean present) throws Exception {
 		final EventSet set = mock(EventSet.class);
 		when(set.suspendPolicy()).thenReturn(policy);
 		when(set.iterator()).thenAnswer(invocation -> Collections.emptyIterator());
-		final SuspensionSession.Context context = session.route(set, thread, false);
+		holdStop(stop, set, present);
+	}
+
+	/** Publishes the supplied event set and retains it for assertions about release. */
+	private void holdStop(BreakpointTracker.LastBreakpoint stop, EventSet set, boolean present) throws Exception {
+		final SuspensionSession.Context context = session.route(set, stop.thread(), false);
 		session.begin(context);
-		session.candidate(context, new BreakpointTracker.LastBreakpoint(thread, breakpointId));
+		session.candidate(context, stop);
 		session.finish(context);
 		if (present) {
 			session.nextStop(0);
 		}
-		stops.put(thread, set);
+		stops.put(stop.thread(), set);
 	}
 
 	private ThreadReference suspendedThread(long id) {
@@ -136,9 +164,10 @@ class JDWPToolsStepTest {
 			"All remaining threads run.");
 	}
 
-	/** A failed release reports all attempts and preserves a confirmed manual release on disconnect. */
-	@Test
-	void shouldReportStepReleaseProgressAndDisconnect() throws Exception {
+	/** A failed release reports all attempts and returns immediately, including for a waiting step. */
+	@ParameterizedTest
+	@CsvSource({"false,true", "true,true", "true,false"})
+	void shouldReportStepReleaseProgressAndDisconnect(boolean wait, boolean disconnect) throws Exception {
 		final FakeSuspendModel model = new FakeSuspendModel();
 		final FakeSuspendModel.FakeThread stepping = model.thread("stepping");
 		when(model.vm.eventRequestManager()).thenReturn(erm);
@@ -149,15 +178,25 @@ class JDWPToolsStepTest {
 		doThrow(new InternalException("first resume rejected")).when(first).resume();
 		final EventSet second = model.breakpointEvent(stepping, EventRequest.SUSPEND_EVENT_THREAD);
 		publish(stepping, second, 12);
-		doThrow(new VMDisconnectedException("transport closed")).when(second).resume();
+		if (disconnect) {
+			doThrow(new VMDisconnectedException("transport closed")).when(second).resume();
+		}
 		final StepRequest request = stubStepRequestCreation(stepping.ref, StepRequest.STEP_OVER);
 		when(request.virtualMachine()).thenReturn(model.vm);
 
-		assertThat(tools.jdwp_step_over(stepping.ref.uniqueID())).startsWith("[VM_DEATH]")
-			.contains("jdwp_suspend_thread hold", "first resume rejected", "VMDisconnectedException", "jdwp_wait_for_attach");
-		assertThat(session.isClosed()).isTrue();
+		final String reply = tools.jdwp_step_over(stepping.ref.uniqueID(), wait);
+		assertThat(reply).startsWith(disconnect ? "[VM_DEATH]" : "Error: cannot step")
+			.contains("jdwp_suspend_thread hold", "first resume rejected")
+			.doesNotContain("Step over started", "[TIMEOUT]");
+		if (disconnect) {
+			assertThat(reply).contains("VMDisconnectedException", "jdwp_wait_for_attach");
+		} else {
+			assertThat(reply).contains("Released: its jdwp_suspend_thread hold; breakpoint 12 stop",
+				"affected holds remain in the session");
+		}
+		assertThat(session.isClosed()).isEqualTo(disconnect);
 		assertThat(session.stepPending(stepping.ref)).isFalse();
-		assertThat(stepping.count).isEqualTo(2);
+		assertThat(stepping.count).isEqualTo(disconnect ? 2 : 1);
 		verify(erm).deleteEventRequest(request);
 	}
 
@@ -297,6 +336,226 @@ class JDWPToolsStepTest {
 			.isLessThanOrEqualTo(5);
 	}
 
+	/** The arming summary has a five-name budget and the appended outcome names its own thread. */
+	@Test
+	void shouldCapArmingSummaryNamesWhenWaitingForGroupedStopAll() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		assertThat(session.releaseThread(stepping).released()).isTrue();
+		final List<ThreadReference> threads = new java.util.ArrayList<>();
+		threads.add(stepping);
+		for (int id = 2; id <= 6; id++) {
+			final ThreadReference other = mock(ThreadReference.class);
+			when(other.uniqueID()).thenReturn((long) id);
+			when(other.name()).thenReturn("worker-" + id);
+			threads.add(other);
+		}
+		holdStop(stepping, 19, EventRequest.SUSPEND_ALL, true);
+		assertThat(session.releaseThread(stepping).released()).isTrue();
+		holdStop(stepping, 19, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(threads);
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> {
+			holdStop(stepping, 30, EventRequest.SUSPEND_EVENT_THREAD, false);
+			return invocation.callRealMethod();
+		}).when(session).awaitStepStop(anyLong(), any());
+
+		final String reply = tools.jdwp_step_over(1L, true);
+		final String[] sections = reply.split("\nEvent fired", 2);
+		assertThat(sections).hasSize(2);
+		assertThat(sections[0]).contains("2 presented stop-alls from thread thread-1",
+			"JDI lists worker-2, worker-3, worker-4 and 2 more");
+		assertThat(java.util.regex.Pattern.compile("\\b(?:thread-1|worker-\\d+)\\b")
+			.matcher(sections[0]).results().count()).isEqualTo(5);
+		assertThat(sections[1]).contains("Thread: thread-1 (ID=1", "breakpoint=30");
+	}
+
+	@Test
+	@DisplayName("wait=true reports the step landing and leaves older stops unseen")
+	void shouldWaitForStepLanding() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		final ThreadReference other = mock(ThreadReference.class);
+		when(other.name()).thenReturn("other");
+		holdStop(other, 2, EventRequest.SUSPEND_EVENT_THREAD, false);
+		final CountDownLatch released = signalOnRelease(stepping);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping, other));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_over(1L, true));
+		assertThat(released.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(reply).isNotDone();
+		holdStop(new BreakpointTracker.LastBreakpoint(stepping, null, BreakpointTracker.EventKind.STEP),
+			EventRequest.SUSPEND_EVENT_THREAD, false);
+
+		assertThat(reply.get(5, TimeUnit.SECONDS)).startsWith("Step over started")
+			.contains("unseen thread stops: other", "\nEvent fired", "via=step", "1 unseen stop");
+		assertThat(session.unseenCount()).isEqualTo(1);
+		verify(stops.get(other), never()).resume();
+	}
+
+	@Test
+	@DisplayName("wait=true reports a breakpoint that interrupts the step on its thread")
+	void shouldWaitForInterruptingStop() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		final CountDownLatch released = signalOnRelease(stepping);
+		when(jdiService.getVM()).thenReturn(vm);
+		final StepRequest request = stubStepRequestCreation(stepping, StepRequest.STEP_INTO);
+		when(request.virtualMachine()).thenReturn(vm);
+
+		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_into(null, true));
+		assertThat(released.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(reply).isNotDone();
+		holdStop(stepping, 3, EventRequest.SUSPEND_EVENT_THREAD, false);
+
+		assertThat(reply.get(5, TimeUnit.SECONDS)).startsWith("Step into started")
+			.contains("\nEvent fired", "breakpoint=3");
+		assertThat(session.stepPending(stepping)).isFalse();
+		verify(erm).deleteEventRequest(request);
+		assertThat(eventHistory.getRecent(10)).extracting(EventHistory.DebugEvent::type).contains("STEP_INTERRUPTED");
+	}
+
+	@Test
+	@DisplayName("a competing presenter cannot make wait=true return a later stop")
+	void shouldReportTheStepOutcomeAlreadyPresentedByAnotherCall() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> {
+			final Object armed = invocation.callRealMethod();
+			holdStop(stepping, 30, EventRequest.SUSPEND_EVENT_THREAD, false);
+			assertThat(tools.jdwp_resume_until_event(0)).contains("breakpoint=30");
+			assertThat(session.releaseThread(stepping).released()).isTrue();
+			holdStop(stepping, 31, EventRequest.SUSPEND_EVENT_THREAD, false);
+			return armed;
+		}).when(session).step(eq(stepping), any(), any());
+
+		assertThat(tools.jdwp_step_over(1L, true)).startsWith("Step over started")
+			.contains("step ended at", "breakpoint=30", "already presented by another call")
+			.doesNotContain("breakpoint=31", "Event fired", "[TIMEOUT]");
+		assertThat(session.currentStop()).isNull();
+		assertThat(session.unseenCount()).isEqualTo(1);
+		assertThat(tools.jdwp_resume_until_event(0)).contains("breakpoint=31");
+	}
+
+	/** Forces T to stop again during enrichment of the step's already selected outcome. */
+	@Test
+	void shouldKeepCapturedStepLocationWhenThreadStopsAgainDuringFrameRead() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		final StackFrame laterFrame = mock(StackFrame.class);
+		final Location laterLocation = location(31);
+		when(laterFrame.location()).thenReturn(laterLocation);
+		doAnswer(invocation -> {
+			final EventSet ending = mock(EventSet.class);
+			final BreakpointEvent event = mock(BreakpointEvent.class);
+			final Location endingLocation = location(30);
+			when(event.thread()).thenReturn(stepping);
+			when(event.location()).thenReturn(endingLocation);
+			when(ending.suspendPolicy()).thenReturn(EventRequest.SUSPEND_EVENT_THREAD);
+			when(ending.iterator()).thenAnswer(ignored -> List.<Event>of(event).iterator());
+			holdStop(new BreakpointTracker.LastBreakpoint(stepping, 30), ending, false);
+			when(stepping.frameCount()).thenAnswer(read -> {
+				assertThat(session.releaseThread(stepping).released()).isTrue();
+				holdStop(stepping, 31, EventRequest.SUSPEND_EVENT_THREAD, false);
+				doReturn(1).when(stepping).frameCount();
+				return 1;
+			});
+			when(stepping.frame(0)).thenReturn(laterFrame);
+			return invocation.callRealMethod();
+		}).when(session).awaitStepStop(anyLong(), any());
+
+		assertThat(tools.jdwp_step_over(1L, true)).contains("Event fired at example.Work:30", "breakpoint=30")
+			.doesNotContain("example.Work:31", "frames=1");
+		assertThat(session.unseenCount()).isOne();
+	}
+
+	/** A source location used to distinguish the selected stop from the later stack. */
+	private static Location location(int line) {
+		final Location location = mock(Location.class);
+		final ReferenceType type = mock(ReferenceType.class);
+		when(type.name()).thenReturn("example.Work");
+		when(location.declaringType()).thenReturn(type);
+		when(location.lineNumber()).thenReturn(line);
+		return location;
+	}
+
+	/** Ensures an armed step keeps its continuation hint when the previous diagnostic thread is stale. */
+	@Test
+	void shouldKeepArmedStepTimeoutWhenFormerStopThreadIsCollected() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		final ThreadReference former = suspendedThread(2L);
+		assertThat(session.releaseThread(former).released()).isTrue();
+		when(former.name()).thenThrow(new ObjectCollectedException("former worker already collected"));
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> session.awaitStepStop(0, invocation.getArgument(1)))
+			.when(session).awaitStepStop(eq(30_000L), any());
+
+		assertThat(tools.jdwp_step_over(1L, true)).startsWith("Step over started")
+			.contains("[TIMEOUT]", "jdwp_resume_until_event(threadId=1)");
+		assertThat(session.stepPending(stepping)).isTrue();
+	}
+
+	/** A failed thread sample must leave the stop-all summary and the waiting step's result intact. */
+	@Test
+	void shouldKeepStopAllSummaryWhenThreadSamplingFails() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		assertThat(session.releaseThread(stepping).released()).isTrue();
+		holdStop(stepping, 19, EventRequest.SUSPEND_ALL, true);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenThrow(new ObjectCollectedException("thread sample unavailable"));
+		stubStepRequestCreation(stepping, StepRequest.STEP_OVER);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> {
+			holdStop(stepping, 30, EventRequest.SUSPEND_EVENT_THREAD, false);
+			return invocation.callRealMethod();
+		}).when(session).awaitStepStop(anyLong(), any());
+
+		assertThat(tools.jdwp_step_over(null, true)).startsWith("Step over started")
+			.contains("presented stop-all from thread thread-1 still covers other threads", "Event fired", "breakpoint=30")
+			.doesNotContain("All other threads run.", "All remaining threads run.");
+		verify(stepping).resume();
+	}
+
+	@Test
+	@DisplayName("a waiting step times out after the default wait and leaves the request armed")
+	void shouldLeaveTimedOutStepPending() throws Exception {
+		final ThreadReference stepping = suspendedThread(1L);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(stepping));
+		final StepRequest request = stubStepRequestCreation(stepping, StepRequest.STEP_OUT);
+
+		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_out(1L, true));
+		assertThat(reply.get(40, TimeUnit.SECONDS)).startsWith("Step out started")
+			.contains("still_waiting", "[TIMEOUT]", "30000ms", "jdwp_resume_until_event(threadId=1)");
+		assertThat(session.stepPending(stepping)).isTrue();
+		verify(erm, never()).deleteEventRequest(request);
+	}
+
+	private CountDownLatch signalOnRelease(ThreadReference thread) {
+		final CountDownLatch released = new CountDownLatch(1);
+		doAnswer(invocation -> {
+			released.countDown();
+			return null;
+		}).when(stops.get(thread)).resume();
+		return released;
+	}
+
 	@Nested
 	@DisplayName("Step depth wiring")
 	class StepDepthWiring {
@@ -365,7 +624,7 @@ class JDWPToolsStepTest {
 			verify(erm).createStepRequest(threadCaptor.capture(), anyInt(), anyInt());
 			assertThat(threadCaptor.getValue()).isSameAs(thread);
 			assertThat(out).contains("42").contains("thread-42")
-				.contains("Call jdwp_resume_until_event to wait for the STEP event")
+				.contains("Call jdwp_resume_until_event(threadId=42) to wait for this thread's next stop")
 				.contains("All other threads run.");
 		}
 
@@ -477,7 +736,7 @@ class JDWPToolsStepTest {
 	class ReturnMessage {
 
 		@Test
-		@DisplayName("includes the 'Call jdwp_resume_until_event to wait for the STEP event.' hint")
+		@DisplayName("includes the hint to wait for the same thread")
 		void shouldIncludeResumeUntilEventHintInReturnMessage() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
 			when(jdiService.getVM()).thenReturn(vm);
@@ -486,7 +745,7 @@ class JDWPToolsStepTest {
 
 			final String out = tools.jdwp_step_over(1L);
 
-			assertThat(out).contains("Call jdwp_resume_until_event to wait for the STEP event");
+			assertThat(out).contains("Call jdwp_resume_until_event(threadId=1) to wait for this thread's next stop");
 		}
 
 		@Test

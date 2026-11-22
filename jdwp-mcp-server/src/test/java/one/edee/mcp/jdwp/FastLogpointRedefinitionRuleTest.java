@@ -53,6 +53,7 @@ class FastLogpointRedefinitionRuleTest {
 	 */
 	private final List<BreakpointRequest> created = new ArrayList<>();
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() throws Exception {
 		model = new FakeSuspendModel();
@@ -60,7 +61,7 @@ class FastLogpointRedefinitionRuleTest {
 		inspected = model.thread("inspected");
 		history = new EventHistory();
 		final BreakpointTracker tracker = new BreakpointTracker();
-		session = tracker.openSuspensionSession(history);
+		session = tracker.openSuspensionSession(model.vm, history);
 		evaluator = mock(JdiExpressionEvaluator.class);
 		service = new FastLogpointService(tracker, history, new EvaluationGuard(), evaluator,
 			mock(JdiEventListener.class), mock(JDIConnectionService.class));
