@@ -165,7 +165,7 @@ public class LocalProjectClasspathProvider {
         private final FutureTask<Breakdown> task;
         /** Dedicated daemon that runs the scan and can be interrupted independently. */
         private final Thread worker;
-        /** Completed result published for readers that cannot wait on the future. */
+        /** Completed result for non-waiting readers, written under the compiler publication gate. */
         private volatile @Nullable Breakdown ready;
 
         /** Prepares a discovery and its daemon. The caller starts it after publishing the scan. */
@@ -179,7 +179,9 @@ public class LocalProjectClasspathProvider {
                     log.warn("[LocalClasspath] Discovery failed (cwd={})", directory, e);
                     breakdown = new Breakdown(0, 0, 0, Set.of(), "Local classpath discovery failed: " + e);
                 }
-                ready = breakdown;
+                synchronized (LocalProjectClasspathProvider.this) {
+                    ready = breakdown;
+                }
                 return breakdown;
             });
             // A filesystem read may still be blocked in the OS after cancellation. A separate
@@ -313,6 +315,11 @@ public class LocalProjectClasspathProvider {
         return statusFor(projectDirectory(), discovery);
     }
 
+    /** Lets diagnose report the runner's cleanup capability without waiting for discovery. */
+    public boolean mavenUsesDescendantPolling() {
+        return mavenRunner.usesDescendantPolling();
+    }
+
     /**
      * Returns status for the requested directory from the scan's published result. A scan for
      * another directory is treated as absent. This read never waits on the discovery task.
@@ -426,9 +433,17 @@ public class LocalProjectClasspathProvider {
         }
     }
 
-    /** Validates both the connection's scan and the reported directory at publication. */
-    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, Runnable publish) {
+    /**
+     * Publishes compiler options on the dispatcher or an evaluation worker only while the
+     * connection, directory, and any observed local result are current. Returns false to retry.
+     */
+    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, boolean includeLocal,
+                                          Runnable publish) {
         if ((connectionScoped && (owner == null || owner != vm)) || discovery != snapshot.scan()) {
+            return false;
+        }
+        final ProjectDirectory project = snapshot.project();
+        if (includeLocal && statusFor(project, discovery).breakdown() != snapshot.status().breakdown()) {
             return false;
         }
         final ClientWorkspace workspace = clientWorkspace;
@@ -436,7 +451,6 @@ public class LocalProjectClasspathProvider {
             publish.run();
             return true;
         }
-        final ProjectDirectory project = snapshot.project();
         return workspace.publishIfCurrent(project.reportedByClient() ? project.path() : null, publish);
     }
 
@@ -572,18 +586,14 @@ public class LocalProjectClasspathProvider {
 
     /**
      * Builds the {@code dependency:build-classpath} command line, picking up the project's Maven
-     * wrapper when available (see {@link #resolveMavenExecutable}). The output file lives under each
-     * module's {@code target/}, never at a bare project-root filename.
+     * wrapper when available (see {@link #resolveMavenExecutable}). The production runner adds
+     * the run-specific output path.
      */
     private static List<String> buildMavenCommand(Path workingDirectory) {
         final String executable = resolveMavenExecutable(workingDirectory);
         // `-q` keeps Maven CLI noise off the operator's terminal; the runner captures stdout to a
         // size-capped buffer so the WARN path can still surface diagnostic output on failure.
         // `-DincludeScope=runtime` matches what's actually on the app's runtime classpath.
-        // The output file lives under each module's `target/` — Maven-owned build output, gitignored
-        // everywhere, wiped by `mvn clean`. NEVER use a bare filename here (`.jdwp-mcp-classpath`):
-        // that would land in project source directories which we must not write to. See the
-        // file-safety policy.
         // We do NOT pass `-Dmdep.pathSeparator=:` — that flag forces a Unix separator on Windows and
         // would corrupt drive letters in jar paths. Letting Maven use the platform default and
         // splitting on File.pathSeparator on the read side keeps things consistent.
@@ -591,8 +601,7 @@ public class LocalProjectClasspathProvider {
             executable,
             "-q",
             "dependency:build-classpath",
-            "-DincludeScope=runtime",
-            "-Dmdep.outputFile=target/.jdwp-mcp-classpath"
+            "-DincludeScope=runtime"
         );
     }
 
@@ -767,7 +776,7 @@ public class LocalProjectClasspathProvider {
          * {@code timeoutSeconds}, and returns the classpath entries the command's output files
          * contributed.
          *
-         * @param command          full argv (executable + arguments) to invoke
+         * @param command          Maven executable and discovery arguments; the runner supplies its output path
          * @param workingDirectory CWD for the spawned process; output files are harvested under it
          * @param timeoutSeconds   wall-clock budget; on timeout the implementation MUST kill the
          *                         process before reporting the failure
@@ -775,5 +784,10 @@ public class LocalProjectClasspathProvider {
          */
         List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds)
             throws IOException, InterruptedException;
+
+        /** Whether cleanup on this host uses descendant polling and may miss reparented helpers. */
+        default boolean usesDescendantPolling() {
+            return false;
+        }
     }
 }

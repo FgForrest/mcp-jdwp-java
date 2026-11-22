@@ -64,7 +64,8 @@ public class InMemoryJavaCompiler {
     private static final Set<String> MISSING_TYPE_CODES = Set.of(
         Integer.toString(IProblem.UndefinedType), Integer.toString(IProblem.UndefinedName),
         Integer.toString(IProblem.UnresolvedVariable), Integer.toString(IProblem.ImportNotFound),
-        Integer.toString(IProblem.IsClassPathCorrect), Integer.toString(IProblem.MissingTypeInMethod),
+        Integer.toString(IProblem.IsClassPathCorrect), Integer.toString(IProblem.IsClassPathCorrectWithReferencingType),
+        Integer.toString(IProblem.MissingTypeInMethod),
         Integer.toString(IProblem.MissingTypeInConstructor), Integer.toString(IProblem.MissingTypeInLambda));
 
     /**

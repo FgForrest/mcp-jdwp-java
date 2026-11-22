@@ -16,7 +16,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -53,6 +56,42 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
+	}
+
+	/** Finishes local discovery during the remote walk and checks one publication with both results. */
+	@Test
+	void eventMergesLocalClasspathThatBecomesReadyDuringRemoteWalk(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path local = project.resolve("local.jar");
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				if (!releaseMaven.await(30, TimeUnit.SECONDS)) {
+					throw new AssertionError("Remote walk did not release Maven");
+				}
+				return List.of(local.toString());
+			});
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(thread.virtualMachine()).thenReturn(vm);
+		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
+		when(jdiService.getTargetMajorVersion()).thenReturn(21);
+		when(jdiService.discoverClasspath(thread)).thenAnswer(call -> {
+			releaseMaven.countDown();
+			assertThat(provider.discover()).containsExactly(local.toString());
+			return "/remote";
+		});
+		final JdiExpressionEvaluator withLocal = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), provider);
+		withLocal.startLocalClasspathDiscovery(vm);
+		try {
+			withLocal.configureCompilerClasspathForEvent(thread);
+			verify(compiler).configure("/opt/jdk", "/remote" + File.pathSeparator + local, 21);
+			verify(compiler, never()).configure("/opt/jdk", "/remote", 21);
+			verify(jdiService).discoverClasspath(thread);
+		} finally {
+			releaseMaven.countDown();
+			withLocal.stopLocalClasspathDiscovery(vm);
+		}
 	}
 
 	/** Changes the reported workspace between reading discovery and publishing compiler options. */

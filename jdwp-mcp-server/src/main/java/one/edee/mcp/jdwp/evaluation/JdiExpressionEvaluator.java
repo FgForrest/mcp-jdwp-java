@@ -1478,6 +1478,7 @@ public class JdiExpressionEvaluator {
      * result or reuse the current remote-only configuration while discovery is pending.
      * Prewarm passes {@code false} because the first suspending stop needs to warm only the
      * remote classloader walk and JDK detection. Discovery started independently at attach.
+     * Publication retries with the finished local result if it arrived during the remote walk.
      *
      * @param suspendedThread an event-suspended target thread for JDI method invocations
      * @param vm the connection that owns the suspended thread
@@ -1493,7 +1494,7 @@ public class JdiExpressionEvaluator {
         final Snapshot previous = configured.snapshot();
         if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(first, includeLocal)
             && (!includeLocal || configured.mergedLocal() == first.status().breakdown())
-            && localClasspathProvider.publishIfCurrent(vm, first, () -> {})) {
+            && localClasspathProvider.publishIfCurrent(vm, first, includeLocal, () -> {})) {
             return;
         }
 
@@ -1513,8 +1514,8 @@ public class JdiExpressionEvaluator {
             final String remoteClasspath = jdiConnectionService.discoverClasspath(suspendedThread);
             final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
             Snapshot snapshot = first;
-            // Directory reports can arrive during the remote walk or while the options are being
-            // assembled. Retry against a fresh snapshot, without another remote walk or Maven wait.
+            // Directory reports and local results can arrive during the remote walk or while
+            // assembling options. Retry with a fresh snapshot without repeating either discovery.
             for (int attempt = 0; attempt < 3; attempt++) {
                 final DiscoveryStatus localStatus = snapshot.status();
                 final LocalProjectClasspathProvider.Breakdown local = includeLocal ? localStatus.breakdown() : null;
@@ -1526,7 +1527,7 @@ public class JdiExpressionEvaluator {
                 final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
                 final int version = jdiConnectionService.getTargetMajorVersion();
                 final Snapshot candidate = snapshot;
-                if (localClasspathProvider.publishIfCurrent(vm, candidate, () -> {
+                if (localClasspathProvider.publishIfCurrent(vm, candidate, includeLocal, () -> {
                     if (jdkPath != null && !mergedClasspath.isEmpty()) {
                         compiler.configure(jdkPath, mergedClasspath, version);
                         compilerState = new CompilerState(vm, candidate, local, compiler.currentConfiguration(),

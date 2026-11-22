@@ -178,6 +178,50 @@ class DispatcherMavenLiveTest {
 		}
 	}
 
+	/** Arms the original fast logpoint after Maven supplies the superclass of a remote type. */
+	@Test
+	void fastLogpointRetriesWhenAnIndirectlyReferencedTypeBecomesAvailable(@TempDir Path project)
+		throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path remote = Files.createDirectory(project.resolve("remote"));
+		final Path localPackage = Files.createDirectories(project.resolve("local/probeclasspath"));
+		final Path parent = Files.writeString(project.resolve("ProbeParent.java"), """
+			package probeclasspath;
+			public class ProbeParent { public int value() { return 42; } }
+			""");
+		final Path child = Files.writeString(project.resolve("ProbeChild.java"), """
+			package probeclasspath;
+			public class ProbeChild extends ProbeParent {}
+			""");
+		assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", remote.toString(),
+			parent.toString(), child.toString())).isZero();
+		Files.move(remote.resolve("probeclasspath/ProbeParent.class"), localPackage.resolve("ProbeParent.class"));
+		final String localClasspath = localPackage.getParent().toString();
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				releaseMaven.await();
+				return List.of(localClasspath);
+			});
+		try (LiveSession session = LiveSession.start(List.of(), provider, remote)) {
+			final int probe = LiveSession.idOf(session.tools.jdwp_set_fast_logpoint(LiveSession.TARGET,
+				LiveSession.lineOf("MARK: label"), "false ? new probeclasspath.ProbeChild().value() : i",
+				null, true, null, null));
+			await("first arming outcome", () -> hasProbeEvent(session, probe, "FAST_LOGPOINT_ARMING_DEFERRED")
+				|| hasProbeEvent(session, probe, "FAST_LOGPOINT_ARM_FAILED"));
+			assertThat(hasProbeEvent(session, probe, "FAST_LOGPOINT_ARMING_DEFERRED")).isTrue();
+			assertThat(hasProbeEvent(session, probe, "FAST_LOGPOINT_ARM_FAILED")).isFalse();
+			assertThat(provider.discoveryStatus().running()).isTrue();
+
+			releaseMaven.countDown();
+			assertThat(provider.discover()).containsExactly(localClasspath);
+			await("the original probe to arm", () -> hasProbeEvent(session, probe, "FAST_LOGPOINT_ARMED"));
+			session.tools.jdwp_clear_breakpoint(probe);
+		} finally {
+			releaseMaven.countDown();
+		}
+	}
+
 	/** Retains both process handles before disconnect and checks that both exit. */
 	@Test
 	@EnabledOnOs({OS.LINUX, OS.MAC})

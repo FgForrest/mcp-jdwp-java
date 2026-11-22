@@ -14,6 +14,7 @@ import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
@@ -27,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.jspecify.annotations.Nullable;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -82,9 +84,18 @@ final class LiveSession implements AutoCloseable {
 			name -> null, (command, workingDirectory, timeoutSeconds) -> List.of()));
 	}
 
+	/** Starts and attaches a test target with the given server-side classpath provider. */
 	static LiveSession start(List<String> extraJvmArgs, LocalProjectClasspathProvider localClasspath) throws Exception {
-		final String classpath = Path.of(FastLogpointTarget.class.getProtectionDomain().getCodeSource()
+		return start(extraJvmArgs, localClasspath, null);
+	}
+
+	/** Starts and attaches a test target with an optional fixture directory on its classpath. */
+	static LiveSession start(List<String> extraJvmArgs, LocalProjectClasspathProvider localClasspath,
+	                         @Nullable Path fixtureClasspath) throws Exception {
+		final String targetClasspath = Path.of(FastLogpointTarget.class.getProtectionDomain().getCodeSource()
 			.getLocation().toURI()).toString();
+		final String classpath = fixtureClasspath == null ? targetClasspath
+			: targetClasspath + File.pathSeparator + fixtureClasspath;
 		// A fixed port, not :0 — after a detach the agent listens again on the same address, and the
 		// disconnect test re-attaches.
 		final int port;

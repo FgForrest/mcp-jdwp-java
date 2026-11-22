@@ -5,13 +5,17 @@ import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.evaluation.ProcessBuilderMavenRunner;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.nio.file.Files;
@@ -390,6 +394,31 @@ class JDWPToolsDiagnoseTest {
 		assertThat(toolsWithProvider.jdwp_diagnose(false))
 			.contains("Sources: env-override=0, filesystem=1, maven=0")
 			.contains("dependency resolution failed");
+	}
+
+	/** Reports the cleanup limitation when the real Maven runner uses descendant polling. */
+	@Test
+	@EnabledOnOs({OS.LINUX, OS.MAC})
+	void shouldReportMavenPollingCleanupLimit(@TempDir Path cwd) throws Exception {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null));
+		Files.writeString(cwd.resolve("pom.xml"), "<project/>");
+		final Path wrapper = Files.writeString(cwd.resolve("mvnw"), "#!/bin/sh\nexit 0\n");
+		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
+		final ProcessBuilderMavenRunner runner;
+		try (MockedStatic<Files> files = Mockito.mockStatic(Files.class, Mockito.CALLS_REAL_METHODS)) {
+			files.when(() -> Files.isExecutable(Path.of("/usr/bin/setsid"))).thenReturn(false);
+			runner = new ProcessBuilderMavenRunner();
+		}
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(cwd, name -> null, runner);
+		assertThat(provider.discoverWithBreakdown().failure()).isNull();
+		final JDWPTools toolsWithProvider = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, provider);
+
+		assertThat(toolsWithProvider.jdwp_diagnose(false))
+			.contains("Helper processes of a cancelled or timed-out Maven run may outlive it.");
 	}
 
 	/**

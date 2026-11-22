@@ -5,7 +5,12 @@ import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import javax.tools.ToolProvider;
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -98,6 +103,29 @@ class InMemoryJavaCompilerTest {
 			assertThatThrownBy(() -> compiler.compile("Foo", "public class Foo {}"))
 				.isInstanceOf(JdiEvaluationException.class)
 				.hasMessageContaining("not configured");
+		}
+
+		/** Classifies ECJ's indirect missing-type diagnostic so fast probes can retry. */
+		@Test
+		void shouldRecognizeMissingIndirectType(@TempDir Path project) throws Exception {
+			final Path remote = Files.createDirectory(project.resolve("remote"));
+			final Path localPackage = Files.createDirectories(project.resolve("local/fixtures"));
+			final Path base = Files.writeString(project.resolve("Base.java"),
+				"package fixtures; public class Base { public int value() { return 42; } }");
+			final Path derived = Files.writeString(project.resolve("Derived.java"),
+				"package fixtures; public class Derived extends Base {}");
+			assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+				"-d", remote.toString(), base.toString(), derived.toString())).isZero();
+			Files.move(remote.resolve("fixtures/Base.class"), localPackage.resolve("Base.class"));
+			final String source = "public class Probe { int read() { return new fixtures.Derived().value(); } }";
+			final String jdkHome = System.getProperty("java.home");
+			compiler.configure(jdkHome, remote.toString(), 17);
+
+			assertThatThrownBy(() -> compiler.compile("Probe", source))
+				.isInstanceOf(InMemoryJavaCompiler.MissingClasspathTypes.class)
+				.hasMessageContaining("indirectly referenced");
+			compiler.configure(jdkHome, remote + File.pathSeparator + localPackage.getParent(), 17);
+			assertThat(compiler.compile("Probe", source)).containsKey("Probe");
 		}
 	}
 }

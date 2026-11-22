@@ -2147,7 +2147,12 @@ public class JDWPTools {
             out.append("  CWD: ").append(status.directory())
                 .append(status.reportedByClient() ? " (session directory reported by the MCP client)" : "")
                 .append('\n');
-            out.append("  pom.xml: ").append(status.hasPomAtRoot() ? "yes" : "no").append('\n');
+            final boolean hasPom = status.hasPomAtRoot();
+            out.append("  pom.xml: ").append(hasPom ? "yes" : "no").append('\n');
+            if (hasPom && localClasspathProvider.mavenUsesDescendantPolling()) {
+                out.append("  Maven cleanup uses descendant polling. ")
+                    .append("Helper processes of a cancelled or timed-out Maven run may outlive it.\n");
+            }
             final String problem = status.problem();
             if (problem != null) {
                 out.append("  ").append(problem).append('\n');
