@@ -69,7 +69,7 @@ Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and pr
 
 ## Expression evaluation fails with "X cannot be resolved"
 
-Ordinary expressions can read private fields on a suspended frame, including manual holds and blocked threads. If a reply includes `not interpreted`, its reason explains why the expression needed compilation. Method calls, lambdas and blocks use the compiled path. Check `jdwp_diagnose` for engine counts, common fallback reasons and classpath discovery status.
+Ordinary expressions can read private fields on a suspended frame, including manual holds and blocked threads. Follow the field path directly from a local or `this` to reach a private member of a package-private class in another package. If a reply includes `not interpreted`, its reason explains why the expression needed compilation. Ordinary method calls, lambdas and blocks use the compiled path. Check `jdwp_diagnose` for engine counts, common fallback reasons and classpath discovery status.
 
 Symptoms: `jdwp_evaluate_expression`, `jdwp_assert_expression`, a logpoint, or a conditional breakpoint returns a JDT compile diagnostic like `X cannot be resolved to a type` / `cannot be resolved to a variable`, or `configureCompilerClasspath` throws `Classpath discovery failed for the current connection: neither the target VM classloader hierarchy nor the local project yielded any classpath entries`.
 

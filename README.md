@@ -161,7 +161,7 @@ From there, just tell the agent (Claude Code or Codex) what to do — *"attach t
 
 ## Find the Bug — test flights
 
-The `jdwp-sandbox` module ships 10 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
+The `jdwp-sandbox` module ships eleven deliberately broken Java scenarios. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
 
 This doubles as a setup verification — if you can solve these, everything works.
 
@@ -383,6 +383,35 @@ An ordinary conditional breakpoint or logpoint on that line goes through the deb
 
 ---
 
+### #11 The Missing Pickup
+
+**Difficulty:** Moderate | **Test:** `PickupDeskTest` | **Package:** `pickup` | **Par:** 3 | **Exercises:** read-only expression evaluation across package boundaries
+
+**Symptom:** `Pickup unavailable for the selected location ==> expected: <true> but was: <false>` — a listed pickup point is reported as unavailable.
+
+**Solved when** you identify the exact value that makes the desk reject the selected pickup point and explain why.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+The name stored in the directory entry for Marché Central contains `U+0065 U+0301` (an `e` followed by a combining acute accent). The request contains `U+00E9` (a precomposed `é`). The directory and the request spell the same name, but `PickupPoint.matches` compares their UTF-16 sequences with `String.equals`, so it rejects the request. Normalize both names to NFC before comparing them.
+
+**Debug path (3 calls after attaching)**
+
+1. `jdwp_set_breakpoint(className="one.edee.jdwp.sandbox.pickup.PickupDeskTest", lineNumber=19)` sets a deferred breakpoint at the failing assertion.
+2. `jdwp_resume_until_event()` stops at the assertion with `desk` and `pickupPoint` in scope.
+3. Pass the expression below to `jdwp_evaluate_expression`. The result is `Catalog: 101 769, request: 233`, exposing the difference in one read from the test frame. The field path crosses the public API into the private `name` field of the package-private `PickupPoint` class.
+
+   ```java
+   "Catalog: " + (int) desk.catalog.points[1].name.charAt(5) + " "
+       + (int) desk.catalog.points[1].name.charAt(6) + ", request: "
+       + (int) pickupPoint.charAt(5)
+   ```
+
+</details>
+
+---
+
 ### Scorecard
 
 **Flights solved** — did you find the root cause?
@@ -391,10 +420,10 @@ An ordinary conditional breakpoint or logpoint on that line goes through the deb
 |--------|----------------------------------------------------------------------|
 | 0-2    | The JVM is winning. Check your setup.                                |
 | 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 6-9    | Impressive. You found bugs that would take hours with println.       |
-| 10     | Bug terminator. Nothing survives your debugger.                      |
+| 6-10   | Impressive. You found bugs that would take hours with println.       |
+| 11     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
+**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 33 stars across the eleven flights.
 
 ## Features beyond standard JDWP
 
@@ -591,7 +620,7 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. Navigation works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 

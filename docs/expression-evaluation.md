@@ -246,7 +246,7 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. Private fields can be read directly by the navigation interpreter. A private field inside a compiled block or ordinary method call still requires an access path legal in the wrapper.
+The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. The navigation interpreter can follow one field path through private fields and package-private classes across package boundaries. A private field inside a compiled block or ordinary method call still requires an access path legal in the wrapper.
 
 ### VMStart suspension
 

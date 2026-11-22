@@ -17,9 +17,8 @@
     <name>JDWP Debugging Sandbox</name>
     <description>
         Deliberately buggy Java classes used as debugging targets for JDWP "test flights".
-        Each flight (one package per flight) pairs a broken production class with an
-        expected-to-fail test. Tests are compiled but skipped by default — they only
-        run when you explicitly set -DskipTests=false during a test flight.
+        Each flight pairs a broken production scenario with an expected-to-fail test.
+        Tests are compiled but skipped by default. Set -DskipTests=false to run a test flight.
     </description>
 
     <properties>
