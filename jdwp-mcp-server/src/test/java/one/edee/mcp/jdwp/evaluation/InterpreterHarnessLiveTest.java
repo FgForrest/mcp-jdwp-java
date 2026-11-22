@@ -2,12 +2,15 @@ package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
 import com.sun.jdi.event.*;
+import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.EventRequest;
 import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.evaluation.fixture.TypeBindingFixture;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.interpret.Interpreter;
 import one.edee.mcp.jdwp.evaluation.interpret.Planner;
@@ -404,6 +407,77 @@ class InterpreterHarnessLiveTest {
                         .isEqualTo(golden(context));
                     return result;
                 }, null, new StringBuilder(), null);
+            });
+        }
+    }
+
+    /** Defers names that can be shadowed by unloaded enclosing scopes or method-local bindings. */
+    @Test
+    void defersUncertainLexicalTypeBindings() throws Exception {
+        final String pkg = TypeBindingFixture.class.getPackageName() + ".";
+        final String localFrame = TypeBindingFixture.class.getName() + "$LocalFrame";
+        final Map<String, String> expressions = Map.of(
+            pkg + "HiddenOuter$Frame", "Scope.Token.class",
+            pkg + "EnclosingOuter$Middle$Frame", "Shared.class",
+            localFrame, "Marker.class",
+            TypeBindingFixture.class.getName() + "$GenericFrame", "((Marker) value).code");
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final VirtualMachine vm = fixture.vm();
+                final EventRequestManager requests = vm.eventRequestManager();
+                for (String owner : expressions.keySet()) {
+                    final ClassPrepareRequest request = requests.createClassPrepareRequest();
+                    request.addClassFilter(owner);
+                    request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    request.enable();
+                }
+                final EvaluationRouter router = new EvaluationRouter(mock(JdiExpressionEvaluator.class),
+                    EvaluationRouter.Mode.INTERPRETER);
+                final Map<String, Planner.Plan> plans = new LinkedHashMap<>();
+                while (plans.size() < expressions.size()) {
+                    final EventSet events = vm.eventQueue().remove(15_000);
+                    assertThat(events).as("next lexical-binding stop after %s", plans.keySet()).isNotNull();
+                    try {
+                        for (Event event : events) {
+                            if (event instanceof ClassPrepareEvent prepare) {
+                                requests.deleteEventRequest(prepare.request());
+                                final Method method = prepare.referenceType().methodsByName("inspect").get(0);
+                                Location stop = method.location();
+                                if (prepare.referenceType().name().equals(localFrame)) {
+                                    final List<Location> lines = method.allLineLocations();
+                                    stop = lines.get(lines.size() - 1);
+                                }
+                                final BreakpointRequest breakpoint = requests.createBreakpointRequest(stop);
+                                breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                                breakpoint.enable();
+                            } else if (event instanceof BreakpointEvent hit) {
+                                requests.deleteEventRequest(hit.request());
+                                final String owner = hit.location().declaringType().name();
+                                final ThreadReference thread = hit.thread();
+                                if (owner.equals(pkg + "HiddenOuter$Frame")) {
+                                    assertThat(vm.classesByName(pkg + "HiddenOuter")).isEmpty();
+                                    assertThat(vm.classesByName(pkg + "HiddenOuter$Scope")).isEmpty();
+                                    assertThat(vm.classesByName(pkg + "HiddenOuter$Scope$Token")).hasSize(1);
+                                } else if (owner.equals(pkg + "EnclosingOuter$Middle$Frame")) {
+                                    assertThat(vm.classesByName(pkg + "EnclosingOuter$Middle")).isEmpty();
+                                    assertThat(vm.classesByName(pkg + "EnclosingOuter")).hasSize(1);
+                                } else if (owner.equals(localFrame)) {
+                                    assertThat(vm.classesByName(localFrame + "$1Marker")).hasSize(1);
+                                }
+                                final String source = Objects.requireNonNull(expressions.get(owner));
+                                plans.put(source, router.prepare(router.parse(source), thread, () -> thread.frame(0),
+                                    Map.of()));
+                            } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
+                                throw new AssertionError("fixture exited after lexical-binding stops " + plans.keySet());
+                            }
+                        }
+                    } finally {
+                        events.resume();
+                    }
+                }
+                assertThat(plans).as("%s", javaHome.getFileName()).allSatisfy((source, plan) ->
+                    assertThat(plan.kind()).as("%s: %s", source, plan).isEqualTo(Planner.KindOfPlan.COMPILE));
+                return plans;
             });
         }
     }

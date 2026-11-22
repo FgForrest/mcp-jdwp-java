@@ -35,6 +35,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
     private final Holder<InterpreterTargetBase> holder = new Holder<>(new InterpreterTargetBase());
     private final int secret = 21;
 
+    /** Runs the corpus stops followed by the type-binding regression stops. */
     public static void main(String[] args) throws Exception {
         final var target = new InterpreterTarget();
         final var packageStop = new PackageStop();
@@ -58,6 +59,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
         inner.inspect();
         target.throwAtStop();
         target.changeAtStop();
+        TypeBindingFixture.run();
         // Keep the connection available until the debugger has read the last event.
         System.in.read();
     }

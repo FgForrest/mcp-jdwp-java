@@ -279,6 +279,95 @@ class InterpreterPlannerTest {
             .isEqualTo(new Planner.Compile("member type is unavailable: app.Example$Scope.Badge"));
     }
 
+    /** A loaded member can be selected from an unloaded enclosing type, but lookup cannot skip that scope. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void stopsLookupAtAnUnloadedEnclosingType(boolean memberLoaded) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Outer$Frame", null);
+        type(vm, "java.lang.Class", null);
+        type(vm, "app.Marker", null);
+        if (memberLoaded) {
+            final ClassType member = type(vm, "app.Outer$Marker", null);
+            assertThat(new JdiTypes(vm, owner).resolve("Marker")).isSameAs(member);
+        } else {
+            assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+                ExpressionParser.parse("Marker.class")))
+                .isEqualTo(new Planner.Compile("enclosing type is not loaded: app.Outer"));
+        }
+    }
+
+    /** Finds formal names after nested generic and interface-only bounds in all three supported scopes. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"method", "declaring", "enclosing"})
+    void defersTypeParametersThatShadowLoadedTypes(String scope) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType enclosing = type(vm, "app.Outer", null);
+        final ClassType owner = type(vm, "app.Outer$Frame", null);
+        type(vm, "app.Outer$Frame$Marker", null);
+        type(vm, "app.Outer$Frame$Marker$Part", null);
+        type(vm, "java.lang.Class", null);
+        final Method method = mock(Method.class);
+        final String formals = "<Other::Ljava/util/List<+Ljava/util/List<Ljava/lang/String;>;>;"
+            + "Next:TOther;Marker:Ljava/lang/Object;:Ljava/io/Serializable;>";
+        switch (scope) {
+            case "method" -> when(method.genericSignature()).thenReturn(formals + "()V");
+            case "declaring" -> when(owner.genericSignature()).thenReturn(formals + "Ljava/lang/Object;");
+            case "enclosing" -> when(enclosing.genericSignature()).thenReturn(formals + "Ljava/lang/Object;");
+            default -> throw new AssertionError(scope);
+        }
+        final StackFrame frame = typeFrame(owner, method);
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("Marker.Part.class")))
+            .isEqualTo(new Planner.Compile("type parameter may shadow type: Marker"));
+    }
+
+    /** A malformed formal list defers lookup even if its apparent first name does not match. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+        "<Other:Ljava/util/List<Ljava/lang/String;>;()V", "<Other:I>()V", "<Other::>()V", "<Other>()V"
+    })
+    void defersTypeLookupWhenTheFormalListIsMalformed(String signature) {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "app.Marker", null);
+        type(vm, "java.lang.Class", null);
+        final Method method = mock(Method.class);
+        when(method.genericSignature()).thenReturn(signature);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, method), Map.of(), ExpressionParser.parse("Marker.class")))
+            .isEqualTo(new Planner.Compile("cannot read formal type parameters"));
+    }
+
+    /** Defers a possible local class found in the declaring or enclosing type's constant pool. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void defersLocalClassesThatShadowLoadedTypes(boolean declaredHere) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType enclosing = type(vm, "app.Outer", null);
+        final ClassType owner = type(vm, "app.Outer$Frame", null);
+        type(vm, "app.Marker", null);
+        type(vm, "java.lang.Class", null);
+        final ClassType scope = declaredHere ? owner : enclosing;
+        when(vm.canGetConstantPool()).thenReturn(true);
+        final String local = scope.name().replace('.', '/') + "$12Marker";
+        when(scope.constantPool()).thenReturn(pool(local));
+        when(scope.constantPoolCount()).thenReturn(3);
+
+        assertThat(Planner.plan(vm, typeFrame(owner, mock(Method.class)), Map.of(),
+            ExpressionParser.parse("Marker.class")))
+            .isEqualTo(new Planner.Compile("local class may shadow type: Marker"));
+    }
+
+    /** Supplies the declaring type and method metadata of a stopped frame. */
+    private static StackFrame typeFrame(ReferenceType owner, Method method) {
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        when(location.declaringType()).thenReturn(owner);
+        when(location.method()).thenReturn(method);
+        when(frame.location()).thenReturn(location);
+        return frame;
+    }
+
     /** An inaccessible declaration in a supertype still hides a declaration above it. */
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})

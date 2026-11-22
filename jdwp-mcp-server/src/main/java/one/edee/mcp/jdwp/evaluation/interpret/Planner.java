@@ -85,13 +85,13 @@ public final class Planner {
     /** Type lookup scoped to the declaring type. */
     private final JdiTypes types;
 
-    /** Captures the frame's receiver and locals before planning the expression. */
+    /** Captures the frame's method, receiver and locals before planning the expression. */
     private Planner(VirtualMachine vm, @Nullable StackFrame frame, @Nullable Location location,
                     Map<String, Value> bindings) {
         this.vm = vm;
         this.bindings = bindings;
         this.declaring = location == null ? null : location.declaringType();
-        this.types = new JdiTypes(vm, declaring);
+        this.types = new JdiTypes(vm, declaring, location == null ? null : location.method());
         final ObjectReference self = frame == null ? null : frame.thisObject();
         this.receiver = self == null || declaring == null ? null
             : new Node(JdiTypes.of(declaring, null), context -> self);

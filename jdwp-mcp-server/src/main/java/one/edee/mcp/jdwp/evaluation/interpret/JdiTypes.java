@@ -53,15 +53,25 @@ final class JdiTypes {
     private final VirtualMachine vm;
     /** Type declaring the method of the frame, or null without a frame; it defines the visible scope. */
     private final @Nullable ReferenceType declaring;
+    /** Method of the frame, when available, for its formal type parameters. */
+    private final @Nullable Method method;
+    /** Lexical scopes, from the declaring type outward, including unloaded enclosing types. */
+    private @Nullable List<LexicalScope> scopes;
     /** Lazily loaded classes visible to the declaring type's class loader. */
     private @Nullable Set<ReferenceType> visible;
     /** Lazily read names of the classes each inspected type's constant pool refers to. */
     private final Map<ReferenceType, Set<String>> constantPoolClasses = new HashMap<>();
 
-    /** Creates type lookup scoped to the declaring type. */
+    /** Creates type lookup for a declaring type without method metadata. */
     JdiTypes(VirtualMachine vm, @Nullable ReferenceType declaring) {
+        this(vm, declaring, null);
+    }
+
+    /** Creates type lookup scoped to the declaring type and the frame's method. */
+    JdiTypes(VirtualMachine vm, @Nullable ReferenceType declaring, @Nullable Method method) {
         this.vm = vm;
         this.declaring = declaring;
+        this.method = method;
     }
 
     /** Returns the static type of a primitive kind. */
@@ -173,31 +183,83 @@ final class JdiTypes {
         return fallback == null ? findQualified(name) : fallback;
     }
 
-    /** Finds a simple name in the declaring type's lexical scopes, including inherited member types. */
+    /** Finds a simple type name after ruling out possible type parameters and local classes. */
     private @Nullable ReferenceType lexicalType(ReferenceType owner, String name) {
-        final String binary = owner.name();
+        if (method != null && FormalTypeParameters.contains(method.genericSignature(), name)) {
+            throw Planner.compile("type parameter may shadow type: " + name);
+        }
+        final List<LexicalScope> lexicalScopes = lexicalScopes(owner);
+        for (LexicalScope scope : lexicalScopes) {
+            final ReferenceType type = scope.type();
+            if (type != null) {
+                checkContextualBinding(type, name);
+            }
+        }
         final String suffix = "$" + name;
         final Map<ReferenceType, Set<ReferenceType>> known = new HashMap<>();
-        for (String enclosing = binary; ; enclosing = enclosing.substring(0, enclosing.lastIndexOf('$'))) {
-            final ReferenceType scope = enclosing.equals(binary) ? owner : findExact(enclosing);
-            if (scope != null) {
-                if (simpleName(enclosing).equals(name)) {
-                    return scope;
-                }
-                final Set<ReferenceType> candidates = memberTypes(scope, suffix, known);
-                if (!candidates.isEmpty()) {
-                    return unique(name, candidates);
-                }
-            } else {
-                final ReferenceType declared = findExact(enclosing + suffix);
+        for (LexicalScope scope : lexicalScopes) {
+            final ReferenceType type = scope.type();
+            if (type == null) {
+                final ReferenceType declared = findExact(scope.binary() + suffix);
                 if (declared != null) {
                     return declared;
                 }
+                throw Planner.compile("enclosing type is not loaded: " + scope.binary());
             }
-            if (enclosing.lastIndexOf('$') <= enclosing.lastIndexOf('.')) {
-                return null;
+            if (simpleName(scope.binary()).equals(name)) {
+                return type;
+            }
+            final Set<ReferenceType> candidates = memberTypes(type, suffix, known);
+            if (!candidates.isEmpty()) {
+                return unique(name, candidates);
             }
         }
+        return null;
+    }
+
+    /** A lexical scope's binary name and its mirror if visible to the frame loader. */
+    private record LexicalScope(String binary, @Nullable ReferenceType type) {}
+
+    /** Caches the lexical chain for all type names in a plan. */
+    private List<LexicalScope> lexicalScopes(ReferenceType owner) {
+        if (scopes == null) {
+            final String binary = owner.name();
+            final List<LexicalScope> collected = new ArrayList<>();
+            for (String enclosing = binary; ; enclosing = enclosing.substring(0, enclosing.lastIndexOf('$'))) {
+                final ReferenceType type = enclosing.equals(binary) ? owner : findExact(enclosing);
+                collected.add(new LexicalScope(enclosing, type));
+                if (enclosing.lastIndexOf('$') <= enclosing.lastIndexOf('.')) {
+                    break;
+                }
+            }
+            scopes = collected;
+        }
+        return scopes;
+    }
+
+    /** Defers when a loaded lexical scope exposes a possible shadowing type parameter or local class. */
+    private void checkContextualBinding(ReferenceType scope, String name) {
+        if (FormalTypeParameters.contains(scope.genericSignature(), name)) {
+            throw Planner.compile("type parameter may shadow type: " + name);
+        }
+        for (String candidate : classNames(scope)) {
+            if (isLocalClassName(candidate, name)) {
+                throw Planner.compile("local class may shadow type: " + name);
+            }
+        }
+    }
+
+    /** Matches a local class binary name ending in a dollar sign, digits and the requested simple name. */
+    private static boolean isLocalClassName(String binary, String name) {
+        if (!binary.endsWith(name)) {
+            return false;
+        }
+        final int nameStart = binary.length() - name.length();
+        int digit = nameStart;
+        while (digit > 0 && binary.charAt(digit - 1) >= '0' && binary.charAt(digit - 1) <= '9') {
+            digit--;
+        }
+        return digit < nameStart && digit > 0 && binary.charAt(digit - 1) == '$';
     }
 
     /** Resolves declared or inherited members, refusing lookup past an unloaded hiding declaration. */
