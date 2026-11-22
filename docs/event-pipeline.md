@@ -261,10 +261,12 @@ The list is what production code emits (`new EventHistory.DebugEvent(` across th
 2. **The session is closed** (disconnect, death, reconnect) → `CLOSED`.
 3. **`jdwp_reset` ran since the call started** (the generation changed) → `RESET`.
 4. **First pass only:** unless a step is in flight, release eligible holds and retry failed releases as `jdwp_resume` does (§ 14). A failed attempt returns `RESUME_FAILED`, or `CLOSED` if JDI reported a disconnect.
-5. **An automatic release or lease debt repayment still needs a retry** → `RESUME_FAILED`. These failures wake an active wait, including one waiting for a step to land. The reply names the affected hold and includes progress from the initial pass.
+5. **An automatic release or lease debt repayment still needs a retry** → `RESUME_FAILED`. These failures wake an active wait, including one waiting for a step to land. The reply names the affected hold and its thread ID when available and includes progress from the initial pass.
 6. **Deadline passed** → `TIMEOUT`. Otherwise wait for the remaining time and select again. A notification never implies that a particular stop exists.
 
 While a step is in flight, the step reply’s remaining holds stay under their original owners.
+
+To retry unpaid lease debt or a failed automatic release, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on.
 
 The tool renders the outcomes as `Event fired …` (the stop's location, with a note when the watchdog made the stop partial), `[VM_DEATH] …`, `[RESUME_FAILED] …`, `[NO_EVENT] …` (reset), or the `[TIMEOUT]` soft-wait envelope with a diagnostic report. Release successes and failures are included when applicable. Pending sets are counted when the wait ends. The reset reply lists any holds whose release failed.
 

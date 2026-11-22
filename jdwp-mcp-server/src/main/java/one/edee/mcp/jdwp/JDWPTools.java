@@ -1634,7 +1634,7 @@ public class JDWPTools {
             + "jdwp_get_current_thread.", unseen) : ".");
     }
 
-    /** Waits for a stop and reports outstanding recoveries that can keep the target parked. */
+    /** Waits for a stop and reports outstanding recoveries with any available targeted retry. */
     @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' if the VM disconnected, '[NO_EVENT] ...' on reset, or 'Wait interrupted' on interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
@@ -1671,7 +1671,8 @@ public class JDWPTools {
                 }
                 case RESUME_FAILED -> {
                     return "[RESUME_FAILED] A suspension could not be released."
-                        + releaseSuffix(next.released()) + (restored.isEmpty() ? "" : "\n" + restored);
+                        + releaseSuffix(next.released()) + resumeFailureAdvice(next.released())
+                        + (restored.isEmpty() ? "" : "\n" + restored);
                 }
                 case RESET -> {
                     return "[NO_EVENT] jdwp_reset ran while waiting and cleared the breakpoints. "
@@ -1734,6 +1735,17 @@ public class JDWPTools {
             final String msg = e.getMessage();
             return "Error in jdwp_resume_until_event: " + (msg != null ? msg : e.getClass().getSimpleName());
         }
+    }
+
+    /** Suggests a retry for each identified thread and explains the scope of a global resume. */
+    private static String resumeFailureAdvice(SuspensionSession.@Nullable ReleaseResult release) {
+        final List<String> commands = release == null ? List.of() : release.failures().stream()
+            .map(SuspensionSession.ReleaseFailure::retryThreadId).filter(Objects::nonNull).distinct()
+            .map(id -> "jdwp_resume_thread(threadId=" + id + ")").toList();
+        final String targeted = commands.isEmpty() ? ""
+            : "\nRetry the affected threads' eligible holds with " + String.join(", ", commands) + '.';
+        return targeted + "\njdwp_resume also releases every other presented stop and every jdwp_suspend_thread hold, "
+            + "including any stop-all a pending step relies on.";
     }
 
     /**

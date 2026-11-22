@@ -205,15 +205,25 @@ public final class SuspensionSession {
      * One release that threw: the holder it tried to release and the JDI failure, with any failed
      * rollback of temporary suspensions attached as suppressed exceptions.
      *
-     * @param holder the released holder, in words ("breakpoint 3 on thread main")
-     * @param cause  what JDI threw
+     * @param holder        the holder whose release failed, in words ("breakpoint 3 on thread main")
+     * @param cause         what JDI threw
+     * @param retryThreadId the event thread or debtor to target for recovery, if available
      */
-    public record ReleaseFailure(String holder, RuntimeException cause) {
+    public record ReleaseFailure(String holder, RuntimeException cause, @Nullable Long retryThreadId) {
+        /** Records a failure without a thread-specific recovery hint. */
+        public ReleaseFailure(String holder, RuntimeException cause) {
+            this(holder, cause, null);
+        }
+
         /**
-         * The failure in words for a tool reply: the holder, the exception and every failed rollback.
+         * The holder, any retry thread ID, the exception and every failed rollback.
          */
         public String describe() {
-            final StringBuilder out = new StringBuilder(holder).append(" (").append(brief(cause));
+            final StringBuilder out = new StringBuilder(holder).append(" (");
+            if (retryThreadId != null) {
+                out.append("thread ID ").append(retryThreadId).append(", ");
+            }
+            out.append(brief(cause));
             for (Throwable rollback : cause.getSuppressed()) {
                 out.append("; ").append(rollback.getMessage());
             }
@@ -1810,13 +1820,13 @@ public final class SuspensionSession {
         contexts.remove(context);
     }
 
-    /** Names a finished set whose automatic release failed, even though it has no stop report. */
+    /** Names a finished set whose automatic release failed and identifies its event thread when available. */
     private static ReleaseFailure automaticReleaseFailure(Context context) {
         final ThreadReference thread = context.thread;
         final String scope = context.policy == EventRequest.SUSPEND_ALL ? " (stop-all, VM-wide suspension)" : "";
         final String holder = "failed automatic release of event set #" + context.id + scope
             + (thread == null ? "" : " on thread " + safeName(thread));
-        return new ReleaseFailure(holder, Objects.requireNonNull(context.automaticReleaseFailure));
+        return new ReleaseFailure(holder, Objects.requireNonNull(context.automaticReleaseFailure), retryThreadId(thread));
     }
 
     /** Lists recoveries that can keep the target parked while a tool waits for a stop. */
@@ -1849,10 +1859,10 @@ public final class SuspensionSession {
             released.manual(), released.recovered(), failures, closed));
     }
 
-    /** Retries a finished set and retains the latest failure if its resume still throws. */
+    /** Retries a finished set and retains the latest failure and retry thread ID if its resume still throws. */
     private void retryAutomaticRelease(Context context, List<String> recovered, List<ReleaseFailure> failures) {
         final ReleaseFailure previous = automaticReleaseFailure(context);
-        if (attemptRelease(() -> release(context), previous::holder, failures)) {
+        if (attemptRelease(() -> release(context), previous::holder, failures, previous.retryThreadId())) {
             recovered.add("retry of " + previous.describe());
         } else {
             context.automaticReleaseFailure = failures.get(failures.size() - 1).cause();
@@ -1923,10 +1933,23 @@ public final class SuspensionSession {
         }
     }
 
-    /** Names the thread, count and failure of an unpaid lease debt. */
+    /** Names the thread, its ID, the count and the failure of an unpaid lease debt. */
     private static ReleaseFailure leaseDebtFailure(ThreadReference thread, LeaseDebt debt) {
         return new ReleaseFailure("lease debt on thread " + safeName(thread)
-            + " (" + debt.count() + " suspension count(s) unpaid)", debt.cause());
+            + " (" + debt.count() + " suspension count(s) unpaid)", debt.cause(), retryThreadId(thread));
+    }
+
+    /** Reads a retry thread ID when available without masking the original release failure. */
+    @Nullable
+    private static Long retryThreadId(@Nullable ThreadReference thread) {
+        if (thread == null) {
+            return null;
+        }
+        try {
+            return thread.uniqueID();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** Retries each unpaid lease debt in the session. */
@@ -2054,6 +2077,12 @@ public final class SuspensionSession {
      * @return whether the release succeeded
      */
     private boolean attemptRelease(Runnable action, Supplier<String> holder, List<ReleaseFailure> failures) {
+        return attemptRelease(action, holder, failures, null);
+    }
+
+    /** Records the retry thread ID along with a failed release when there is a targeted recovery. */
+    private boolean attemptRelease(Runnable action, Supplier<String> holder, List<ReleaseFailure> failures,
+                                   @Nullable Long retryThreadId) {
         try {
             action.run();
             return true;
@@ -2061,7 +2090,7 @@ public final class SuspensionSession {
             if (e instanceof VMDisconnectedException) {
                 close();
             }
-            failures.add(new ReleaseFailure(holder.get(), e));
+            failures.add(new ReleaseFailure(holder.get(), e, retryThreadId));
             return false;
         }
     }

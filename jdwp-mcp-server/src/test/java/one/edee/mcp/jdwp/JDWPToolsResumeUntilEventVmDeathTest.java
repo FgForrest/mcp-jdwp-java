@@ -5,6 +5,8 @@ import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -60,11 +62,11 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 	}
 
 	/**
-	 * Publishes a stop of {@code main} with {@code policy}, as the dispatcher does once a set is
-	 * processed.
+	 * Publishes a stop with {@code policy}, as the dispatcher does once a set is processed.
 	 */
 	private SuspensionSession.Context publish(BreakpointTracker.LastBreakpoint stop, int policy) {
-		final SuspensionSession.Context context = session.route(model.breakpointEvent(main, policy), main.ref, false);
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(model.of(stop.thread()), policy), stop.thread(), false);
 		session.begin(context);
 		session.candidate(context, stop);
 		session.finish(context);
@@ -202,7 +204,8 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 
 		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
 			.contains("the jdwp_suspend_thread hold of worker", "failed automatic release",
-				"automatic release rejected during wait")
+				"automatic release rejected during wait", "thread ID " + main.ref.uniqueID(),
+				"jdwp_resume_thread(threadId=" + main.ref.uniqueID() + ")")
 			.doesNotContain("still being processed");
 		assertThat(main.count).isEqualTo(1);
 	}
@@ -224,6 +227,45 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
 			.contains("breakpoint 11", "the jdwp_suspend_thread hold of worker", "lease debt", "lease repayment rejected");
 		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** The advised debt retry leaves the pending step and the bystander's stop-all share in place. */
+	@Test
+	void targetedDebtRetryKeepsBystanderParkedDuringStep() throws Exception {
+		final FakeSuspendModel.FakeThread debtor = model.thread("debtor");
+		final FakeSuspendModel.FakeThread bystander = model.thread("bystander");
+		final EventRequestManager requests = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(requests);
+		when(requests.createStepRequest(main.ref, StepRequest.STEP_LINE, StepRequest.STEP_OVER))
+			.thenReturn(mock(StepRequest.class));
+
+		publish(new BreakpointTracker.LastBreakpoint(debtor.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(debtor.ref);
+		model.beginInvocation(debtor);
+		assertThat(tools.jdwp_resume()).contains("breakpoint 11 on thread debtor");
+
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 12), EventRequest.SUSPEND_ALL);
+		session.presentCurrent();
+		assertThat(tools.jdwp_step_over(main.ref.uniqueID())).contains("Step over started", "stop-all");
+		model.completeInvocation(debtor);
+		doThrow(new InternalException("debt repayment rejected"))
+			.doAnswer(call -> --debtor.count).when(debtor.ref).resume();
+		session.unlease(debtor.ref);
+		assertThat(debtor.count).isEqualTo(2);
+
+		final long debtorId = debtor.ref.uniqueID();
+		final String reply = tools.jdwp_resume_until_event(50);
+
+		assertThat(reply).startsWith("[RESUME_FAILED]").contains("lease debt on thread debtor",
+			"thread ID " + debtorId, "jdwp_resume_thread(threadId=" + debtorId + ")",
+			"jdwp_resume also releases every other presented stop", "jdwp_suspend_thread hold",
+			"stop-all a pending step relies on");
+		assertThat(bystander.count).isEqualTo(1);
+		assertThat(tools.jdwp_resume_thread(debtorId)).contains("lease debt on thread debtor");
+		assertThat(debtor.count).isZero();
+		assertThat(bystander.count).isEqualTo(1);
+		assertThat(session.stepPending(main.ref)).isTrue();
 	}
 
 	/** A closed wait keeps confirmed earlier releases and omits obsolete pending-set counts. */
@@ -253,7 +295,7 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		return waiting;
 	}
 
-	/** An automatic resume rejects the initial release pass before the waiter begins. */
+	/** An automatic resume that fails again on the initial pass still gives the event thread's ID. */
 	@Test
 	void resumeUntilEventReportsFailedAutomaticReleaseBeforeWaiting() {
 		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
@@ -261,7 +303,8 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		finishWithoutStop(set);
 
 		assertThat(tools.jdwp_resume_until_event(50)).startsWith("[RESUME_FAILED]")
-			.contains("failed automatic release", "automatic release rejected");
+			.contains("failed automatic release", "automatic release rejected", "thread ID " + main.ref.uniqueID(),
+				"jdwp_resume_thread(threadId=" + main.ref.uniqueID() + ")");
 	}
 
 	/** Processes a non-stopping event set so finish attempts its automatic release. */
