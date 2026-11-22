@@ -591,14 +591,14 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. An ordinary call with one applicable signature can reach a private or package-private method. Same-arity overloads, varargs, generic methods, lambdas and blocks use compilation. Code still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. An ordinary call with one applicable signature can reach a private or package-private method. Same-arity overloads, varargs, generic methods and lambdas use compilation. Code still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 
 Two input modes:
 
 - **Single expression** — `order.getTotal()`, `x + y`, `list.size() == 5`. The same expression form works for navigation and compilation.
-- **Block mode** — wrap the input in `{ ... }` to send a multi-statement body with try/catch, intermediate locals, or early `return`. The agent writes explicit `return X;` to yield a value. Available everywhere expressions are accepted: `jdwp_evaluate_expression`, `jdwp_assert_expression`, breakpoint conditions, logpoint expressions, watchers.
+- **Block mode** — wrap the input in `{ ... }` to send a multi-statement body with try/catch, intermediate locals, or early `return`. Use explicit `return X;` to yield a value. Read-only blocks with local variables, assignments to those locals, and branches can run without invoking the target. Constructs such as loops and try/catch use compilation. Available everywhere expressions are accepted: `jdwp_evaluate_expression`, `jdwp_assert_expression`, breakpoint conditions, logpoint expressions, watchers.
 
 Set `JDWP_EVAL_ENGINE=auto|compiler|interpreter` in the server environment. `jdwp_diagnose` reports engine counts and why expressions needed compilation. [Expression evaluation](docs/expression-evaluation.md)
 
@@ -794,7 +794,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                       | Parameters                                          | Description                                                       |
 |----------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
-| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java in a suspended frame, including supported calls to private members and `{ block }` syntax. `threadId` defaults to the current stop's thread. |
+| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java in a suspended frame, including supported private member access and `{ block }` syntax. Read-only blocks work on manual holds. `threadId` defaults to the current stop's thread. |
 | `jdwp_assert_expression`   | `expression`, `expected`, `threadId?`, `frameIndex?` | Evaluate and compare against expected value                       |
 | `jdwp_set_local`           | `threadId`, `frameIndex`, `varName`, `value`        | Set a local variable's value                                      |
 | `jdwp_set_field`           | `objectId`, `fieldName`, `value`                    | Set a field's value on a cached object                            |

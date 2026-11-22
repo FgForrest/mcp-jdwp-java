@@ -9,6 +9,7 @@ import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.jspecify.annotations.Nullable;
 
 import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Path;
@@ -29,7 +30,7 @@ class InterpreterExceptionLogpointLiveTest {
     void bindsTheThrownObjectInTheProductionExceptionLogpoint() throws Exception {
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome)) {
-                checkExceptionLogpoint(target.port(), "$exception.getMessage()", true);
+                checkExceptionLogpoint(target.port(), "$exception.getMessage()", true, null);
             }
         }
     }
@@ -39,13 +40,25 @@ class InterpreterExceptionLogpointLiveTest {
     void navigatesTheThrownObjectsPrivateMessageField() throws Exception {
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome)) {
-                checkExceptionLogpoint(target.port(), "$exception.detailMessage", false);
+                checkExceptionLogpoint(target.port(), "$exception.detailMessage", false, null);
             }
         }
     }
 
-    /** Verifies the production reply and the invocation count for the selected expression. */
-    private static void checkExceptionLogpoint(int port, String expression, boolean invokes) throws Exception {
+    /** A failing interpreted condition still logs the result of the logpoint block. */
+    @Test
+    void logsAfterABlockConditionRaisesAnException() throws Exception {
+        for (final Path javaHome : InterpreterTargetVm.javaHomes()) {
+            try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome)) {
+                checkExceptionLogpoint(target.port(), "{ var message = $exception.detailMessage; return message; }",
+                    false, "{ int quotient = 1 / 0; return quotient == 0; }");
+            }
+        }
+    }
+
+    /** Verifies the logpoint result and the condition's fail-safe event when a condition is supplied. */
+    private static void checkExceptionLogpoint(int port, String expression, boolean invokes, @Nullable String condition)
+        throws Exception {
         final BreakpointTracker tracker = new BreakpointTracker();
         final EventHistory history = new EventHistory();
         final EvaluationGuard guard = new EvaluationGuard();
@@ -75,15 +88,24 @@ class InterpreterExceptionLogpointLiveTest {
             assertThat(connection.connect("127.0.0.1", port)).startsWith("Connected");
             assertThat(tools.jdwp_resume_until_event(10_000)).contains("via=vm_start");
             assertThat(tools.jdwp_set_exception_logpoint("java.lang.IllegalArgumentException", expression,
-                null, true, false, null, null, false, null, null)).contains("ID:").doesNotContain("Error");
+                condition, true, false, null, null, false, null, null)).contains("ID:").doesNotContain("Error");
             assertThat(tools.jdwp_resume()).startsWith("Resumed:");
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
                 assertThat(history.getRecent(20)).anySatisfy(event -> {
                     assertThat(event.type()).isEqualTo("EXCEPTION_LOG");
                     assertThat(event.details()).containsEntry("result", "fixture exception");
                 }));
-            assertThat(router.diagnostics()).contains("interpreted 1, compiled 0",
-                invokes ? "with invocations 1, without invocations 0" : "with invocations 0, without invocations 1");
+            if (condition != null) {
+                assertThat(history.getRecent(20)).anySatisfy(event -> {
+                    assertThat(event.type()).isEqualTo("CONDITION_ERROR");
+                    assertThat(event.details().get("error")).contains("ArithmeticException");
+                });
+                assertThat(router.diagnostics()).contains("interpreted 2, compiled 0",
+                    "with invocations 0, without invocations 2");
+            } else {
+                assertThat(router.diagnostics()).contains("interpreted 1, compiled 0",
+                    invokes ? "with invocations 1, without invocations 0" : "with invocations 0, without invocations 1");
+            }
         } finally {
             connection.disconnect();
         }

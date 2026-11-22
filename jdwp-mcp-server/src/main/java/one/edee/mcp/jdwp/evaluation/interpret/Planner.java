@@ -5,6 +5,7 @@ import com.sun.jdi.ArrayReference;
 import com.sun.jdi.Location;
 import org.eclipse.jdt.internal.compiler.ASTVisitor;
 import org.eclipse.jdt.internal.compiler.ast.*;
+import org.eclipse.jdt.internal.compiler.classfmt.ClassFileConstants;
 import org.eclipse.jdt.internal.compiler.impl.Constant;
 import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
 import org.jspecify.annotations.Nullable;
@@ -16,7 +17,7 @@ import static one.edee.mcp.jdwp.evaluation.interpret.JdiTypes.StaticType;
 import static one.edee.mcp.jdwp.evaluation.interpret.PrimitiveOps.Kind;
 import static org.eclipse.jdt.internal.compiler.ast.OperatorIds.*;
 
-/** Resolves and types both sides of each expression before the interpreter evaluates either side. */
+/** Binds and checks every expression and branch before the interpreter executes the plan. */
 public final class Planner {
     /** Discriminator of the plan variants. */
     public enum KindOfPlan { NAVIGATE, INVOKE, COMPILE, ERROR }
@@ -142,6 +143,8 @@ public final class Planner {
     private boolean targetStringIntrinsics;
     /** Flow-scoped bindings visible on the current planning branch. */
     private @Nullable PatternBinding patterns;
+    /** Block scope and flow during statement planning, or null in expression mode. */
+    private @Nullable Blocks blocks;
     /** Type lookup scoped to the declaring type. */
     private final JdiTypes types;
 
@@ -171,31 +174,28 @@ public final class Planner {
         }
     }
 
-    /**
-     * Routes unsupported syntax first, then binds supported expressions against the frame.
-     */
+    /** Routes unsupported syntax first, then binds a complete plan against the frame. */
     public static Plan plan(VirtualMachine vm, @Nullable StackFrame frame, Map<String, Value> bindings,
                             ExpressionParser.Parsed parsed) {
         final Plan syntax = SyntaxShape.routing(parsed);
         if (syntax != null) {
             return syntax;
         }
-        return navigation(vm, frame, frame == null ? null : frame.location(), bindings,
-            Objects.requireNonNull(parsed.expression()));
+        return bind(vm, frame, frame == null ? null : frame.location(), bindings, parsed);
     }
 
-    /** Plans a depth-checked expression from {@link SyntaxShape#routing}, returning any fallback the expression needs. */
-    static Plan navigation(VirtualMachine vm, @Nullable StackFrame frame, @Nullable Location location,
-                           Map<String, Value> bindings, Expression expression) {
+    /** Binds depth-checked syntax from {@link SyntaxShape#routing}, returning any fallback it needs. */
+    static Plan bind(VirtualMachine vm, @Nullable StackFrame frame, @Nullable Location location,
+                     Map<String, Value> bindings, ExpressionParser.Parsed parsed) {
+        final List<Statement> statements = parsed.statements();
         try {
             final Planner planner = new Planner(vm, frame, location, bindings);
-            planner.collectPatternNames(expression);
-            Node root = planner.node(expression);
+            planner.collectPatternNames(parsed);
+            Interpreter.Read read = planner.bindBody(parsed);
             if (planner.invokes && planner.usedStringIntrinsic) {
-                // Host String intrinsics can discover a transfer refusal. Bind the real calls
-                // before execution when an expression can invoke anywhere.
+                // An invoking plan cannot discover a String transfer refusal at runtime.
                 planner.targetStringIntrinsics = true;
-                root = planner.node(expression);
+                read = planner.bindBody(parsed);
             }
             if (planner.invokes) {
                 if (planner.navigationOnly != null) {
@@ -205,10 +205,14 @@ public final class Planner {
                     // Confirm the snapshot before admission can invalidate the frame.
                     frame.location();
                 }
-                return new Invoke(vm, root.read());
+                return new Invoke(vm, read);
             }
-            return new Navigate(vm, root.read(), frame);
+            return new Navigate(vm, read, frame);
         } catch (Refusal e) {
+            // In a block, let the compiler diagnose invalid bindings as well as unsupported syntax.
+            if (statements != null && e.plan instanceof Error error) {
+                return new Compile(error.message());
+            }
             return e.plan;
         } catch (ClassNotLoadedException e) {
             return new Compile("type is not loaded: " + e.className());
@@ -216,6 +220,353 @@ public final class Planner {
             return new Compile("type is not prepared");
         } catch (ObjectCollectedException e) {
             return new Compile("object was collected");
+        }
+    }
+
+    /** Binds the full input, starting with fresh block-local state on a second pass. */
+    private Interpreter.Read bindBody(ExpressionParser.Parsed parsed) throws ClassNotLoadedException {
+        final List<Statement> statements = parsed.statements();
+        if (statements == null) {
+            return node(Objects.requireNonNull(parsed.expression())).read();
+        }
+        final Blocks block = new Blocks();
+        blocks = block;
+        final Interpreter.Statement body = block.sequence(statements);
+        block.prepareTargetStores();
+        return context -> Objects.requireNonNull(body.run(context)).value();
+    }
+
+    /** A stored value whose target reader can be selected while the enclosing body is bound. */
+    private static final class StoredRead {
+        /** Source of the value, including its phase-2 target preparation. */
+        private final Node value;
+        /** Prebound target reader when any later consumer needs it. */
+        private Interpreter.@Nullable Read prepared;
+
+        /** Keeps the source's ordinary reader until a target use is found. */
+        StoredRead(Node value) {
+            this.value = value;
+        }
+
+        /** Prepares the stored value at most once, following aliases via the planner's queue. */
+        void prepare() {
+            if (prepared == null) {
+                prepared = targetRead(value);
+            }
+        }
+
+        /** Runs the selected reader once at the assignment or pattern test. */
+        @Nullable Value run(Interpreter.Context context) {
+            final Interpreter.Read read = prepared == null ? value.read() : prepared;
+            return read.run(context);
+        }
+    }
+
+    /** A lexical declaration and its execution slot. Metadata is filled in while binding its initializer. */
+    private static final class BlockLocal {
+        /** Declared type, or the inferred type once the initializer has been bound. */
+        private StaticType type;
+        /** Whether the declaration is final. */
+        private final boolean isFinal;
+        /** Whether this is an initialized final and therefore cannot be assigned again, even in dead code. */
+        private final boolean initializedFinal;
+        /** Whether any assignment introduced a String whose identity could depend on interning. */
+        private boolean stringIdentity;
+        /** Whether a source expression contains a floating-point operand. */
+        private boolean floatingOperand;
+        /** Whether an initialized final local could be a Java constant variable. */
+        private boolean constantCandidate;
+        /** Converted constant value of a final primitive or String initialized with a known constant. */
+        private @Nullable Object constant;
+
+        /** Creates the slot before its initializer is bound, so its name already shadows any field. */
+        BlockLocal(StaticType type, boolean isFinal, boolean hasInitializer) {
+            this.type = type;
+            this.isFinal = isFinal;
+            this.initializedFinal = isFinal && hasInitializer;
+        }
+    }
+
+    /**
+     * Tracks definite assignment and the stores that may supply a local on paths reaching this point.
+     *
+     * @param assigned locals assigned on every incoming path
+     * @param unassigned final locals still unassigned on every incoming path
+     * @param targetOrigins stores that may supply a local and need preparation if its value enters target code
+     */
+    private record Flow(Set<BlockLocal> assigned, Set<BlockLocal> unassigned,
+                        Map<BlockLocal, Set<StoredRead>> targetOrigins) {
+        /** Starts a block with no declared slots. */
+        Flow() {
+            this(new HashSet<>(), new HashSet<>(), new HashMap<>());
+        }
+
+        /** Forks the facts, sharing the sets of origins until a write or merge replaces them. */
+        Flow fork() {
+            return new Flow(new HashSet<>(assigned), new HashSet<>(unassigned), new HashMap<>(targetOrigins));
+        }
+
+        /** Merges paths, keeping facts proved on both and origins that can reach either. */
+        void merge(Flow other) {
+            assigned.retainAll(other.assigned);
+            unassigned.retainAll(other.unassigned);
+            // A later call may consume the value from either branch, so preserve both sets of stores.
+            for (final Map.Entry<BlockLocal, Set<StoredRead>> entry : other.targetOrigins.entrySet()) {
+                targetOrigins.merge(entry.getKey(), entry.getValue(), (left, right) -> {
+                    final Set<StoredRead> union = new LinkedHashSet<>(left);
+                    union.addAll(right);
+                    return union;
+                });
+            }
+        }
+
+        /** Removes a slot's facts when its enclosing scope ends. */
+        void remove(BlockLocal local) {
+            assigned.remove(local);
+            unassigned.remove(local);
+            targetOrigins.remove(local);
+        }
+    }
+
+    /** Binds block-local names and checks definite assignment separately from syntax reachability. */
+    private final class Blocks {
+        /** Lexically visible locals of the block, keyed by source name. */
+        private final Map<String, BlockLocal> scope = new HashMap<>();
+        /** Current assignment facts; null means no path reaches this point for JLS §16 purposes. */
+        private @Nullable Flow flow = new Flow();
+        /** Whether the current expression is part of a test that controls a block path. */
+        private boolean inCondition;
+        /** Stores that need target preparation because an eventual consumer crosses into target code. */
+        private final Deque<StoredRead> targetStores = new ArrayDeque<>();
+
+        /** Resolves target readers before execution, including arbitrary chains of local aliases. */
+        private void prepareTargetStores() {
+            // Preparing one store can queue earlier stores that supplied its value through an alias.
+            while (!targetStores.isEmpty()) {
+                targetStores.removeFirst().prepare();
+            }
+        }
+
+        /** Marks the possible origins of a read for preparation without executing the local's source again. */
+        private TargetUse targetUse(Interpreter.Read read, Set<StoredRead> origins) {
+            return () -> {
+                targetStores.addAll(origins);
+                return read;
+            };
+        }
+
+        /** Binds a sequence and closes the scope of every local it declares. */
+        Interpreter.Statement sequence(List<Statement> statements) throws ClassNotLoadedException {
+            final List<Interpreter.Statement> steps = new ArrayList<>(statements.size());
+            for (final Statement statement : statements) {
+                steps.add(statement(statement));
+            }
+            for (final Statement statement : statements) {
+                if (statement instanceof LocalDeclaration declaration) {
+                    final BlockLocal local = scope.remove(new String(declaration.name));
+                    if (flow != null) {
+                        flow.remove(Objects.requireNonNull(local));
+                    }
+                }
+            }
+            return Interpreter.sequence(steps);
+        }
+
+        /** Plans an already shape-checked statement. */
+        private Interpreter.Statement statement(Statement syntax) throws ClassNotLoadedException {
+            if (syntax instanceof Block block) {
+                return sequence(block.statements == null ? List.of() : Arrays.asList(block.statements));
+            }
+            if (syntax instanceof LocalDeclaration declaration) {
+                return declare(declaration);
+            }
+            if (syntax instanceof IfStatement branch) {
+                return branch(branch);
+            }
+            if (syntax instanceof ReturnStatement result) {
+                final Node value = node(Objects.requireNonNull(result.expression));
+                if (value.type().kind() == Kind.VOID) {
+                    throw compile("return requires a value");
+                }
+                if (value.type().imprecise()) {
+                    throw compile("return type cannot be proved assignable to Object");
+                }
+                // The wrapper returns Object. Primitive mirrors are the evaluator's equivalent of
+                // that boxed scalar result. Explicit boxing within the block still takes a lease.
+                flow = null;
+                return ctx -> new Interpreter.Return(value.read().run(ctx));
+            }
+            if (syntax instanceof Assignment assignment) {
+                final String name = new String(((SingleNameReference) assignment.lhs).token);
+                requirePatternScope(name);
+                final BlockLocal local = scope.get(name);
+                if (local == null) {
+                    throw compile("assignment requires a block local: " + name);
+                }
+                final Flow current = Objects.requireNonNull(flow);
+                if (local.isFinal && (local.initializedFinal || !current.unassigned().contains(local))) {
+                    throw compile("assignment to a final local: " + name);
+                }
+                return store(name, local, node(assignment.expression));
+            }
+            final Node call = node((MessageSend) syntax);
+            return ctx -> {
+                call.read().run(ctx);
+                return null;
+            };
+        }
+
+        /** Declares the name before evaluating its initializer, as required by Java lexical scope. */
+        private Interpreter.Statement declare(LocalDeclaration declaration) throws ClassNotLoadedException {
+            final String name = new String(declaration.name);
+            if (names.contains(name) || scope.containsKey(name) || patternNames.contains(name)
+                || receiver != null && name.equals("_this")) {
+                throw compile("block local redeclares a name in scope: " + name);
+            }
+            final boolean inferred = declaration.type.isTypeNameVar(null);
+            if (declaration.annotations != null || (declaration.type.bits & ASTNode.HasTypeAnnotations) != 0
+                || (declaration.modifiers & ~ClassFileConstants.AccFinal) != 0) {
+                throw compile("unsupported local declaration modifiers or annotations");
+            }
+            if (inferred && ((declaration.bits & ASTNode.IsAdditionalDeclarator) != 0
+                || declaration.type.dimensions() != 0)) {
+                throw compile("var requires a single declaration without array brackets");
+            }
+            final Expression initializer = declaration.initialization;
+            final StaticType type = inferred ? JdiTypes.DEFERRED : type(declaration.type);
+            if (type.kind() == Kind.VOID) {
+                throw compile("a local cannot have type void: " + name);
+            }
+            final BlockLocal local = new BlockLocal(type, (declaration.modifiers & ClassFileConstants.AccFinal) != 0,
+                initializer != null);
+            scope.put(name, local);
+            if (local.isFinal) {
+                Objects.requireNonNull(flow).unassigned().add(local);
+            }
+            if (initializer == null && !inferred) {
+                return ctx -> null;
+            }
+            if (initializer == null) {
+                throw compile("var requires a precise initializer: " + name);
+            }
+            final Node value = node(initializer);
+            if (inferred) {
+                final StaticType actual = value.type();
+                if (actual.imprecise() || actual.isNull() || actual.kind() == Kind.VOID) {
+                    throw compile("var requires a precise initializer: " + name);
+                }
+                local.type = actual;
+            }
+            final Interpreter.Statement store = store(name, local, value);
+            // Preserve constant-variable facts for later conditions and assignment conversions.
+            if (local.initializedFinal && value.potentiallyConstant()) {
+                final Kind kind = local.type.kind();
+                if (kind != null && value.type().kind() != null) {
+                    local.constantCandidate = true;
+                    if (value.constant() != null) {
+                        local.constant = kind.convert(value.constant());
+                    }
+                } else if (local.type.isString() && value.type().isString()) {
+                    local.constantCandidate = true;
+                    local.constant = value.constant();
+                }
+            }
+            return store;
+        }
+
+        /** Plans assignment conversion before recording that the store is definite. */
+        private Interpreter.Statement store(String name, BlockLocal local, Node value) {
+            // The slot's declared type determines the generic checkcast at this store.
+            final Node converted = assignmentConversion(value, local.type, name);
+            final StoredRead stored = new StoredRead(converted);
+            local.stringIdentity |= converted.stringIdentity();
+            local.floatingOperand |= value.floatingOperand() || converted.floatingOperand();
+            final Flow current = Objects.requireNonNull(flow);
+            current.assigned().add(local);
+            current.unassigned().remove(local);
+            // This assignment replaces earlier origins along the current path.
+            if (converted.targetUse() == null) {
+                current.targetOrigins().remove(local);
+            } else {
+                current.targetOrigins().put(local, Set.of(stored));
+            }
+            return ctx -> {
+                ctx.store(local, stored.run(ctx));
+                return null;
+            };
+        }
+
+        /** Binds both branches and intersects the facts from branches that may complete normally. */
+        private Interpreter.Statement branch(IfStatement branch) throws ClassNotLoadedException {
+            final PatternBinding enclosing = patterns;
+            final Node condition;
+            final Interpreter.Statement yes;
+            final Flow otherwise = Objects.requireNonNull(flow);
+            final Flow thenFlow;
+            try {
+                condition = conditionOperand(branch.condition, true);
+                if (JdiTypes.unboxed(condition.type()) != Kind.BOOLEAN || condition.type().imprecise()) {
+                    throw compile("if condition requires boolean");
+                }
+                // Both edges of a supported test must be checked. Only a return ends a path.
+                flow = otherwise.fork();
+                yes = statement(branch.thenStatement);
+                thenFlow = flow;
+            } finally {
+                // Condition bindings are available only in the supported true-branch scope.
+                patterns = enclosing;
+            }
+            flow = otherwise;
+            final Interpreter.Statement no = branch.elseStatement == null ? ctx -> null : statement(branch.elseStatement);
+            // A returning branch contributes no assignment facts to the following statement.
+            if (flow == null) {
+                flow = thenFlow;
+            } else if (thenFlow != null) {
+                flow.merge(thenFlow);
+            }
+            final Field unbox = unbox(condition);
+            final Interpreter.Read read = unboxRead(condition, unbox);
+            return ctx -> {
+                final boolean taken = (Boolean) Interpreter.primitive(read.run(ctx), unbox);
+                return (taken ? yes : no).run(ctx);
+            };
+        }
+
+        /** Resolves a visible block local and proves its value is assigned at this read. */
+        private @Nullable Node local(String name) {
+            final BlockLocal local = scope.get(name);
+            if (local == null) {
+                return null;
+            }
+            final Flow current = Objects.requireNonNull(flow);
+            if (!current.assigned().contains(local) || local.type.deferred()) {
+                throw compile("local is not definitely assigned: " + name);
+            }
+            final Interpreter.Read read = ctx -> ctx.local(local);
+            final Set<StoredRead> origins = current.targetOrigins().get(local);
+            final TargetUse boundary = origins == null ? null : targetUse(read, origins);
+            return new Node(local.type, read, local.constant, local.constantCandidate, local.stringIdentity, null,
+                boundary, false, local.floatingOperand || isFloating(local.type), null);
+        }
+    }
+
+    /** Binds a test and leaves constant control flow to the compiler. */
+    private Node conditionOperand(Expression syntax, boolean exportsPatterns) throws ClassNotLoadedException {
+        final Blocks block = blocks;
+        if (block == null) {
+            return exportsPatterns ? trueCondition(syntax) : node(syntax);
+        }
+        // Nested tests inherit the same restrictions on constant operands and ternaries.
+        final boolean enclosing = block.inCondition;
+        block.inCondition = true;
+        try {
+            final Node result = exportsPatterns ? trueCondition(syntax) : node(syntax);
+            if (result.type().kind() == Kind.BOOLEAN && result.potentiallyConstant()) {
+                throw compile("constant block condition");
+            }
+            return result;
+        } finally {
+            block.inCondition = enclosing;
         }
     }
 
@@ -245,17 +596,28 @@ public final class Planner {
     }
 
     /** Collects names from all branches before any of those names can bind to a local, field or type. */
-    private void collectPatternNames(Expression expression) {
-        expression.traverse(new ASTVisitor() {
+    private void collectPatternNames(ExpressionParser.Parsed parsed) {
+        final ASTVisitor visitor = new ASTVisitor() {
             /** Records every supported type pattern regardless of its flow scope. */
             @Override
             public boolean visit(InstanceOfExpression test, BlockScope scope) {
                 if (test.pattern instanceof TypePattern pattern) {
-                    patternNames.add(new String(pattern.local.name));
+                    final String name = new String(pattern.local.name);
+                    if (!patternNames.add(name) && parsed.statements() != null) {
+                        throw compile("repeated pattern name in block: " + name);
+                    }
                 }
                 return true;
             }
-        }, (BlockScope) null);
+        };
+        if (parsed.expression() != null) {
+            parsed.expression().traverse(visitor, (BlockScope) null);
+        }
+        if (parsed.statements() != null) {
+            for (final Statement statement : parsed.statements()) {
+                statement.traverse(visitor, (BlockScope) null);
+            }
+        }
     }
 
     /** Marks a step whose lookup or transfer may refuse at runtime on the read-only path. */
@@ -304,21 +666,30 @@ public final class Planner {
             return index(node(access.receiver), node(access.position));
         }
         if (expression instanceof UnaryExpression unary) {
-            return unary(operator(unary), node(unary.expression));
+            final int op = operator(unary);
+            final Node input = op == NOT && blocks != null && blocks.inCondition
+                ? conditionOperand(unary.expression, false) : node(unary.expression);
+            return unary(op, input);
         }
         if (expression instanceof BinaryExpression binary) {
             final int op = operator(binary);
             if (op == AND_AND) {
                 return and(binary);
             }
+            if (op == OR_OR) {
+                return binary(op, conditionOperand(binary.left, false), conditionOperand(binary.right, false));
+            }
             return binary(op, node(binary.left), node(binary.right));
         }
         if (expression instanceof ConditionalExpression conditional) {
+            if (blocks != null && blocks.inCondition) {
+                throw compile("conditional expression inside a block condition");
+            }
             final PatternBinding enclosing = patterns;
             final Node condition;
             final Node yes;
             try {
-                condition = trueCondition(conditional.condition);
+                condition = conditionOperand(conditional.condition, true);
                 yes = node(conditional.valueIfTrue);
             } finally {
                 patterns = enclosing;
@@ -353,7 +724,9 @@ public final class Planner {
     /** Plans a condition and leaves only bindings that are definitely matched when it is true. */
     private Node trueCondition(Expression expression) throws ClassNotLoadedException {
         if (expression instanceof BinaryExpression binary && operator(binary) == AND_AND) {
-            return binary(AND_AND, trueCondition(binary.left), trueCondition(binary.right));
+            final Node left = conditionOperand(binary.left, true);
+            final Node right = conditionOperand(binary.right, true);
+            return binary(AND_AND, left, right);
         }
         if (expression instanceof InstanceOfExpression test) {
             return instanceOf(test, true);
@@ -361,7 +734,7 @@ public final class Planner {
         return node(expression);
     }
 
-    /** Proves pattern applicability, then reads the operand once and shares the successful match. */
+    /** Uses the same pattern applicability rules in expressions and blocks, then shares the successful match. */
     private Node instanceOf(InstanceOfExpression test, boolean exports) throws ClassNotLoadedException {
         final Node value = node(test.expression);
         final Pattern pattern = test.pattern;
@@ -381,7 +754,8 @@ public final class Planner {
         final Object slot;
         if (pattern instanceof TypePattern typePattern) {
             final String name = new String(typePattern.local.name);
-            if (locals.containsKey(name) || pattern(name) != null) {
+            if (locals.containsKey(name) || pattern(name) != null || blocks != null
+                && (names.contains(name) || blocks.scope.containsKey(name) || receiver != null && name.equals("_this"))) {
                 throw compile("pattern variable shadows a local: " + name);
             }
             if (exports) {
@@ -391,7 +765,7 @@ public final class Planner {
                     throw compile("pattern binding carries a debugger-created String into a call");
                 };
                 final Node binding = new Node(JdiTypes.of(target, null), ctx -> ctx.pattern(key),
-                    null, false, false, null, boundary, false);
+                    null, false, value.stringIdentity(), null, boundary, false);
                 patterns = new PatternBinding(name, binding, patterns);
                 slot = key;
             } else {
@@ -568,14 +942,25 @@ public final class Planner {
         return null;
     }
 
-    /** Resolves a pattern, local, binding or field of this class or an enclosing class. */
+    /** Prevents an unbound pattern name from falling through to another kind of lookup. */
+    private void requirePatternScope(String name) {
+        if (patternNames.contains(name) && pattern(name) == null) {
+            throw compile("pattern variable is outside the supported scope: " + name);
+        }
+    }
+
+    /** Resolves a pattern, block local, frame local, binding or field of this class or an enclosing class. */
     private @Nullable Node variable(String name) throws ClassNotLoadedException {
         final Node pattern = pattern(name);
         if (pattern != null) {
             return pattern;
         }
-        if (patternNames.contains(name)) {
-            throw compile("pattern variable is outside the supported scope: " + name);
+        requirePatternScope(name);
+        if (blocks != null) {
+            final Node local = blocks.local(name);
+            if (local != null) {
+                return local;
+            }
         }
         final Local local = locals.get(name);
         if (local != null) {
@@ -652,6 +1037,9 @@ public final class Planner {
 
     /** Plans a field selection, including the length of an array. */
     private Node select(Node instance, String name) throws ClassNotLoadedException {
+        if (blocks != null && instance.type().imprecise()) {
+            throw compile("block field receiver has an imprecise type: " + name);
+        }
         final StaticType type = instance.type();
         if (type.reference() instanceof ArrayType && name.equals("length")) {
             final Interpreter.Read read = memberRead(instance, instance.read());
@@ -741,27 +1129,35 @@ public final class Planner {
             isFloating(type), erasureForCast(type, erased));
     }
 
-    /** Resolves a source type, requiring a binding for an array's simple reference component name. */
+    /** Resolves a source type and requires a known binding for each reference component. */
     private StaticType type(TypeReference syntax) {
+        if (blocks != null && (syntax.bits & ASTNode.HasTypeAnnotations) != 0) {
+            throw compile("type-use annotations require compilation");
+        }
         if (syntax instanceof IntersectionCastTypeReference intersection) {
-            final List<ReferenceType> bounds = Arrays.stream(intersection.typeReferences)
-                .map(this::reference).toList();
-            if (new HashSet<>(bounds).size() != bounds.size()
-                || bounds.stream().skip(1).anyMatch(bound -> !(bound instanceof InterfaceType))) {
-                throw compile("invalid intersection cast");
+            final List<ReferenceType> bounds = new ArrayList<>();
+            final Set<ReferenceType> used = new HashSet<>();
+            // Only the first bound may be a class, and each bound must be distinct.
+            for (final TypeReference component : intersection.typeReferences) {
+                final ReferenceType bound = reference(component);
+                if (!used.add(bound) || !bounds.isEmpty() && !(bound instanceof InterfaceType)) {
+                    throw compile("invalid intersection cast");
+                }
+                bounds.add(bound);
             }
             return new StaticType(null, bounds.get(0), false, bounds);
         }
         if (syntax.getTypeArguments() != null) {
             throw compile("parameterized type");
         }
-        final String name = Arrays.stream(syntax.getTypeName()).map(String::new)
-            .reduce((a, b) -> a + "." + b).orElseThrow();
+        final StringJoiner qualified = new StringJoiner(".");
+        for (final char[] token : syntax.getTypeName()) {
+            qualified.add(new String(token));
+        }
+        final String name = qualified.toString();
         final int firstDot = name.indexOf('.');
         final String first = firstDot < 0 ? name : name.substring(0, firstDot);
-        if (patternNames.contains(first) && pattern(first) == null) {
-            throw compile("pattern variable is outside the supported scope: " + first);
-        }
+        requirePatternScope(first);
         final Optional<Kind> primitive = primitiveNamed(name);
         if (syntax.dimensions() == 0 && primitive.isPresent()) {
             return JdiTypes.primitive(primitive.get());
@@ -785,8 +1181,12 @@ public final class Planner {
 
     /** Returns the primitive kind with the given Java name, if any. */
     private static Optional<Kind> primitiveNamed(String name) {
-        return Arrays.stream(Kind.values()).filter(kind -> kind.name().toLowerCase(Locale.ROOT).equals(name))
-            .findFirst();
+        for (final Kind kind : Kind.values()) {
+            if (kind.name().toLowerCase(Locale.ROOT).equals(name)) {
+                return Optional.of(kind);
+            }
+        }
+        return Optional.empty();
     }
 
     /** Resolves a type written in the source that must be a reference type. */
@@ -896,6 +1296,7 @@ public final class Planner {
             if (left.stringIdentity() || right.stringIdentity()) {
                 throw compile("String constant identity");
             }
+            checkGenericReferencePair(left.type(), right.type(), false);
             checkReferenceEquality(left.type(), right.type());
             return new Node(JdiTypes.primitive(Kind.BOOLEAN), ctx -> ctx.mirror((op == EQUAL_EQUAL)
                 == Interpreter.identity(ctx.keep(left.read().run(ctx)), right.read().run(ctx))));
@@ -1028,7 +1429,7 @@ public final class Planner {
         return Interpreter.string(text);
     }
 
-    /** Plans a conditional expression, converting both branches to the common type. */
+    /** Plans a conditional expression and refuses branches with context-dependent generic casts. */
     private Node conditional(Node condition, Node yes, Node no) {
         if (primitiveKind(condition) != Kind.BOOLEAN) {
             throw compile("conditional test requires boolean");
@@ -1129,7 +1530,25 @@ public final class Planner {
         if (b.isNull()) {
             return a;
         }
+        checkGenericReferencePair(a, b, true);
         return types.commonType(a, b);
+    }
+
+    /** Refuses block typing that would depend on arguments discarded by the erased class hierarchy. */
+    private void checkGenericReferencePair(StaticType a, StaticType b, boolean conditional) {
+        final ReferenceType first = a.reference();
+        final ReferenceType second = b.reference();
+        if (blocks == null || first == null || second == null || a.equals(b)
+            || a.genericSignature() == null && b.genericSignature() == null) {
+            return;
+        }
+        // A conditional with the same erased class and different arguments may instead have a
+        // wildcard or raw result. JDI's common-type computation cannot distinguish those cases.
+        if ((conditional && first.equals(second))
+            || (!referenceWidening(a, b, second) && !referenceWidening(b, a, first))) {
+            throw compile(conditional ? "generic conditional type requires compilation"
+                : "generic reference comparison requires compilation");
+        }
     }
 
     /** Whether an int branch that may be a constant field could narrow to the other branch's type. */
@@ -1305,7 +1724,7 @@ public final class Planner {
         throw compile("incompatible reference types: " + ref.name() + " and " + to.name());
     }
 
-    /** Plans a method call using the qualifier and argument types available to Java source lookup. */
+    /** Plans a call using Java source types, requiring a static receiver type in a block. */
     private Node methodCall(MessageSend call) throws ClassNotLoadedException {
         if (call.typeArguments != null) {
             throw compile("explicit method type arguments");
@@ -1314,6 +1733,9 @@ public final class Planner {
         final boolean implicit = call.receiver.isImplicitThis();
         final boolean nonvirtual = call.receiver.isSuper();
         final Node qualifier = implicit ? receiver : callQualifier(call.receiver);
+        if (blocks != null && qualifier != null && qualifier.type().imprecise()) {
+            throw compile("block method receiver has an imprecise type: " + name);
+        }
         final int arity = call.arguments == null ? 0 : call.arguments.length;
         final ReferenceType lookup;
         // Resolve the source receiver before selecting a method, using a captured class only for erased lookup.
@@ -1356,6 +1778,10 @@ public final class Planner {
         final Method selected = CallCandidates.single(candidates, arity, name);
         if (selected.isStatic() && qualifier != null && qualifier.type().imprecise()) {
             throw compile("static method on an erased receiver: " + name);
+        }
+        if (blocks != null && selected.isStatic() && selected.declaringType() instanceof InterfaceType
+            && qualifier != null && !implicit) {
+            throw compile("static interface method requires a type qualifier: " + name);
         }
         if (!selected.isStatic() && qualifier == null && !implicit) {
             throw compile("instance method requires a receiver: " + name);
@@ -1483,6 +1909,34 @@ public final class Planner {
 
     /** Plans an invocation conversion, declining conversions that depend on an unknown argument type. */
     private Node convertArgument(Node argument, StaticType formal, Type erased, String name) {
+        return convertAssignmentOrArgument(argument, formal, erased, "inapplicable argument: " + name);
+    }
+
+    /** Applies JLS §5.2 assignment conversion and binds any checkcast required by the local's type. */
+    private Node assignmentConversion(Node value, StaticType target, String name) {
+        final StaticType actual = value.type();
+        if (actual.imprecise() || target.imprecise()) {
+            throw compile("incompatible assignment: " + name);
+        }
+        if (actual.equals(target) && value.erasedResult() == null) {
+            return value;
+        }
+        final Kind from = actual.kind();
+        final Kind to = JdiTypes.unboxed(target);
+        final Object constant = value.constant();
+        // Assignment can narrow a representable integer constant and then box it if required.
+        if (from != null && to != null && from.promote() == Kind.INT && constant != null
+            && (to == Kind.BYTE || to == Kind.SHORT || to == Kind.CHAR)
+            && to.represents((Integer) Kind.INT.convert(constant))) {
+            final Node narrow = new Node(JdiTypes.primitive(to), ctx -> ctx.mirror(to.convert(
+                Interpreter.primitive(value.read().run(ctx), null))));
+            return target.kind() != null ? narrow : box(narrow);
+        }
+        return convertAssignmentOrArgument(value, target, target.reference(), "incompatible assignment: " + name);
+    }
+
+    /** Converts by identity, widening, boxing or unboxing, as shared by invocation and assignment. */
+    private Node convertAssignmentOrArgument(Node argument, StaticType formal, @Nullable Type erased, String failure) {
         final StaticType actual = argument.type();
         if (!formal.imprecise()) {
             final Kind from = JdiTypes.unboxed(actual);
@@ -1505,7 +1959,7 @@ public final class Planner {
                 }
                 if (actual.reference() != null && referenceWidening(actual, formal, reference)) {
                     final ReferenceType erasedResult = argument.erasedResult();
-                    // javac checks the erased parameter's type, which can be wider than the source argument.
+                    // The erased parameter or the local's declared type sets the JVM checkcast bound.
                     if (erasedResult != null && erased instanceof ReferenceType parameter
                         && !JdiTypes.assignable(erasedResult, parameter)) {
                         return new Node(actual, checkedGenericCast(argument.read(), parameter));
@@ -1514,7 +1968,7 @@ public final class Planner {
                 }
             }
         }
-        throw compile("inapplicable argument: " + name);
+        throw compile(failure);
     }
 
     /** Checks a reference conversion including the parameterized target's arguments. */

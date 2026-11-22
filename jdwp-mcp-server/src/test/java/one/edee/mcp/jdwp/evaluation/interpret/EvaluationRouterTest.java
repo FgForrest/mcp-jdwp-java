@@ -40,6 +40,30 @@ class EvaluationRouterTest {
         assertThat(router.diagnostics()).contains("interpreted 1, compiled 0");
     }
 
+    /** Retains an existing mirror stored in a read-only block through result formatting. */
+    @Test
+    void pinsAReadOnlyBlockLocalWithoutTakingALease() throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType type = mock(ClassType.class);
+        final ObjectReference marked = mock(ObjectReference.class);
+        when(thread.virtualMachine()).thenReturn(vm);
+        when(marked.type()).thenReturn(type);
+        when(marked.uniqueID()).thenReturn(42L);
+
+        final String source = "{ var alias = $marked; return alias; }";
+        final long formatted = router.evaluateEvent(source, thread, Map.of("$marked", marked),
+            value -> ((ObjectReference) value).uniqueID());
+        assertThat(formatted).isEqualTo(42);
+        final InOrder order = inOrder(marked);
+        order.verify(marked).disableCollection();
+        order.verify(marked).uniqueID();
+        order.verify(marked).enableCollection();
+        verifyNoInteractions(compiler);
+    }
+
     /** Refuses syntax errors and unsupported calls directly in strict mode. */
     @Test
     void syntaxErrorsAndStrictInterpreterRefusalsNeverFallBack() throws Exception {
@@ -153,6 +177,76 @@ class EvaluationRouterTest {
         verify(owner, times(2)).invokeMethod(thread, helper, arguments, options);
         verify(first, never()).enableCollection();
         verify(next).enableCollection();
+    }
+
+    /** A block snapshots its frame and uses one lease for both calls and reports a collected mirror without replay. */
+    @Test
+    void blockKeepsItsSnapshotAndNeverReplaysAfterInvoking() throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationGuard guard = new EvaluationGuard();
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final StackFrame frame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        final ObjectReference receiver = mock(ObjectReference.class);
+        final LocalVariable local = mock(LocalVariable.class);
+        final IntegerType integer = mock(IntegerType.class);
+        final IntegerValue snapshot = mock(IntegerValue.class);
+        final Method use = mock(Method.class);
+        final Field field = mock(Field.class);
+        final AtomicBoolean ran = new AtomicBoolean();
+        final int options = ObjectReference.INVOKE_SINGLE_THREADED;
+        when(thread.virtualMachine()).thenReturn(vm);
+        when(thread.frame(0)).thenReturn(frame);
+        when(frame.thisObject()).thenReturn(receiver);
+        when(frame.location()).thenAnswer(call -> {
+            assertThat(ran).isFalse();
+            return location;
+        });
+        when(location.declaringType()).thenReturn(owner);
+        when(owner.name()).thenReturn("app.Example");
+        when(frame.visibleVariables()).thenReturn(List.of(local));
+        when(frame.getValues(List.of(local))).thenAnswer(call -> {
+            assertThat(ran).isFalse();
+            return Map.of(local, snapshot);
+        });
+        when(local.name()).thenReturn("frameValue");
+        when(local.type()).thenReturn(integer);
+        when(integer.name()).thenReturn("int");
+        when(owner.methods()).thenReturn(List.of(use));
+        when(use.name()).thenReturn("use");
+        when(use.signature()).thenReturn("(I)I");
+        when(use.declaringType()).thenReturn(owner);
+        when(use.returnType()).thenReturn(integer);
+        when(use.argumentTypes()).thenReturn(List.of(integer));
+        when(owner.fields()).thenReturn(List.of(field));
+        when(field.declaringType()).thenReturn(owner);
+        when(field.name()).thenReturn("field");
+        when(field.type()).thenReturn(integer);
+        when(receiver.getValue(field)).thenThrow(new ObjectCollectedException());
+        when(compiler.invocationLease(thread)).thenAnswer(call -> guard.lease(thread));
+        when(receiver.invokeMethod(thread, use, List.of(snapshot), options)).thenAnswer(call -> {
+            assertThat(guard.isEvaluating(thread)).isTrue();
+            ran.set(true);
+            return snapshot;
+        });
+
+        // The final field read reports collection after both calls have run.
+        final String source = "{ int copy = frameValue; this.use(copy); this.use(copy); return this.field; }";
+        assertThatThrownBy(() -> router.evaluateEvent(source, thread, Map.of(), String::valueOf))
+            .isInstanceOf(JdiEvaluationException.class)
+            .hasMessage("A mirror used by the expression was collected by the target's garbage collector before the "
+                + "debugger could pin it. 2 target calls already ran. Re-running the expression repeats those calls.");
+        final InOrder order = inOrder(frame, compiler, receiver);
+        order.verify(frame).getValues(List.of(local));
+        order.verify(compiler).invocationLease(thread);
+        order.verify(receiver, times(2)).invokeMethod(thread, use, List.of(snapshot), options);
+        order.verify(receiver).getValue(field);
+        verify(compiler).invocationLease(thread);
+        verifyNoMoreInteractions(compiler);
+        assertThat(guard.isEvaluating(thread)).isFalse();
     }
 
     /** A dispatcher result based on an invalidated frame is refused without a retry or compilation. */
