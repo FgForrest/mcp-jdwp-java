@@ -29,7 +29,7 @@ When connected, an inline breakpoint-and-events sub-report is appended (`JDWPToo
 
 ### Local project classpath
 
-This section shows the current project directory, whether the client reported it, the presence of a root `pom.xml`, and the state of `JDWP_EXTRA_CLASSPATH`. It reports progress while discovery runs and shows the per-source counts, total entries, and any Maven failure when it finishes. Output-read failures identify the affected per-run file and preserve entries from readable modules. On hosts where Maven cleanup uses descendant polling, the section warns that helper processes may outlive a cancelled or timed-out run. A torn-down connection no longer reports a scan in progress. Diagnose reads the available snapshot immediately.
+This section shows the current project directory, whether the client reported it, the presence of a root `pom.xml`, and the state of `JDWP_EXTRA_CLASSPATH`. It reports progress while discovery runs and shows the per-source counts, total entries, and any Maven failure when it finishes. Output-read failures identify the affected per-run file and preserve entries from readable modules. On hosts where Maven cleanup uses descendant polling, the section warns that helper processes may outlive a cancelled or timed-out run, even if there is no current root POM. A torn-down connection no longer reports a scan in progress. Diagnose reads the available snapshot immediately.
 
 ### Block 3 — Local JVMs
 

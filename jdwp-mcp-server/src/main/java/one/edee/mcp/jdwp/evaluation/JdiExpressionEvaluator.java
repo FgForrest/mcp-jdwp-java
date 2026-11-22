@@ -105,6 +105,9 @@ public class JdiExpressionEvaluator {
                                  InMemoryJavaCompiler.@Nullable Configuration options,
                                  Map<String, CachedCompilation> cache) {}
 
+    /** Compiled classes and whether they can enter the wrapper cache for the captured options. */
+    private record Compilation(Map<String, byte[]> classes, boolean cacheable) {}
+
     public JdiExpressionEvaluator(
         InMemoryJavaCompiler compiler,
         JDIConnectionService jdiConnectionService,
@@ -1205,10 +1208,11 @@ public class JdiExpressionEvaluator {
 
             final String sourceCode = generateSourceCode(className, context, expression);
 
-            final Map<String, byte[]> compiledCode = compileWithClasspathContext(className, sourceCode, state);
-            bytecode = findCompiledBytecode(compiledCode, className);
-
-            cache.put(cacheKey, new CachedCompilation(className, bytecode));
+            final Compilation compilation = compileWithClasspathContext(className, sourceCode, state);
+            bytecode = findCompiledBytecode(compilation.classes(), className);
+            if (compilation.cacheable()) {
+                cache.put(cacheKey, new CachedCompilation(className, bytecode));
+            }
         }
 
         // 3. Everything else the invocation needs from the frame is read before the lease: taking
@@ -1383,11 +1387,11 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Compiles a probe's source; the probe must compile to exactly one class.
+     * Compiles the dispatcher probe with discovery context and requires exactly one class.
      */
     private FastLogpointProbe compileProbe(String className, List<FastLogpointProbeSource.Parameter> parameters,
                                            CompilerState state, String sourceCode) throws JdiEvaluationException {
-        final Map<String, byte[]> compiledCode = compileWithClasspathContext(className, sourceCode, state);
+        final Map<String, byte[]> compiledCode = compileWithClasspathContext(className, sourceCode, state).classes();
         if (compiledCode.size() > 1) {
             // The probe is defined as a single class; a nested/anonymous class in the user code
             // would compile to a second class file that is never defined in the target.
@@ -1601,32 +1605,51 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Compiles with the captured options and returns bytecode by class name. Reports compilation
-     * failures as {@link JdiEvaluationException} with discovery context when available, using
-     * {@link LocalClasspathPendingException} for missing types that a later merge might supply.
+     * Compiles on the dispatcher or tool worker. If discovery finished during a failed
+     * remote-only compile, retries once with fresh local entries without walking or waiting.
+     * Throws a pending exception only if the same scan can still supply missing types.
      */
-    private Map<String, byte[]> compileWithClasspathContext(String className, String sourceCode, CompilerState state)
+    private Compilation compileWithClasspathContext(String className, String sourceCode, CompilerState state)
         throws JdiEvaluationException {
+        final InMemoryJavaCompiler.Configuration options = state.options();
         try {
-            final InMemoryJavaCompiler.Configuration options = state.options();
-            return options != null ? compiler.compile(className, sourceCode, options)
+            final Map<String, byte[]> classes = options != null ? compiler.compile(className, sourceCode, options)
                 : compiler.compile(className, sourceCode);
-        } catch (JdiEvaluationException e) {
-            final Snapshot snapshot = state.snapshot();
-            if (snapshot == null) {
-                throw e;
+            return new Compilation(classes, true);
+        } catch (JdiEvaluationException failure) {
+            final Snapshot captured = state.snapshot();
+            final Snapshot current = localClasspathProvider.snapshotFor(state.vm(), false);
+            if (captured == null || current == null || !captured.sameInput(current, false)) {
+                throw failure;
             }
-            if (state.mergedLocal() == null && snapshot.scan() != null
-                && e instanceof InMemoryJavaCompiler.MissingClasspathTypes) {
-                throw new LocalClasspathPendingException(e.getMessage()
-                    + "\nLocal classpath discovery has not been merged into this compilation. See jdwp_diagnose.", e);
+            final DiscoveryStatus status = current.status();
+            if (state.mergedLocal() == null && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes) {
+                if (status.running()) {
+                    throw new LocalClasspathPendingException(failure.getMessage()
+                        + "\nLocal classpath discovery is still running. See jdwp_diagnose.", failure);
+                }
+                final LocalProjectClasspathProvider.Breakdown ready = status.breakdown();
+                if (ready != null && options != null
+                    && localClasspathProvider.publishIfCurrent(state.vm(), current, true, () -> {})) {
+                    final InMemoryJavaCompiler.Configuration merged = new InMemoryJavaCompiler.Configuration(
+                        options.jdkPath(), mergeClasspaths(options.classpath(), ready.all()), options.targetMajorVersion());
+                    try {
+                        // These options are local to this retry. The original cache belongs to
+                        // the captured remote-only options until normal configuration publishes a merge.
+                        return new Compilation(compiler.compile(className, sourceCode, merged), false);
+                    } catch (JdiEvaluationException retryFailure) {
+                        throw withDiscoveryProblem(retryFailure, status);
+                    }
+                }
             }
-            final String problem = snapshot.status().problem();
-            if (problem == null) {
-                throw e;
-            }
-            throw new JdiEvaluationException(e.getMessage() + "\n" + problem, e);
+            throw withDiscoveryProblem(failure, status);
         }
+    }
+
+    /** Preserves ECJ's failure and adds a diagnostic only when discovery has one. */
+    private static JdiEvaluationException withDiscoveryProblem(JdiEvaluationException failure, DiscoveryStatus status) {
+        final String problem = status.problem();
+        return problem == null ? failure : new JdiEvaluationException(failure.getMessage() + "\n" + problem, failure);
     }
 
     /**

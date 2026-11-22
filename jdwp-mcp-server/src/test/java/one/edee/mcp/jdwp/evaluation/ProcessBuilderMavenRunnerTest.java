@@ -1,5 +1,8 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.sun.jdi.VirtualMachine;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -7,9 +10,12 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -19,6 +25,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -79,8 +86,8 @@ class ProcessBuilderMavenRunnerTest {
 			assertThat(firstStarted.await(30, TimeUnit.SECONDS)).isTrue();
 			provider.startForConnection(second);
 			assertThat(provider.discover()).containsExactly("/m2/new.jar");
-			assertThat(replacementOutput.get()).isNotEqualTo(cancelledOutput.get()).doesNotExist();
-			awaitFileRemoval(cancelledOutput.get());
+			assertThat(replacementOutput.get().getParent()).isNotEqualTo(cancelledOutput.get().getParent()).doesNotExist();
+			awaitFileRemoval(cancelledOutput.get().getParent());
 		} finally {
 			replacementWrote.countDown();
 			provider.stopForConnection(second);
@@ -88,11 +95,18 @@ class ProcessBuilderMavenRunnerTest {
 		}
 	}
 
-	/** Resolves the Maven output path from the command the test executor receives. */
+	/** Resolves the path Maven writes for a test module after coordinate expansion. */
 	private static Path classpathOutput(ProcessBuilderMavenRunner.CommandRequest request) {
+		return request.workingDirectory().resolve(outputArgument(request)
+			.replace("${project.groupId}", "fixture").replace("${project.artifactId}", "module")
+			.replace("${project.version}", "1"));
+	}
+
+	/** Extracts the exact argument Maven will resolve against each reactor module. */
+	private static String outputArgument(ProcessBuilderMavenRunner.CommandRequest request) {
 		final String prefix = "-Dmdep.outputFile=";
-		return request.workingDirectory().resolve(request.command().stream()
-			.filter(argument -> argument.startsWith(prefix)).findFirst().orElseThrow().substring(prefix.length()));
+		return request.command().stream().filter(argument -> argument.startsWith(prefix))
+			.findFirst().orElseThrow().substring(prefix.length());
 	}
 
 	/** Waits for cleanup on a cancelled daemon without joining it from the attach caller. */
@@ -104,27 +118,37 @@ class ProcessBuilderMavenRunnerTest {
 		assertThat(output).doesNotExist();
 	}
 
-	/** Exercises group cleanup on both normal exit and timeout with a reparented stdout helper. */
+	/** How the test ends a real Maven invocation under the supervisor. */
+	private enum End { SUCCESS, TIMEOUT, CANCEL }
+
+	/** Exercises normal exit, timeout, and cancellation with a reparented stdout helper. */
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
+	@EnumSource(End.class)
 	@EnabledOnOs(OS.LINUX)
-	void mavenGroupCleanupReachesAnAdoptedStdoutHelper(boolean timeout, @TempDir Path project) throws Exception {
+	void mavenGroupCleanupReachesAnAdoptedStdoutHelper(End end, @TempDir Path project) throws Exception {
 		assumeTrue(Files.isExecutable(Path.of("/usr/bin/setsid")));
 		final Path wrapper = Files.writeString(project.resolve("mvnw"), """
 			#!/bin/sh
 			group=$(ps -o pgid= -p "$$")
 			(sleep 90 & printf '%s\\n' "$!" > helper.pid)
 			printf '%s %s %s\\n' "$group" "$$" "$(cat helper.pid)" > pids
-			if [ "$1" = "true" ]; then
+			if [ "$1" != "SUCCESS" ]; then
 				exec sleep 90
 			fi
 			while [ ! -f finish ]; do sleep 0.05; done
 			""");
 		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
 		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner();
-		final List<String> command = List.of(wrapper.toString(), Boolean.toString(timeout));
-		final int budget = timeout ? 5 : 30;
-		final FutureTask<List<String>> run = new FutureTask<>(() -> runner.run(command, project, budget));
+		final List<String> command = List.of(wrapper.toString(), end.name());
+		final int budget = end == End.TIMEOUT ? 5 : 30;
+		final AtomicBoolean interrupted = new AtomicBoolean();
+		final FutureTask<List<String>> run = new FutureTask<>(() -> {
+			try {
+				return runner.run(command, project, budget);
+			} finally {
+				interrupted.set(Thread.currentThread().isInterrupted());
+			}
+		});
 		final Thread worker = new Thread(run, "maven-group-cleanup-test");
 		worker.setDaemon(true);
 		worker.start();
@@ -136,10 +160,15 @@ class ProcessBuilderMavenRunnerTest {
 			final ProcessHandle leader = ProcessHandle.of(group).orElseThrow();
 			final ProcessHandle commandProcess = ProcessHandle.of(maven).orElseThrow();
 			helper = ProcessHandle.of(Long.parseLong(ids[2])).orElseThrow();
-			if (timeout) {
+			if (end == End.TIMEOUT) {
 				assertThatThrownBy(() -> run.get(30, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
 					.hasRootCauseExactlyInstanceOf(IOException.class)
 					.hasRootCauseMessage("Maven timed out after " + budget + " seconds");
+			} else if (end == End.CANCEL) {
+				worker.interrupt();
+				assertThatThrownBy(() -> run.get(30, TimeUnit.SECONDS))
+					.hasRootCauseExactlyInstanceOf(InterruptedException.class);
+				assertThat(interrupted).isTrue();
 			} else {
 				Files.createFile(project.resolve("finish"));
 				assertThat(run.get(30, TimeUnit.SECONDS)).isEmpty();
@@ -155,6 +184,142 @@ class ProcessBuilderMavenRunnerTest {
 			}
 			worker.join(TimeUnit.SECONDS.toMillis(30));
 		}
+	}
+
+	/** Checks that a status written during the process-exit notification gets one final read. */
+	@Test
+	void shouldReadStatusAgainWhenSupervisorExits(@TempDir Path project) throws Exception {
+		final Path status = Files.createFile(project.resolve("status"));
+		final Process supervisor = mock(Process.class);
+		when(supervisor.waitFor(org.mockito.ArgumentMatchers.anyLong(),
+			org.mockito.ArgumentMatchers.eq(TimeUnit.NANOSECONDS))).thenAnswer(call -> {
+				Files.writeString(status, "3\n");
+				return true;
+			});
+		final Method await = ProcessBuilderMavenRunner.class.getDeclaredMethod(
+			"awaitMavenStatus", Process.class, Path.class, int.class);
+		await.setAccessible(true);
+
+		assertThat(await.invoke(null, supervisor, status, 30)).isEqualTo(3);
+	}
+
+	/** Preserves the child's output in diagnostics when decoding the status fails. */
+	@Test
+	@EnabledOnOs({OS.LINUX, OS.MAC})
+	void shouldLogOutputWhenStatusIsInvalid(@TempDir Path project) throws Exception {
+		final Path status = Files.writeString(project.resolve("status"), "invalid\n");
+		final List<String> command = List.of("sh", "-c", "printf 'maven status failure detail\\n'");
+		final ProcessBuilderMavenRunner.CommandRequest request =
+			new ProcessBuilderMavenRunner.CommandRequest(command, project, 30);
+		final Method collect = ProcessBuilderMavenRunner.class.getDeclaredMethod(
+			"collectProcessOutput", ProcessBuilderMavenRunner.CommandRequest.class, List.class, Path.class);
+		collect.setAccessible(true);
+		final Logger logger = (Logger) LoggerFactory.getLogger(ProcessBuilderMavenRunner.class);
+		final ListAppender<ILoggingEvent> captured = new ListAppender<>();
+		captured.start();
+		logger.addAppender(captured);
+		try {
+			assertThatThrownBy(() -> collect.invoke(null, request, command, status))
+				.isInstanceOf(InvocationTargetException.class).hasCauseInstanceOf(IOException.class);
+			assertThat(captured.list).anySatisfy(event -> assertThat(event.getFormattedMessage())
+				.contains("Invalid Maven exit status", "maven status failure detail"));
+		} finally {
+			logger.detachAppender(captured);
+			captured.stop();
+		}
+	}
+
+	/** Verifies that the real shell supervisor forwards argv and reports executable errors. */
+	@Test
+	@EnabledOnOs(OS.LINUX)
+	void wrapperPreservesArgumentsAndReportsExitCodes(@TempDir Path project) throws Exception {
+		assumeTrue(Files.isExecutable(Path.of("/usr/bin/setsid")));
+		final Path wrapper = Files.writeString(project.resolve("maven with spaces"), """
+			#!/bin/sh
+			printf '<%s>' "$1" "$2" "$3" "$4" "$5" > argv
+			exit 3
+			""");
+		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner();
+		assertThatThrownBy(() -> runner.run(List.of(wrapper.toString(), "a b", "$HOME", "*", "it's", ""), project, 30))
+			.isInstanceOf(IOException.class).hasMessage("Maven exited with code 3");
+		assertThat(project.resolve("argv")).hasContent("<a b><$HOME><*><it's><>");
+
+		final Path missing = project.resolve("missing maven");
+		assertThatThrownBy(() -> runner.run(List.of(missing.toString()), project, 30))
+			.isInstanceOf(IOException.class).hasMessage("Maven executable not found: " + missing);
+		final Path nonExecutable = Files.createFile(project.resolve("non-executable maven"));
+		assertThatThrownBy(() -> runner.run(List.of(nonExecutable.toString()), project, 30))
+			.isInstanceOf(IOException.class).hasMessage("Maven executable not executable: " + nonExecutable);
+	}
+
+	/** Treats cancellation between Maven exit and classpath harvest as an interrupt. */
+	@Test
+	void shouldKeepInterruptDuringHarvest(@TempDir Path project) throws Exception {
+		Files.createDirectory(project.resolve("target"));
+		final AtomicReference<Path> output = new AtomicReference<>();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			output.set(Files.writeString(classpathOutput(request), "/m2/partial.jar"));
+			Thread.currentThread().interrupt();
+			return 0;
+		});
+		try {
+			assertThatThrownBy(() -> runner.run(List.of("mvn"), project, 30))
+				.isInstanceOf(InterruptedException.class);
+			assertThat(Thread.currentThread().isInterrupted()).isTrue();
+			assertThat(output.get().getParent()).doesNotExist();
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	/** Rejects a literal output template from Maven instead of harvesting an overwritten classpath. */
+	@Test
+	void shouldRejectUnexpandedOutputPath(@TempDir Path project) throws Exception {
+		Files.createDirectory(project.resolve("target"));
+		final AtomicReference<Path> literal = new AtomicReference<>();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			final Path requested = classpathOutput(request);
+			literal.set(Files.writeString(requested.resolveSibling(
+				"${project.groupId}@${project.artifactId}@${project.version}.cp"), "/m2/incomplete.jar"));
+			return 0;
+		});
+		assertThatThrownBy(() -> runner.run(List.of("mvn"), project, 30))
+			.isInstanceOf(ProcessBuilderMavenRunner.OutputReadException.class)
+			.hasMessageContaining("did not expand");
+		assertThat(literal.get()).doesNotExist();
+	}
+
+	/** Simulates Maven's per-module path resolution across a deep module, a sibling and two links. */
+	@Test
+	@EnabledOnOs({OS.LINUX, OS.MAC})
+	void shouldCollectReactorOutputOutsideProjectTree(@TempDir Path root) throws Exception {
+		final Path project = Files.createDirectory(root.resolve("project"));
+		final Path deep = Files.createDirectories(project.resolve("a/b/c/d/e/f/g/h"));
+		final Path outside = Files.createDirectory(root.resolve("sibling-module"));
+		final Path target = Files.createDirectory(root.resolve("build-output"));
+		Files.createSymbolicLink(project.resolve("target"), target);
+		final Path cwd = Files.createSymbolicLink(root.resolve("project-link"), project);
+		final AtomicReference<Path> outputDirectory = new AtomicReference<>();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			final String template = outputArgument(request);
+			outputDirectory.set(cwd.resolve(template).getParent());
+			for (Path module : List.of(cwd, deep, outside)) {
+				final String artifact = module.getFileName().toString();
+				final Path output = module.resolve(template.replace("${project.groupId}", "fixture")
+					.replace("${project.artifactId}", artifact).replace("${project.version}", "1"));
+				Files.createDirectories(output.getParent());
+				Files.writeString(output, "/m2/" + artifact + ".jar");
+			}
+			return 0;
+		});
+
+		assertThat(runner.run(List.of("mvn"), cwd, 30))
+			.containsExactlyInAnyOrder("/m2/project-link.jar", "/m2/h.jar", "/m2/sibling-module.jar");
+		assertThat(outputDirectory.get()).doesNotExist();
+		assertThat(target).isEmptyDirectory();
+		assertThat(deep).isEmptyDirectory();
+		assertThat(outside).isEmptyDirectory();
 	}
 
 	/** Allows a signalled process to exit without relying on how soon the OS reaps it. */
@@ -185,15 +350,14 @@ class ProcessBuilderMavenRunnerTest {
 	@Test
 	void malformedMavenOutputReportsFailureAndKeepsOtherModules(@TempDir Path project) throws Exception {
 		Files.writeString(project.resolve("pom.xml"), "<project/>");
-		final Path good = Files.createDirectories(project.resolve("good/target"));
-		final Path bad = Files.createDirectories(project.resolve("bad/target"));
-		final Path malformedPath = Files.createDirectories(project.resolve("nul/target"));
+		final AtomicReference<Path> outputDirectory = new AtomicReference<>();
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
 			new ProcessBuilderMavenRunner(request -> {
-				final Path name = classpathOutput(request).getFileName();
-				Files.writeString(good.resolve(name), "/m2/good.jar");
-				Files.write(bad.resolve(name), new byte[] {(byte) 0xff});
-				Files.writeString(malformedPath.resolve(name), "/m2/bad.jar\0");
+				final Path output = classpathOutput(request);
+				outputDirectory.set(output.getParent());
+				Files.writeString(output, "/m2/good.jar");
+				Files.write(output.resolveSibling("fixture@bad.cp"), new byte[] {(byte) 0xff});
+				Files.writeString(output.resolveSibling("fixture@nul.cp"), "/m2/bad.jar\0");
 				return 0;
 			}));
 
@@ -202,34 +366,26 @@ class ProcessBuilderMavenRunnerTest {
 		assertThat(breakdown.all()).containsExactly("/m2/good.jar");
 		assertThat(breakdown.maven()).isEqualTo(1);
 		assertThat(breakdown.failure()).contains("Maven classpath discovery failed", "additional output read failures")
-			.containsAnyOf(bad.toString(), malformedPath.toString());
+			.containsAnyOf("fixture@bad.cp", "fixture@nul.cp");
+		assertThat(outputDirectory.get()).doesNotExist();
 	}
 
-	/** Harvests and removes the run's files only when their direct parent is a target directory. */
+	/** Collects all module outputs, using the host separator and deduplicating across files. */
 	@Test
-	@DisplayName("only harvests .jdwp-mcp-classpath files whose direct parent is a target/ directory")
-	void shouldOnlyHarvestOutputFilesUnderTargetParent(@TempDir Path tmp) throws Exception {
-		Files.createDirectories(tmp.resolve("target"));
-		final Path moduleTarget = Files.createDirectories(tmp.resolve("module-a/target"));
-		final AtomicReference<Path> outputName = new AtomicReference<>();
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
-			final Path output = classpathOutput(req);
-			final Path name = output.getFileName();
-			outputName.set(name);
-			// Use the host separator and repeat one entry across modules to test deduplication.
+	void shouldHarvestAllModuleFiles(@TempDir Path project) throws Exception {
+		final AtomicReference<Path> outputDirectory = new AtomicReference<>();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			final Path output = classpathOutput(request);
+			outputDirectory.set(output.getParent());
 			Files.writeString(output, String.join(java.io.File.pathSeparator, "/m2/foo.jar", "/m2/bar.jar"));
-			Files.writeString(moduleTarget.resolve(name),
+			Files.writeString(output.resolveSibling("fixture@second.cp"),
 				String.join(java.io.File.pathSeparator, "/m2/baz.jar", "/m2/foo.jar"));
-			Files.writeString(tmp.resolve(name), "/should/not/be/harvested.jar");
 			return 0;
 		});
 
-		final List<String> result = runner.run(List.of("echo"), tmp, 10);
-
-		assertThat(result).containsExactlyInAnyOrder("/m2/foo.jar", "/m2/bar.jar", "/m2/baz.jar");
-		assertThat(tmp.resolve("target").resolve(outputName.get())).doesNotExist();
-		assertThat(moduleTarget.resolve(outputName.get())).doesNotExist();
-		assertThat(tmp.resolve(outputName.get())).hasContent("/should/not/be/harvested.jar");
+		assertThat(runner.run(List.of("mvn"), project, 30))
+			.containsExactlyInAnyOrder("/m2/foo.jar", "/m2/bar.jar", "/m2/baz.jar");
+		assertThat(outputDirectory.get()).doesNotExist();
 	}
 
 	/** Leaves legacy and other runs' classpath files untouched. */
@@ -259,7 +415,7 @@ class ProcessBuilderMavenRunnerTest {
 
 		assertThatThrownBy(() -> runner.run(List.of("false"), tmp, 10))
 			.isInstanceOf(IOException.class).hasMessageContaining("Maven exited with code 1");
-		assertThat(output.get()).doesNotExist();
+		assertThat(output.get().getParent()).doesNotExist();
 	}
 
 	/**
@@ -270,9 +426,8 @@ class ProcessBuilderMavenRunnerTest {
 	 * non-overreach: a sibling subprocess started by the test stays alive even when the
 	 * executor throws {@link InterruptedException}.
 	 *
-	 * <p>The real "destroy MY child on interrupt" behaviour lives in
-	 * {@link ProcessBuilderMavenRunner#executeRealCommand} and is exercised by
-	 * {@link #shouldDestroyOwnedProcessTreeOnTimeout} below using the production code path.
+	 * <p>This seam does not spawn Maven. The real supervisor's interrupt cleanup is exercised by
+	 * {@link #mavenGroupCleanupReachesAnAdoptedStdoutHelper(End, Path)}.
 	 */
 	@Test
 	@org.junit.jupiter.api.condition.EnabledOnOs({
@@ -294,19 +449,19 @@ class ProcessBuilderMavenRunnerTest {
 
 			assertThatThrownBy(() -> runner.run(List.of("anything"), tmp, 10))
 				.isInstanceOf(InterruptedException.class);
+			assertThat(Thread.currentThread().isInterrupted()).isTrue();
 			assertThat(sibling.isAlive())
 				.as("Sibling subprocess must NOT be destroyed by run() — process ownership is scoped to the executor")
 				.isTrue();
 		} finally {
+			Thread.interrupted();
 			sibling.destroyForcibly();
 			sibling.onExit().get(2, java.util.concurrent.TimeUnit.SECONDS);
 		}
 	}
 
 	/**
-	 * The production {@link ProcessBuilderMavenRunner#executeRealCommand} (used via the default,
-	 * no-arg constructor) must destroy the spawned process and its descendants on timeout. This
-	 * exercises the real ProcessBuilder code path with a short timeout against {@code sleep 30}.
+	 * Forces the host fallback and checks that a real timed-out command leaves no running children.
 	 */
 	@Test
 	@org.junit.jupiter.api.condition.EnabledOnOs({
@@ -315,8 +470,8 @@ class ProcessBuilderMavenRunnerTest {
 	})
 	@DisplayName("executeRealCommand destroys its own process tree on timeout")
 	void shouldDestroyOwnedProcessTreeOnTimeout(@TempDir Path tmp) throws Exception {
-		// Real production runner — exercises executeRealCommand via the default constructor.
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner();
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(true);
+		assertThat(runner.usesDescendantPolling()).isTrue();
 
 		// Snapshot PIDs of the current JVM's descendants before the call so we can verify
 		// after-state.
@@ -327,7 +482,7 @@ class ProcessBuilderMavenRunnerTest {
 		final long startTime = System.currentTimeMillis();
 		// 1s timeout against a 30s sleep — the runner must terminate the child within a few
 		// seconds of the budget, not 30s later.
-		assertThatThrownBy(() -> runner.run(List.of("sh", "-c", "exec sleep 30"), tmp, 1))
+		assertThatThrownBy(() -> runner.run(List.of("sh", "-c", "sleep 30 & wait"), tmp, 1))
 			.isInstanceOf(IOException.class).hasMessageContaining("Maven timed out");
 		final long elapsed = System.currentTimeMillis() - startTime;
 
@@ -370,89 +525,20 @@ class ProcessBuilderMavenRunnerTest {
 		verify(root).destroyForcibly();
 	}
 
-	/**
-	 * File-safety: the harvester reads files only when they are regular non-link files. A symlink
-	 * matching the run's output name inside a {@code target/} directory must NOT be
-	 * followed — it could point to any file on the host, breaking the "we only read Maven-written
-	 * output we found in-tree" invariant.
-	 */
+	/** Discards a symlink in the private output directory without reading or deleting its target. */
 	@Test
-	@org.junit.jupiter.api.condition.EnabledOnOs({
-		org.junit.jupiter.api.condition.OS.LINUX,
-		org.junit.jupiter.api.condition.OS.MAC
-	})
-	@DisplayName("does not follow a symlink at target/.jdwp-mcp-classpath")
-	void shouldNotFollowSymlinkAtHarvestPath(@TempDir Path tmp) throws Exception {
-		// Outside-the-tree file the symlink would point at.
-		final Path elsewhere = tmp.resolve("somewhere-else.txt");
-		Files.writeString(elsewhere, "/from/outside/should-not-be-harvested.jar");
-
-		Files.createDirectories(tmp.resolve("target"));
+	@EnabledOnOs({OS.LINUX, OS.MAC})
+	void shouldNotFollowSymlinkAtHarvestPath(@TempDir Path project) throws Exception {
+		final Path elsewhere = Files.writeString(project.resolve("elsewhere.txt"), "/m2/unrelated.jar");
 		final AtomicReference<Path> link = new AtomicReference<>();
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
-			link.set(Files.createSymbolicLink(classpathOutput(req), elsewhere));
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			link.set(Files.createSymbolicLink(classpathOutput(request), elsewhere));
 			return 0;
 		});
 
-		final List<String> result = runner.run(List.of("echo"), tmp, 10);
-
-		assertThat(result)
-			.as("Symlinks at the harvest path must not be followed — file-safety invariant")
-			.doesNotContain("/from/outside/should-not-be-harvested.jar");
-		assertThat(link.get()).isSymbolicLink();
-		assertThat(elsewhere).hasContent("/from/outside/should-not-be-harvested.jar");
-	}
-
-	/**
-	 * {@link Files#walk(Path, int, java.nio.file.FileVisitOption...)} descends into every directory
-	 * up to the depth limit. The harvester must skip non-Maven trees ({@code node_modules},
-	 * {@code .git}, {@code .idea}, etc.) so a stray
-	 * {@code node_modules/foo/target/.jdwp-mcp-classpath} (e.g. a packaged JS module shipping its own
-	 * Maven artifact) is NOT picked up.
-	 */
-	@Test
-	@DisplayName("does not harvest .jdwp-mcp-classpath files under SKIP_DIRS (e.g. node_modules)")
-	void shouldSkipNodeModulesDuringHarvest(@TempDir Path tmp) throws Exception {
-		Files.createDirectories(tmp.resolve("target"));
-		final Path skipped = Files.createDirectories(tmp.resolve("node_modules/foo/target"));
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
-			final Path output = classpathOutput(req);
-			Files.writeString(output, "/real/m2/foo.jar");
-			Files.writeString(skipped.resolve(output.getFileName()), "/from/node_modules/should-not-be-harvested.jar");
-			return 0;
-		});
-
-		final List<String> result = runner.run(List.of("echo"), tmp, 10);
-
-		assertThat(result)
-			.contains("/real/m2/foo.jar")
-			.doesNotContain("/from/node_modules/should-not-be-harvested.jar");
-	}
-
-	/**
-	 * Deep-reactor regression: a module discovered at the filesystem scan's depth boundary (5 levels
-	 * below {@code workingDirectory}) puts its {@code target/.jdwp-mcp-classpath} two more levels
-	 * down — total depth 7. A shallower harvest cap silently drops Maven-resolved dependencies for
-	 * legitimate reactor layouts.
-	 */
-	@Test
-	@DisplayName("harvests .jdwp-mcp-classpath at reactor-boundary depth (module at scan depth 5 → file at depth 7)")
-	void shouldHarvestOutputFileAtReactorBoundaryDepth(@TempDir Path tmp) throws Exception {
-		// Path: <tmp>/a/b/c/d/e/target/.jdwp-mcp-classpath
-		// Counting from <tmp> as depth 0: a=1, b=2, c=3, d=4, e=5 (matches MAX_SCAN_DEPTH=5),
-		// target=6, file=7. The harvest cap must reach depth 7.
-		final Path boundaryModule = tmp.resolve("a/b/c/d/e/target");
-		Files.createDirectories(boundaryModule);
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
-			Files.writeString(boundaryModule.resolve(classpathOutput(req).getFileName()), "/m2/deep.jar");
-			return 0;
-		});
-
-		final List<String> result = runner.run(List.of("echo"), tmp, 10);
-
-		assertThat(result)
-			.as("Maven output at <root>/a/b/c/d/e/target/.jdwp-mcp-classpath must be reachable — depth 7")
-			.containsExactly("/m2/deep.jar");
+		assertThat(runner.run(List.of("mvn"), project, 30)).isEmpty();
+		assertThat(link.get().getParent()).doesNotExist();
+		assertThat(elsewhere).hasContent("/m2/unrelated.jar");
 	}
 
 	/**

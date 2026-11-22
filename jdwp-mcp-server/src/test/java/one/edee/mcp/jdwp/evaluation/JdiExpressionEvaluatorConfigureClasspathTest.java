@@ -1,16 +1,22 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.evaluation.exceptions.LocalClasspathPendingException;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.jspecify.annotations.Nullable;
 
+import javax.tools.ToolProvider;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -56,6 +63,69 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
+	}
+
+	/** Completes discovery during ECJ's first attempt, then checks a typo or a newly available type. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void probeRetriesOnceIfDiscoveryFinishesDuringCompilation(boolean typo, @TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path local = Files.createDirectory(project.resolve("local"));
+		final Path source = Files.writeString(project.resolve("Late.java"),
+			"package fixture; public class Late { public static final int VALUE = 42; }");
+		assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+			"-d", local.toString(), source.toString())).isZero();
+		final CountDownLatch releaseMaven = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			(command, directory, timeout) -> {
+				assertThat(releaseMaven.await(30, TimeUnit.SECONDS)).isTrue();
+				return List.of(local.toString());
+			});
+		final AtomicInteger attempts = new AtomicInteger();
+		final InMemoryJavaCompiler finishingCompiler = new InMemoryJavaCompiler() {
+			/** Publishes the local result while the first compilation still holds its remote options. */
+			@Override
+			Map<String, byte[]> compile(String name, String text, @Nullable Configuration config)
+				throws JdiEvaluationException {
+				if (attempts.getAndIncrement() == 0) {
+					releaseMaven.countDown();
+					assertThat(provider.discover()).containsExactly(local.toString());
+				}
+				return super.compile(name, text, config);
+			}
+		};
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final StackFrame frame = mock(StackFrame.class);
+		when(thread.virtualMachine()).thenReturn(vm);
+		when(frame.virtualMachine()).thenReturn(vm);
+		when(frame.visibleVariables()).thenReturn(List.of());
+		when(jdiService.getDiscoveredJdkPath()).thenReturn(System.getProperty("java.home"));
+		when(jdiService.getTargetMajorVersion()).thenReturn(17);
+		when(jdiService.discoverClasspath(thread)).thenReturn(project.toString());
+		final JdiExpressionEvaluator withLocal = new JdiExpressionEvaluator(
+			finishingCompiler, jdiService, new EvaluationGuard(), provider);
+		final String expression = typo ? "unknownVariable" : "fixture.Late.VALUE";
+		final FastLogpointProbeSource.Metadata metadata = new FastLogpointProbeSource.Metadata(
+			"fixture.Target", "work", "()V", 10, expression, null, 0, "test");
+		withLocal.startLocalClasspathDiscovery(vm);
+		try {
+			withLocal.configureCompilerClasspathForEvent(thread);
+			assertThat(provider.discoveryStatus().running()).isTrue();
+			if (typo) {
+				assertThatThrownBy(() -> withLocal.compileFastLogpointProbe(
+					frame, false, "fixture", expression, null, 16, metadata))
+					.isInstanceOf(JdiEvaluationException.class).isNotInstanceOf(LocalClasspathPendingException.class)
+					.hasMessageContaining("unknownVariable cannot be resolved");
+			} else {
+				assertThat(withLocal.compileFastLogpointProbe(frame, false, "fixture", expression, null, 16, metadata))
+					.isNotNull();
+			}
+			assertThat(attempts.get()).isEqualTo(2);
+			verify(jdiService).discoverClasspath(thread);
+		} finally {
+			releaseMaven.countDown();
+			withLocal.stopLocalClasspathDiscovery(vm);
+		}
 	}
 
 	/** Finishes local discovery during the remote walk and checks one publication with both results. */

@@ -2166,6 +2166,7 @@ public class JDWPTools {
      * Reading the snapshot leaves diagnose available during a Maven run of up to three minutes.
      * It reports whether discovery is pending, then reports the counts by source and any failure
      * once the breakdown is ready. The root POM check and env-var lookup are independent of the scan.
+     * The Maven cleanup note describes the host capability even if the POM has since disappeared.
      *
      * <p>The env-state line is three-way:
      * {@code (unset)} when the variable is absent, {@code (set, no entries)} when present but
@@ -2182,8 +2183,8 @@ public class JDWPTools {
                 .append('\n');
             final boolean hasPom = status.hasPomAtRoot();
             out.append("  pom.xml: ").append(hasPom ? "yes" : "no").append('\n');
-            if (hasPom && localClasspathProvider.mavenUsesDescendantPolling()) {
-                out.append("  Maven cleanup uses descendant polling. ")
+            if (localClasspathProvider.mavenUsesDescendantPolling()) {
+                out.append("  This host uses descendant polling for Maven cleanup. ")
                     .append("Helper processes of a cancelled or timed-out Maven run may outlive it.\n");
             }
             final String problem = status.problem();

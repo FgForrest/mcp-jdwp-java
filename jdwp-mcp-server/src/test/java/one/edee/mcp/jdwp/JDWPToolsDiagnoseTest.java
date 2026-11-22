@@ -23,6 +23,8 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -396,14 +398,18 @@ class JDWPToolsDiagnoseTest {
 			.contains("dependency resolution failed");
 	}
 
-	/** Reports the cleanup limitation when the real Maven runner uses descendant polling. */
+	/** Reports the host cleanup capability even if the POM is removed during discovery. */
 	@Test
 	@EnabledOnOs({OS.LINUX, OS.MAC})
 	void shouldReportMavenPollingCleanupLimit(@TempDir Path cwd) throws Exception {
 		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
 			false, null, 0, null, null));
-		Files.writeString(cwd.resolve("pom.xml"), "<project/>");
-		final Path wrapper = Files.writeString(cwd.resolve("mvnw"), "#!/bin/sh\nexit 0\n");
+		final Path pom = Files.writeString(cwd.resolve("pom.xml"), "<project/>");
+		final Path wrapper = Files.writeString(cwd.resolve("mvnw"), """
+			#!/bin/sh
+			touch started
+			while [ ! -f finish ]; do sleep 0.05; done
+			""");
 		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
 		final ProcessBuilderMavenRunner runner;
 		try (MockedStatic<Files> files = Mockito.mockStatic(Files.class, Mockito.CALLS_REAL_METHODS)) {
@@ -411,14 +417,27 @@ class JDWPToolsDiagnoseTest {
 			runner = new ProcessBuilderMavenRunner();
 		}
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(cwd, name -> null, runner);
-		assertThat(provider.discoverWithBreakdown().failure()).isNull();
 		final JDWPTools toolsWithProvider = JDWPToolsTestSupport.newTools(
 			jdiService, new BreakpointTracker(), new WatcherManager(),
 			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
 			discovery, provider);
 
-		assertThat(toolsWithProvider.jdwp_diagnose(false))
-			.contains("Helper processes of a cancelled or timed-out Maven run may outlive it.");
+		final CompletableFuture<LocalProjectClasspathProvider.Breakdown> scan =
+			CompletableFuture.supplyAsync(provider::discoverWithBreakdown);
+		try {
+			final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+			while (Files.notExists(cwd.resolve("started")) && System.nanoTime() < deadline) {
+				Thread.sleep(10);
+			}
+			assertThat(cwd.resolve("started")).exists();
+			Files.delete(pom);
+			assertThat(toolsWithProvider.jdwp_diagnose(false))
+				.contains("pom.xml: no", "Local classpath discovery is still running",
+					"Helper processes of a cancelled or timed-out Maven run may outlive it.");
+		} finally {
+			Files.createFile(cwd.resolve("finish"));
+			assertThat(scan.get(30, TimeUnit.SECONDS).failure()).isNull();
+		}
 	}
 
 	/**
