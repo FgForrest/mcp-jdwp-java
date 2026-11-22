@@ -627,7 +627,7 @@ public class JDIConnectionService {
     }
 
     /**
-     * Post-mortem cleanup invoked by {@link JdiEventListener} on VMDeath / VMDisconnect.
+     * Runs post-mortem cleanup when a caller reports that the current connection has died.
      * Idempotent and best-effort: preserves {@link #eventHistory} (the listener's VM_DEATH entry
      * stays queryable) and {@link #lastHost} / {@link #lastPort} (so {@link #ensureConnected()}
      * can auto-reconnect on the next restart cycle). Marked-instance pins are released as a side
@@ -635,11 +635,24 @@ public class JDIConnectionService {
      * leak dangling entries into the next session.
      */
     public synchronized void notifyVmDied() {
-        if (vm == null) {
+        final VirtualMachine current = vm;
+        if (current != null) {
+            notifyVmDied(current);
+        }
+    }
+
+    /**
+     * Runs post-mortem cleanup for the VM named by the listener's death hook. The hook can run
+     * on the listener thread or the caller of {@link JdiEventListener#stop()}. A delayed callback
+     * for an old VM leaves its replacement untouched.
+     */
+    private synchronized void notifyVmDied(VirtualMachine deadVm) {
+        if (vm != deadVm) {
             return;
         }
+        eventListener.cancelLocalClasspathDiscovery(deadVm);
         try {
-            vm.dispose();
+            deadVm.dispose();
         } catch (Exception ignored) {
             // VM already gone — nothing to dispose.
         }
@@ -1560,35 +1573,40 @@ public class JDIConnectionService {
         try {
             // Route through synchronized getVM() to avoid a race with disconnect().
             final VirtualMachine currentVm = getVM();
+            if (suspendedThread.virtualMachine() != currentVm) {
+                return null;
+            }
 
             log.info("[JDI] Discovering full classpath using breakpoint thread '{}'", suspendedThread.name());
 
             final ClasspathDiscoverer discoverer = new ClasspathDiscoverer(currentVm);
             final DiscoveryResult result = discoverer.discoverFullClasspath(suspendedThread);
 
-            discoveredJdkPath = result.localJdkPath();
-            targetMajorVersion = result.targetMajorVersion();
-            log.info("[JDI] Using local JDK: {} (Java {})", discoveredJdkPath, targetMajorVersion);
-
             final Set<String> classpathEntries = result.applicationClasspath();
-
-            if (classpathEntries.isEmpty()) {
+            // Infer the target's separator from the first entry. Windows uses semicolons.
+            final String separator = classpathEntries.stream().findFirst()
+                .map(path -> path.contains("\\") ? ";" : ":")
+                .orElse(File.pathSeparator);
+            final String resolved = classpathEntries.isEmpty() ? null : String.join(separator, classpathEntries);
+            synchronized (this) {
+                // The remote walk ran outside the service monitor and might have outlived its VM.
+                if (vm != currentVm) {
+                    return null;
+                }
+                cachedClasspath = resolved;
+                discoveredJdkPath = result.localJdkPath();
+                targetMajorVersion = result.targetMajorVersion();
+            }
+            log.info("[JDI] Using local JDK: {} (Java {})", result.localJdkPath(), result.targetMajorVersion());
+            if (resolved == null) {
                 log.warn("[JDI] No classpath entries discovered after {}ms", System.currentTimeMillis() - startTime);
                 return null;
             }
 
-            // Separator inferred from the first entry — Windows uses ';', Unix ':'.
-            final String separator = classpathEntries.stream()
-                .findFirst()
-                .map(path -> path.contains("\\") ? ";" : ":")
-                .orElse(File.pathSeparator);
-
-            cachedClasspath = String.join(separator, classpathEntries);
-
             log.info("[JDI] Full classpath discovered ({} entries) in {}ms",
                 classpathEntries.size(), System.currentTimeMillis() - startTime);
 
-            return cachedClasspath;
+            return resolved;
 
         } catch (JdkNotFoundException e) {
             log.error("[JDI] {} (after {}ms)", e.getMessage(), System.currentTimeMillis() - startTime);

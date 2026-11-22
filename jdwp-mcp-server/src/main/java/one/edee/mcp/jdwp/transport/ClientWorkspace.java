@@ -9,6 +9,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * The directory the MCP client works in, when the client reports one.
@@ -53,9 +54,12 @@ public class ClientWorkspace {
             if (directory == null) {
                 return;
             }
-            final Path previous = this.reportedDirectory;
+            final Path previous;
+            synchronized (this) {
+                previous = reportedDirectory;
+                reportedDirectory = directory;
+            }
             if (!directory.equals(previous)) {
-                this.reportedDirectory = directory;
                 log.info("[ClientWorkspace] Client reports session directory {}{}", directory,
                     previous == null ? "" : " (was " + previous + ")");
             }
@@ -71,6 +75,18 @@ public class ClientWorkspace {
      */
     public @Nullable Path reportedDirectory() {
         return this.reportedDirectory;
+    }
+
+    /**
+     * Publishes a result for an observed directory atomically with respect to new reports.
+     * The action must be short and must not perform discovery or invoke the target VM.
+     */
+    public synchronized boolean publishIfCurrent(@Nullable Path reported, Runnable publish) {
+        if (!Objects.equals(reportedDirectory, reported)) {
+            return false;
+        }
+        publish.run();
+        return true;
     }
 
     /**

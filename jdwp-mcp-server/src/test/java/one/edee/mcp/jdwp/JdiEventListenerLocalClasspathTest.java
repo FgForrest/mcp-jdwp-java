@@ -4,6 +4,7 @@ import com.sun.jdi.BooleanValue;
 import com.sun.jdi.StackFrame;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.EventQueue;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.BreakpointRequest;
@@ -12,6 +13,7 @@ import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
+import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -19,13 +21,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockBreakpointEvent;
@@ -33,6 +35,7 @@ import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -49,12 +52,16 @@ class JdiEventListenerLocalClasspathTest {
 	private final JdiEventListener listener;
 	private final JdiExpressionEvaluator evaluator;
 	private final LinkedBlockingQueue<EventSet> events = new LinkedBlockingQueue<>();
+	/** Shared queue mock so transport-loss tests can replace its blocking read. */
+	private final EventQueue queue = mock(EventQueue.class);
 	private final VirtualMachine vm = mock(VirtualMachine.class);
 	private final ThreadReference thread = mockThread("test-target", 42L);
 	private final BreakpointRequest request = mock(BreakpointRequest.class);
 	private final ClientWorkspace workspace = new ClientWorkspace();
 	private final LocalProjectClasspathProvider provider;
 	private final LinkedBlockingQueue<Path> mavenDirectories = new LinkedBlockingQueue<>();
+	/** Signalled when the Maven stub observes worker cancellation. */
+	private final CountDownLatch mavenInterrupted = new CountDownLatch(1);
 	private final CountDownLatch releaseMaven = new CountDownLatch(1);
 	private final String remote = "/app/classes";
 	private final String local = "/m2/dependency.jar";
@@ -66,6 +73,7 @@ class JdiEventListenerLocalClasspathTest {
 			try {
 				releaseMaven.await(10, TimeUnit.SECONDS);
 			} catch (InterruptedException e) {
+				mavenInterrupted.countDown();
 				Thread.currentThread().interrupt();
 			}
 			return List.of(local);
@@ -82,9 +90,9 @@ class JdiEventListenerLocalClasspathTest {
 		evaluator = spy(new JdiExpressionEvaluator(compiler, connection, evaluatorGuard, provider));
 		listener = new JdiEventListener(tracker, new EventHistory(), evaluator,
 			new EvaluationGuard(), null, new MarkedInstanceRegistry());
-		final EventQueue queue = mock(EventQueue.class);
 		when(vm.eventQueue()).thenReturn(queue);
 		when(queue.remove()).thenAnswer(call -> events.take());
+		when(thread.virtualMachine()).thenReturn(vm);
 		when(thread.frame(0)).thenReturn(mock(StackFrame.class));
 		final BooleanValue falseValue = mock(BooleanValue.class);
 		doReturn(falseValue).when(evaluator).evaluate(any(), any(), any());
@@ -97,19 +105,25 @@ class JdiEventListenerLocalClasspathTest {
 		listener.stop();
 	}
 
+	/** Observes the worker inside discovery before sending a condition hit to the dispatcher. */
 	@Test
 	void dispatcherUsesRemoteClasspathWhileWorkerWaits() throws Exception {
 		listener.start(vm);
 		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(provider.getWorkingDirectory());
 
+		final CompletableFuture<Thread> workerThread = new CompletableFuture<>();
 		final CompletableFuture<Void> worker = CompletableFuture.runAsync(() -> {
+			workerThread.complete(Thread.currentThread());
 			try {
 				evaluator.configureCompilerClasspath(thread);
 			} catch (Exception e) {
 				throw new IllegalStateException(e);
 			}
 		});
-		assertThatThrownBy(() -> worker.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+		final Thread waitingWorker = workerThread.get(2, TimeUnit.SECONDS);
+		await().atMost(2, TimeUnit.SECONDS).until(() ->
+			Arrays.stream(waitingWorker.getStackTrace()).anyMatch(frame ->
+				frame.getClassName().equals("java.util.concurrent.FutureTask") && frame.getMethodName().equals("get")));
 		fireCondition();
 		verify(compiler).configure("/opt/jdk", remote, 21);
 		assertThat(worker).isNotDone();
@@ -155,6 +169,51 @@ class JdiEventListenerLocalClasspathTest {
 		listener.start(vm);
 		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(nextDirectory);
 		assertThat(provider.discover()).containsExactly(local);
+	}
+
+	/** Checks that stopping the listener clears discovery status and interrupts the Maven worker. */
+	@Test
+	void stoppingListenerCancelsDiscovery() throws Exception {
+		listener.start(vm);
+		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+
+		listener.stop();
+
+		assertThat(provider.discoveryStatus().running()).isFalse();
+		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+	}
+
+	/** Simulates transport loss on the listener thread and checks that discovery is cancelled. */
+	@Test
+	void transportLossCancelsDiscovery() throws Exception {
+		final CountDownLatch disconnect = new CountDownLatch(1);
+		doAnswer(call -> {
+			disconnect.await();
+			throw new VMDisconnectedException();
+		}).when(queue).remove();
+		listener.start(vm);
+		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+
+		disconnect.countDown();
+
+		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(provider.discoveryStatus().running()).isFalse();
+	}
+
+	/** Checks that a failed replacement attach leaves no discovery for the departing VM. */
+	@Test
+	void failedReconnectLeavesDiscoveryStopped() throws Exception {
+		final JDIConnectionService service = new JDIConnectionService(listener, tracker, new EventHistory(),
+			new WatcherManager(), new EvaluationGuard(), new MarkedInstanceRegistry(), new JdiHealthMonitor());
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
+		tracker.reset();
+		listener.start(vm);
+		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+
+		assertThatThrownBy(service::reconnectPreservingSpecs).isInstanceOf(java.io.IOException.class);
+
+		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(provider.discoveryStatus().running()).isFalse();
 	}
 
 	private void fireCondition() throws Exception {

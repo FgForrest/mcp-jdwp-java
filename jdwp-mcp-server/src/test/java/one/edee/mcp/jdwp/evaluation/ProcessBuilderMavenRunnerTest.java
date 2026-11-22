@@ -10,10 +10,16 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Tests for {@link ProcessBuilderMavenRunner}: the {@code .jdwp-mcp-classpath} harvester (parent
@@ -22,6 +28,27 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("ProcessBuilderMavenRunner — harvest, no-delete, exit propagation")
 class ProcessBuilderMavenRunnerTest {
+
+	/** Checks that malformed output is reported alongside entries from readable modules. */
+	@Test
+	void malformedMavenOutputReportsFailureAndKeepsOtherModules(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path good = Files.createDirectories(project.resolve("good/target"));
+		final Path bad = Files.createDirectories(project.resolve("bad/target"));
+		Files.writeString(good.resolve(".jdwp-mcp-classpath"), "/m2/good.jar");
+		Files.write(bad.resolve(".jdwp-mcp-classpath"), new byte[] {(byte) 0xff});
+		final Path malformedPath = Files.createDirectories(project.resolve("nul/target"));
+		Files.writeString(malformedPath.resolve(".jdwp-mcp-classpath"), "/m2/bad.jar\0");
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
+			new ProcessBuilderMavenRunner(request -> 0));
+
+		final var breakdown = provider.discoverWithBreakdown();
+
+		assertThat(breakdown.all()).containsExactly("/m2/good.jar");
+		assertThat(breakdown.maven()).isEqualTo(1);
+		assertThat(breakdown.failure()).contains("Maven classpath discovery failed", "additional output read failures")
+			.containsAnyOf(bad.toString(), malformedPath.toString());
+	}
 
 	@Test
 	@DisplayName("only harvests .jdwp-mcp-classpath files whose direct parent is a target/ directory")
@@ -160,6 +187,31 @@ class ProcessBuilderMavenRunnerTest {
 		assertThat(stillAlive)
 			.as("executeRealCommand must destroy every descendant it spawned")
 			.isEmpty();
+	}
+
+	/** Exposes a second child on the next descendant snapshot and checks that cleanup reaches it. */
+	@Test
+	void sweepsAgainForHelpersForkedDuringCleanup() {
+		final Process root = mock(Process.class);
+		final ProcessHandle first = mock(ProcessHandle.class);
+		final ProcessHandle late = mock(ProcessHandle.class);
+		when(first.isAlive()).thenReturn(true, false);
+		when(late.isAlive()).thenReturn(true, false);
+		when(first.onExit()).thenReturn(CompletableFuture.completedFuture(first));
+		when(late.onExit()).thenReturn(CompletableFuture.completedFuture(late));
+		when(root.onExit()).thenReturn(CompletableFuture.completedFuture(root));
+		final AtomicInteger snapshots = new AtomicInteger();
+		when(root.descendants()).thenAnswer(call -> switch (snapshots.getAndIncrement()) {
+			case 0 -> Stream.of(first);
+			case 1 -> Stream.of(late);
+			default -> Stream.empty();
+		});
+
+		ProcessBuilderMavenRunner.destroyProcessTree(root);
+
+		verify(first).destroyForcibly();
+		verify(late).destroyForcibly();
+		verify(root).destroyForcibly();
 	}
 
 	/**

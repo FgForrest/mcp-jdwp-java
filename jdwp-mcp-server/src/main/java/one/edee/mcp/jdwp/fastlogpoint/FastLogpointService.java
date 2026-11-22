@@ -21,6 +21,7 @@ import one.edee.mcp.jdwp.evaluation.FastLogpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.RemoteCodeExecutor;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
+import one.edee.mcp.jdwp.evaluation.exceptions.LocalClasspathPendingException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.Opcodes;
@@ -559,11 +560,35 @@ public class FastLogpointService {
         // Each invocation of the arming takes its own lease, never one spanning the frame reads in
         // between: a lease may resume the thread (issue #45), which invalidates its frames.
         try {
+            if (flp.waitingForLocalClasspath && expressionEvaluator.localClasspathDiscoveryRunning()) {
+                rearm(flp);
+                return ArmingOutcome.RESUME;
+            }
             return arm(flp, thread, setStops) ? ArmingOutcome.STOPPED : ArmingOutcome.RESUME;
+        } catch (LocalClasspathPendingException pending) {
+            deferForLocalClasspath(flp);
+            return ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
             markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
         }
+    }
+
+    /**
+     * Keep the same logical probe pending. The firing request was single-use, so re-arm it and
+     * release this event set. Future hits skip compilation until the background result is ready.
+     */
+    private synchronized void deferForLocalClasspath(FastLogpoint flp) {
+        if (flp.state != State.PENDING || logpoints.get(flp.id) != flp) {
+            return;
+        }
+        if (!flp.waitingForLocalClasspath) {
+            flp.waitingForLocalClasspath = true;
+            eventHistory.record(new EventHistory.DebugEvent(flp.kind.eventPrefix + "_ARMING_DEFERRED",
+                String.format("[%s %d] Waiting for local classpath discovery. Arming will retry on a later hit.",
+                    flp.kind.tag, flp.id), Map.of("breakpointId", String.valueOf(flp.id))));
+        }
+        rearm(flp);
     }
 
     /**
@@ -1736,7 +1761,8 @@ public class FastLogpointService {
      * code, so without this the very hit that triggered arming — possibly the rare one the user is
      * waiting for — would be lost.
      */
-    private void logArmingHit(FastLogpoint flp, ThreadReference thread, Location location) throws FastLogpointException {
+    private void logArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
+        throws FastLogpointException, LocalClasspathPendingException {
         final String context = String.format(" at %s:%d (thread %s, arming hit — evaluated through the debugger)",
             flp.className(), flp.line, thread.name());
         try {
@@ -1754,6 +1780,8 @@ public class FastLogpointService {
             }
             final Value value = expressionEvaluator.evaluate(thread.frame(0), flp.expression);
             recordArmingHit(flp, "FAST_LOGPOINT", renderArmingValue(value), context, thread);
+        } catch (LocalClasspathPendingException pending) {
+            throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
             recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describe(e), context, thread);
@@ -2827,7 +2855,7 @@ public class FastLogpointService {
             byArmingRequest.put(fresh, flp);
             enableArmingRequest(flp.vm, fresh);
         } catch (Exception e) {
-            markFailed(flp, "could not re-arm after a hit inside an MCP evaluation: " + describe(e), true);
+            markFailed(flp, "could not re-arm the probe: " + describe(e), true);
         }
     }
 
@@ -3183,7 +3211,7 @@ public class FastLogpointService {
      * @return whether the hit was published as a stop
      */
     private boolean evaluateArmingHit(FastLogpoint flp, ThreadReference thread, Location location)
-        throws FastLogpointException {
+        throws FastLogpointException, LocalClasspathPendingException {
         String error = null;
         boolean passed = false;
         try {
@@ -3194,6 +3222,8 @@ public class FastLogpointService {
             } else {
                 passed = result;
             }
+        } catch (LocalClasspathPendingException pending) {
+            throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
             error = describe(e);
@@ -3611,6 +3641,9 @@ public class FastLogpointService {
      * Mutable state of one fast logpoint; guarded by the service monitor.
      */
     private static final class FastLogpoint {
+        /** Set by the dispatcher when an arming compile needs a local type. */
+        private boolean waitingForLocalClasspath;
+
         final int id;
         final Kind kind;
         final VirtualMachine vm;

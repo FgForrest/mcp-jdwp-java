@@ -1,5 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import com.sun.jdi.VirtualMachine;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.transport.ClientWorkspace;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -15,14 +17,13 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -77,18 +78,6 @@ public class LocalProjectClasspathProvider {
      */
     private static final int MAVEN_TIMEOUT_SECONDS = 180;
     /**
-     * The daemon worker runs the filesystem scan and Maven away from the attach thread, the
-     * JDI listener and dispatcher, and the tool evaluation workers. One worker serializes
-     * discoveries so an interrupted Maven invocation can clean up its process tree before a
-     * replacement scan starts.
-     */
-    private static final ExecutorService DISCOVERY_EXECUTOR = Executors.newSingleThreadExecutor(task -> {
-        final Thread worker = new Thread(task, "jdi-local-classpath");
-        worker.setDaemon(true);
-        return worker;
-    });
-
-    /**
      * Directory names the filesystem scan must never descend into — VCS, IDE, package-manager
      * caches, and {@code target} itself (we look at it explicitly and never recurse). Without the
      * list a {@code target/} hit in {@code node_modules} would balloon I/O and yield junk entries.
@@ -136,6 +125,7 @@ public class LocalProjectClasspathProvider {
             return hasPom(directory);
         }
 
+        /** Returns a pending or failed discovery message, or {@code null} when neither applies. */
         public @Nullable String problem() {
             if (running) {
                 return "Local classpath discovery is still running.";
@@ -147,6 +137,21 @@ public class LocalProjectClasspathProvider {
     private record ProjectDirectory(Path path, boolean reportedByClient) {}
 
     /**
+     * The directory, scan identity, and result observed together during compiler configuration.
+     * The evaluator uses this snapshot to check publication and decide whether to reuse options.
+     */
+    record Snapshot(ProjectDirectory project, @Nullable Discovery scan, DiscoveryStatus status) {
+        /**
+         * Returns whether the snapshots refer to the same directory and scan. When local entries
+         * are in use, also checks the result's identity to detect completion of a pending scan.
+         */
+        boolean sameInput(Snapshot other, boolean includeLocal) {
+            return scan == other.scan && project.equals(other.project)
+                && (!includeLocal || status.breakdown() == other.status.breakdown());
+        }
+    }
+
+    /**
      * One background scan for a directory captured when the task was submitted. The daemon
      * publishes its completed breakdown through {@code ready} so the dispatcher and diagnose can
      * read it without waiting on the future. Tool evaluations and tests can wait on the future
@@ -154,10 +159,16 @@ public class LocalProjectClasspathProvider {
      * result, even if that task finishes after the replacement is installed.
      */
     private final class Discovery {
+        /** Root captured by the thread that requested the scan. */
         private final Path directory;
+        /** Background computation that MCP workers can wait for. */
         private final FutureTask<Breakdown> task;
+        /** Dedicated daemon that runs the scan and can be interrupted independently. */
+        private final Thread worker;
+        /** Completed result published for readers that cannot wait on the future. */
         private volatile @Nullable Breakdown ready;
 
+        /** Prepares a discovery and its daemon. The caller starts it after publishing the scan. */
         private Discovery(Path directory) {
             this.directory = directory;
             this.task = new FutureTask<>(() -> {
@@ -171,8 +182,17 @@ public class LocalProjectClasspathProvider {
                 ready = breakdown;
                 return breakdown;
             });
+            // A filesystem read may still be blocked in the OS after cancellation. A separate
+            // worker lets a replacement scan run while this one unwinds.
+            this.worker = new Thread(task, "jdi-local-classpath");
+            this.worker.setDaemon(true);
         }
 
+        /**
+         * Waits on a tool worker or test thread up to the Maven budget. Returns the breakdown,
+         * or {@code null} on timeout, cancellation, or interruption. Wraps unexpected task
+         * failure in {@link IllegalStateException}.
+         */
         private @Nullable Breakdown await() {
             try {
                 return task.get(MAVEN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -197,6 +217,10 @@ public class LocalProjectClasspathProvider {
     private final MavenRunner mavenRunner;
     /** Replaced on attach or directory change. The executor completes only its own task. */
     private volatile @Nullable Discovery discovery;
+    /** Once bound, only a thread of the active VM can request or publish a scan. Guarded by this. */
+    private boolean connectionScoped;
+    /** Active VM identity, or {@code null} after teardown. Guarded by the provider monitor. */
+    private @Nullable VirtualMachine owner;
 
     /**
      * Test seam: build the provider with explicit working directory, env-lookup function, and Maven
@@ -286,8 +310,14 @@ public class LocalProjectClasspathProvider {
 
     /** Reads the current project's discovery state without starting discovery or waiting for it. */
     public DiscoveryStatus discoveryStatus() {
-        final ProjectDirectory directory = projectDirectory();
-        final Discovery current = discovery;
+        return statusFor(projectDirectory(), discovery);
+    }
+
+    /**
+     * Returns status for the requested directory from the scan's published result. A scan for
+     * another directory is treated as absent. This read never waits on the discovery task.
+     */
+    private static DiscoveryStatus statusFor(ProjectDirectory directory, @Nullable Discovery current) {
         if (current == null || !directory.path().equals(current.directory)) {
             return new DiscoveryStatus(directory.path(), directory.reportedByClient(), false, null);
         }
@@ -340,7 +370,11 @@ public class LocalProjectClasspathProvider {
      * Production diagnostics read {@link #discoveryStatus()} so the report stays responsive.
      */
     public Breakdown discoverWithBreakdown() {
-        final Breakdown breakdown = currentDiscovery().await();
+        final Discovery current;
+        synchronized (this) {
+            current = currentDiscovery(getWorkingDirectory());
+        }
+        final Breakdown breakdown = current.await();
         if (breakdown == null) {
             throw new IllegalStateException("Local classpath discovery did not complete within the wait");
         }
@@ -353,30 +387,64 @@ public class LocalProjectClasspathProvider {
      * reconnect sees the current project layout. Requests cancellation of any prior discovery
      * and returns without waiting for either scan to finish.
      */
-    synchronized void startForConnection() {
+    synchronized void startForConnection(VirtualMachine vm) {
+        connectionScoped = true;
+        owner = vm;
         replaceDiscovery(getWorkingDirectory());
     }
 
-    /**
-     * The event dispatcher calls this before configuring an evaluation. It reuses discovery for
-     * the current directory or queues a replacement if the client reported a different one.
-     * Returns without waiting so pending discovery leaves the dispatcher free to process events.
-     */
-    void startForEvaluation() {
-        currentDiscovery();
+    /** Clears a stopped connection's scan immediately and interrupts its worker without joining it. */
+    synchronized void stopForConnection(VirtualMachine vm) {
+        if (owner == vm) {
+            owner = null;
+            reset();
+        }
     }
 
     /**
-     * An MCP tool's invocation worker calls this before configuring an evaluation. It starts
-     * discovery if needed and may block for up to the Maven timeout. The caller waits outside
-     * the evaluator and session monitors so the dispatcher can keep processing events.
+     * The event dispatcher reads a snapshot without waiting. When the client reports a different
+     * directory, an evaluation starts the replacement scan. Remote-only prewarming just reads.
      */
-    void awaitDiscovery() {
-        currentDiscovery().await();
+    synchronized @Nullable Snapshot snapshotFor(@Nullable VirtualMachine vm, boolean start) {
+        if (connectionScoped && (owner == null || owner != vm)) {
+            return null;
+        }
+        final ProjectDirectory project = projectDirectory();
+        final Discovery current = start ? currentDiscovery(project.path()) : discovery;
+        return new Snapshot(project, current, statusFor(project, current));
     }
 
-    private synchronized Discovery currentDiscovery() {
-        final Path directory = getWorkingDirectory();
+    /**
+     * An MCP invocation worker waits outside the evaluator and session monitors. Cancellation
+     * wakes the wait, and the evaluator checks the connection again before publishing anything.
+     */
+    void awaitDiscovery(@Nullable VirtualMachine vm) {
+        final Snapshot snapshot = snapshotFor(vm, true);
+        final Discovery current = snapshot == null ? null : snapshot.scan();
+        if (current != null && current.ready == null) {
+            InvocationRunner.duringLocalClasspathWait(current::await);
+        }
+    }
+
+    /** Validates both the connection's scan and the reported directory at publication. */
+    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, Runnable publish) {
+        if ((connectionScoped && (owner == null || owner != vm)) || discovery != snapshot.scan()) {
+            return false;
+        }
+        final ClientWorkspace workspace = clientWorkspace;
+        if (workspace == null) {
+            publish.run();
+            return true;
+        }
+        final ProjectDirectory project = snapshot.project();
+        return workspace.publishIfCurrent(project.reportedByClient() ? project.path() : null, publish);
+    }
+
+    /**
+     * Gets the current scan for the directory or starts a replacement without waiting.
+     * Called under the provider monitor by evaluation or test threads.
+     */
+    private Discovery currentDiscovery(Path directory) {
         final Discovery current = discovery;
         if (current != null && directory.equals(current.directory)) {
             return current;
@@ -384,15 +452,20 @@ public class LocalProjectClasspathProvider {
         return replaceDiscovery(directory);
     }
 
+    /**
+     * Installs and returns a fresh scan under the provider monitor. The attach or evaluation
+     * caller starts the dedicated worker and requests cancellation of the prior scan.
+     */
     private Discovery replaceDiscovery(Path directory) {
         final Discovery previous = discovery;
         final Discovery next = new Discovery(directory);
         discovery = next;
         cancel(previous);
-        DISCOVERY_EXECUTOR.execute(next.task);
+        next.worker.start();
         return next;
     }
 
+    /** Runs on the discovery daemon and returns the combined entries and per-source counts. */
     private Breakdown scan(Path workingDirectory) {
         final Set<String> entries = new LinkedHashSet<>();
         addEnvOverride(entries);
@@ -411,7 +484,7 @@ public class LocalProjectClasspathProvider {
             Collections.unmodifiableSet(new LinkedHashSet<>(entries)),
             mavenFailure
         );
-        if (entries.isEmpty()) {
+        if (entries.isEmpty() && !Thread.currentThread().isInterrupted()) {
             // Required by the logging policy: ONE INFO line on empty result explaining the why.
             // NOFOLLOW_LINKS on every probe — keep the diagnostic readout consistent with the
             // "symlinks not followed" invariant used by every other filesystem probe in this class.
@@ -430,8 +503,8 @@ public class LocalProjectClasspathProvider {
 
     /**
      * Tests use this to discard the current result without queuing a replacement. It interrupts
-     * an active daemon task and returns without waiting for cleanup. A production reconnect
-     * replaces the discovery directly through {@link #startForConnection()}.
+     * an active daemon task and returns without waiting for cleanup. Production teardown uses
+     * {@link #stopForConnection(VirtualMachine)} to cancel work for the departing VM.
      */
     public synchronized void reset() {
         final Discovery previous = discovery;
@@ -439,9 +512,17 @@ public class LocalProjectClasspathProvider {
         cancel(previous);
     }
 
+    /**
+     * Cancels the future immediately to wake waiters. A separate daemon interrupts the old
+     * worker so an I/O close hook cannot block the replacement or teardown caller.
+     */
     private static void cancel(@Nullable Discovery previous) {
-        if (previous != null) {
-            previous.task.cancel(true);
+        if (previous != null && previous.task.cancel(false)) {
+            // Wake anyone awaiting the result now. Thread.interrupt() may run an I/O close hook
+            // on its caller, so signal the worker from a daemon outside the discovery monitor.
+            final Thread interrupter = new Thread(previous.worker::interrupt, "jdi-local-classpath-cancel");
+            interrupter.setDaemon(true);
+            interrupter.start();
         }
     }
 
@@ -475,6 +556,10 @@ public class LocalProjectClasspathProvider {
                 log.info("[LocalClasspath] Maven contributed {} dependency jars in {}ms", added, elapsed);
             }
             return null;
+        } catch (ProcessBuilderMavenRunner.OutputReadException e) {
+            entries.addAll(e.entries());
+            log.warn("[LocalClasspath] Maven classpath output read failed (cwd={})", workingDirectory, e);
+            return "Maven classpath discovery failed: " + e.getMessage();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return "Maven classpath discovery was interrupted.";
@@ -583,7 +668,8 @@ public class LocalProjectClasspathProvider {
         // NOFOLLOW_LINKS everywhere: a symlink to another tree on the same filesystem could create
         // walk cycles or pull in jars from outside the project. The documented invariant is that
         // this scan never follows links — enforce it at every probe.
-        if (depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+        if (Thread.currentThread().isInterrupted()
+            || depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
         // At each directory, probe for target/classes and target/test-classes BEFORE recursing — we
@@ -609,16 +695,16 @@ public class LocalProjectClasspathProvider {
             return;
         }
         try (Stream<Path> children = Files.list(dir)) {
-            children
-                // `Files::isDirectory` (the method reference) FOLLOWS links — use the explicit
-                // overload with NOFOLLOW_LINKS so a symlinked directory is treated as "not a
-                // directory" and skipped.
-                .filter(p -> Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS))
-                .filter(p -> {
-                    final String name = p.getFileName().toString();
-                    return !name.startsWith(".") && !SKIP_DIRS.contains(name);
-                })
-                .forEach(child -> scanForClassDirs(child, depth + 1, entries));
+            final Iterator<Path> paths = children.iterator();
+            // Check before advancing the directory iterator, which may itself block on I/O.
+            while (!Thread.currentThread().isInterrupted() && paths.hasNext()) {
+                final Path child = paths.next();
+                final String name = child.getFileName().toString();
+                if (!name.startsWith(".") && !SKIP_DIRS.contains(name)) {
+                    // scanForClassDirs checks the type without following symlinked directories.
+                    scanForClassDirs(child, depth + 1, entries);
+                }
+            }
         } catch (AccessDeniedException e) {
             // Permission denied on a single directory is expected (CI agents, restricted dev envs).
             // Log at WARN so an operator sees it once, but never abort the whole scan.

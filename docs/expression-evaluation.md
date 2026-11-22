@@ -88,7 +88,9 @@ The project directory is the directory the agent session runs in. Claude Code st
 
 **Union order matters.** The merge in `configureCompilerClasspath` is `[remote..., local-only...]` (de-duplicated, host `File.pathSeparator` as the joiner). JDT resolves types left-to-right, so a class present in BOTH a remote entry and a stale local copy binds against the remote definition first — the live target VM always wins on resolution. The local entries are reachable only as a fallback for classes the remote view did not provide.
 
-Each connection starts local discovery on the `jdi-local-classpath` daemon executor as soon as it attaches. Reconnect starts a fresh discovery. The first suspending stop still prewarms remote classpath discovery and JDK detection. A logpoint, condition, or fast-probe arming hit can use the remote classpath while local discovery runs. A later evaluation merges the completed local entries and invalidates cached wrapper bytecode. Tool evaluations can wait for discovery for up to 180 seconds, subject to the tool's normal response deadline.
+Each connection starts local discovery on its own `jdi-local-classpath` daemon thread. Disconnect, target exit, and reconnect teardown cancel the departing connection's discovery and its Maven process tree. A fresh attach or directory change can start a new scan while the old one is still unwinding. The compiler checks the connection and directory when it publishes options and binds its wrapper cache to those options.
+
+The first suspending stop still prewarms remote classpath discovery and JDK detection. Dispatcher evaluations can use the remote classpath while the scan runs. A fast probe that needs an unresolved local type stays pending and retries on a later hit after the scan completes. Tool evaluations can wait for discovery for up to 180 seconds. If the tool deadline expires during that wait, `[STILL_RUNNING]` names local discovery and points to `jdwp_diagnose`.
 
 **Limitations.**
 
@@ -96,7 +98,7 @@ Each connection starts local discovery on the `jdi-local-classpath` daemon execu
 - **Gradle is not supported in v1.** Only Maven layouts contribute via the Maven source; Gradle projects fall back to filesystem scan + env-override only.
 - **No targeted-module mode.** All modules detected in the reactor union into one classpath; the provider does not try to match the breakpoint frame back to its owning module.
 
-**Inspection.** The `Local project classpath` block in `jdwp_diagnose` lists the CWD, whether it contains a `pom.xml`, and whether the override is set. It shows discovery progress until the per-source counts (`env-override=N, filesystem=N, maven=N`) and total are available. A Maven failure appears alongside any entries found through the environment or filesystem. The provider logs timings and source contributions under `[LocalClasspath]`, including captured Maven output on nonzero exit or timeout.
+**Inspection.** The `Local project classpath` block in `jdwp_diagnose` lists the CWD, whether it contains a `pom.xml`, and whether the override is set. It shows discovery progress until the per-source counts (`env-override=N, filesystem=N, maven=N`) and total are available. Maven failures, including unreadable or malformed output, appear alongside entries collected from other modules, the environment, and the filesystem. The provider logs timings and source contributions under `[LocalClasspath]`, including captured Maven output on nonzero exit or timeout.
 
 **How to disable.** Don't set `JDWP_EXTRA_CLASSPATH` AND run the agent session in a directory that has no `pom.xml` and no `target/classes` under it (e.g. `/tmp`). With all three sources silent, the merged classpath is identical to the remote-discovered one.
 
