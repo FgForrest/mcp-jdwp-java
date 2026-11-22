@@ -153,7 +153,7 @@ Everything else (object cache, watchers, marks, classpath cache, target version)
 - The object cache
 - The event history
 
-It also releases every held stop — seen or not — and every `jdwp_suspend_thread` hold, deletes pending step requests, and starts a new suspension generation, so an event set still being processed can no longer publish a stop.
+It also attempts to release every held stop and every `jdwp_suspend_thread` hold, deletes pending step requests, and starts a new suspension generation, so an event set still being processed can no longer publish a stop. Reset retries failed automatic releases, unpaid lease debts and eligible failed watchdog releases. Its summary counts recovered releases and lists any failures. A disconnect during the release pass leaves earlier progress in the summary and prompts the user to reattach.
 
 It does **not** clear marks (those are persistent labels the agent set deliberately) and does **not** touch `lastHost` / `lastPort` (the connection stays live).
 
@@ -163,7 +163,7 @@ It does **not** clear marks (those are persistent labels the agent set deliberat
 |---|---|---|---|---|---|
 | `vm` reference + `vm.dispose()` | yes | yes | no | no-op short-circuit | yes (then re-attach) |
 | Event listener thread | stopped | stops itself | no | no | stopped, restarted |
-| Suspension session (held stops, manual holds) | closed; `vm.dispose()` releases the threads | closed | stops and holds released, new generation | no | closed, new session |
+| Suspension session (held stops, manual holds) | closed; `vm.dispose()` releases the threads | closed | new generation, with failed holds reported and retained | no | closed, new session |
 | Active JDI breakpoint requests | yes | reset in-memory | yes | no | yes |
 | Pending BPs, ID counter, dependency graph | yes | yes | yes | no | yes |
 | Watchers | yes | yes | yes | no | yes |

@@ -1,7 +1,9 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.InternalException;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import org.jspecify.annotations.Nullable;
@@ -14,6 +16,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -98,6 +101,76 @@ class SuspensionSessionUnblockTest {
 		assertThat(session.finish(later)).isTrue();
 		assertThat(session.nextStop(0).outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
 		session.releaseAll();
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
+	/** A failed cancellation leaves the original set eligible on the watchdog's next tick. */
+	@Test
+	void failedCancellationKeepsTheQueuedThreadSet() throws Exception {
+		final SuspensionSession.Context own = processing(t, EventRequest.SUSPEND_EVENT_THREAD);
+		final SuspensionSession.Invocation invocation = invoking(t);
+		final EventSet set = model.breakpointEvent(u, EventRequest.SUSPEND_EVENT_THREAD);
+		final SuspensionSession.Context queued = session.route(set, u.ref, false);
+		doThrow(new InternalException("watchdog resume rejected")).doAnswer(call -> {
+			u.ref.resume();
+			return null;
+		}).when(set).resume();
+
+		assertThat(unblock(invocation, u.ref)).isNull();
+		assertThat(session.stateOf(queued)).isEqualTo(SuspensionSession.State.QUEUED);
+		assertThat(session.holdsOn(u.ref)).containsExactly(queued.id());
+		assertThat(u.count).isEqualTo(1);
+		assertThat(types()).doesNotContain("EVENT_CANCELLED", "EVALUATION_UNBLOCKED");
+
+		assertThat(unblock(invocation, u.ref)).contains("cancelled");
+		assertThat(session.stateOf(queued)).isEqualTo(SuspensionSession.State.RELEASED);
+		assertThat(u.count).isZero();
+		finishInvocation(t);
+		session.finish(own);
+	}
+
+	/** A targeted resume can retry the failed share without releasing the dispatcher's stop-all. */
+	@Test
+	void targetedResumeRetriesFailedWatchdogShare() throws Exception {
+		final SuspensionSession.Context own = processing(t, EventRequest.SUSPEND_ALL);
+		final SuspensionSession.Invocation invocation = invoking(t);
+		doThrow(new InternalException("share resume rejected")).doAnswer(call -> --u.count).when(u.ref).resume();
+
+		assertThat(unblock(invocation, u.ref)).isNull();
+		assertThat(session.holdsOn(u.ref)).containsExactly(own.id());
+		assertThat(u.count).isEqualTo(1);
+		assertThat(w.count).isEqualTo(1);
+		assertThat(types()).doesNotContain("EVALUATION_UNBLOCKED");
+
+		assertThat(session.releaseThread(u.ref).holders()).singleElement().asString().contains("watchdog");
+		assertThat(model.counts()).containsEntry("u", 0).containsEntry("w", 1);
+		finishInvocation(t);
+		session.candidate(own, new BreakpointTracker.LastBreakpoint(t.ref, 1));
+		assertThat(session.finish(own)).isTrue();
+		session.nextStop(0);
+		assertThat(session.unblockedNote()).contains("u");
+		session.releaseAll();
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
+	/** Reset retries the event thread of a failed stop-all cancellation and leaves the rest to finish. */
+	@Test
+	void resetRetriesFailedWatchdogCancellationOfStopAll() throws Exception {
+		final SuspensionSession.Context own = processing(t, EventRequest.SUSPEND_EVENT_THREAD);
+		final SuspensionSession.Invocation invocation = invoking(t);
+		final SuspensionSession.Context queued =
+			session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL), u.ref, false);
+		doThrow(new InternalException("event thread resume rejected")).doAnswer(call -> --u.count).when(u.ref).resume();
+
+		assertThat(unblock(invocation, u.ref)).isNull();
+		assertThat(session.holdsOn(u.ref)).containsExactly(queued.id());
+		assertThat(types()).doesNotContain("EVENT_CANCELLED");
+		assertThat(session.reset().failures()).isEmpty();
+		assertThat(model.counts()).containsEntry("u", 0).containsEntry("w", 1);
+		finishInvocation(t);
+		session.finish(own);
+		assertThat(session.begin(queued)).isFalse();
+		session.finish(queued);
 		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
 	}
 

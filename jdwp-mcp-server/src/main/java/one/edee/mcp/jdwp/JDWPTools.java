@@ -1517,12 +1517,15 @@ public class JDWPTools {
         try {
             jdiService.getVM();
             final SuspensionSession.ReleaseResult result = suspensions().releaseAll();
+            if (result.closed()) {
+                return vmDisconnectedMessage("jdwp_resume") + releaseSuffix(result);
+            }
             // A thread released here may have kept a cleared fast probe's class from being restored.
             final String restored = fastLogpoints.retryPendingRemovals();
             return renderRelease(result) + (restored.isEmpty() ? "" : " " + restored)
                 + " To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
-            return errorReply(e);
+            return isVmGone(e) ? vmDisconnectedMessage("jdwp_resume") : errorReply(e);
         }
     }
 
@@ -1540,33 +1543,41 @@ public class JDWPTools {
     }
 
     /**
-     * Renders what a release did: released stops, stops still held because nobody saw them, sets
-     * still in processing, or that nothing was held.
+     * Renders released stops, holds and recoveries, failures, unseen stops and in-flight sets.
      */
     private static String renderRelease(SuspensionSession.ReleaseResult result) {
         final StringBuilder out = new StringBuilder();
-        if (!result.releasedAnything()) {
-            out.append("Nothing to release — no stop you have seen and no jdwp_suspend_thread hold is held.");
-        } else {
+        if (result.releasedAnything()) {
             out.append("Resumed:");
             for (BreakpointTracker.LastBreakpoint stop : result.released()) {
-                out.append(' ').append(describeStop(stop)).append(';');
+                out.append(' ').append(SuspensionSession.describeStop(stop)).append(';');
             }
             for (ThreadReference thread : result.manual()) {
-                out.append(" the jdwp_suspend_thread hold of ").append(thread.name()).append(';');
+                out.append(" the jdwp_suspend_thread hold of ").append(safeThreadName(thread)).append(';');
+            }
+            for (String recovered : result.recovered()) {
+                out.append(' ').append(recovered).append(';');
             }
             out.setLength(out.length() - 1);
             out.append('.');
+        } else if (result.failures().isEmpty()) {
+            out.append("Nothing to release — no stop you have seen and no jdwp_suspend_thread hold is held.");
         }
-        if (!result.unseen().isEmpty()) {
+        if (!result.failures().isEmpty()) {
+            if (!out.isEmpty()) {
+                out.append(' ');
+            }
+            out.append(renderReleaseFailures(result.failures(), result.closed()));
+        }
+        if (!result.closed() && !result.unseen().isEmpty()) {
             out.append(" Still held, not yet seen:");
             for (BreakpointTracker.LastBreakpoint stop : result.unseen()) {
-                out.append(' ').append(describeStop(stop)).append(';');
+                out.append(' ').append(SuspensionSession.describeStop(stop)).append(';');
             }
             out.setLength(out.length() - 1);
             out.append(" — jdwp_resume_until_event shows it.");
         }
-        if (result.pending() > 0) {
+        if (!result.closed() && result.pending() > 0) {
             out.append(String.format(" %d event set(s) are still being processed; their threads stay parked until "
                 + "then.", result.pending()));
         }
@@ -1574,17 +1585,19 @@ public class JDWPTools {
     }
 
     /**
-     * One stop in words: "breakpoint 3 on thread main".
+     * The "Resume failed: …" sentence; while the session is open it adds that the affected holds remain.
      */
-    private static String describeStop(BreakpointTracker.LastBreakpoint stop) {
-        final String thread = safeThreadName(stop.thread());
-        return switch (stop.kind()) {
-            case BREAKPOINT -> (stop.id() != null ? "breakpoint " + stop.id() : "untracked breakpoint") + " on thread "
-                + thread;
-            case STEP -> "step on thread " + thread;
-            case EXCEPTION -> "exception on thread " + thread;
-            case VM_START -> "the VM-start suspension";
-        };
+    private static String renderReleaseFailures(List<SuspensionSession.ReleaseFailure> failures, boolean closed) {
+        return "Resume failed: " + String.join("; ", failures.stream().map(SuspensionSession.ReleaseFailure::describe)
+            .toList()) + (closed ? "." : ". The affected holds remain in the session.");
+    }
+
+    /**
+     * The release report as a trailing line, or {@code ""} when nothing was released and nothing failed.
+     */
+    private static String releaseSuffix(SuspensionSession.@Nullable ReleaseResult released) {
+        return released != null && (released.releasedAnything() || !released.failures().isEmpty())
+            ? "\n" + renderRelease(released) : "";
     }
 
     private static String safeThreadName(ThreadReference thread) {
@@ -1621,7 +1634,8 @@ public class JDWPTools {
             + "jdwp_get_current_thread.", unseen) : ".");
     }
 
-    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. Returns the same info as jdwp_get_current_thread on success. Returns one of: 'Event fired ...' on a stop, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
+    /** Waits for a stop and reports failed releases that need the user's attention. */
+    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' if the VM disconnected, '[NO_EVENT] ...' on reset, or 'Wait interrupted' on interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
@@ -1639,8 +1653,8 @@ public class JDWPTools {
             // What the call released before it waited, as a trailing line: replies keep starting with
             // "Event fired" / "Status: still_waiting".
             // "Released before waiting:", not "Resumed:" — the reply is about the stop that follows.
-            final String releasedSuffix = (next.released() != null && next.released().releasedAnything()
-                ? "\n" + renderRelease(next.released()).replaceFirst("^Resumed:", "Released before waiting:") : "")
+            final String releasedSuffix = releaseSuffix(next.released()).replaceFirst("^\nResumed:",
+                "\nReleased before waiting:")
                 + (restored.isEmpty() ? "" : "\n" + restored);
             switch (next.outcome()) {
                 case TIMEOUT -> {
@@ -1653,11 +1667,15 @@ public class JDWPTools {
                         + "connection." + renderRecordedBeforeExit() + renderFieldWatchesAtExit()
                         + "\nNext: jdwp_get_events for what was recorded; jdwp_connect / jdwp_wait_for_attach to attach "
                         + "to a new run; jdwp_diagnose if the exit was unexpected."
-                        + renderFailedPendingHint();
+                        + renderFailedPendingHint() + releaseSuffix(next.released());
+                }
+                case RESUME_FAILED -> {
+                    return "[RESUME_FAILED] A suspension could not be released."
+                        + releaseSuffix(next.released()) + (restored.isEmpty() ? "" : "\n" + restored);
                 }
                 case RESET -> {
-                    return "[NO_EVENT] jdwp_reset ran while waiting: every stop was released and every breakpoint "
-                        + "cleared. Set breakpoints again, then call jdwp_resume_until_event.";
+                    return "[NO_EVENT] jdwp_reset ran while waiting and cleared the breakpoints. "
+                        + "Set breakpoints again, then call jdwp_resume_until_event.";
                 }
                 case STOPPED -> {
                 }
@@ -2569,7 +2587,8 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Resume a specific thread by its ID: releases what you hold on it — its jdwp_suspend_thread hold, its own stop, and its share of a stop-all stop (the other threads stay parked). Refuses while one of its events is still being processed or holds a stop you have not seen yet.")
+    /** Releases eligible holds for the named thread and reports successful retries and refusals. */
+    @McpTool(description = "Resume a specific thread by its ID: releases what you hold on it — its jdwp_suspend_thread hold, its own stop, and its share of a stop-all. Also retries failed automatic releases for its events. Refuses ordinary holds from events still processing or stops you have not seen.")
     public String jdwp_resume_thread(@McpToolParam(description = "Thread unique ID") long threadId) {
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -2579,15 +2598,28 @@ public class JDWPTools {
             }
 
             final SuspensionSession.ThreadRelease release = suspensions().releaseThread(thread);
+            final String name = safeThreadName(thread);
+            final boolean partiallyRefused = release.released() && release.refusal() != null;
+            if (release.closed() || !release.failures().isEmpty() || partiallyRefused) {
+                final String released = release.released() ? String.format(" Released from thread %d (%s): %s.",
+                    threadId, name, String.join("; ", release.holders())) : "";
+                final String failure = release.failures().isEmpty() ? ""
+                    : " " + renderReleaseFailures(release.failures(), release.closed());
+                final String prefix = release.closed() ? vmDisconnectedMessage("jdwp_resume_thread")
+                    : String.format("Could not fully resume thread %d (%s).", threadId, name);
+                final String restored = !release.closed() && release.released() ? fastLogpoints.retryPendingRemovals() : "";
+                final String refusal = partiallyRefused ? " Other holds remain: " + release.refusal() : "";
+                return prefix + released + failure + refusal + (restored.isEmpty() ? "" : " " + restored);
+            }
             if (!release.released()) {
-                return String.format("Thread %d (%s) was not resumed: %s", threadId, thread.name(), release.refusal());
+                return String.format("Thread %d (%s) was not resumed: %s", threadId, name, release.refusal());
             }
             final String restored = fastLogpoints.retryPendingRemovals();
             return String.format("Thread %d (%s) resumed (released: %s).%s Use jdwp_resume_until_event to wait for the "
-                + "next event.", threadId, thread.name(), String.join("; ", release.holders()),
+                + "next event.", threadId, name, String.join("; ", release.holders()),
                 restored.isEmpty() ? "" : " " + restored);
         } catch (Exception e) {
-            return errorReply(e);
+            return isVmGone(e) ? vmDisconnectedMessage("jdwp_resume_thread") : errorReply(e);
         }
     }
 
@@ -4404,6 +4436,7 @@ public class JDWPTools {
         }
     }
 
+    /** Clears debugging state and reports release progress even when the target disconnects. */
     @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, fast logpoints and fast breakpoints — restoring the original bytecode at once and releasing every stop —, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target. It releases every stop and jdwp_suspend_thread hold: a target that only a stop kept waiting runs on — a test JVM may run to its end and exit, so finish inspecting first.")
     public String jdwp_reset() {
         final int activeBp = breakpointTracker.getAllBreakpoints().size();
@@ -4458,6 +4491,11 @@ public class JDWPTools {
         final SuspensionSession session = breakpointTracker.suspensionSession();
         final SuspensionSession.ResetResult released = session != null ? session.reset() : SuspensionSession.ResetResult.NONE;
         final int stopsReleased = released.stops();
+        final boolean connectionPreserved = vmCleared && !released.closed();
+        final String releaseFailures = released.failures().isEmpty() ? ""
+            : "\n" + renderReleaseFailures(released.failures(), released.closed());
+        final String recovered = released.recovered().isEmpty() ? "" : String.format(
+            "%n  Recovered releases:            %d (%s)", released.recovered().size(), String.join("; ", released.recovered()));
 
         // These clears are server-local and must happen regardless of VM liveness.
         watcherManager.clearAll();
@@ -4465,7 +4503,7 @@ public class JDWPTools {
         eventHistory.clear();
 
         // List the leftovers again under fresh IDs — unless a teardown worker is still stuck in the VM.
-        final String leftovers = vm != null && vmCleared && !fastLogpoints.isTeardownStuck()
+        final String leftovers = vm != null && connectionPreserved && !fastLogpoints.isTeardownStuck()
             ? fastLogpoints.discover(vm) : "";
 
         // The target's exit already dropped its breakpoints and probes (notifyVmDied): say so rather
@@ -4478,10 +4516,15 @@ public class JDWPTools {
                 + String.format(". Event history cleared: %d entries; object cache cleared.", events)
                 + " Next: start the target again and attach (jdwp_wait_for_attach).";
         }
-        final String header = vmCleared
-            ? "Reset complete (VM connection preserved)."
-            : "Reset complete (VM unreachable — server-local state cleared).";
-        final String next = vm != null
+        final String header;
+        if (released.closed()) {
+            header = "Reset complete (VM disconnected — server-local state cleared).";
+        } else if (connectionPreserved) {
+            header = "Reset complete (VM connection preserved).";
+        } else {
+            header = "Reset complete (VM unreachable — server-local state cleared).";
+        }
+        final String next = vm != null && !released.closed()
             ? " Next: set breakpoints, then jdwp_resume_until_event."
             : " Next: attach to the target again (jdwp_wait_for_attach).";
         // P2-14: terse one-line summary when nothing was set up. The full 7-line breakdown is
@@ -4489,8 +4532,8 @@ public class JDWPTools {
         // "agent connects, runs jdwp_reset before starting" warm-up, repeating zeros adds noise.
         final int total = activeBp + pendingBp + activeExBp + pendingExBp
             + activeFieldBp + pendingFieldBp + fastLogpointsCleared + leftoversDisabled + watchers + events
-            + stopsReleased + released.holds();
-        if (total == 0) {
+            + stopsReleased + released.holds() + released.recovered().size();
+        if (total == 0 && releaseFailures.isEmpty()) {
             return header + " Nothing was set." + next + leftovers;
         }
         final String leftoverLine = leftoversDisabled == 0 ? "" : String.format(
@@ -4498,7 +4541,8 @@ public class JDWPTools {
         final String holdsReleased = released.holds() == 0 ? "" : String.format(" (+%d jdwp_suspend_thread hold%s)",
             released.holds(), released.holds() == 1 ? "" : "s");
         // Nothing holds the released threads any more: a target only a stop kept alive runs to its end.
-        final String runsOn = vmCleared && stopsReleased + released.holds() > 0
+        final String runsOn = connectionPreserved && releaseFailures.isEmpty()
+            && stopsReleased + released.holds() + released.recovered().size() > 0
             ? String.format("%nThe released threads run on — a test JVM that was held only by them may now run to "
             + "its end and exit.") : "";
         return String.format("""
@@ -4508,13 +4552,13 @@ public class JDWPTools {
                   Field breakpoints cleared:     %d active + %d pending
                   In-target probes cleared:      %d (fast logpoints and breakpoints; original bytecode restored)%s
                   Watchers cleared:              %d
-                  Stops released:                %d%s
+                  Stops released:                %d%s%s
                   Event history cleared:         %d entries
                   Object cache cleared.""",
             header, activeBp, pendingBp, activeExBp, pendingExBp,
             activeFieldBp, pendingFieldBp, fastLogpointsCleared, leftoverLine, watchers, stopsReleased, holdsReleased,
-            events)
-            + runsOn + next + leftovers;
+            recovered, events)
+            + runsOn + releaseFailures + next + leftovers;
     }
 
     // ========================================

@@ -741,10 +741,12 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_resume`             | —            | Release the stops you have seen and `jdwp_suspend_thread` holds; event sets still being processed keep their threads until processed |
 | `jdwp_resume_thread`      | `threadId`   | Resume a specific thread                                     |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
-| `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until next breakpoint/step/exception (soft-wait envelope at the ceiling) |
+| `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until the next breakpoint, step, exception, or timeout. Returns `[RESUME_FAILED]` immediately if a hold cannot be released |
 | `jdwp_step_over`          | `threadId?`  | Step over current line; follow with `resume_until_event`     |
 | `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`      |
 | `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event`  |
+
+Resume replies list which holds were released and which failed, with the JDI exception. The resume tools and `jdwp_reset` can retry failed automatic releases, unpaid lease debt and eligible watchdog releases. An automatic release failure can end an active `jdwp_resume_until_event` wait with `[RESUME_FAILED]`. A disconnect ends the session and directs you to reattach.
 
 ### Breakpoints (10)
 
