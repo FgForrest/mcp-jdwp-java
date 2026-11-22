@@ -76,7 +76,7 @@ Every debug session follows this sequence:
 
 **On `[TIMEOUT]`:** the response includes a structured diagnostic — *read it*. If your breakpoints are `PENDING` (target class not loaded), the code path is not executing and a larger timeout will not help — verify the entry point or class name. If a pending BP shows `[FAILED]`, the line/class is invalid. If recent events show `LOGPOINT` or `BREAKPOINT_SUPPRESSED` hits, your BP *is* firing but auto-resuming (logpoint or false condition). Do **not** blindly retry with a bigger timeout. Call `jdwp_diagnose()` any time for the same snapshot without resuming — useful as a sanity check before waiting on a long path.
 
-**On `[RESUME_FAILED]`:** a hold could not be released during the initial resume or by an automatic release while waiting. Read which holds were released and which failed. Use `jdwp_resume` to retry a failed event set release or unpaid lease debt.
+**On `[RESUME_FAILED]`:** a release or lease debt repayment failed before or during the wait. Read which holds were released and which need recovery. Use `jdwp_resume` to retry the affected holds.
 
 For follow-up investigations in the same long-running JVM, use `jdwp_reset` to clear session state, then set new breakpoints.
 

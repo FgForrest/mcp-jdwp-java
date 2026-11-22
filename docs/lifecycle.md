@@ -153,7 +153,7 @@ Everything else (object cache, watchers, marks, classpath cache, target version)
 - The object cache
 - The event history
 
-It also attempts to release every held stop and every `jdwp_suspend_thread` hold, deletes pending step requests, and starts a new suspension generation, so an event set still being processed can no longer publish a stop. Reset retries failed automatic releases, unpaid lease debts and eligible failed watchdog releases. Its summary counts recovered releases and lists any failures. A disconnect during the release pass leaves earlier progress in the summary and prompts the user to reattach.
+It also attempts to release every held stop and every `jdwp_suspend_thread` hold, deletes pending step requests, and starts a new suspension generation, so an event set still being processed can no longer publish a stop. Reset retries failed automatic releases, unpaid lease debts and eligible failed watchdog releases. Its summary counts recovered releases and lists failures. A disconnect during the release pass leaves earlier progress in the summary and prompts the user to reattach.
 
 It does **not** clear marks (those are persistent labels the agent set deliberately) and does **not** touch `lastHost` / `lastPort` (the connection stays live).
 

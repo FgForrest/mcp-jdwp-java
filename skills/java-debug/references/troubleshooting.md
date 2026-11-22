@@ -31,7 +31,7 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 
 ## A resume reply reports a failed hold
 
-`jdwp_resume` and `jdwp_resume_thread` report successful releases alongside any `Resume failed` details. `jdwp_resume_until_event` returns `[RESUME_FAILED]` when its initial release fails or an automatic release fails during the wait. A failed hold remains in the session. Use `jdwp_resume` to retry failed automatic releases or unpaid lease debt. Use `jdwp_resume_thread` for a specific thread's debt or a failed automatic release on that event thread. `jdwp_reset` also retries failed holds and counts its successful recoveries. If a resume or reset reply reports a disconnect, attach to a live target.
+`jdwp_resume` and `jdwp_resume_thread` report successful releases alongside any `Resume failed` details. `jdwp_resume_until_event` returns `[RESUME_FAILED]` when a release or lease debt repayment fails before or during the wait. Use `jdwp_resume` to retry the affected holds. Use `jdwp_resume_thread` for a specific thread's debt or a failed automatic release on that event thread. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_reset` also retries affected holds and reports its successful recoveries. If a resume or reset reply reports a disconnect, attach to a live target.
 
 ## JDWP port is already in use
 

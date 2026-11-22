@@ -162,7 +162,8 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 			.doesNotContain("still being processed");
 		assertThat(model.counts()).containsEntry("main", 1).containsEntry("worker", 1);
 
-		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID())).contains("failed automatic release", "released:");
+		assertThat(tools.jdwp_resume_thread(main.ref.uniqueID()))
+			.contains("failed automatic release", "released:", "VM-wide suspension");
 		assertThat(model.counts()).containsEntry("main", 0).containsEntry("worker", 0);
 	}
 
@@ -191,22 +192,65 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 	/** An automatic release failure wakes a waiter that already finished its initial release pass. */
 	@Test
 	void resumeUntilEventWakesWhenAutomaticReleaseFailsDuringWait() throws Exception {
-		assertThat(session.suspendThread(main.ref)).isNull();
-		final CountDownLatch resumed = new CountDownLatch(1);
-		doAnswer(call -> {
-			main.count--;
-			resumed.countDown();
-			return null;
-		}).when(main.ref).resume();
-		final CompletableFuture<String> waiting = CompletableFuture.supplyAsync(() -> tools.jdwp_resume_until_event(10_000));
-		assertThat(resumed.await(5, TimeUnit.SECONDS)).isTrue();
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
 		final EventSet set = model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD);
 		doThrow(new InternalException("automatic release rejected during wait")).when(set).resume();
-		finishWithoutStop(set);
+		final SuspensionSession.Context context = session.route(set, main.ref, false, false);
+		session.begin(context);
+		final CompletableFuture<String> waiting = startWaitReleasing(worker);
+		session.finish(context);
 
 		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
-			.contains("the jdwp_suspend_thread hold of main", "failed automatic release", "automatic release rejected during wait");
+			.contains("the jdwp_suspend_thread hold of worker", "failed automatic release",
+				"automatic release rejected during wait")
+			.doesNotContain("still being processed");
 		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** An invocation ending after the first pass can leave debt that prevents another stop. */
+	@Test
+	void resumeUntilEventReportsLateLeaseDebtAndEarlierProgress() throws Exception {
+		publish(new BreakpointTracker.LastBreakpoint(main.ref, 11), EventRequest.SUSPEND_EVENT_THREAD);
+		session.presentCurrent();
+		session.lease(main.ref);
+		model.beginInvocation(main);
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final CompletableFuture<String> waiting = startWaitReleasing(worker);
+		model.completeInvocation(main);
+		doThrow(new InternalException("lease repayment rejected")).when(main.ref).resume();
+
+		session.unlease(main.ref);
+
+		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[RESUME_FAILED]")
+			.contains("breakpoint 11", "the jdwp_suspend_thread hold of worker", "lease debt", "lease repayment rejected");
+		assertThat(main.count).isEqualTo(1);
+	}
+
+	/** A closed wait keeps confirmed earlier releases and omits obsolete pending-set counts. */
+	@Test
+	void closedWaitKeepsProgressWithoutReportingPendingSets() throws Exception {
+		final SuspensionSession.Context context =
+			session.route(model.breakpointEvent(main, EventRequest.SUSPEND_EVENT_THREAD), main.ref, false);
+		session.begin(context);
+		final CompletableFuture<String> waiting = startWaitReleasing(model.thread("worker"));
+		session.close();
+
+		assertThat(waiting.get(2, TimeUnit.SECONDS)).startsWith("[VM_DEATH]")
+			.contains("the jdwp_suspend_thread hold of worker").doesNotContain("still being processed");
+	}
+
+	/** Starts a wait and signals after its first release pass reaches the given manual hold. */
+	private CompletableFuture<String> startWaitReleasing(FakeSuspendModel.FakeThread thread) throws Exception {
+		assertThat(session.suspendThread(thread.ref)).isNull();
+		final CountDownLatch resumed = new CountDownLatch(1);
+		doAnswer(call -> {
+			thread.count--;
+			resumed.countDown();
+			return null;
+		}).when(thread.ref).resume();
+		final CompletableFuture<String> waiting = CompletableFuture.supplyAsync(() -> tools.jdwp_resume_until_event(5_000));
+		assertThat(resumed.await(5, TimeUnit.SECONDS)).isTrue();
+		return waiting;
 	}
 
 	/** An automatic resume rejects the initial release pass before the waiter begins. */

@@ -396,6 +396,7 @@ class SuspensionSessionTest {
 		assertThat(session.isClosed()).isTrue();
 	}
 
+	/** Keeps the hold and the JDI failure after cleaning up the unsuccessful step. */
 	@Test
 	void failedStepReleaseKeepsTheHoldAndDeletesTheRequest() throws Exception {
 		assertThat(session.suspendThread(t.ref)).isNull();
@@ -404,7 +405,11 @@ class SuspensionSessionTest {
 		final EventRequestManager manager = mock(EventRequestManager.class);
 		when(model.vm.eventRequestManager()).thenReturn(manager);
 
-		assertThat(session.step(t.ref, List::of, () -> request).refusal()).contains("InternalException");
+		final SuspensionSession.StepResult step = session.step(t.ref, List::of, () -> request);
+		assertThat(step.refusal()).isNotNull();
+		assertThat(step.releaseFailure()).isNotNull().satisfies(release ->
+			assertThat(release.failures()).singleElement().satisfies(failure ->
+				assertThat(failure.cause()).isInstanceOf(InternalException.class)));
 		assertThat(session.stepPending(t.ref)).isFalse();
 		verify(manager).deleteEventRequest(request);
 		assertThat(session.holdsOn(t.ref)).containsExactly(SuspensionSession.MANUAL_HOLD);
@@ -859,6 +864,28 @@ class SuspensionSessionTest {
 		session.begin(other);
 		session.finish(other);
 		assertThat(model.counts()).containsEntry("t", 0).containsEntry("u", 0).containsEntry("w", 0);
+	}
+
+	/** A failed restoration can spend the returned anchor count on the unseen stop-all. */
+	@Test
+	void failedExemptionRestorationTakesTheReleasedAnchorsCount() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		session.lease(t.ref);
+		model.beginInvocation(t);
+		final SuspensionSession.Context unseen = stopOn(u, EventRequest.SUSPEND_ALL, 2);
+		assertThat(session.releaseAll().released()).extracting(BreakpointTracker.LastBreakpoint::id).containsExactly(1);
+		model.completeInvocation(t);
+		doThrow(new InternalException("exemption restore rejected")).when(t.ref).suspend();
+
+		session.unlease(t.ref);
+
+		assertThat(session.holdsOn(t.ref)).containsExactly(unseen.id());
+		assertThat(t.count).isEqualTo(1);
+		assertThat(session.releaseAll().unseen()).hasSize(1);
+		assertThat(t.count).isEqualTo(1);
+		presented(unseen);
+		assertThat(session.releaseAll().released()).hasSize(1);
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
 	}
 
 	@Test

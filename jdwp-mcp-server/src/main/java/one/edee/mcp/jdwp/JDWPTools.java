@@ -1543,7 +1543,7 @@ public class JDWPTools {
     }
 
     /**
-     * Renders released stops, holds and recoveries, failures, unseen stops and in-flight sets.
+     * Renders released stops and holds, failures, unseen stops and in-flight sets.
      */
     private static String renderRelease(SuspensionSession.ReleaseResult result) {
         final StringBuilder out = new StringBuilder();
@@ -1593,7 +1593,7 @@ public class JDWPTools {
     }
 
     /**
-     * The release report as a trailing line, or {@code ""} when nothing was released and nothing failed.
+     * The release report as a trailing line, or {@code ""} when no release succeeded or failed.
      */
     private static String releaseSuffix(SuspensionSession.@Nullable ReleaseResult released) {
         return released != null && (released.releasedAnything() || !released.failures().isEmpty())
@@ -1634,7 +1634,7 @@ public class JDWPTools {
             + "jdwp_get_current_thread.", unseen) : ".");
     }
 
-    /** Waits for a stop and reports failed releases that need the user's attention. */
+    /** Waits for a stop and reports outstanding recoveries that can keep the target parked. */
     @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' if the VM disconnected, '[NO_EVENT] ...' on reset, or 'Wait interrupted' on interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
@@ -1675,7 +1675,8 @@ public class JDWPTools {
                 }
                 case RESET -> {
                     return "[NO_EVENT] jdwp_reset ran while waiting and cleared the breakpoints. "
-                        + "Set breakpoints again, then call jdwp_resume_until_event.";
+                        + "See its reply for any holds it could not release. Set breakpoints again, "
+                        + "then call jdwp_resume_until_event." + releasedSuffix;
                 }
                 case STOPPED -> {
                 }
@@ -2587,8 +2588,8 @@ public class JDWPTools {
         }
     }
 
-    /** Releases eligible holds for the named thread and reports successful retries and refusals. */
-    @McpTool(description = "Resume a specific thread by its ID: releases what you hold on it — its jdwp_suspend_thread hold, its own stop, and its share of a stop-all. Also retries failed automatic releases for its events. Refuses ordinary holds from events still processing or stops you have not seen.")
+    /** Releases eligible thread holds and reports the scope and outcome of any recovery. */
+    @McpTool(description = "Resume a thread's manual hold, presented stop, or share of a stop-all by thread ID. Retries failed automatic releases of its events, including the VM-wide suspension of a failed stop-all. Refuses ordinary holds from processing events or unseen stops.")
     public String jdwp_resume_thread(@McpToolParam(description = "Thread unique ID") long threadId) {
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -2731,7 +2732,7 @@ public class JDWPTools {
 
     /**
      * Single-line step (over/into/out) on the given thread; when {@code threadId} is null,
-     * falls back to the last breakpoint thread.
+     * falls back to the last breakpoint thread. Reports partial progress when a release fails.
      */
     private String doStep(@Nullable Long threadId, int stepDepth, String label) {
         try {
@@ -2806,6 +2807,10 @@ public class JDWPTools {
                     return stepRequest;
                 }
             });
+            final SuspensionSession.ThreadRelease releaseFailure = step.releaseFailure();
+            if (releaseFailure != null) {
+                return renderStepReleaseFailure(thread, label, releaseFailure);
+            }
             if (step.refusal() != null) {
                 return String.format("Error: cannot step thread %d (%s): %s", thread.uniqueID(), thread.name(), step.refusal());
             }
@@ -2816,7 +2821,7 @@ public class JDWPTools {
             if (!step.remainingHolders().isEmpty()) {
                 otherThreadParts.add("Still suspended by " + String.join("; ", step.remainingHolders()) + '.');
             }
-            if (step.remainingStopAlls().isEmpty()) {
+            if (step.remainingStopAlls().isEmpty() && !step.recoveryPending()) {
                 otherThreadParts.add(step.remainingHolders().isEmpty() ? "All other threads run." : "All remaining threads run.");
             }
             final String otherThreads = String.join(" ", otherThreadParts);
@@ -2826,6 +2831,15 @@ public class JDWPTools {
         } catch (Exception e) {
             return errorReply(e);
         }
+    }
+
+    /** Reports confirmed step releases and all failures after the step request has been removed. */
+    private static String renderStepReleaseFailure(ThreadReference thread, String label,
+                                                   SuspensionSession.ThreadRelease release) {
+        final String prefix = release.closed() ? vmDisconnectedMessage("jdwp_step_" + label)
+            : String.format("Error: cannot step thread %d (%s).", thread.uniqueID(), safeThreadName(thread));
+        final String progress = release.released() ? " Released: " + String.join("; ", release.holders()) + '.' : "";
+        return prefix + progress + " " + renderReleaseFailures(release.failures(), release.closed());
     }
 
     /**

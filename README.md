@@ -666,8 +666,9 @@ Replaces the manual "resume → poll events → poll events" pattern. The agent 
 
 - `Event fired …` — a BP / step / exception suspended a thread; the message includes thread + stop site
 - `[TIMEOUT] …` — the wait expired without an event; the message offers `wait_more` / `reconnect` / `abort` and reports JDI health so the agent never blindly hangs
-- `[VM_DEATH] …` — the target VM died before any event
-- `[NO_EVENT] …` — `jdwp_reset` ran while the call waited: every stop was released and every breakpoint cleared, so set breakpoints again
+- `[RESUME_FAILED] …` — a release failed or lease debt remains unpaid. The reply names the affected holds and reports any completed releases.
+- `[VM_DEATH] …` — the target connection closed before the next stop
+- `[NO_EVENT] …` — `jdwp_reset` ran while the call waited. See the reset reply for any holds retained after a failed release, then set breakpoints again.
 
 The same soft-wait envelope wraps `jdwp_wait_for_attach`, so bootstrap and resume share one "wait sensibly, decide deliberately" idiom.
 
@@ -739,14 +740,14 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | Tool                      | Parameters   | Description                                                  |
 |---------------------------|--------------|--------------------------------------------------------------|
 | `jdwp_resume`             | —            | Release the stops you have seen and `jdwp_suspend_thread` holds; event sets still being processed keep their threads until processed |
-| `jdwp_resume_thread`      | `threadId`   | Resume a specific thread                                     |
+| `jdwp_resume_thread`      | `threadId`   | Resume a specific thread. Retrying a failed automatic stop-all release releases the VM-wide suspension. |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
 | `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until the next breakpoint, step, exception, or timeout. Returns `[RESUME_FAILED]` immediately if a hold cannot be released |
 | `jdwp_step_over`          | `threadId?`  | Step over current line; follow with `resume_until_event`     |
 | `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`      |
 | `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event`  |
 
-Resume replies list which holds were released and which failed, with the JDI exception. The resume tools and `jdwp_reset` can retry failed automatic releases, unpaid lease debt and eligible watchdog releases. An automatic release failure can end an active `jdwp_resume_until_event` wait with `[RESUME_FAILED]`. A disconnect ends the session and directs you to reattach.
+Resume replies list which holds were released and which failed, with the JDI exception. The resume tools and `jdwp_reset` can retry failed automatic releases, unpaid lease debt and eligible watchdog releases. A failed automatic release or lease debt repayment can end an active `jdwp_resume_until_event` wait with `[RESUME_FAILED]`. A disconnect ends the session and directs you to reattach.
 
 ### Breakpoints (10)
 
@@ -1068,7 +1069,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | First expression evaluation returns `[STILL_RUNNING]` | If the reply names local classpath discovery, check its progress with `jdwp_diagnose`. An evaluation that takes over 20 s returns `[STILL_RUNNING]` and finishes in the background; its result shows up in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`. Once it has finished, later evaluations use the cached classpath. |
 | A long `jdwp_resume_until_event` / `jdwp_wait_for_attach` is cut off by the client | The client's tool-call timeout is shorter than the `timeoutMs` passed. Codex: raise `tool_timeout_sec` of a manual registration. Claude Code waits long by default; raise `MCP_TOOL_TIMEOUT` in its environment if it is set low. |
-| `resume_until_event` returns `[TIMEOUT]` / `[NO_EVENT]` | `[TIMEOUT]`: the wait expired without a stop; the message reports the transport's health and offers waiting more (just call again), `jdwp_reconnect` when the transport is wedged, or giving up. `[NO_EVENT]`: `jdwp_reset` ran meanwhile and cleared every breakpoint; set them again. |
+| `resume_until_event` returns `[TIMEOUT]` / `[RESUME_FAILED]` / `[NO_EVENT]` | `[TIMEOUT]` reports the transport's health when the wait expires. `[RESUME_FAILED]` reports suspensions that need recovery. `[NO_EVENT]` means reset ran during the wait. Check its reply for failed holds and set breakpoints again. |
 | Build fails with Error Prone / toolchain error  | Building from source needs JDK 21+ on the toolchain. The bytecode target stays at Java 17, but the build step itself needs ≥21 because Error Prone 2.48 ships Java-21 bytecode. |
 
 ## License
