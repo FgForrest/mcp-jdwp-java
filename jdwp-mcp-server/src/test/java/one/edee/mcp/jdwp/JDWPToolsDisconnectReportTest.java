@@ -76,11 +76,12 @@ class JDWPToolsDisconnectReportTest {
 		assertThat(tools.jdwp_disconnect()).isEqualTo("Not connected — nothing to disconnect.");
 	}
 
+	/** Reports the saved exit and the state it took with it. */
 	@Test
 	@DisplayName("after the target exited, the reply says so and names what its exit dropped")
 	void shouldReportTheTargetsExit() {
 		final JDIConnectionService.VmExit exit = new JDIConnectionService.VmExit(
-			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 2, 0, 1, 1, 0, List.of());
+			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 2, 0, 1, 1, 0, List.of(), 1);
 		when(jdiService.disconnect()).thenReturn(new JDIConnectionService.DisconnectResult(
 			false, null, 0, 0, 0, 0, 0, 0, 0, 0, exit, null));
 

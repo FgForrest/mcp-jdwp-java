@@ -132,7 +132,7 @@ class JDWPToolsResetReportTest {
 	private SuspensionSession useSession(FakeSuspendModel model) throws Exception {
 		when(model.vm.eventRequestManager()).thenReturn(mock(EventRequestManager.class));
 		when(jdiService.getVM()).thenReturn(model.vm);
-		final SuspensionSession session = new BreakpointTracker().openSuspensionSession(new EventHistory());
+		final SuspensionSession session = new BreakpointTracker().openSuspensionSession(model.vm, new EventHistory());
 		when(breakpointTracker.suspensionSession()).thenReturn(session);
 		return session;
 	}
@@ -149,12 +149,13 @@ class JDWPToolsResetReportTest {
 				+ "jdwp_resume_until_event.");
 	}
 
+	/** Reports the saved exit and directs the caller to attach to a new run. */
 	@Test
 	@DisplayName("after the target exited: says so, names what its exit dropped and points at a new attach")
 	void reportsTheTargetsExit() throws Exception {
 		when(jdiService.getVM()).thenThrow(new Exception("Not connected"));
 		when(jdiService.lastExit()).thenReturn(new JDIConnectionService.VmExit(
-			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 1, 0, 0, 1, 0, List.of()));
+			Instant.parse("2026-10-30T17:42:10Z"), "localhost", 5005, 1, 0, 0, 1, 0, List.of(), 1));
 
 		assertThat(tools.jdwp_reset())
 			.startsWith("Reset complete — there is no target to reset: the target VM at localhost:5005 exited at ")

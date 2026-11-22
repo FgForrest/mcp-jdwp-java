@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ObjectReference;
+import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.ThreadReference;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
@@ -42,11 +43,12 @@ class InvocationRunnerTest {
 	private EventHistory history;
 	private SuspensionSession session;
 
+	/** Creates the runner fixture with its own suspension session and VM. */
 	@BeforeEach
 	void setUp() {
 		pool = InvocationRunner.newPool();
 		history = new EventHistory();
-		session = new BreakpointTracker().openSuspensionSession(history);
+		session = new BreakpointTracker().openSuspensionSession(mock(VirtualMachine.class), history);
 	}
 
 	@AfterEach
@@ -153,6 +155,7 @@ class InvocationRunnerTest {
 		assertThat(runner.run(main, "evaluating 4", () -> 4)).as("free again once the first ended").isEqualTo(4);
 	}
 
+	/** Replaces the closed session with one bound to a different VM before the result arrives. */
 	@Test
 	@DisplayName("a late result of an ended connection is not recorded in the next one")
 	void lateResultOfAnEndedConnectionIsDropped() throws Exception {
@@ -169,7 +172,7 @@ class InvocationRunnerTest {
 		})).isInstanceOf(InvocationRunner.StillRunning.class);
 
 		session.close();
-		session = new BreakpointTracker().openSuspensionSession(history);
+		session = new BreakpointTracker().openSuspensionSession(mock(VirtualMachine.class), history);
 		release.countDown();
 		assertThat(finished.await(5, TimeUnit.SECONDS)).isTrue();
 		Thread.sleep(100);
@@ -193,6 +196,7 @@ class InvocationRunnerTest {
 		assertThat(runner.isRunning(main)).isFalse();
 	}
 
+	/** Replaces the session with one bound to a new VM. */
 	@Test
 	@DisplayName("a job of an ended connection neither refuses nor counts for a thread of the next one with the same ID")
 	void jobOfAnEndedConnectionDoesNotBlockTheNext() throws Exception {
@@ -203,7 +207,7 @@ class InvocationRunnerTest {
 				() -> release.await(10, TimeUnit.SECONDS))).isInstanceOf(InvocationRunner.StillRunning.class);
 
 			session.close();
-			session = new BreakpointTracker().openSuspensionSession(history);
+			session = new BreakpointTracker().openSuspensionSession(mock(VirtualMachine.class), history);
 			final ThreadReference reused = thread("worker", 1);
 			assertThat(runner.isRunning(reused)).isFalse();
 			assertThat(runner.run(reused, "evaluating 5", () -> 5)).isEqualTo(5);

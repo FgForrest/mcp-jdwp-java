@@ -138,13 +138,13 @@ public class JdiEventListener {
     @Nullable
     private volatile Consumer<VirtualMachine> vmDeathHook;
     /**
-     * Optional callback invoked when the target exits, after the in-target probes were read and
+     * Optional callback receiving the session whose target exited, after the in-target probes were read and
      * before the session closes (which wakes a {@code jdwp_resume_until_event} waiter) — so the
      * waiter's {@code [VM_DEATH]} reply can say what the exit takes with it. Not invoked for a
      * user-initiated {@link #stop}.
      */
     @Nullable
-    private volatile Runnable vmExitingHook;
+    private volatile Consumer<SuspensionSession> vmExitingHook;
     /**
      * Optional callback invoked every time the listener drains an {@link EventSet} from the JDI
      * queue. Used by {@link JdiHealthMonitor} to advance its last-traffic timestamp without
@@ -358,9 +358,9 @@ public class JdiEventListener {
     }
 
     /**
-     * Registers (or clears) the callback invoked when the target exits — see {@link #vmExitingHook}.
+     * Registers (or clears) the callback receiving the exiting target's session — see {@link #vmExitingHook}.
      */
-    public void setVmExitingHook(@Nullable Runnable hook) {
+    public void setVmExitingHook(@Nullable Consumer<SuspensionSession> hook) {
         this.vmExitingHook = hook;
     }
 
@@ -382,8 +382,8 @@ public class JdiEventListener {
     }
 
     /**
-     * Spawns a fresh daemon listener thread for `vm`. Calls {@link #stop()} first so there is at
-     * most one listener active at any time. The thread is a daemon — it does not block JVM shutdown.
+     * Spawns a fresh daemon listener and binds its suspension session to {@code vm}.
+     * Calls {@link #stop()} first so there is at most one listener active at any time.
      */
     public void start(VirtualMachine vm) {
         stop();
@@ -398,7 +398,7 @@ public class JdiEventListener {
             return worker;
         });
         dispatcher = sessionDispatcher;
-        final SuspensionSession suspensions = breakpointTracker.openSuspensionSession(eventHistory);
+        final SuspensionSession suspensions = breakpointTracker.openSuspensionSession(vm, eventHistory);
         session = suspensions;
         evaluationGuard.bind(suspensions);
         watchdog = SuspensionWatchdog.start(suspensions);
@@ -433,15 +433,15 @@ public class JdiEventListener {
     }
 
     /**
-     * Runs the registered {@link #vmExitingHook}; never throws.
+     * Runs the registered {@link #vmExitingHook} for the session that observed the exit; never throws.
      */
-    private void invokeVmExitingHook() {
-        final Runnable hook = vmExitingHook;
+    private void invokeVmExitingHook(SuspensionSession suspensions) {
+        final Consumer<SuspensionSession> hook = vmExitingHook;
         if (hook == null) {
             return;
         }
         try {
-            hook.run();
+            hook.accept(suspensions);
         } catch (Exception e) {
             log.warn("[JDI] VM-exiting hook threw: {}", e.getMessage());
         }
@@ -541,7 +541,7 @@ public class JdiEventListener {
      * On either death path (in-loop {@code VMDeath}/{@code VMDisconnect} event, or
      * {@code VMDisconnectedException}/{@code IllegalStateException} from the JDI queue), the loop
      * waits for the dispatcher, closes the session (which wakes a {@code jdwp_resume_until_event}
-     * waiter), records {@code VM_DEATH}, clears {@link #running}, and invokes the registered
+     * waiter) after taking the exit snapshot, records {@code VM_DEATH}, clears {@link #running}, and invokes the registered
      * {@link #vmDeathHook} before exiting. An {@code InterruptedException} from an external
      * {@link #stop} closes the session, clears {@link #running} and invokes the hook.
      */
@@ -568,7 +568,7 @@ public class JdiEventListener {
                     awaitDispatched(dispatcher);
                     readProbesBeforeExit(eventSet);
                     if (running) {
-                        invokeVmExitingHook();
+                        invokeVmExitingHook(suspensions);
                     }
                     suspensions.close();
                     process(eventSet, null, null);
@@ -598,7 +598,7 @@ public class JdiEventListener {
                 cancelLocalClasspathDiscovery(vm);
                 awaitDispatched(dispatcher);
                 if (running) {
-                    invokeVmExitingHook();
+                    invokeVmExitingHook(suspensions);
                 }
                 suspensions.close();
                 eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));

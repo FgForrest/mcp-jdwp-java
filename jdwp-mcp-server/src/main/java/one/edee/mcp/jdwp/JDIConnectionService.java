@@ -675,9 +675,13 @@ public class JDIConnectionService {
      * when the target exits — after reading the in-target probes, before closing the session, which
      * wakes a {@code jdwp_resume_until_event} waiter — so that waiter's {@code [VM_DEATH]} reply, and
      * a later {@code jdwp_reset} or {@code jdwp_disconnect}, can report it; {@link #notifyVmDied}
-     * drops the state right after. Takes no lock: the listener must not wait behind a tool call.
+     * drops the state right after. Tags the snapshot with the exiting session's epoch. Takes no
+     * lock: the listener must not wait behind a tool call.
      */
-    void captureExit() {
+    void captureExit(SuspensionSession session) {
+        if (eventHistory.currentEpoch() != session.epoch() || breakpointTracker.suspensionSession() != session) {
+            return;
+        }
         final List<VmExit.FieldWatch> watches = new ArrayList<>();
         for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> entry
             : breakpointTracker.getAllFieldBreakpoints().entrySet()) {
@@ -687,13 +691,16 @@ public class JDIConnectionService {
         }
         watches.sort(Comparator.comparingInt(VmExit.FieldWatch::id));
         final FastLogpointService flps = fastLogpoints;
-        lastExit = new VmExit(Instant.now(), lastHost, lastPort,
+        final VmExit exit = new VmExit(Instant.now(), lastHost, lastPort,
             breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size(),
             breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size(),
             breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size(),
             flps != null ? flps.ownCount() : 0,
             watcherManager.getAllWatchers().size(),
-            List.copyOf(watches));
+            List.copyOf(watches), session.epoch());
+        if (eventHistory.currentEpoch() == session.epoch() && breakpointTracker.suspensionSession() == session) {
+            lastExit = exit;
+        }
     }
 
     /**
@@ -1097,9 +1104,11 @@ public class JDIConnectionService {
      * @param probes               fast logpoints and fast breakpoints dropped
      * @param watchers             watchers dropped
      * @param fieldWatches         the active field breakpoints and how often each fired
+     * @param sessionEpoch        the history epoch of the exiting connection
      */
     public record VmExit(Instant at, @Nullable String host, int port, int lineBreakpoints, int exceptionBreakpoints,
-                         int fieldBreakpoints, int probes, int watchers, List<FieldWatch> fieldWatches) {
+                         int fieldBreakpoints, int probes, int watchers, List<FieldWatch> fieldWatches,
+                         int sessionEpoch) {
 
         /**
          * An active field breakpoint at the exit.

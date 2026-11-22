@@ -101,7 +101,7 @@ With `requireVmStart=true`, an existing session is refused with `[NOT_FRESH]` an
 
 `stop()`:
 
-1. Closes the `SuspensionSession`. Every later call on it is a no-op, and a tool blocked in `jdwp_resume_until_event` (`SuspensionSession.nextStop`) wakes and answers `[VM_DEATH]`. The session resumes nothing — `vm.dispose()` releases the target's threads.
+1. Closes the `SuspensionSession` and wakes a tool waiting for a stop, including a step with `wait=true`. The `[VM_DEATH]` reply names the selected stop if there was one. The session leaves the release of the target's threads to `vm.dispose()`.
 2. Stops the watchdog and shuts the dispatcher down.
 3. Interrupts the listener thread and joins it for up to 500 ms.
 4. Runs the VM-death hook (at most once per session).

@@ -36,6 +36,7 @@ class SuspensionSessionUnblockTest {
 	private EventHistory history;
 	private SuspensionSession session;
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() {
 		model = new FakeSuspendModel();
@@ -43,7 +44,7 @@ class SuspensionSessionUnblockTest {
 		u = model.thread("u");
 		w = model.thread("w");
 		history = new EventHistory();
-		session = new BreakpointTracker().openSuspensionSession(history);
+		session = new BreakpointTracker().openSuspensionSession(model.vm, history);
 	}
 
 	@AfterEach
@@ -70,6 +71,36 @@ class SuspensionSessionUnblockTest {
 		assertThat(session.unblockedNote()).contains("partial stop").contains("u");
 
 		session.releaseAll();
+		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
+	}
+
+	/** A failed rollback can still hold a bystander the watchdog already released from the stop-all. */
+	@Test
+	void targetedWaitReportsCompensationRetainedByFailedAutomaticRelease() throws Exception {
+		final EventSet set = model.breakpointEvent(t, EventRequest.SUSPEND_ALL);
+		final SuspensionSession.Context own = session.route(set, t.ref, false);
+		assertThat(session.begin(own)).isTrue();
+		session.beginProcessing(own);
+		assertThat(unblock(invoking(t), u.ref)).contains("thread u");
+		assertThat(u.count).isZero();
+		finishInvocation(t);
+
+		doThrow(new InternalException("automatic VM resume rejected")).doAnswer(call -> {
+			model.vm.resume();
+			return null;
+		}).when(set).resume();
+		doThrow(new InternalException("rollback rejected")).when(u.ref).resume();
+		assertThat(session.finish(own)).isFalse();
+		assertThat(session.stateOf(own)).isEqualTo(SuspensionSession.State.RELEASE_FAILED);
+		assertThat(u.count).isOne();
+
+		final SuspensionSession.NextStop next = session.nextStop(0, u.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.RESUME_FAILED);
+		assertThat(next.threadRelease().failures()).singleElement().satisfies(failure -> {
+			assertThat(failure.describe()).contains("automatic VM resume rejected", "rollback rejected");
+			assertThat(failure.retryThreadId()).isEqualTo(t.ref.uniqueID());
+		});
+		assertThat(session.releaseThread(t.ref).holders()).singleElement().asString().contains("VM-wide suspension");
 		assertThat(model.counts()).allSatisfy((name, count) -> assertThat(count).isZero());
 	}
 

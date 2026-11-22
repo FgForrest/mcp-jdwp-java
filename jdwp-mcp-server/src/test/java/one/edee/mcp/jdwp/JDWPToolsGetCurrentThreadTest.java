@@ -1,12 +1,22 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.IncompatibleThreadStateException;
+import com.sun.jdi.InternalException;
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.List;
+import java.util.Objects;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -22,15 +32,18 @@ import static org.mockito.Mockito.when;
 class JDWPToolsGetCurrentThreadTest {
 
 	private BreakpointTracker breakpointTracker;
+	/** The event history shared by the getters and their suspension sessions. */
+	private EventHistory eventHistory;
 	private JDWPTools tools;
 
+	/** Wires both getters to the same simulated debugger history. */
 	@BeforeEach
 	void setUp() {
 		final JDIConnectionService jdiService = mock(JDIConnectionService.class);
 		breakpointTracker = mock(BreakpointTracker.class);
 		final WatcherManager watcherManager = mock(WatcherManager.class);
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final EventHistory eventHistory = new EventHistory();
+		eventHistory = new EventHistory();
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, breakpointTracker, watcherManager, evaluator,
 			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
@@ -155,5 +168,64 @@ class JDWPToolsGetCurrentThreadTest {
 
 		assertThat(result).startsWith("Error:");
 		assertThat(result).contains("tracker boom");
+	}
+
+	/** Both presenting getters must identify the stop before the step waiter observes it as seen. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void shouldIdentifyThePresentedStopWhenLiveStatusFails(boolean breakpointContext) throws Exception {
+		final FakeSuspendModel model = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final SuspensionSession session = new BreakpointTracker().openSuspensionSession(model.vm, new EventHistory());
+		when(breakpointTracker.suspensionSession()).thenReturn(session);
+		assertThat(session.suspendThread(worker.ref)).isNull();
+		final SuspensionSession.ArmedStep step = Objects.requireNonNull(
+			session.step(worker.ref, List::of, () -> mock(StepRequest.class)).armed());
+		final SuspensionSession.Context stop = session.route(
+			model.breakpointEvent(worker, EventRequest.SUSPEND_EVENT_THREAD), worker.ref, false);
+		session.begin(stop);
+		session.candidate(stop, new BreakpointTracker.LastBreakpoint(worker.ref, 30));
+		assertThat(session.finish(stop)).isTrue();
+		when(worker.ref.isSuspended()).thenThrow(new InternalException("status read failed"));
+
+		final String reply = breakpointContext ? tools.jdwp_get_breakpoint_context(null, null)
+			: tools.jdwp_get_current_thread();
+		assertThat(reply).contains("worker", "ID=1", "breakpoint=30").doesNotStartWith("Error:");
+		assertThat(session.awaitStepStop(0, step).outcome()).isEqualTo(SuspensionSession.Outcome.ALREADY_PRESENTED);
+	}
+
+	/** Both getters report the selected stop and its epoch when a frame read fails during close. */
+	@ParameterizedTest
+	@CsvSource({"false,false", "true,false", "false,true", "true,true"})
+	void shouldReportDeathWhenSessionClosesDuringFailedFrameRead(boolean breakpointContext, boolean reconnect) throws Exception {
+		final FakeSuspendModel model = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final BreakpointTracker sessions = new BreakpointTracker();
+		final SuspensionSession session = sessions.openSuspensionSession(model.vm, eventHistory);
+		when(breakpointTracker.suspensionSession()).thenReturn(session);
+		final SuspensionSession.Context stop = session.route(
+			model.breakpointEvent(worker, EventRequest.SUSPEND_EVENT_THREAD), worker.ref, false);
+		session.begin(stop);
+		session.candidate(stop, new BreakpointTracker.LastBreakpoint(
+			worker.ref, 30, BreakpointTracker.EventKind.BREAKPOINT, "example.Work:30"));
+		assertThat(session.finish(stop)).isTrue();
+		eventHistory.record(new EventHistory.DebugEvent("BREAKPOINT", "original stop"));
+		when(worker.ref.frameCount()).thenAnswer(invocation -> {
+			session.close();
+			if (reconnect) {
+				final FakeSuspendModel replacement = new FakeSuspendModel();
+				eventHistory.beginNewSession();
+				when(breakpointTracker.suspensionSession()).thenReturn(sessions.openSuspensionSession(replacement.vm, eventHistory));
+				eventHistory.record(new EventHistory.DebugEvent("RECONNECT", "replacement attached"));
+				eventHistory.record(new EventHistory.DebugEvent("LOGPOINT", "replacement logpoint"));
+			}
+			throw new IncompatibleThreadStateException("frame read lost the suspension");
+		});
+
+		final String reply = breakpointContext ? tools.jdwp_get_breakpoint_context(null, null)
+			: tools.jdwp_get_current_thread();
+		assertThat(reply).startsWith("[VM_DEATH]")
+			.contains("example.Work:30", "breakpoint=30", "Recorded before the exit (jdwp_get_events): 1 BREAKPOINT.")
+			.doesNotContain("1 RECONNECT", "1 LOGPOINT");
 	}
 }

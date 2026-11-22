@@ -32,13 +32,14 @@ class JDWPToolsReconnectAndSoftWaitTest {
 	private JdiHealthMonitor healthMonitor;
 	private JDWPTools tools;
 
+	/** Provides a VM-bound suspension session for soft waits. */
 	@BeforeEach
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
 		breakpointTracker = mock(BreakpointTracker.class);
 		// The wait tools need the connection's suspension-ownership session (issue #45).
 		when(breakpointTracker.suspensionSession())
-			.thenReturn(new BreakpointTracker().openSuspensionSession(new EventHistory()));
+			.thenReturn(new BreakpointTracker().openSuspensionSession(mock(VirtualMachine.class), new EventHistory()));
 		final WatcherManager watcherManager = mock(WatcherManager.class);
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		eventHistory = new EventHistory();

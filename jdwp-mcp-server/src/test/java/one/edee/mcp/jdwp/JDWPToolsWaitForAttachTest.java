@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.EventRequest;
@@ -62,10 +63,11 @@ class JDWPToolsWaitForAttachTest {
 			eventHistory, new EvaluationGuard(), discovery);
 	}
 
+	/** Publishes the delayed VM start on the connection's session. */
 	@Test
 	@DisplayName("Strict attach waits for a suspending VM_START to be published after connect")
 	void shouldWaitForDelayedVmStart() throws Exception {
-		final SuspensionSession session = tracker.openSuspensionSession(eventHistory);
+		final SuspensionSession session = tracker.openSuspensionSession(mock(VirtualMachine.class), eventHistory);
 		final ThreadReference thread = JdiEventListenerTestSupport.mockThread("main", 1L);
 		final EventSet eventSet = JdiEventListenerTestSupport.mockEventSet();
 		when(eventSet.suspendPolicy()).thenReturn(EventRequest.SUSPEND_ALL);

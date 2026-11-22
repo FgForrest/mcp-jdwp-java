@@ -117,7 +117,7 @@ The server starts in a few seconds, well within the 30 seconds Claude Code waits
 codex mcp add jdwp-inspector -- java --add-modules jdk.jdi,jdk.attach -jar /path/to/mcp-jdwp-java.jar
 ```
 
-This writes an entry to `~/.codex/config.toml`. Give that entry timeouts that fit the server: Spring Boot takes a few seconds to start, and `jdwp_resume_until_event` and `jdwp_wait_for_attach` block for as long as the `timeoutMs` the agent passes, so the tool-call timeout should exceed the longest wait you expect:
+This writes an entry to `~/.codex/config.toml`. Spring Boot takes a few seconds to start. Set the client tool-call timeout above the longest wait you expect. `jdwp_resume_until_event` and `jdwp_wait_for_attach` can block for the supplied `timeoutMs`, and a step with `wait=true` can block for 30 seconds.
 
 ```toml
 [mcp_servers.jdwp-inspector]
@@ -666,12 +666,15 @@ jdwp_resume_until_event(timeoutMs=30000)
 → blocks until next breakpoint/step/exception, returns context immediately
 ```
 
-Replaces the manual "resume → poll events → poll events" pattern. The agent resumes and gets the next stop in one synchronous call. Returns one of:
+An unfiltered `jdwp_resume_until_event()` presents the oldest unseen stop immediately. With no unseen stop, it releases presented stops and manual holds before waiting, unless any step is pending. Pass `threadId=T` to present the oldest unseen stop on T and, if a release is needed, release only T. A pending step suppresses the targeted release pass only when the step is on T. If T is already running, the call can wait for its next stop without releasing anything. Other threads' unseen stops stay suspended and the reply counts them when there are any. The wait identifies a blocker, such as another thread's unseen stop-all, even if it arrives after the wait starts.
+
+The reply describes how the wait ended.
 
 - `Event fired …` — a BP / step / exception suspended a thread; the message includes thread + stop site
 - `[TIMEOUT] …` — the wait expired without an event; the message offers `wait_more` / `reconnect` / `abort` and reports JDI health so the agent never blindly hangs
-- `[RESUME_FAILED] …` — a release failed or lease debt remains unpaid. The reply reports completed releases and gives the affected thread IDs and targeted retry calls when available.
-- `[VM_DEATH] …` — the target connection closed before the next stop
+- `[RESUME_FAILED] …` — a release failed or lease debt remains unpaid. A targeted wait reports only recovery holds affecting its thread. The reply reports completed releases and gives targeted retry calls when available.
+- `[VM_DEATH] …` — the target VM died. The reply names a selected stop if there was one.
+- `[CONNECTION_CHANGED] …` — a targeted wait or resume fetched a VM from a different connection. Verify the target and look up a fresh ID with `jdwp_get_threads` before retrying.
 - `[NO_EVENT] …` — `jdwp_reset` ran while the call waited. See the reset reply for any holds retained after a failed release, then set breakpoints again.
 
 The same soft-wait envelope wraps `jdwp_wait_for_attach`, so bootstrap and resume share one "wait sensibly, decide deliberately" idiom.
@@ -704,7 +707,9 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 ### Stepping: when it's worth it
 
-`jdwp_step_over`, `jdwp_step_into` and `jdwp_step_out` release the selected thread and report remaining stops and manual holds. A stop-all still covers threads JDI omits from the list, including virtual threads on some JVMs. Call `jdwp_resume_until_event` to wait for the landing. Omit `threadId` to step the thread of the current stop.
+`jdwp_step_over`, `jdwp_step_into` and `jdwp_step_out` release the selected thread and report remaining stops and manual holds. A stop-all still covers threads JDI omits from the list, including virtual threads on some JVMs. Omit `threadId` to step the thread of the current stop.
+
+Use `wait=true` to append that step's landing or interrupting stop in the same call. If another call already presented that stop, the step reply identifies it as already presented. Stops on other threads stay unseen. The wait is bounded at 30 seconds. If it times out, the step stays pending. Use `jdwp_resume_until_event(threadId=T)` to continue waiting or to collect the stop after a step made with the default `wait=false`.
 
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
@@ -746,12 +751,12 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_resume`             | —            | Release the stops you have seen and `jdwp_suspend_thread` holds; event sets still being processed keep their threads until processed |
 | `jdwp_resume_thread`      | `threadId`   | Resume a specific thread. Retrying a failed automatic stop-all release releases the VM-wide suspension. |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
-| `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until the next breakpoint, step, exception, or timeout. Returns `[RESUME_FAILED]` immediately if a hold cannot be released |
-| `jdwp_step_over`          | `threadId?`  | Step over current line; follow with `resume_until_event`     |
-| `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`      |
-| `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event`  |
+| `jdwp_resume_until_event` | `timeoutMs?`, `threadId?` | Resume and wait for the next stop, optionally scoped to one thread |
+| `jdwp_step_over`          | `threadId?`, `wait?` | Step over the current line and optionally wait for the thread's next stop |
+| `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call and optionally wait for the thread's next stop |
+| `jdwp_step_out`           | `threadId?`, `wait?` | Step out of the current frame and optionally wait for the thread's next stop |
 
-Resume replies list which holds were released and which failed, with the JDI exception. For unpaid lease debt or a failed automatic release in a `[RESUME_FAILED]` reply, use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach.
+Resume replies list which holds were released and which failed, with the JDI exception. For `[RESUME_FAILED]`, use `jdwp_resume_thread(threadId=…)` with the reported retry thread ID when available. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach.
 
 ### Breakpoints (10)
 
@@ -1072,7 +1077,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 | MCP server times out on startup                 | JVM startup takes several seconds. Claude Code: start it with a longer wait, e.g. `MCP_TIMEOUT=60000 claude` (the variable must be in Claude Code's environment, not in the server's `env`). Codex: raise `startup_timeout_sec` of a manual registration; with the plugin, start a new session. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | First expression evaluation returns `[STILL_RUNNING]` | If the reply names local classpath discovery, check its progress with `jdwp_diagnose`. An evaluation that takes over 20 s returns `[STILL_RUNNING]` and finishes in the background; its result shows up in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`. Once it has finished, later evaluations use the cached classpath. |
-| A long `jdwp_resume_until_event` / `jdwp_wait_for_attach` is cut off by the client | The client's tool-call timeout is shorter than the `timeoutMs` passed. Codex: raise `tool_timeout_sec` of a manual registration. Claude Code waits long by default; raise `MCP_TOOL_TIMEOUT` in its environment if it is set low. |
+| The client cuts off a blocking resume, attach, or step | Set the client tool-call timeout above the call's `timeoutMs` or the 30-second limit for a step with `wait=true`. Codex: raise `tool_timeout_sec` of a manual registration. Claude Code waits long by default; raise `MCP_TOOL_TIMEOUT` in its environment if it is set low. |
 | `resume_until_event` returns `[TIMEOUT]` / `[RESUME_FAILED]` / `[NO_EVENT]` | `[TIMEOUT]` reports the transport's health when the wait expires. For `[RESUME_FAILED]`, use the targeted retry in the reply when available. See [Execution control](#execution-control-7) for the scope of each resume tool. `[NO_EVENT]` means reset ran during the wait. Check its reply for failed holds and set breakpoints again. |
 | Build fails with Error Prone / toolchain error  | Building from source needs JDK 21+ on the toolchain. The bytecode target stays at Java 17, but the build step itself needs ≥21 because Error Prone 2.48 ships Java-21 bytecode. |
 

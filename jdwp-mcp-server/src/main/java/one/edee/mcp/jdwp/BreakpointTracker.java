@@ -1735,6 +1735,11 @@ public class BreakpointTracker {
         publishOrCandidate(new LastBreakpoint(thread, breakpointId));
     }
 
+    /** Proposes a breakpoint stop with a user-code site already resolved by its handler. */
+    public void setLastBreakpointThread(ThreadReference thread, int breakpointId, String sourceSite) {
+        publishOrCandidate(new LastBreakpoint(thread, breakpointId, EventKind.BREAKPOINT, sourceSite));
+    }
+
     /**
      * Kind-aware variant of {@link #setLastBreakpointThread(ThreadReference, int)}. Used by the
      * JDI listener for STEP and EXCEPTION events so the renderer can label the suspension
@@ -1818,15 +1823,15 @@ public class BreakpointTracker {
     }
 
     /**
-     * Opens the suspension-ownership session of a new connection, closing the previous one; called
-     * by {@link JdiEventListener#start}.
+     * Opens the suspension-ownership session for the listener's VM, closing the previous session.
+     * Called by {@link JdiEventListener#start}.
      */
-    public SuspensionSession openSuspensionSession(EventHistory history) {
+    public SuspensionSession openSuspensionSession(VirtualMachine vm, EventHistory history) {
         final SuspensionSession previous = suspensionSession;
         if (previous != null) {
             previous.close();
         }
-        final SuspensionSession session = new SuspensionSession(this, history);
+        final SuspensionSession session = new SuspensionSession(vm, this, history);
         suspensionSession = session;
         return session;
     }
@@ -1971,8 +1976,10 @@ public class BreakpointTracker {
      *               snapshot for {@link EventKind#STEP}; always {@code null} for
      *               {@link EventKind#EXCEPTION} (normalised by the canonical constructor)
      * @param kind   the {@link EventKind} that produced the suspension
+     * @param sourceSite the handler's user-code location, when different from the event location
      */
-    public record LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind) {
+    public record LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind,
+                                 @Nullable String sourceSite) {
         /**
          * Canonical constructor. Normalises {@code (kind, id)} consistency: EXCEPTION snapshots
          * always carry {@code id=null} because there is no associated BP context. BREAKPOINT and
@@ -1983,6 +1990,11 @@ public class BreakpointTracker {
             if (kind == EventKind.EXCEPTION || kind == EventKind.VM_START) {
                 id = null;
             }
+        }
+
+        /** A stop whose location comes from the event set. */
+        public LastBreakpoint(ThreadReference thread, @Nullable Integer id, EventKind kind) {
+            this(thread, id, kind, null);
         }
 
         /**

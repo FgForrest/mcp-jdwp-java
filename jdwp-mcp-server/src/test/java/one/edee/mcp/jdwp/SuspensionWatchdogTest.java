@@ -33,12 +33,13 @@ class SuspensionWatchdogTest {
 	private final AtomicLong now = new AtomicLong();
 	private SuspensionWatchdog watchdog;
 
+	/** Binds the suspension fixture to the simulated VM. */
 	@BeforeEach
 	void setUp() throws Exception {
 		model = new FakeSuspendModel();
 		t = model.thread("t");
 		u = model.thread("u");
-		session = new BreakpointTracker().openSuspensionSession(new EventHistory());
+		session = new BreakpointTracker().openSuspensionSession(model.vm, new EventHistory());
 		watchdog = new SuspensionWatchdog(session, now::get);
 		// The dispatcher processes a stop-all of t and invokes on t; u, parked by it, owns the monitor
 		// the invoked code waits for.

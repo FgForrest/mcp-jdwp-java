@@ -241,6 +241,7 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
+	/** A fast stop also records the user site for replies that can no longer read its frames. */
 	@Test
 	@Order(6)
 	@DisplayName("a fast stop is inspected at the user's frame: stack, locals, evaluation, set_local, and a step")
@@ -249,8 +250,12 @@ class FastBreakpointLiveTest {
 		// threads one suspension behind (issue #45).
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
 			null, null));
-		assertThat(waitForStop())
-			.contains("fast_breakpoint=" + id + ", condition true");
+		final SuspensionSession suspended = Objects.requireNonNull(session.tracker.suspensionSession());
+		final SuspensionSession.NextStop stop = suspended.nextStop(TIMEOUT.toMillis());
+		assertThat(stop.outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
+		assertThat(stop.report()).isNotNull().satisfies(report ->
+			assertThat(report.locationSuffix()).isEqualTo(" at " + TARGET + ':' + probeLine));
+		assertThat(tools.jdwp_get_current_thread()).contains("fast_breakpoint=" + id + ", condition true");
 		final long threadId = stoppedThread().uniqueID();
 
 		assertThat(tools.jdwp_get_stack(threadId, null, null))
