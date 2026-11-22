@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Objects;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -63,6 +64,155 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
+	}
+
+	/** A replacement workspace can supply a dependency missing from the initial remote options. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void probeUsesReplacementScanDuringFirstCompile(boolean ready, @TempDir Path root) throws Exception {
+		final Path initial = Files.createDirectory(root.resolve("initial"));
+		Files.writeString(initial.resolve("pom.xml"), "<project/>");
+		final Path replacement = Files.createDirectory(root.resolve("replacement"));
+		final Path classes = compileProbeDependency(replacement);
+		final ClientWorkspace workspace = new ClientWorkspace();
+		final CountDownLatch release = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(initial, workspace, name -> null,
+			(command, directory, timeout) -> {
+				assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
+				return directory.equals(replacement) ? List.of(classes.toString()) : List.of();
+			});
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final StackFrame frame = configureProbeFrame(vm, root);
+		final AtomicInteger attempts = new AtomicInteger();
+		final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler() {
+			/** Switches workspaces once, while ECJ still holds the original remote-only options. */
+			@Override
+			Map<String, byte[]> compile(String name, String source, @Nullable Configuration options)
+				throws JdiEvaluationException {
+				if (attempts.getAndIncrement() == 0) {
+					reportWorkspace(workspace, replacement);
+					if (ready) {
+						release.countDown();
+						assertThat(provider.discover()).containsExactly(classes.toString());
+					}
+				}
+				return super.compile(name, source, options);
+			}
+		};
+		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), provider);
+		evaluator.startLocalClasspathDiscovery(vm);
+		try {
+			evaluator.configureCompilerClasspathForEvent(thread);
+			if (ready) {
+				assertThat(compileDependencyProbe(evaluator, frame)).isNotNull();
+				assertThat(attempts).hasValue(2);
+			} else {
+				assertThatThrownBy(() -> compileDependencyProbe(evaluator, frame))
+					.isInstanceOf(LocalClasspathPendingException.class);
+				assertThat(provider.discoveryStatus().running()).isTrue();
+				assertThat(attempts).hasValue(1);
+				release.countDown();
+				assertThat(provider.discover()).containsExactly(classes.toString());
+				evaluator.configureCompilerClasspathForEvent(thread);
+				assertThat(compileDependencyProbe(evaluator, frame)).isNotNull();
+			}
+		} finally {
+			release.countDown();
+			evaluator.stopLocalClasspathDiscovery(vm);
+		}
+	}
+
+	/** Rejects both probe bytecode and a compiler diagnostic from a superseded merged retry. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void probeDiscardsRetryResultWhenWorkspaceChanges(boolean oldDependencyPresent, @TempDir Path root)
+		throws Exception {
+		final Path original = Files.createDirectory(root.resolve("original"));
+		Files.writeString(original.resolve("pom.xml"), "<project/>");
+		final Path oldClasses = oldDependencyPresent ? compileProbeDependency(original) : original;
+		final Path replacement = Files.createDirectory(root.resolve("replacement"));
+		final Path newClasses = compileProbeDependency(replacement);
+		final ClientWorkspace workspace = new ClientWorkspace();
+		final CountDownLatch release = new CountDownLatch(1);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(original, workspace, name -> null,
+			(command, directory, timeout) -> {
+				assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
+				return List.of((directory.equals(original) ? oldClasses : newClasses).toString());
+			});
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final StackFrame frame = configureProbeFrame(vm, root);
+		final AtomicInteger attempts = new AtomicInteger();
+		final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler() {
+			/** Makes the original scan ready, then replaces it while ECJ runs with its result. */
+			@Override
+			Map<String, byte[]> compile(String name, String source, @Nullable Configuration options)
+				throws JdiEvaluationException {
+				final int attempt = attempts.incrementAndGet();
+				if (attempt == 1) {
+					release.countDown();
+					assertThat(provider.discover()).containsExactly(oldClasses.toString());
+				} else if (attempt == 2) {
+					assertThat(Objects.requireNonNull(options).classpath()).contains(oldClasses.toString());
+					reportWorkspace(workspace, replacement);
+					assertThat(provider.discover()).containsExactly(newClasses.toString());
+				}
+				return super.compile(name, source, options);
+			}
+		};
+		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), provider);
+		evaluator.startLocalClasspathDiscovery(vm);
+		try {
+			evaluator.configureCompilerClasspathForEvent(thread);
+			assertThatThrownBy(() -> compileDependencyProbe(evaluator, frame))
+				.isInstanceOf(LocalClasspathPendingException.class)
+				.hasMessageContaining("changed");
+			assertThat(attempts).hasValue(2);
+			verify(jdiService).discoverClasspath(thread);
+			evaluator.configureCompilerClasspathForEvent(thread);
+			assertThat(compileDependencyProbe(evaluator, frame)).isNotNull();
+		} finally {
+			release.countDown();
+			evaluator.stopLocalClasspathDiscovery(vm);
+		}
+	}
+
+	/** Prepares a probe frame whose remote classpath does not contain the Maven dependency. */
+	private StackFrame configureProbeFrame(VirtualMachine vm, Path root) throws Exception {
+		final StackFrame frame = mock(StackFrame.class);
+		when(thread.virtualMachine()).thenReturn(vm);
+		when(frame.virtualMachine()).thenReturn(vm);
+		when(frame.visibleVariables()).thenReturn(List.of());
+		when(jdiService.getDiscoveredJdkPath()).thenReturn(System.getProperty("java.home"));
+		when(jdiService.getTargetMajorVersion()).thenReturn(17);
+		when(jdiService.discoverClasspath(thread)).thenReturn(Files.createDirectory(root.resolve("remote")).toString());
+		return frame;
+	}
+
+	/** Produces a compile-time constant available only through the specified workspace's scan. */
+	private static Path compileProbeDependency(Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), "<project/>");
+		final Path classes = Files.createDirectory(project.resolve("classes"));
+		final Path source = Files.writeString(project.resolve("Dependency.java"),
+			"package fixture; public class Dependency { public static final int VALUE = 42; }");
+		assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+			"-d", classes.toString(), source.toString())).isZero();
+		return classes;
+	}
+
+	/** Reports the new workspace through the same metadata path used by the client. */
+	private static void reportWorkspace(ClientWorkspace workspace, Path directory) {
+		workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", directory.toString())));
+	}
+
+	/** Arms the compile step of a fast logpoint that references the local dependency. */
+	private static FastLogpointProbe compileDependencyProbe(JdiExpressionEvaluator evaluator, StackFrame frame)
+		throws JdiEvaluationException {
+		final String expression = "fixture.Dependency.VALUE";
+		final FastLogpointProbeSource.Metadata metadata = new FastLogpointProbeSource.Metadata(
+			"fixture.Target", "work", "()V", 10, expression, null, 0, "test");
+		return evaluator.compileFastLogpointProbe(frame, false, "fixture", expression, null, 16, metadata);
 	}
 
 	/** Completes discovery during ECJ's first attempt, then checks a typo or a newly available type. */

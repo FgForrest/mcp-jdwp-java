@@ -1605,9 +1605,9 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Compiles on the dispatcher or tool worker. If discovery finished during a failed
-     * remote-only compile, retries once with fresh local entries without walking or waiting.
-     * Throws a pending exception only if the same scan can still supply missing types.
+     * Compiles on the dispatcher or tool worker. After a remote-only missing-type error, reads
+     * the current workspace's scan without waiting. Retries once if ready, or throws a pending
+     * exception if discovery is still running or the retry's classpath is superseded.
      */
     private Compilation compileWithClasspathContext(String className, String sourceCode, CompilerState state)
         throws JdiEvaluationException {
@@ -1618,31 +1618,58 @@ public class JdiExpressionEvaluator {
             return new Compilation(classes, true);
         } catch (JdiEvaluationException failure) {
             final Snapshot captured = state.snapshot();
-            final Snapshot current = localClasspathProvider.snapshotFor(state.vm(), false);
-            if (captured == null || current == null || !captured.sameInput(current, false)) {
+            if (captured == null) {
+                throw failure;
+            }
+            final boolean missingFromRemote = state.mergedLocal() == null
+                && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes;
+            // A workspace reported during ECJ may not have a scan yet. Starting it here
+            // lets this evaluation defer against the replacement without waiting for Maven.
+            final Snapshot current = localClasspathProvider.snapshotFor(state.vm(), missingFromRemote);
+            if (current == null || (!missingFromRemote && !captured.sameInput(current, false))) {
                 throw failure;
             }
             final DiscoveryStatus status = current.status();
-            if (state.mergedLocal() == null && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes) {
+            if (missingFromRemote) {
                 if (status.running()) {
                     throw new LocalClasspathPendingException(failure.getMessage()
                         + "\nLocal classpath discovery is still running. See jdwp_diagnose.", failure);
                 }
                 final LocalProjectClasspathProvider.Breakdown ready = status.breakdown();
-                if (ready != null && options != null
-                    && localClasspathProvider.publishIfCurrent(state.vm(), current, true, () -> {})) {
-                    final InMemoryJavaCompiler.Configuration merged = new InMemoryJavaCompiler.Configuration(
-                        options.jdkPath(), mergeClasspaths(options.classpath(), ready.all()), options.targetMajorVersion());
-                    try {
-                        // These options are local to this retry. The original cache belongs to
-                        // the captured remote-only options until normal configuration publishes a merge.
-                        return new Compilation(compiler.compile(className, sourceCode, merged), false);
-                    } catch (JdiEvaluationException retryFailure) {
-                        throw withDiscoveryProblem(retryFailure, status);
-                    }
+                if (ready != null && options != null) {
+                    return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready);
                 }
             }
             throw withDiscoveryProblem(failure, status);
+        }
+    }
+
+    /** Retries once with local entries and accepts the result only while its snapshot is current. */
+    private Compilation retryWithLocalClasspath(String className, String sourceCode, @Nullable VirtualMachine vm,
+                                               InMemoryJavaCompiler.Configuration remote, Snapshot current,
+                                               LocalProjectClasspathProvider.Breakdown ready)
+        throws JdiEvaluationException {
+        final InMemoryJavaCompiler.Configuration merged = new InMemoryJavaCompiler.Configuration(
+            remote.jdkPath(), mergeClasspaths(remote.classpath(), ready.all()), remote.targetMajorVersion());
+        requireCurrentRetryClasspath(vm, current);
+        final Map<String, byte[]> classes;
+        try {
+            classes = compiler.compile(className, sourceCode, merged);
+        } catch (JdiEvaluationException failure) {
+            requireCurrentRetryClasspath(vm, current);
+            throw withDiscoveryProblem(failure, current.status());
+        }
+        // The retry does not populate the cache tied to the captured remote-only options.
+        requireCurrentRetryClasspath(vm, current);
+        return new Compilation(classes, false);
+    }
+
+    /** Rejects superseded options or results without waiting on discovery or invoking the target. */
+    private void requireCurrentRetryClasspath(@Nullable VirtualMachine vm, Snapshot snapshot)
+        throws LocalClasspathPendingException {
+        if (!localClasspathProvider.publishIfCurrent(vm, snapshot, true, () -> {})) {
+            throw new LocalClasspathPendingException(
+                "The local classpath changed during compilation. Retry with the current project classpath.", null);
         }
     }
 

@@ -27,6 +27,30 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("LocalProjectClasspathProvider — Maven dependency:build-classpath")
 class LocalProjectClasspathProviderMavenTest {
 
+	/** Reports a POM-directed export as missing discovery output and leaves the project file alone. */
+	@Test
+	void shouldReportWhenPluginWritesOutsidePrivateDirectory(@TempDir Path project) throws Exception {
+		Files.writeString(project.resolve("pom.xml"), """
+			<project><build><plugins><plugin>
+			  <artifactId>maven-dependency-plugin</artifactId>
+			  <configuration><outputFile>target/custom.cp</outputFile></configuration>
+			</plugin></plugins></build></project>
+			""");
+		final Path export = Files.createDirectory(project.resolve("target")).resolve("custom.cp");
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(request -> {
+			Files.writeString(export, "/m2/project-dependency.jar");
+			return 0;
+		});
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null, runner);
+
+		final LocalProjectClasspathProvider.Breakdown result = provider.discoverWithBreakdown();
+
+		assertThat(result.failure()).contains("Maven classpath discovery failed",
+			"wrote no classpath output", "outputFile", "POM");
+		assertThat(result.all()).isEmpty();
+		assertThat(export).hasContent("/m2/project-dependency.jar");
+	}
+
 	/** Runs dependency discovery from a Maven project's root and includes the runner's entries. */
 	@Test
 	@DisplayName("invokes Maven dependency:build-classpath when pom.xml is at the working directory")

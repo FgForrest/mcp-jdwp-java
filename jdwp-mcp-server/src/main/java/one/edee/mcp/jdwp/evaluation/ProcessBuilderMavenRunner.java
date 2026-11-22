@@ -11,17 +11,17 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.DirectoryIteratorException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -53,6 +53,8 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
 
     /** Uses full Maven coordinates because a reactor can build multiple versions of an artifact. */
     private static final String MODULE_OUTPUT = "${project.groupId}@${project.artifactId}@${project.version}.cp";
+    /** Passes the private path outside argv so platform launchers cannot reinterpret it. */
+    private static final String OUTPUT_DIRECTORY_ENV = "JDWP_MCP_CLASSPATH_DIR";
     /** Upper bound on captured child stdout/stderr included in the WARN log on failure. */
     private static final int STDOUT_CAPTURE_BYTES = 64 * 1024;
     /**
@@ -105,15 +107,16 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         final Path outputDirectory = Files.createTempDirectory("jdwp-mcp-maven-classpath-").toAbsolutePath();
         try {
             final List<String> argv = new ArrayList<>(command);
-            // Pass the template literally. Maven interpolates it against each reactor project's
-            // coordinates. '@' separates group and artifact IDs without colliding with either.
-            argv.add("-Dmdep.outputFile=" + outputDirectory.resolve(MODULE_OUTPUT));
+            // Maven expands the environment reference and reactor coordinates for each module.
+            // Keep the absolute path out of argv, especially when launching mvnw.cmd on Windows.
+            argv.add("-Dmdep.outputFile=${env." + OUTPUT_DIRECTORY_ENV + "}/" + MODULE_OUTPUT);
             final int exitCode = commandExecutor.execute(new CommandRequest(List.copyOf(argv), workingDirectory,
-                timeoutSeconds));
+                timeoutSeconds, outputDirectory));
             switch (exitCode) {
                 case -1 -> throw new IOException("Maven timed out after " + timeoutSeconds + " seconds");
-                case 127 -> throw new IOException("Maven executable not found: " + command.get(0));
-                case 126 -> throw new IOException("Maven executable not executable: " + command.get(0));
+                case 126, 127 -> throw new IOException("Maven executable could not be started: " + command.get(0)
+                    + " (exit code " + exitCode + "). Check for a missing interpreter, CRLF line endings,"
+                    + " or a missing inner command.");
                 case 0 -> { return harvestOutputFiles(outputDirectory); }
                 default -> throw new IOException("Maven exited with code " + exitCode);
             }
@@ -126,22 +129,27 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     /**
-     * Reads the run's flat output directory on the discovery worker. Returns the union of entries
-     * or throws with partial results. An interrupted read cancels discovery instead.
+     * Reads regular files recursively without following links, including paths nested by a version.
+     * Returns the union of entries, reports read failures with partial results, and treats an
+     * interrupted read as cancellation. A successful Maven run must produce at least one file.
      */
     private static List<String> harvestOutputFiles(Path directory) throws IOException, InterruptedException {
         checkDiscoveryInterrupted();
         final Set<String> entries = new LinkedHashSet<>();
         final List<IOException> failures = new ArrayList<>();
-        try (DirectoryStream<Path> files = Files.newDirectoryStream(directory)) {
-            for (Path file : files) {
+        boolean foundOutput = false;
+        try (Stream<Path> paths = Files.walk(directory)) {
+            final Iterator<Path> files = paths.iterator();
+            while (files.hasNext()) {
                 checkDiscoveryInterrupted();
+                final Path file = files.next();
                 try {
-                    if (file.getFileName().toString().contains("${")) {
-                        throw new IOException("Maven did not expand the classpath output path");
-                    }
                     if (Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)
                         .isRegularFile()) {
+                        foundOutput = true;
+                        if (directory.relativize(file).toString().contains("${")) {
+                            throw new IOException("Maven did not expand the classpath output path");
+                        }
                         readOutputFile(file, entries);
                     }
                 } catch (IOException e) {
@@ -151,7 +159,7 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
                     failures.add(new IOException("Could not read classpath output " + file + ": " + e, e));
                 }
             }
-        } catch (DirectoryIteratorException e) {
+        } catch (UncheckedIOException e) {
             final IOException cause = Objects.requireNonNull(e.getCause());
             checkHarvestInterrupted(cause);
             failures.add(cause);
@@ -162,6 +170,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         checkDiscoveryInterrupted();
         if (!failures.isEmpty()) {
             throw new OutputReadException(List.copyOf(entries), failures);
+        }
+        if (!foundOutput) {
+            throw new IOException("Maven succeeded but wrote no classpath output. "
+                + "Check whether the POM configures the dependency plugin's outputFile.");
         }
         return List.copyOf(entries);
     }
@@ -295,9 +307,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     /**
-     * Drains output while waiting for Maven on the discovery worker. Cleans up before joining
-     * the drainer, since a reparented helper can hold the pipe open. Returns the Maven exit code,
-     * or {@code -1} on timeout, and propagates interruption or a status-channel failure.
+     * Exports the private output directory and drains output while waiting on the discovery worker.
+     * Cleans up before joining the drainer, since a reparented helper can hold the pipe open.
+     * Returns the Maven exit code, or {@code -1} on timeout, and propagates interruption or a
+     * status-channel failure.
      */
     private static int collectProcessOutput(CommandRequest req, List<String> command, @Nullable Path status)
         throws IOException, InterruptedException {
@@ -315,8 +328,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         // atomic and the toString() snapshot consistent.
         final Object capturedLock = new Object();
         final Set<ProcessHandle> observed = new LinkedHashSet<>();
-        final Process process = new ProcessBuilder(command).directory(req.workingDirectory().toFile())
-            .redirectErrorStream(true).start();
+        final ProcessBuilder builder = new ProcessBuilder(command).directory(req.workingDirectory().toFile())
+            .redirectErrorStream(true);
+        builder.environment().put(OUTPUT_DIRECTORY_ENV, req.outputDirectory().toString());
+        final Process process = builder.start();
         final Thread drainer;
         int exit = -1;
         IOException statusFailure = null;
@@ -562,6 +577,6 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         int execute(CommandRequest request) throws IOException, InterruptedException;
     }
 
-    /** Bundles the inputs the {@link CommandExecutor} needs so the seam stays a single-arg lambda. */
-    record CommandRequest(List<String> command, Path workingDirectory, int timeoutSeconds) {}
+    /** Carries the argv, process directory, timeout and private output directory to the executor. */
+    record CommandRequest(List<String> command, Path workingDirectory, int timeoutSeconds, Path outputDirectory) {}
 }

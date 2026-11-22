@@ -4,13 +4,13 @@ import org.jspecify.annotations.Nullable;
 
 import java.io.Serial;
 
-/** An unresolved type may become available when local classpath discovery is merged. */
+/** Compilation can be retried when discovery is ready or when an earlier classpath was superseded. */
 public final class LocalClasspathPendingException extends JdiEvaluationException {
     /** Serialization version for this discovery exception. */
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** Signals a pending local classpath and preserves the compiler failure if one occurred. */
+    /** Signals a retryable classpath condition with an optional compiler failure. */
     public LocalClasspathPendingException(String message, @Nullable Throwable cause) {
         super(message, cause);
     }

@@ -409,6 +409,7 @@ class JDWPToolsDiagnoseTest {
 			#!/bin/sh
 			touch started
 			while [ ! -f finish ]; do sleep 0.05; done
+			: > "$JDWP_MCP_CLASSPATH_DIR/fixture@empty@1.cp"
 			""");
 		assertThat(wrapper.toFile().setExecutable(true)).isTrue();
 		final ProcessBuilderMavenRunner runner;
