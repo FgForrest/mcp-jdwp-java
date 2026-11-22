@@ -16,14 +16,17 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -64,7 +67,20 @@ class InvocationRunnerTest {
 			(command, directory, timeout) -> { release.await(); return List.of(); });
 		final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(mock(InMemoryJavaCompiler.class),
 			mock(JDIConnectionService.class), new EvaluationGuard(), provider);
-		final InvocationRunner runner = runner(500);
+		final AtomicReference<Thread> worker = new AtomicReference<>();
+		final InvocationRunner runner = new InvocationRunner(command -> {
+			pool.execute(() -> {
+				worker.set(Thread.currentThread());
+				command.run();
+			});
+			// The runner starts its deadline after Executor.execute returns. Wait for the
+			// actual classpath wait so this test exercises the deadline in that phase.
+			await().atMost(30, TimeUnit.SECONDS).until(() -> {
+				final Thread thread = worker.get();
+				return thread != null && Arrays.stream(thread.getStackTrace()).anyMatch(frame ->
+					frame.getClassName().equals("java.util.concurrent.FutureTask") && frame.getMethodName().equals("get"));
+			});
+		}, 100, history, () -> session);
 		final ThreadReference target = thread("main", 1);
 		try {
 			assertThatThrownBy(() -> runner.run(target, "evaluating a.MissingType.VALUE", () -> {

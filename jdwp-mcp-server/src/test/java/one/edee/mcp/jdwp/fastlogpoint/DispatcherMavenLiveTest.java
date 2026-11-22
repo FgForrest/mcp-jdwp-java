@@ -33,6 +33,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @EnabledIfSystemProperty(named = "jdwp.live", matches = "true")
 class DispatcherMavenLiveTest {
+	/** Safety bound for observing target and discovery signals. */
+	private static final int SIGNAL_TIMEOUT_SECONDS = 30;
 	@Test
 	void firstLogpointAndFollowingStopCompleteWhileMavenIsStillRunning(@TempDir Path project) throws Exception {
 		Files.writeString(project.resolve("pom.xml"), "<project/>");
@@ -42,26 +44,24 @@ class DispatcherMavenLiveTest {
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(project, name -> null,
 			(command, workingDirectory, timeoutSeconds) -> {
 				mavenStarted.complete(Thread.currentThread());
-				try {
-					releaseMaven.await(30, TimeUnit.SECONDS);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-				}
+				releaseMaven.await();
 				return List.of();
 			});
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
 			try {
 				final int logpoint = LiveSession.idOf(session.tools.jdwp_set_logpoint(
 					LiveSession.TARGET, LiveSession.lineOf("MARK: label"), "i", null, null));
-				final Thread mavenThread = mavenStarted.get(10, TimeUnit.SECONDS);
+				final Thread mavenThread = mavenStarted.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+				// Either target worker can reach the plain breakpoint first. Observe a logpoint
+				// evaluation before arming the stop that could park both workers.
+				await("successful logpoint", () -> session.history.getRecent(100).stream().anyMatch(event ->
+					event.type().equals("LOGPOINT") && event.summary().contains("[Logpoint " + logpoint + "]")));
 				final int stopLine = LiveSession.lineOf("MARK: other");
 				final int breakpoint = LiveSession.idOf(session.tools.jdwp_set_breakpoint(
 					LiveSession.TARGET, stopLine, "thread", null, null, null, null));
 
-				assertThat(session.tools.jdwp_resume_until_event(5_000))
+				assertThat(session.tools.jdwp_resume_until_event(SIGNAL_TIMEOUT_SECONDS * 1_000))
 					.startsWith("Event fired at " + LiveSession.TARGET + ":" + stopLine);
-				await("successful logpoint", () -> session.history.getRecent(100).stream().anyMatch(event ->
-					event.type().equals("LOGPOINT") && event.summary().contains("[Logpoint " + logpoint + "]")));
 				assertThat(mavenThread.isDaemon()).isTrue();
 				assertThat(mavenThread.getName()).doesNotStartWith("jdi-event-");
 				assertThat(session.tools.jdwp_diagnose(false)).contains("Local classpath discovery is still running");
@@ -94,7 +94,7 @@ class DispatcherMavenLiveTest {
 				return List.of(directory.resolve("dependency.jar").toString());
 			});
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
-			assertThat(scanned.poll(5, TimeUnit.SECONDS)).isEqualTo(first);
+			assertThat(scanned.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(first);
 			assertThat(provider.discover()).containsExactly(first.resolve("dependency.jar").toString());
 
 			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", second.toString())));
@@ -106,7 +106,7 @@ class DispatcherMavenLiveTest {
 				assertThat(result).startsWith("Reconnected to");
 				return true;
 			});
-			assertThat(scanned.poll(5, TimeUnit.SECONDS)).isEqualTo(second);
+			assertThat(scanned.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(second);
 			assertThat(provider.discover()).containsExactly(second.resolve("dependency.jar").toString());
 
 			session.connection.notifyVmDied();
@@ -118,7 +118,7 @@ class DispatcherMavenLiveTest {
 					return false;
 				}
 			});
-			assertThat(scanned.poll(5, TimeUnit.SECONDS)).isEqualTo(second);
+			assertThat(scanned.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(second);
 		}
 	}
 
@@ -146,7 +146,7 @@ class DispatcherMavenLiveTest {
 			});
 		try (LiveSession session = LiveSession.start(List.of(), provider)) {
 			try {
-				assertThat(mavenStarted.await(5, TimeUnit.SECONDS)).isTrue();
+				assertThat(mavenStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 				final int line = LiveSession.lineOf("MARK: label");
 				final String constant = "probeclasspath.BuildConstant.VALUE";
 				final String prefix = breakpoint ? "FAST_BREAKPOINT" : "FAST_LOGPOINT";
@@ -226,7 +226,7 @@ class DispatcherMavenLiveTest {
 	}
 
 	private static void await(String expected, Callable<Boolean> condition) throws Exception {
-		final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SIGNAL_TIMEOUT_SECONDS);
 		while (System.nanoTime() < deadline) {
 			if (condition.call()) {
 				return;

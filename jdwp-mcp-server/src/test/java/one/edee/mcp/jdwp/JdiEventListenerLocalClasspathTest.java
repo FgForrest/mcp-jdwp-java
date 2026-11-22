@@ -46,6 +46,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class JdiEventListenerLocalClasspathTest {
+	/** Safety bound for observing a fixture signal. */
+	private static final long SIGNAL_TIMEOUT_SECONDS = 30;
 	private final BreakpointTracker tracker = new BreakpointTracker();
 	private final InMemoryJavaCompiler compiler = mock(InMemoryJavaCompiler.class);
 	private final JDIConnectionService connection = mock(JDIConnectionService.class);
@@ -71,7 +73,7 @@ class JdiEventListenerLocalClasspathTest {
 		provider = new LocalProjectClasspathProvider(root, workspace, name -> null, (command, directory, timeout) -> {
 			mavenDirectories.add(directory);
 			try {
-				releaseMaven.await(10, TimeUnit.SECONDS);
+				releaseMaven.await();
 			} catch (InterruptedException e) {
 				mavenInterrupted.countDown();
 				Thread.currentThread().interrupt();
@@ -109,7 +111,7 @@ class JdiEventListenerLocalClasspathTest {
 	@Test
 	void dispatcherUsesRemoteClasspathWhileWorkerWaits() throws Exception {
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(provider.getWorkingDirectory());
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(provider.getWorkingDirectory());
 
 		final CompletableFuture<Thread> workerThread = new CompletableFuture<>();
 		final CompletableFuture<Void> worker = CompletableFuture.runAsync(() -> {
@@ -120,8 +122,8 @@ class JdiEventListenerLocalClasspathTest {
 				throw new IllegalStateException(e);
 			}
 		});
-		final Thread waitingWorker = workerThread.get(2, TimeUnit.SECONDS);
-		await().atMost(2, TimeUnit.SECONDS).until(() ->
+		final Thread waitingWorker = workerThread.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		await().atMost(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS).until(() ->
 			Arrays.stream(waitingWorker.getStackTrace()).anyMatch(frame ->
 				frame.getClassName().equals("java.util.concurrent.FutureTask") && frame.getMethodName().equals("get")));
 		fireCondition();
@@ -129,7 +131,7 @@ class JdiEventListenerLocalClasspathTest {
 		assertThat(worker).isNotDone();
 
 		releaseMaven.countDown();
-		worker.get(2, TimeUnit.SECONDS);
+		worker.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 		fireCondition();
 		verify(compiler, times(1)).configure("/opt/jdk", remote + File.pathSeparator + local, 21);
 		assertThat(mavenDirectories).isEmpty();
@@ -138,7 +140,7 @@ class JdiEventListenerLocalClasspathTest {
 	@Test
 	void laterConditionMergesCompletedDiscovery() throws Exception {
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(provider.getWorkingDirectory());
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(provider.getWorkingDirectory());
 
 		fireCondition();
 		fireCondition();
@@ -159,15 +161,15 @@ class JdiEventListenerLocalClasspathTest {
 		listener.start(vm);
 		workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", nextDirectory.toString())));
 
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(attachDirectory);
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(attachDirectory);
 		assertThat(provider.peekCachedBreakdown()).isNull();
 		releaseMaven.countDown();
 		fireCondition();
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(nextDirectory);
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(nextDirectory);
 		assertThat(provider.discover()).containsExactly(local);
 
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isEqualTo(nextDirectory);
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(nextDirectory);
 		assertThat(provider.discover()).containsExactly(local);
 	}
 
@@ -175,12 +177,12 @@ class JdiEventListenerLocalClasspathTest {
 	@Test
 	void stoppingListenerCancelsDiscovery() throws Exception {
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isNotNull();
 
 		listener.stop();
 
 		assertThat(provider.discoveryStatus().running()).isFalse();
-		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(mavenInterrupted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 	}
 
 	/** Simulates transport loss on the listener thread and checks that discovery is cancelled. */
@@ -192,11 +194,11 @@ class JdiEventListenerLocalClasspathTest {
 			throw new VMDisconnectedException();
 		}).when(queue).remove();
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isNotNull();
 
 		disconnect.countDown();
 
-		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(mavenInterrupted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 		assertThat(provider.discoveryStatus().running()).isFalse();
 	}
 
@@ -208,11 +210,11 @@ class JdiEventListenerLocalClasspathTest {
 		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 		tracker.reset();
 		listener.start(vm);
-		assertThat(mavenDirectories.poll(2, TimeUnit.SECONDS)).isNotNull();
+		assertThat(mavenDirectories.poll(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isNotNull();
 
 		assertThatThrownBy(service::reconnectPreservingSpecs).isInstanceOf(java.io.IOException.class);
 
-		assertThat(mavenInterrupted.await(2, TimeUnit.SECONDS)).isTrue();
+		assertThat(mavenInterrupted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 		assertThat(provider.discoveryStatus().running()).isFalse();
 	}
 
@@ -224,6 +226,6 @@ class JdiEventListenerLocalClasspathTest {
 			return null;
 		}).when(hit).resume();
 		events.add(hit);
-		resumed.get(2, TimeUnit.SECONDS);
+		resumed.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 	}
 }

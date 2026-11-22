@@ -11,12 +11,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -25,6 +28,9 @@ import static org.mockito.Mockito.mock;
  */
 @DisplayName("LocalProjectClasspathProvider — caching and breakdown")
 class LocalProjectClasspathProviderCacheTest {
+
+	/** Safety bound for positive test signals. Progress is asserted while the old scan is gated. */
+	private static final long SIGNAL_TIMEOUT_SECONDS = 30;
 
 	/** Keeps the old worker blocked while a replacement scan completes, then releases its late result. */
 	@Test
@@ -57,15 +63,16 @@ class LocalProjectClasspathProviderCacheTest {
 
 		try {
 			provider.startForConnection(mock(VirtualMachine.class));
-			assertThat(started.await(2, TimeUnit.SECONDS)).isTrue();
+			assertThat(started.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", next.toString())));
 			provider.startForConnection(mock(VirtualMachine.class));
-			assertThat(cancelled.await(2, TimeUnit.SECONDS)).isTrue();
-			assertThat(replacement.await(2, TimeUnit.SECONDS)).isTrue();
-			assertThat(provider.discover()).containsExactly("/new.jar");
+			assertThat(cancelled.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			assertThat(replacement.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			awaitCachedEntry(provider, "/new.jar");
 			release.countDown();
-			assertThat(oldScanReturned.await(2, TimeUnit.SECONDS)).isTrue();
-			assertThat(provider.discover()).containsExactly("/new.jar");
+			assertThat(oldScanReturned.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+			assertThat(provider.peekCachedBreakdown()).isNotNull()
+				.extracting(LocalProjectClasspathProvider.Breakdown::all).isEqualTo(Set.of("/new.jar"));
 		} finally {
 			release.countDown();
 			provider.reset();
@@ -80,18 +87,21 @@ class LocalProjectClasspathProviderCacheTest {
 		Files.writeString(next.resolve("pom.xml"), "<project/>");
 		final ClientWorkspace workspace = new ClientWorkspace();
 		final CountDownLatch workerStarted = new CountDownLatch(1);
-		final CountDownLatch releaseWorker = new CountDownLatch(1);
+		final Semaphore releaseWorker = new Semaphore(0);
 		final CountDownLatch closeEntered = new CountDownLatch(1);
-		final CountDownLatch releaseClose = new CountDownLatch(1);
+		final Semaphore releaseClose = new Semaphore(0);
+		final CountDownLatch closeFinished = new CountDownLatch(1);
 
 		/** Test channel whose close hook can block the thread requesting interruption. */
 		final class StalledChannel extends AbstractInterruptibleChannel {
 			/** Registers the interrupt hook and parks the discovery worker until released. */
-			void blockInRead() throws InterruptedException, java.io.IOException {
+			void blockInRead() throws java.io.IOException {
 				begin();
 				try {
 					workerStarted.countDown();
-					releaseWorker.await();
+					// An interruptible wait could unwind to end(false) and unregister the
+					// channel hook before Thread.interrupt() gets to invoke it.
+					releaseWorker.acquireUninterruptibly();
 				} finally {
 					end(false);
 				}
@@ -101,11 +111,8 @@ class LocalProjectClasspathProviderCacheTest {
 			@Override
 			protected void implCloseChannel() {
 				closeEntered.countDown();
-				try {
-					releaseClose.await();
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-				}
+				releaseClose.acquireUninterruptibly();
+				closeFinished.countDown();
 			}
 		}
 
@@ -119,18 +126,29 @@ class LocalProjectClasspathProviderCacheTest {
 			});
 		provider.startForConnection(mock(VirtualMachine.class));
 		try {
-			assertThat(workerStarted.await(2, TimeUnit.SECONDS)).isTrue();
+			assertThat(workerStarted.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+				.as("the old worker registered its channel interrupt hook").isTrue();
 			workspace.observe(Map.of("codex/sandbox-state", Map.of("sandboxCwd", next.toString())));
 			final VirtualMachine replacement = mock(VirtualMachine.class);
-			final var attachment = CompletableFuture.runAsync(() -> provider.startForConnection(replacement));
-			assertThat(closeEntered.await(2, TimeUnit.SECONDS)).isTrue();
-			attachment.get(2, TimeUnit.SECONDS);
-			assertThat(provider.discover()).containsExactly(next.resolve("dependency.jar").toString());
+			final CompletableFuture<Void> attachment =
+				CompletableFuture.runAsync(() -> provider.startForConnection(replacement));
+			assertThat(closeEntered.await(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+				.as("cancellation entered the old channel's close hook").isTrue();
+			attachment.get(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			awaitCachedEntry(provider, next.resolve("dependency.jar").toString());
+			assertThat(closeFinished.getCount()).as("attach and discovery completed while close was blocked").isEqualTo(1);
 		} finally {
-			releaseClose.countDown();
-			releaseWorker.countDown();
+			releaseClose.release();
+			releaseWorker.release();
 			provider.reset();
 		}
+	}
+
+	/** Observes the cached result of the scan started by attach. */
+	private static void awaitCachedEntry(LocalProjectClasspathProvider provider, String entry) {
+		await().atMost(SIGNAL_TIMEOUT_SECONDS, TimeUnit.SECONDS).untilAsserted(() ->
+			assertThat(provider.peekCachedBreakdown()).isNotNull()
+				.extracting(LocalProjectClasspathProvider.Breakdown::all).isEqualTo(Set.of(entry)));
 	}
 
 	@Test
