@@ -38,13 +38,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Tests the discovery-failure and pre-warm semantics of
- * {@link JdiExpressionEvaluator#configureCompilerClasspath(ThreadReference)} and
- * {@link JdiExpressionEvaluator#prewarmClasspath(ThreadReference)}.
- *
- * <p>Covers the classpath-warming lifecycle contract: a failed discovery must reset
- * the compiler (so no stale config survives), surface an actionable exception from the strict path,
- * and stay silent on the best-effort pre-warm path.
+ * Tests on-demand compiler configuration, including local classpath publication and reset after
+ * discovery failure.
  */
 class JdiExpressionEvaluatorConfigureClasspathTest {
 
@@ -411,13 +406,10 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		verify(compiler, never()).configure(any(), any(), org.mockito.ArgumentMatchers.anyInt());
 	}
 
+	/** Reuses options when the connection and the completed local discovery still match. */
 	@Test
 	@DisplayName("A completed full configure short-circuits a second call without re-discovering")
 	void shouldShortCircuitWhenAlreadyConfigured() throws Exception {
-		// First call: discovery succeeds and the local fallback is merged → the connection is fully
-		// configured. A non-null JDK path alone is NOT enough to short-circuit a real evaluation now
-		// (prewarm leaves it set with the local fallback still pending); only a completed full
-		// configure is. Drive one full configure, then assert the second call does nothing.
 		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, "/opt/jdk");
 		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
 		when(jdiService.getTargetMajorVersion()).thenReturn(21);
@@ -430,28 +422,6 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		verify(compiler, never()).reset();
 		verify(compiler, never()).configure(any(), any(), org.mockito.ArgumentMatchers.anyInt());
 		verify(jdiService, never()).discoverClasspath(any());
-	}
-
-	@Test
-	@DisplayName("prewarm warms remote+JDK but defers local merge; first real eval completes it")
-	void prewarmDefersLocalMergeUntilFirstEvaluation() throws Exception {
-		final LocalProjectClasspathProvider local = new LocalProjectClasspathProvider(
-			java.nio.file.Path.of("missing-classpath-fixture"), name -> "/local/a", (c, d, t) -> java.util.List.of());
-		final JdiExpressionEvaluator deferEvaluator = new JdiExpressionEvaluator(
-			compiler, jdiService, new EvaluationGuard(), local);
-		final VirtualMachine vm = mock(VirtualMachine.class);
-		when(thread.virtualMachine()).thenReturn(vm);
-		deferEvaluator.startLocalClasspathDiscovery(vm);
-		local.discover();
-
-		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, null, "/opt/jdk");
-		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
-		when(jdiService.getTargetMajorVersion()).thenReturn(21);
-
-		deferEvaluator.prewarmClasspath(thread);
-		verify(compiler).configure("/opt/jdk", "/app/classes", 21);
-		deferEvaluator.configureCompilerClasspath(thread);
-		verify(compiler).configure("/opt/jdk", "/app/classes" + java.io.File.pathSeparator + "/local/a", 21);
 	}
 
 	@Test
@@ -468,24 +438,4 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 		verify(compiler).configure("/opt/jdk", "/app/classes:/app/lib.jar", 21);
 	}
 
-	@Test
-	@DisplayName("prewarmClasspath swallows a discovery failure instead of throwing")
-	void prewarmShouldNotThrowOnFailure() {
-		when(jdiService.getDiscoveredJdkPath()).thenReturn(null);
-		when(jdiService.discoverClasspath(thread)).thenReturn(null);
-
-		assertThatCode(() -> evaluator.prewarmClasspath(thread)).doesNotThrowAnyException();
-		verify(compiler).reset();
-	}
-
-	@Test
-	@DisplayName("prewarmClasspath short-circuits when the connection is already configured")
-	void prewarmShouldShortCircuitWhenConfigured() {
-		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
-
-		evaluator.prewarmClasspath(thread);
-
-		verify(jdiService, never()).discoverClasspath(any());
-		verify(compiler, never()).reset();
-	}
 }

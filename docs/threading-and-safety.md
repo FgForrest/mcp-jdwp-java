@@ -11,7 +11,7 @@ Every concurrency decision in the code orbits these actors.
 | **Spring `main`** | `JDWPMcpServerApplication.main` | Boots the context, then idles. No HTTP listener (`spring.main.web-application-type=none`). |
 | **MCP STDIO worker** | `MultiVersionStdioServerTransportProvider` (Spring AI MCP) | Reads JSON-RPC frames from `System.in`, dispatches to `@McpTool` methods one at a time, writes responses to `System.out`. |
 | **`jdi-event-listener`** | Spawned by `JdiEventListener.start(vm)` on every `connect()` | Daemon. Drains `vm.eventQueue().remove()` and routes event sets. Exactly one at a time — `start()` calls `stop()` first. Never calls into the target itself. |
-| **`jdi-event-dispatcher`** | Single-thread executor created by `JdiEventListener.start(vm)`, shut down by `stop()` | Daemon. Processes the routed event sets in arrival order — handlers, logpoint and condition evaluation, fast-logpoint arming, remote classpath pre-warm — and ends each with `SuspensionSession.finish`: publish a stop, or release the set. |
+| **`jdi-event-dispatcher`** | Single-thread executor created by `JdiEventListener.start(vm)`, shut down by `stop()` | Daemon. Processes the routed event sets in arrival order — handlers, logpoint and condition evaluation, and fast-probe arming — and ends each with `SuspensionSession.finish`: publish a stop, or release the set. |
 | **`jdi-local-classpath`** | One daemon thread per discovery | Resolves the environment override, scans the project, and runs Maven when the root has a `pom.xml`. Teardown interrupts the old scan. A replacement has its own worker and private Maven output directory. The dispatcher checks for a ready result at publication and after a remote-only missing-type error. After an ECJ retry it checks that the result still belongs to the current workspace. Tool evaluations can wait outside the compiler and suspension-session monitors. |
 | **`jdi-suspension-watchdog`** | `SuspensionWatchdog.start(session)`, called by `JdiEventListener.start(vm)` | Daemon, one per session. Every 500 ms samples the dispatcher's invocations and frees the owner of a monitor a stuck one waits for ([event-pipeline.md](event-pipeline.md) § 14). Stops once its session is closed. |
 | **`jdi-invoker-N`** | `InvocationRunner.newPool()`, a cached pool `JDWPTools` creates | Daemon, created on demand. Runs a tool's invoking work — an evaluation, `toString()`, force-loading a class — while the MCP worker waits at most 20 s (§ 5). A hung job pins its thread until the connection ends. |
@@ -79,7 +79,7 @@ Use sites:
 
 - `JdiExpressionEvaluator.systemClassLoader` — the `getSystemClassLoader()` fallback.
 - `RemoteCodeExecutor` — the wrapper method invoke, `ClassLoader.defineClass`, `Class.forName`.
-- `ClasspathDiscoverer` and `JdkDiscoveryService` — `System.getProperty`, the classloader walk.
+- `ClasspathDiscoverer` — the `getURLs()` fallback for custom classloaders during compiler setup.
 - `JDIConnectionService.findOrForceLoadClass` — `Class.forName`.
 - `JDWPTools.jdwp_to_string` — `Object.toString`.
 - `FastLogpointService` — reading the class file (`getResourceAsStream`, `read`, `close`).
@@ -121,7 +121,7 @@ try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
 
 `EvaluationGuard` keeps one **hold** per target thread, keyed by `uniqueID()`: the Java thread running the invocation chain, and the session that admitted it.
 
-- **Same chain re-enters.** `lease(T)` from the Java thread that already holds T returns a nested lease that ends nothing — classpath discovery inside an evaluation, say.
+- **Same chain re-enters.** `lease(T)` from the Java thread that already holds T returns a nested lease that ends nothing when compiler setup runs inside an invocation chain.
 - **Other chains are refused.** `lease(T)` from any other Java thread throws `EvaluationRefusedException` ("an evaluation on thread T is already running"). The JDWP agent runs one invocation per thread, and a second chain would spend the suspension the first one borrows. The hold is taken with `putIfAbsent`, so two racing chains cannot both win.
 - **Admission.** The outermost lease is also taken in the bound session: `SuspensionSession.lease(T)` admits the invocation or refuses it with a reason, checks T's suspend count against the holds it knows, and takes T out of every other stop that suspends it ([event-pipeline.md](event-pipeline.md) § 14, "Leases and admission"). A refusal removes the hold again.
 - **End.** Closing the outermost lease calls `SuspensionSession.unlease(T)` first — T's own events stay suppressed meanwhile — and then removes the hold by identity, so a hold of an earlier connection never removes one of the current connection. A failed suspend can use a remaining lease debt count to restore the hold. A failed debt repayment leaves the count available for retry and wakes next-stop waiters.
@@ -132,7 +132,7 @@ The listener checks `isEvaluating` before it routes a set (`fromEvaluatingThread
 
 Lease sites:
 
-- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and around classpath discovery in `configureCompilerClasspath`.
+- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and around `configureCompilerClasspath` for a possible custom-loader fallback.
 - `FastLogpointService` — the arming, once around reading the class file and once around defining the probe.
 - `JDIConnectionService.findOrForceLoadClass` — around `Class.forName`.
 - `JDWPTools.jdwp_to_string` — around `toString()`.
@@ -182,7 +182,7 @@ So the lease captures the `long` once, when it is taken and the thread is provab
 
 No lock is held across `invokeMethod`: the guard's maps are lock-free, and the session monitor is held only inside `lease` and `unlease`, not across the call. T is never re-suspended by the pipeline while the server is waiting on it. The same mechanism covers nested `Class.forName`, `toString`, `getSystemClassLoader`, and step events fired during evaluation.
 
-Ordinary conditions and logpoint expressions, fast-probe arming and classpath prewarm run on the `jdi-event-dispatcher` thread. A navigation plan uses the frame held by the event set and takes no lease. A compiled plan can block the dispatcher at step 4 while the listener keeps draining. Step 6 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and handles that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. A dispatcher invocation borrows the count of the set being processed; it does not go through `InvocationRunner`, and the `SuspensionWatchdog` watches it instead ([event-pipeline.md](event-pipeline.md) § 14).
+Ordinary conditions, logpoint expressions and fast-probe arming run on the `jdi-event-dispatcher` thread. The dispatcher configures the classpath when one of these needs compilation. A navigation plan uses the frame held by the event set and takes no lease. A compiled plan can block the dispatcher at step 4 while the listener keeps draining. Step 6 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and handles that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. A dispatcher invocation borrows the count of the set being processed; it does not go through `InvocationRunner`, and the `SuspensionWatchdog` watches it instead ([event-pipeline.md](event-pipeline.md) § 14).
 
 ### Bounded waits — `InvocationRunner`
 

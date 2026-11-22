@@ -36,8 +36,8 @@ import java.util.function.Consumer;
  * <p>
  * Threading: the listener thread only drains the queue and routes each event set; the sets are
  * processed, in arrival order, on one `jdi-event-dispatcher` thread per connection. Processing
- * invokes methods in the target (logpoint and condition evaluation, fast-logpoint arming, classpath
- * pre-warm), and an invoked method can hit a breakpoint of its own. That event's set must be drained
+ * can invoke methods in the target during compiled logpoint and condition evaluation and fast-probe
+ * arming. An invoked method can hit a breakpoint of its own. That event's set must be drained
  * and resumed while the invocation is still waiting, so a set whose thread is inside an MCP-driven
  * evaluation ({@link EvaluationGuard}) is {@link #suppress}ed on the listener thread at once: routed
  * as a context and released; that path never calls into the target. Every other set becomes a QUEUED
@@ -688,19 +688,17 @@ public class JdiEventListener {
      * suspending event keeps every thread in the set parked for user inspection. A death event records
      * {@code VM_DEATH}, clears {@link #running}, and fires the resume-until-event latch before the
      * listener invokes the {@link #vmDeathHook}. The rest of its set is not processed.
+     * Compiler setup runs only when an event's evaluation or probe arming needs it.
      *
      * @return whether the caller should resume the set
      */
     private boolean process(EventSet eventSet, @Nullable SuspensionSession suspensions,
                             SuspensionSession.@Nullable Context context) {
         boolean shouldSuspend = false;
-        // First thread parked for inspection in this set; used to pre-warm the compiler
-        // classpath once the set has been handled (see the prewarm call below).
-        ThreadReference warmThread = null;
         final FastLogpointService fastLogpointService = fastLogpoints;
         List<BreakpointEvent> armingHits = null;
 
-        for (Event event : eventSet) {
+        for (final Event event : eventSet) {
             if (event instanceof BreakpointEvent bpEvent
                 && fastLogpointService != null && fastLogpointService.claimsArmingEvent(bpEvent)) {
                 if (armingHits == null) {
@@ -729,23 +727,17 @@ public class JdiEventListener {
             // breakpoint records its snapshot before its condition is evaluated).
             final int candidates = candidateMark(suspensions, context);
             final boolean stop;
-            ThreadReference stopThread = null;
             if (event instanceof BreakpointEvent bpEvent
                 && fastLogpointService != null && fastLogpointService.claimsStopEvent(bpEvent)) {
                 stop = fastLogpointService.handleStopHit(bpEvent);
-                stopThread = bpEvent.thread();
             } else if (event instanceof BreakpointEvent bpEvent) {
                 stop = handleBreakpointEvent(bpEvent);
-                stopThread = bpEvent.thread();
             } else if (event instanceof StepEvent stepEvent) {
                 stop = handleStepEvent(stepEvent);
-                stopThread = stepEvent.thread();
             } else if (event instanceof ExceptionEvent exEvent) {
                 stop = handleExceptionEvent(exEvent);
-                stopThread = exEvent.thread();
             } else if (event instanceof WatchpointEvent wpEvent) {
                 stop = handleWatchpointEvent(wpEvent);
-                stopThread = wpEvent.thread();
             } else if (event instanceof ClassPrepareEvent cpEvent) {
                 handleClassPrepareEvent(cpEvent);
                 if (fastLogpointService != null) {
@@ -756,16 +748,12 @@ public class JdiEventListener {
                 log.info("[JDI] VM started — keeping suspended for breakpoint setup");
                 eventHistory.record(new EventHistory.DebugEvent("VM_START", "VM started"));
                 breakpointTracker.setLastSuspendingEvent(vmStart.thread(), BreakpointTracker.EventKind.VM_START);
-                // The JDWP agent does not enable method invocation at VM start: no pre-warm.
                 stop = true;
             } else {
                 stop = false;
             }
             if (stop) {
                 shouldSuspend = true;
-                if (warmThread == null) {
-                    warmThread = stopThread;
-                }
             } else {
                 withdrawCandidates(suspensions, context, candidates);
             }
@@ -774,35 +762,20 @@ public class JdiEventListener {
         // Arm last: arming redefines the class, which replaces the JDI requests behind any
         // other breakpoint event of this set located in the same class.
         if (armingHits != null && fastLogpointService != null) {
-            for (BreakpointEvent armingHit : armingHits) {
+            for (final BreakpointEvent armingHit : armingHits) {
                 final int candidates = candidateMark(suspensions, context);
                 // A fast breakpoint's arming hit whose condition holds is published as its stop. A set
                 // that stops keeps its thread for the user, so arming must not obsolete its frame.
                 if (fastLogpointService.handleArmingHit(armingHit, shouldSuspend)
                     == FastLogpointService.ArmingOutcome.STOPPED) {
                     shouldSuspend = true;
-                    if (warmThread == null) {
-                        warmThread = armingHit.thread();
-                    }
                 } else {
                     withdrawCandidates(suspensions, context, candidates);
                 }
             }
         }
 
-        if (shouldSuspend) {
-            // The set stays parked for inspection. Pre-warm the compiler classpath now — still
-            // inside the set's processing, before its stop is published, so no tool can touch the
-            // thread meanwhile — on the first suspending thread, so the agent's first
-            // evaluate_expression does not pay the one-time ~1-3s discovery cost. Runs only on the
-            // first stop per connection and never for a set that suspends nothing (its thread runs).
-            // Never throws (warming failures are logged and retried by the real evaluation call).
-            if (warmThread != null && eventSet.suspendPolicy() != EventRequest.SUSPEND_NONE) {
-                expressionEvaluator.prewarmClasspath(warmThread);
-            }
-            return false;
-        }
-        return true;
+        return !shouldSuspend;
     }
 
     /**
@@ -864,7 +837,7 @@ public class JdiEventListener {
     /**
      * Handles, on the listener thread, a set raised inside an MCP-driven evaluation (see
      * {@link #fromEvaluatingThread}) and resumes it, so the invocation waiting for its thread can
-     * finish. Only suppresses: it never evaluates, arms or pre-warms, whatever the evaluation guard
+     * finish. Only suppresses: it never evaluates or arms, whatever the evaluation guard
      * says by now — the listener thread must never call into the target. A class prepare still
      * promotes the deferred breakpoints of its class, which touches debugger-side state only.
      */

@@ -63,9 +63,15 @@ final class InterpreterBaseline {
 
     record Sample(Map<Command, Long> before, Map<Command, Long> configured, Map<Command, Long> after,
                   long classpathNanos, long compileNanos, long totalNanos, int bytes) {
+        /** Checks the standard loader's read-only discovery and the wrapper's invocation budget. */
         void verify(boolean cold) {
             final long discovery = discoveryPackets();
             assertThat(discovery).matches(count -> cold ? count > 0 : count == 0);
+            assertThat(configured.getOrDefault(CLASS_INVOKE, 0L)).isEqualTo(before.getOrDefault(CLASS_INVOKE, 0L));
+            assertThat(configured.getOrDefault(OBJECT_INVOKE, 0L)).isEqualTo(before.getOrDefault(OBJECT_INVOKE, 0L));
+            if (cold) {
+                assertThat(totalPackets()).isLessThan(229);
+            }
             assertThat(delta(CLASS_INVOKE)).isEqualTo(2);
             assertThat(delta(OBJECT_INVOKE)).isEqualTo(cold ? 1 : 0);
             assertThat(delta(ARRAY_SET_VALUES)).isEqualTo(cold ? 1 : 0);

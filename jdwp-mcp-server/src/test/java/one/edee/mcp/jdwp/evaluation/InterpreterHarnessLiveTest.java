@@ -646,7 +646,8 @@ class InterpreterHarnessLiveTest {
         };
     }
 
-    private static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
+    /** Plants a VM attached through the packet-counting transport into a connection service. */
+    static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
         final JDIConnectionService connection = new JDIConnectionService(mock(JdiEventListener.class),
             new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
             new MarkedInstanceRegistry(), new JdiHealthMonitor(), mock(JvmDiscoveryService.class)) {

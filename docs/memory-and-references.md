@@ -202,11 +202,11 @@ There is **no recursive descent into entry values**. Each key and value goes thr
 
 ## 9. Classpath discovery is transient
 
-`ClasspathDiscoverer` walks the target's classloader hierarchy to find every JAR for ECJ to compile against. The walk uses `invokeMethod` (`URLClassLoader.getURLs()`, `ClassLoader.getParent()`, etc.) and returns ObjectReferences for each URL — but **none of them are routed through `cacheObject(...)`**. They never touch `formatFieldValue`, so they never land in the `objectCache`.
+`ClasspathDiscoverer` walks the target's classloader hierarchy to find classpath entries for ECJ. The walk uses JDI field reads and can invoke `getURLs()` when a loader's effective URL list is unavailable through fields. The URL mirrors are used directly by discovery, outside the `formatFieldValue` and `cacheObject(...)` paths.
 
 The references are held only for the duration of the discovery call and become eligible for GC on both sides once the local references go out of scope. The JDI implementation releases the corresponding JDWP IDs lazily.
 
-The result of discovery — the list of JAR paths as strings — **is** cached, in `JDIConnectionService.cachedClasspath` (`volatile List<String>`). That cache is invalidated on disconnect and on `notifyVmDied`, and is rebuilt the next time an expression evaluator needs to configure the compiler. See [expression-evaluation.md](expression-evaluation.md) § "Compilation classpath" for the discovery details.
+The result of discovery — the ordered classpath string — is cached in `JDIConnectionService.cachedClasspath`. That cache is invalidated on disconnect and on `notifyVmDied`, and is rebuilt the next time an expression evaluator needs to configure the compiler. See [expression-evaluation.md](expression-evaluation.md) § "Compilation classpath" for the discovery details.
 
 ## 10. Memory summary
 

@@ -31,6 +31,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -59,9 +60,10 @@ class JdiEventListenerConditionEvaluationTest {
 	private JdiExpressionEvaluator evaluator;
 	private JdiEventListener listener;
 
+	/** Wires the listener with an observable tracker for the dispatcher interrupt test. */
 	@BeforeEach
 	void setUp() {
-		tracker = new BreakpointTracker();
+		tracker = spy(new BreakpointTracker());
 		eventHistory = new EventHistory();
 		evaluator = mock(JdiExpressionEvaluator.class);
 		listener = new JdiEventListener(tracker, eventHistory, evaluator, new EvaluationGuard(), null, new MarkedInstanceRegistry(), JDWPToolsTestSupport.compiled(evaluator));
@@ -176,34 +178,33 @@ class JdiEventListenerConditionEvaluationTest {
 	@Test
 	@DisplayName("evaluateCondition preserves interrupt status when the evaluator throws InterruptedException")
 	void shouldPreserveInterruptStatusWhenConditionEvaluatorThrowsInterrupted() throws Exception {
-		BreakpointRequest bp = mock(BreakpointRequest.class);
-		int bpId = tracker.registerBreakpoint(bp);
+		final BreakpointRequest bp = mock(BreakpointRequest.class);
+		final int bpId = tracker.registerBreakpoint(bp);
 		tracker.setCondition(bpId, "neverTerminates()");
 
-		ThreadReference thread = mockThread("worker-cond-interrupt", 1104L);
-		StackFrame frame = mock(StackFrame.class);
+		final ThreadReference thread = mockThread("worker-cond-interrupt", 1104L);
+		final StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
 
 		// Mockito rejects checked-throws for methods that don't declare them, so we throw the
 		// InterruptedException through thenAnswer which has no signature validation.
-		AtomicReference<Thread> evaluatingThread = new AtomicReference<>();
+		final AtomicReference<Thread> evaluatingThread = new AtomicReference<>();
 		when(evaluator.evaluate(any(StackFrame.class), anyString(), any()))
 			.thenAnswer(invocation -> {
 				evaluatingThread.set(Thread.currentThread());
 				throw new InterruptedException("simulated interrupt");
 			});
-		// The fail-safe parks the thread, so the set's processing ends with the classpath pre-warm —
-		// on the same thread, after evaluateCondition returned. Record what that call observes.
-		AtomicReference<Thread> warmingThread = new AtomicReference<>();
-		AtomicBoolean interruptedWhileWarming = new AtomicBoolean();
+		// The dispatcher records the chain trigger after the fail-safe condition result.
+		final AtomicReference<Thread> triggerThread = new AtomicReference<>();
+		final AtomicBoolean interruptedAtTrigger = new AtomicBoolean();
 		doAnswer(invocation -> {
-			warmingThread.set(Thread.currentThread());
-			interruptedWhileWarming.set(Thread.currentThread().isInterrupted());
-			return null;
-		}).when(evaluator).prewarmClasspath(any());
+			triggerThread.set(Thread.currentThread());
+			interruptedAtTrigger.set(Thread.currentThread().isInterrupted());
+			return invocation.callRealMethod();
+		}).when(tracker).markTriggerFired(bpId);
 
-		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 14);
-		EventSet eventSet = mockEventSet(event);
+		final BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 14);
+		final EventSet eventSet = mockEventSet(event);
 
 		runListenerWith(listener, eventSet);
 
@@ -211,11 +212,11 @@ class JdiEventListenerConditionEvaluationTest {
 		verify(eventSet, never()).resume();
 		assertThat(hasEventOfType("BREAKPOINT")).isTrue();
 
-		assertThat(warmingThread.get())
-			.as("the pre-warm must run on the thread that evaluated the condition")
+		assertThat(triggerThread.get())
+			.as("the trigger must be recorded on the thread that evaluated the condition")
 			.isNotNull()
 			.isSameAs(evaluatingThread.get());
-		assertThat(interruptedWhileWarming.get())
+		assertThat(interruptedAtTrigger.get())
 			.as("evaluateCondition must restore interrupt status when the evaluator throws InterruptedException")
 			.isTrue();
 	}

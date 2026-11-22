@@ -23,7 +23,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -1615,9 +1614,8 @@ public class JDIConnectionService {
     }
 
     /**
-     * Discovers and caches the full classpath of the target JVM, including JARs loaded dynamically
-     * by Tomcat / container classloaders that don't appear in `java.class.path`. Result is cached
-     * after the first successful call and reused until {@link #cleanupSessionState}.
+     * Discovers and caches the target VM's launch classpath and URL-based loader repositories.
+     * The first successful result is reused until {@link #cleanupSessionState}.
      * <p>
      * Side effects: also populates {@link #discoveredJdkPath} and {@link #targetMajorVersion} via
      * {@link JdkDiscoveryService} so the JDT compiler can be configured.
@@ -1626,9 +1624,8 @@ public class JDIConnectionService {
      * can be found — the {@link JdkDiscoveryService.JdkNotFoundException} is
      * caught here and never bubbles out.
      *
-     * @param suspendedThread thread already suspended at a JDI method-invocation event (breakpoint
-     *                        or step); plain `vm.suspend()` is not enough because the discovery uses
-     *                        `INVOKE_SINGLE_THREADED` which requires a usable invocation thread
+     * @param suspendedThread compilation thread. A custom loader fallback requires an event
+     *                        suspension that admits method invocation.
      * @return classpath string (separator inferred from the first entry), or `null` on any failure
      */
     @Nullable
@@ -1656,11 +1653,15 @@ public class JDIConnectionService {
             final DiscoveryResult result = discoverer.discoverFullClasspath(suspendedThread);
 
             final Set<String> classpathEntries = result.applicationClasspath();
-            // Infer the target's separator from the first entry. Windows uses semicolons.
-            final String separator = classpathEntries.stream().findFirst()
-                .map(path -> path.contains("\\") ? ";" : ":")
-                .orElse(File.pathSeparator);
-            final String resolved = classpathEntries.isEmpty() ? null : String.join(separator, classpathEntries);
+            final String resolved;
+            if (classpathEntries.isEmpty()) {
+                resolved = null;
+            } else {
+                // Infer the target's separator from the first entry. Windows uses semicolons.
+                final String first = classpathEntries.iterator().next();
+                final String separator = first.contains("\\") ? ";" : ":";
+                resolved = String.join(separator, classpathEntries);
+            }
             synchronized (this) {
                 // The remote walk ran outside the service monitor and might have outlived its VM.
                 if (vm != currentVm) {
