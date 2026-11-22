@@ -35,6 +35,8 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Owns every fast logpoint ({@code jdwp_set_fast_logpoint}): registration, arming, reading the
@@ -173,9 +175,15 @@ public class FastLogpointService {
     private static final Set<String> BOXED_TYPES = Set.of("java.lang.Integer", "java.lang.Long", "java.lang.Short",
         "java.lang.Byte", "java.lang.Character", "java.lang.Boolean", "java.lang.Float", "java.lang.Double");
 
+    /** ECJ's diagnostic for an unresolved bare variable, with or without its longer wording. */
+    private static final Pattern UNRESOLVED_VARIABLE = Pattern.compile(
+        "(?m)(?:^|: )(\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)"
+            + " cannot be resolved(?: to a variable)?\\h*$");
+
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
+    /** The same compiled engine serves arming-hit evaluations and in-target probe generation. */
     private final JdiExpressionEvaluator expressionEvaluator;
     /**
      * Written into every probe this server arms ({@code MCP_ARMED_BY}): the product and an opaque
@@ -580,7 +588,7 @@ public class FastLogpointService {
             deferForLocalClasspath(flp);
             return ArmingOutcome.RESUME;
         } catch (Exception | LinkageError e) {
-            markFailed(flp, describe(e), !(e instanceof UncertainRedefinitionException));
+            markFailed(flp, describeProbeFailure(flp.kind, e, thread), !(e instanceof UncertainRedefinitionException));
             return ArmingOutcome.RESUME;
         }
     }
@@ -1803,7 +1811,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describe(e), context, thread);
+            recordArmingHit(flp, "FAST_LOGPOINT_ERROR", describeProbeFailure(flp.kind, e, thread), context, thread);
         }
         log.debug("[FastLogpoint] #{} arming hit at {}", flp.id, location);
     }
@@ -3053,6 +3061,45 @@ public class FastLogpointService {
         return message != null && !message.isBlank() ? message : e.getClass().getSimpleName();
     }
 
+    /**
+     * Describes a probe compilation failure and adds the ordinary probe hint for a visibility
+     * diagnostic or an unresolved name that belongs to the arming receiver.
+     */
+    static String describeProbeFailure(Kind kind, Throwable failure, ThreadReference thread) {
+        final String message = describe(failure);
+        if (failure instanceof JdiEvaluationException && message.startsWith("Compilation failed:")
+            && (message.contains(" is not visible") || unresolvedReceiverField(message, thread))) {
+            return message + "\n" + kind.fallbackTool
+                + " can interpret the same navigation expression and reach private members, "
+                + "at the cost of a debugger round trip per hit.";
+        }
+        return message;
+    }
+
+    /** Checks the receiver's declared and inherited fields while the arming frame is still readable. */
+    private static boolean unresolvedReceiverField(String message, ThreadReference thread) {
+        final Matcher unresolved = UNRESOLVED_VARIABLE.matcher(message);
+        if (!unresolved.find()) {
+            return false;
+        }
+        try {
+            final StackFrame frame = thread.frame(0);
+            final ObjectReference receiver = frame.thisObject();
+            if (receiver != null) {
+                final List<Field> fields = receiver.referenceType().allFields();
+                do {
+                    final String name = unresolved.group(1);
+                    if (fields.stream().anyMatch(field -> field.name().equals(name))) {
+                        return true;
+                    }
+                } while (unresolved.find());
+            }
+        } catch (IncompatibleThreadStateException | RuntimeException ignored) {
+            // A lost frame or VM can only suppress the hint, never replace the original diagnostic.
+        }
+        return false;
+    }
+
     // ── Fast breakpoints ──
 
     /**
@@ -3263,7 +3310,7 @@ public class FastLogpointService {
     }
 
     /**
-     * On the dispatcher, evaluates the condition and any admitted capture outside the monitor.
+     * Runs the condition and any admitted capture through the compiled evaluator outside the monitor.
      * This execution runs the old code, so the probe never sees it. A hit that stops (the condition
      * holds or fails, and its gate is open) is published at once and installs nothing — redefining the
      * method now would leave this stopped frame in an obsolete method without locals. A true stop
@@ -3282,7 +3329,7 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception e) {
             requireStillSuspended(thread, e);
-            condition = new ArmingCondition(false, describe(e));
+            condition = new ArmingCondition(false, describeProbeFailure(flp.kind, e, thread));
         }
         final String error = condition.error();
         final int epoch;
@@ -3344,8 +3391,9 @@ public class FastLogpointService {
     }
 
     /**
-     * Evaluates the capture of a true arming hit through the debugger, on the dispatcher, with the same
-     * rendering as the installed probe. Returns the value or {@code capture failed: …} text.
+     * Evaluates a true arming hit's capture through the compiled evaluator on the dispatcher, with
+     * the same value rendering as the installed probe. A compiler visibility error or an unresolved
+     * receiver field can also include a hint to use an ordinary logpoint for the capture expression.
      * Throws if local discovery is pending or the event thread has resumed.
      */
     private String evaluateArmingCapture(FastLogpoint flp, ThreadReference thread)
@@ -3357,7 +3405,10 @@ public class FastLogpointService {
             throw pending;
         } catch (Exception | LinkageError e) {
             requireStillSuspended(thread, e);
-            return FastBreakpointProbeSource.captureFailure(describe(e));
+            final String diagnostic = describe(e);
+            final String withHint = describeProbeFailure(Kind.LOGPOINT, e, thread);
+            // Cap the diagnostic before appending the debugger hint.
+            return FastBreakpointProbeSource.captureFailure(diagnostic) + withHint.substring(diagnostic.length());
         }
     }
 

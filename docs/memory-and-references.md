@@ -101,14 +101,11 @@ Marks are cleared on VM death (`JDIConnectionService.java:411`), explicit discon
 
 `MarkedInstanceRegistry.buildBindings()` (`MarkedInstanceRegistry.java:191`) returns a `Map<String, Value>` keyed `"$" + label`. The "$" sigil is a constant at `marks/MarkedInstanceRegistry.java:43`. Entries whose underlying ObjectReference has been collected since the mark are silently skipped (line 190) but stay in the registry so `jdwp_overview` can still surface them with a "(collected)" hint.
 
-The bindings are merged into the evaluator's `extraBindings` map at the call sites that evaluate expressions:
-
-- Conditional breakpoints, logpoints, watchers, field watchpoints, exception logpoints — all go through `JdiEventListener.mergeMarkedBindings(extraBindings)` (`JdiEventListener.java:884-899`), called at `JdiEventListener.java:879` and `:925`.
-- `jdwp_evaluate_expression` and `jdwp_assert_expression` — merge at `JDWPTools.java:3677` and `:3717`.
-
-The evaluator picks them up at `JdiExpressionEvaluator.java:294-322` and appends them as wrapper-method parameters. A user expression like `$customer.getId() == orderId` resolves `$customer` to the pinned mark and `orderId` to a frame local, with no ambiguity. Reserved binding names are validated up front so a mark can't shadow `$exception` or `$oldValue`.
+The evaluation, assertion and watcher tools pass these marks to the router. Ordinary conditions and logpoints merge in event bindings before routing. Navigation resolves a mark alongside frame locals, and the compiled wrapper receives marks as method parameters. Reserved names keep marks distinct from bindings such as `$exception` and `$oldValue`.
 
 ## 5. Wrapper bytecode in the target — the permanent allocation
+
+Navigation avoids creating a wrapper class. String literals and concatenation can create target String mirrors, which are pinned during evaluation and formatting and released afterwards.
 
 > **Background — when is a Java class actually unloaded?**
 >
@@ -134,6 +131,8 @@ If a session does enough churn to make this matter, the answer is to disconnect-
 
 ## 6. The compilation cache
 
+Only compiled evaluations populate the wrapper cache. Navigation evaluates a fresh snapshot each time.
+
 `JdiExpressionEvaluator.java:69`:
 
 ```java
@@ -148,7 +147,7 @@ Where `CachedCompilation` carries `(className, bytecode)`. The key is `context.g
 
 > LRU bookkeeping isn't worth it for a cache whose miss cost (compile + cache) is already orders of magnitude larger than just rebuilding the few entries that get hot again.
 
-A full ECJ compile against a fully-loaded classpath plus the JDWP-side `defineClass` (one round-trip per byte!) takes tens to hundreds of milliseconds. Re-doing a hot entry after a flush is cheap relative to maintaining a per-access LRU list under concurrent reads.
+A cache miss compiles with ECJ, uploads the wrapper bytecode and invokes the target classloader to define it. Re-doing a hot entry after a flush is cheap relative to maintaining a per-access LRU list under concurrent reads.
 
 ### Other clear paths
 
@@ -162,13 +161,7 @@ Shipping bytecode to the target requires creating a `byte[]` in the target heap.
 2. **Per-byte loop** calling `vm.mirrorOf(b)` to box each Java `byte` into a JDI `ByteValue` mirror (line 199).
 3. `arrayRef.setValues(0, mirrorBytes, 0, length)` — single round-trip to push the whole list (line 203).
 
-The per-byte loop is the cost. For a typical 1–4 KB wrapper class, that is 1,000–4,000 JDWP requests on a localhost socket. The `setValues` call itself is one request; the per-byte `mirrorOf` is what dominates.
-
-### Why is this unavoidable?
-
-JDI's `ArrayReference.setValues(...)` requires a `List<Value>` of already-mirrored JDI values. There is no API to push raw bytes from server-JVM memory across the wire in one shot — primitives must first be wrapped into JDWP-side mirrors, and `mirrorOf(byte)` is the only way to manufacture a `ByteValue`. The only alternative would be cooperating native or agent code running inside the target JVM (a JVMTI agent, or a pre-installed helper class) — which would defeat the design goal of attaching to an unmodified JDWP target.
-
-This cost dominates first-time expression evaluation. The cache exists in large part to eliminate it on second and subsequent hits of the same expression.
+The per-byte loop creates host-side mirrors. JDWP sends the entire byte array in the single `setValues` command. A cache hit reuses the wrapper already defined in the target and avoids the upload and definition. [Packet measurement](expression-interpreter-harness.md)
 
 ## 8. Smart collection rendering — keeping `jdwp_get_fields` bounded
 

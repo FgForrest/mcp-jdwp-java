@@ -1536,15 +1536,7 @@ public final class SuspensionSession {
             throw new EvaluationRefusedException("thread " + safeName(thread)
                 + " has unpaid lease debt — retry with jdwp_resume_thread");
         }
-        // A job that outlived its tool's wait runs only at the stop it was started at: once none of
-        // its holds is left, the thread may have run on, and a later stop at the same place is
-        // another activation.
-        final Admitted admitted = ADMITTED.get();
-        if (admitted != null && admitted.thread().equals(thread) && !admitted.holds().isEmpty()
-            && Collections.disjoint(admitted.holds(), holdsOn(thread))) {
-            throw new EvaluationRefusedException("thread " + safeName(thread) + " was released from the stop this "
-                + "evaluation started at, and may have run on since — evaluate again at the stop it is at now");
-        }
+        requireAdmittedStop(thread);
         final Context anchor = leaseAnchor(thread);
         final List<Context> others = new ArrayList<>();
         for (Context context : contexts) {
@@ -1577,6 +1569,19 @@ public final class SuspensionSession {
             lease.manualExempt = true;
         }
         leases.put(thread, lease);
+    }
+
+    /** Refuses a worker whose original stop has ended, including its read-only evaluations. */
+    public synchronized void requireAdmittedStop(ThreadReference thread) {
+        // A job that outlived its tool's wait runs only at the stop it was started at: once none of
+        // its holds is left, the thread may have run on, and a later stop at the same place is
+        // another activation.
+        final Admitted admitted = ADMITTED.get();
+        if (admitted != null && admitted.thread().equals(thread) && !admitted.holds().isEmpty()
+            && Collections.disjoint(admitted.holds(), holdsOn(thread))) {
+            throw new EvaluationRefusedException("thread " + safeName(thread) + " was released from the stop this "
+                + "evaluation started at, and may have run on since — evaluate again at the stop it is at now");
+        }
     }
 
     /**

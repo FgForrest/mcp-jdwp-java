@@ -20,14 +20,14 @@ final class InterpreterBaseline {
     private static final Command ARRAY_SET_VALUES = new Command(13, 3);
 
     static final String HEADER = """
-        # Compiled expression baseline
+        # Expression evaluation baseline
 
         Host JVM: %s %s
 
         For each target, five fresh connections each contribute one cold `n + 1` evaluation and
-        five immediately repeated cache hits. One untimed connection per target warms host ECJ
-        before sampling. The cold sample starts with an unconfigured evaluator at the first
-        fixture breakpoint. Local Maven classpath discovery is disabled. Measurement includes
+        five immediately repeated evaluations per engine. One untimed connection per engine and
+        target warms the host before sampling. The cold sample starts at the first
+        fixture breakpoint with the compiler unconfigured. Local Maven classpath discovery is disabled. Measurement includes
         a fresh frame read and production value formatting. Attach, stop setup, semantic
         observation and report writing are outside the timed window.
 
@@ -69,6 +69,13 @@ final class InterpreterBaseline {
             assertThat(delta(CLASS_INVOKE)).isEqualTo(2);
             assertThat(delta(OBJECT_INVOKE)).isEqualTo(cold ? 1 : 0);
             assertThat(delta(ARRAY_SET_VALUES)).isEqualTo(cold ? 1 : 0);
+        }
+
+        void verifyNavigation() {
+            assertThat(discoveryPackets()).isZero();
+            assertThat(delta(CLASS_INVOKE)).isZero();
+            assertThat(delta(OBJECT_INVOKE)).isZero();
+            assertThat(delta(ARRAY_SET_VALUES)).isZero();
         }
 
         private long discoveryPackets() {

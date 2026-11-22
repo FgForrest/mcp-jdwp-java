@@ -25,7 +25,7 @@ The point is: tool calls do not run concurrently with each other. Event sets do 
 `application.properties:9` sets `spring.ai.mcp.server.type=SYNC`. The Spring AI MCP framework serialises tool invocations on the STDIO dispatch thread. Implications:
 
 - **Request order = execution order = response order.** No reordering, no interleaved responses, no out-of-order replies. The client always sees responses in the order it issued requests.
-- **A long tool call blocks the next one.** `jdwp_evaluate_expression` on a cold cache (classpath discovery + ECJ compilation) can take many seconds; nothing else moves until it returns. Tools that invoke in the target wait at most 20 s for it (§ 5), so a blocked invocation cannot take the user's tools away.
+- **A long tool call blocks the next one.** `jdwp_evaluate_expression` on a cold compiler cache (classpath discovery + ECJ compilation) can take many seconds; nothing else moves until it returns. Tools that invoke in the target wait at most 20 s for it (§ 5), so a blocked invocation cannot take the user's tools away.
 - **No reactor pool, no Netty.** Consistent with `web-application-type=none`. The JVM stays small.
 
 The trade is simpler reasoning about state. We do not have to defend `BreakpointTracker.registerBreakpoint` against being called twice in parallel from two tool calls because that cannot happen.
@@ -71,6 +71,8 @@ Without `INVOKE_SINGLE_THREADED`, JDI would resume **all** threads in the target
 
 A single-threaded invocation borrows exactly one of the thread's suspensions: the JDWP agent resumes the thread once to run it and suspends it once when it completes. The thread runs only if that count was its last one.
 
+Navigation evaluation uses JDI reads on a suspended thread and leaves its suspend count alone. It can read a manual hold, another thread's stop-all bystander, and a suspended thread in MONITOR or WAIT. The three ordinary evaluation tools use the same reservation and frame retry as the other frame tools. A plan that needs compilation leaves the reservation before entering invocation admission.
+
 Before an invocation, cheap checks reject an obviously unusable thread: the evaluation tools refuse a thread that is not suspended or is blocked on a monitor or in `Object.wait()` (`checkSafeToInvoke`), and `JDIConnectionService.isUsableForInvoke` (suspended, with frames) picks a thread for force-loading. The deciding check is the session's admission when the lease is taken (§ 5): the thread must be stopped at an event of its own that a tool has presented. A bystander of another thread's stop-all, a `jdwp_suspend_thread` hold or a VM-start stop is refused with a reason instead of an `IncompatibleThreadStateException`.
 
 Use sites:
@@ -103,7 +105,7 @@ This is the most subtle correctness mechanism in the codebase. Read `EvaluationG
 
 ### The problem
 
-The MCP server runs an expression by calling `invokeMethod` on a suspended target-VM thread T. While the expression runs, T executes user bytecode that may re-enter the line that the agent originally breakpointed. JDWP delivers the resulting `BreakpointEvent` to the server's event queue. If the pipeline followed its normal path, it would publish a stop and keep T suspended — but T is **exactly the thread** the outer `invokeMethod` is waiting on. Cross-thread deadlock.
+The compiled evaluator calls `invokeMethod` on a suspended target-VM thread T. While the expression runs, T executes user bytecode that may re-enter the line that the agent originally breakpointed. JDWP delivers the resulting `BreakpointEvent` to the server's event queue. If the pipeline followed its normal path, it would publish a stop and keep T suspended — but T is **exactly the thread** the outer `invokeMethod` is waiting on. Cross-thread deadlock.
 
 The borrowed count (§ 4) adds two more problems. If another thread's stop-all also holds T, the borrowed count is not T's last one and the invocation never runs. And if a tool releases the stop the invocation borrows from while it runs, that release must not be lost or spend the wrong count.
 
@@ -180,15 +182,15 @@ So the lease captures the `long` once, when it is taken and the thread is provab
 
 No lock is held across `invokeMethod`: the guard's maps are lock-free, and the session monitor is held only inside `lease` and `unlease`, not across the call. T is never re-suspended by the pipeline while the server is waiting on it. The same mechanism covers nested `Class.forName`, `toString`, `getSystemClassLoader`, and step events fired during evaluation.
 
-The event pipeline drives evaluations of its own — logpoint expressions, breakpoint conditions, fast-logpoint arming, the classpath pre-warm. Those run on the `jdi-event-dispatcher` thread, so step 4 blocks the dispatcher, not the listener. Step 6 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and handles that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. A dispatcher invocation borrows the count of the set being processed; it does not go through `InvocationRunner`, and the `SuspensionWatchdog` watches it instead ([event-pipeline.md](event-pipeline.md) § 14).
+Ordinary conditions and logpoint expressions, fast-probe arming and classpath prewarm run on the `jdi-event-dispatcher` thread. A navigation plan uses the frame held by the event set and takes no lease. A compiled plan can block the dispatcher at step 4 while the listener keeps draining. Step 6 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and handles that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. A dispatcher invocation borrows the count of the set being processed; it does not go through `InvocationRunner`, and the `SuspensionWatchdog` watches it instead ([event-pipeline.md](event-pipeline.md) § 14).
 
 ### Bounded waits — `InvocationRunner`
 
-Invoked code can block — on a lock a parked thread holds, on a `join`. MCP tool calls are serialized, so a tool blocked in `invokeMethod` would leave the user no tool to release that thread with. So the tools that invoke — `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`, `jdwp_to_string`, and the six paths that force-load a class (`JDWPTools.forceLoad`) — hand their whole invoking work (classpath discovery, the frame read, the evaluation) to `InvocationRunner.run(thread, what, work)`:
+Invoked code can block — on a lock a parked thread holds, on a `join`. MCP tool calls are serialized, so a tool blocked in `invokeMethod` would leave the user no tool to release that thread with. So the compiled branches of `jdwp_evaluate_expression`, `jdwp_assert_expression` and `jdwp_evaluate_watchers`, plus `jdwp_to_string` and force-loading, hand their invoking work to `InvocationRunner.run(thread, what, work)`:
 
 - The job runs on the `jdi-invoker-N` pool; the MCP worker waits at most `InvocationRunner.TIMEOUT_MS` (20 s, well under the 120 s MCP tool timeout).
 - A target thread with a job still running refuses another one at once, before anything is read from it (`[STILL_RUNNING] … wait for EVALUATION_COMPLETED_LATE`). A job of an ended connection refuses nothing: its thread ID may name a thread of the next VM.
-- A job runs only at the stop it was started at. `run` records `holdsOn(T)` and runs the work under `SuspensionSession.admittedUnder`; every lease of T inside is refused once none of those holds is left — the user released the stop after `[STILL_RUNNING]`, and T may have run on and stopped again, even at the same line, which is another activation.
+- A job runs only at the stop it was started at. `run` records `holdsOn(T)` and runs the work under `SuspensionSession.admittedUnder`; leases and read-only evaluations on T are refused once none of those holds is left — the user released the stop after `[STILL_RUNNING]`, and T may have run on and stopped again, even at the same line, which is another activation.
 - The caller's timeout and the job's completion are settled by one compare-and-set on the job's state, so a job yields exactly one of: its result, or `[STILL_RUNNING]` now and `EVALUATION_COMPLETED_LATE` in the history later. A job the caller gave up on before it started never runs.
 - The `[STILL_RUNNING]` reply names what blocks the thread when JDI can tell: its status, and for a thread blocked on a monitor, the monitor's owner — asked for with a balanced suspend → `currentContendedMonitor().owningThread()` → resume, on the pool, waited for at most 2 s (the probe still resumes what it suspended when the reply gives up on it). It points at the recovery tools: `jdwp_resume_thread` for a parked thread the job waits for, `jdwp_resume` for the user's stops (the evaluating thread stays suspended until the evaluation ends), `jdwp_reconnect` for everything.
 - The job keeps its lease until it completes. A late result is recorded only in the session the job started in, never in a later connection's. A hung job pins its pool thread until the connection ends.
@@ -196,6 +198,8 @@ Invoked code can block — on a lock a parked thread holds, on a `join`. MCP too
 ### Frame tools during an evaluation
 
 `jdwp_get_stack`, `jdwp_get_locals`, `jdwp_set_local` and `jdwp_get_breakpoint_context` run their work through `JDWPTools.withFreshFrames(thread, …)`:
+
+Navigation evaluation goes through the same reservation while it snapshots the frame and reads the values. Once planned, it only uses the snapshot's values, arrays, objects and type metadata.
 
 - **Refusal.** A thread an evaluation runs on is refused ("an evaluation is running on thread T — its frames are, or are about to be, the invoked code's"), before the suspended check: during an invocation the thread runs, and its frames belong to the invoked code. A job that outlived its tool's wait counts for its whole life (`InvocationRunner.isRunning`), also while it still compiles and holds no lease.
 - **Reservation.** For the whole call the thread is reserved in the session (`reserve` / `unreserve`); the watchdog never releases a reserved thread, and a lease of it waits until the call ends (`awaitUnreserved`, at most `RESERVATION_WAIT_MS` = 2 s, then the lease is refused). Only the dispatcher can lease the thread meanwhile — for a set of the thread's own that it processes, its condition say; tools run one at a time, and a job that outlived its tool's wait refuses the frame tool already. Without the wait the invocation would run the thread under the tool, and the frames it read next would be the invoked code's (#47 § 4).

@@ -16,7 +16,7 @@ The chapters go from the outside in, then sideways:
 4. **[memory-and-references.md](memory-and-references.md)** — memory and JDI object references. The object cache, marks and pinning, the compilation cache, byte-array mirroring costs, smart collection rendering, what leaks (and why it is bounded).
 5. **[event-pipeline.md](event-pipeline.md)** — the JDI event loop. How events route, when threads suspend versus auto-resume, the event history ring buffer, the suspension decision matrix, and suspension ownership: who may release each suspension, and the invocation watchdog.
 6. **[breakpoints.md](breakpoints.md)** — the breakpoint registry. Synthetic IDs, deferred breakpoints, conditions, logpoint dispatch, breakpoint chains, the `ClassPrepareRequest` promotion path.
-7. **[expression-evaluation.md](expression-evaluation.md)** — the compile-and-inject pipeline. Wrapper generation, ECJ compilation, `defineClass` into the target classloader, synthetic bindings. Cross-references chapters 3–5 for the safety story.
+7. **[expression-evaluation.md](expression-evaluation.md)** — expression routing, JDI navigation, ECJ compilation and injection, and synthetic bindings. Cross-references chapters 3–5 for the safety story.
 8. **[diagnostics.md](diagnostics.md)** — diagnostics and observability. `jdwp_diagnose`, the JVM-discovery sources, the JDWP handshake probe, logging configuration, transport-loss envelopes.
 9. **[testing.md](testing.md)** — test architecture for contributors. Unit vs. mocked-JDI vs. in-process integration tests, the role of the sandbox module, NullAway enforcement.
 
@@ -58,7 +58,7 @@ jdwp-mcp-server/src/main/java/one/edee/mcp/jdwp/
 ├── InvocationRunner.java           ← bounded wait for a tool's invocation
 ├── EventHistory.java               ← 500-entry ring buffer
 ├── ThreadFormatting.java           ← noise-filtering helpers
-├── evaluation/                     ← compile-and-inject expression pipeline
+├── evaluation/                     ← expression interpreter and compiled evaluator
 ├── watchers/                       ← MCP-side expression bookmarks
 ├── marks/                          ← named object pins ($label bindings)
 ├── discovery/                      ← local-JVM enumeration + handshake probe

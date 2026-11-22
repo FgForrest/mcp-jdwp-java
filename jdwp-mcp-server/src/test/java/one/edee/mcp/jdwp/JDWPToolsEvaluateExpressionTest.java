@@ -23,6 +23,15 @@ import org.mockito.ArgumentCaptor;
 import java.util.List;
 import java.util.Map;
 
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -324,5 +333,41 @@ class JDWPToolsEvaluateExpressionTest {
 		tools.jdwp_assert_expression("$session.getRole()", "null", 1L, null);
 
 		verify(evaluator).evaluate(eq(frame), eq("$session.getRole()"), argThat(m -> m.containsKey("$session")));
+	}
+
+	/** Keeps the invocation runner reply for both compiler-mode expression tools while a job is running. */
+	@Test
+	void preservesStillRunningReplyWhileAnEarlierInvocationIsPending() throws Exception {
+		final FakeSuspendModel target = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread thread = target.thread("debuggee");
+		final BreakpointTracker tracker = new BreakpointTracker();
+		final EventHistory history = new EventHistory();
+		final EvaluationGuard guard = new EvaluationGuard();
+		tracker.openSuspensionSession(target.vm, history).suspendThread(thread.ref);
+		final JDIConnectionService connection = mock(JDIConnectionService.class);
+		when(connection.getVM()).thenReturn(target.vm);
+		final EvaluationRouter router = new EvaluationRouter(mock(JdiExpressionEvaluator.class), EvaluationRouter.Mode.COMPILER);
+		final JDWPTools tools = new JDWPTools(connection, tracker, new WatcherManager(), router, history, guard,
+			mock(JvmDiscoveryService.class), new MarkedInstanceRegistry(), new JdiHealthMonitor(),
+			mock(LocalProjectClasspathProvider.class), mock(FastLogpointService.class));
+		final InvocationRunner invocations = (InvocationRunner) ReflectionTestUtils.getField(tools, "invocations");
+		final CountDownLatch started = new CountDownLatch(1);
+		final CountDownLatch finish = new CountDownLatch(1);
+		final FutureTask<String> first = new FutureTask<>(() -> invocations.run(thread.ref, "earlier evaluation", () -> {
+			started.countDown();
+			finish.await();
+			return "done";
+		}));
+		new Thread(first).start();
+		try {
+			assertThat(started.await(3, TimeUnit.SECONDS)).isTrue();
+			assertThat(tools.jdwp_evaluate_expression(thread.ref.uniqueID(), "1", null))
+				.startsWith("[STILL_RUNNING]");
+			assertThat(tools.jdwp_assert_expression("1", "1", thread.ref.uniqueID(), null))
+				.startsWith("[STILL_RUNNING]");
+		} finally {
+			finish.countDown();
+			first.get(3, TimeUnit.SECONDS);
+		}
 	}
 }

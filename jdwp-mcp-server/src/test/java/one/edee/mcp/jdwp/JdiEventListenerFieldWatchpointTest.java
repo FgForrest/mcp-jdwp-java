@@ -70,7 +70,7 @@ class JdiEventListenerFieldWatchpointTest {
 		eventHistory = new EventHistory();
 		evaluator = mock(JdiExpressionEvaluator.class);
 		evaluationGuard = new EvaluationGuard();
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry(), JDWPToolsTestSupport.compiled(evaluator));
 	}
 
 	@AfterEach

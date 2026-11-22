@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp;
 
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -57,6 +58,11 @@ final class JDWPToolsTestSupport {
 		);
 	}
 
+	/** Selects the compiled path in tests whose evaluator is a scripted mock. */
+	static EvaluationRouter compiled(JdiExpressionEvaluator evaluator) {
+		return new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+	}
+
 	/**
 	 * A mock fast-logpoint service whose pending-removal retry, which the resume tools call after
 	 * every release, restores nothing.
@@ -102,7 +108,7 @@ final class JDWPToolsTestSupport {
 			jdiService,
 			breakpointTracker,
 			watcherManager,
-			expressionEvaluator,
+			compiled(expressionEvaluator),
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
@@ -132,7 +138,7 @@ final class JDWPToolsTestSupport {
 			jdiService,
 			breakpointTracker,
 			watcherManager,
-			expressionEvaluator,
+			compiled(expressionEvaluator),
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
@@ -161,7 +167,7 @@ final class JDWPToolsTestSupport {
 			jdiService,
 			breakpointTracker,
 			watcherManager,
-			expressionEvaluator,
+			compiled(expressionEvaluator),
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
@@ -191,7 +197,7 @@ final class JDWPToolsTestSupport {
 			jdiService,
 			breakpointTracker,
 			watcherManager,
-			expressionEvaluator,
+			compiled(expressionEvaluator),
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
@@ -217,7 +223,7 @@ final class JDWPToolsTestSupport {
 			jdiService,
 			breakpointTracker,
 			watcherManager,
-			expressionEvaluator,
+			compiled(expressionEvaluator),
 			new EventHistory(),
 			new EvaluationGuard(),
 			mock(JvmDiscoveryService.class),

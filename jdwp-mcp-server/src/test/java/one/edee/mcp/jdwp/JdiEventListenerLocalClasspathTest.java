@@ -92,7 +92,7 @@ class JdiEventListenerLocalClasspathTest {
 		when(connection.getTargetMajorVersion()).thenReturn(21);
 		evaluator = spy(new JdiExpressionEvaluator(compiler, connection, evaluatorGuard, provider));
 		listener = new JdiEventListener(tracker, new EventHistory(), evaluator,
-			new EvaluationGuard(), null, new MarkedInstanceRegistry());
+			new EvaluationGuard(), null, new MarkedInstanceRegistry(), JDWPToolsTestSupport.compiled(evaluator));
 		when(vm.eventQueue()).thenReturn(queue);
 		when(queue.remove()).thenAnswer(call -> events.take());
 		when(thread.virtualMachine()).thenReturn(vm);

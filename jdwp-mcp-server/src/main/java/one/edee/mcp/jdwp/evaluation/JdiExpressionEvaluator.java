@@ -604,9 +604,9 @@ public class JdiExpressionEvaluator {
      * happens to start with '{') stay in expression mode, and a comment containing '}' inside an
      * otherwise-block input does not prematurely close the outer block.
      *
-     * <p>Static + package-private so it can be unit-tested without a real {@link StackFrame}.
+     * <p>Public so the parser and compiler use the same mode without a real {@link StackFrame}.
      */
-    static boolean isBlockMode(String expression) {
+    public static boolean isBlockMode(String expression) {
         return blockEnd(expression.trim()) >= 0;
     }
 
@@ -1205,7 +1205,7 @@ public class JdiExpressionEvaluator {
      * longer has exactly one frame there — it ran on, or recursion makes the frame ambiguous.
      */
     @Nullable
-    private static StackFrame sameFrame(ThreadReference thread, Location location) {
+    public static StackFrame sameFrame(ThreadReference thread, Location location) {
         try {
             StackFrame match = null;
             for (StackFrame candidate : thread.frames()) {

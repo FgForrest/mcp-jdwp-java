@@ -82,7 +82,7 @@ class JdiEventListenerReentrantHitTest {
 		guard = new EvaluationGuard();
 		evaluator = mock(JdiExpressionEvaluator.class);
 		fastLogpoints = mock(FastLogpointService.class);
-		listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
+		listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry(), JDWPToolsTestSupport.compiled(evaluator));
 		listener.setFastLogpointService(fastLogpoints);
 	}
 
@@ -184,7 +184,7 @@ class JdiEventListenerReentrantHitTest {
 		final EvaluationGuard closing = spy(new EvaluationGuard());
 		doReturn(true, false).when(closing).isEvaluating(thread);
 		listener.stop();
-		listener = new JdiEventListener(tracker, history, evaluator, closing, null, new MarkedInstanceRegistry());
+		listener = new JdiEventListener(tracker, history, evaluator, closing, null, new MarkedInstanceRegistry(), JDWPToolsTestSupport.compiled(evaluator));
 		final EventSet eventSet = mockEventSet(mockBreakpointEvent(thread, conditional, "com.example.Hot", 10));
 
 		start(eventSet);

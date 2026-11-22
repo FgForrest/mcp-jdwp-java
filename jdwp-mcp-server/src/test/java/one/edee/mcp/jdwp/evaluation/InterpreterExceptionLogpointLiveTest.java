@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -26,12 +27,21 @@ class InterpreterExceptionLogpointLiveTest {
     void bindsTheThrownObjectInTheProductionExceptionLogpoint() throws Exception {
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             try (var target = InterpreterTargetVm.start(javaHome)) {
-                checkExceptionLogpoint(target.port());
+                checkExceptionLogpoint(target.port(), "$exception.getMessage()", false);
             }
         }
     }
 
-    private static void checkExceptionLogpoint(int port) throws Exception {
+    @Test
+    void navigatesTheThrownObjectsPrivateMessageField() throws Exception {
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            try (var target = InterpreterTargetVm.start(javaHome)) {
+                checkExceptionLogpoint(target.port(), "$exception.detailMessage", true);
+            }
+        }
+    }
+
+    private static void checkExceptionLogpoint(int port, String expression, boolean interpreted) throws Exception {
         final var tracker = new BreakpointTracker();
         final var history = new EventHistory();
         final var guard = new EvaluationGuard();
@@ -48,18 +58,19 @@ class InterpreterExceptionLogpointLiveTest {
                 throw e.getCause();
             }
         });
-        final var listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks);
+        final var router = new EvaluationRouter(lazyEvaluator, EvaluationRouter.Mode.AUTO);
+        final var listener = new JdiEventListener(tracker, history, lazyEvaluator, guard, null, marks, router);
         final var connection = new JDIConnectionService(listener, tracker, history, watchers, guard, marks, health,
             mock(JvmDiscoveryService.class));
         final var evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection, guard, noLocalClasspath);
         delegate.set(evaluator);
         final var fast = new FastLogpointService(tracker, history, guard, evaluator, listener, connection);
-        final var tools = new JDWPTools(connection, tracker, watchers, evaluator, history, guard,
+        final var tools = new JDWPTools(connection, tracker, watchers, router, history, guard,
             mock(JvmDiscoveryService.class), marks, health, noLocalClasspath, fast);
         try {
             assertThat(connection.connect("127.0.0.1", port)).startsWith("Connected");
             assertThat(tools.jdwp_resume_until_event(10_000)).contains("via=vm_start");
-            assertThat(tools.jdwp_set_exception_logpoint("java.lang.IllegalArgumentException", "$exception.getMessage()",
+            assertThat(tools.jdwp_set_exception_logpoint("java.lang.IllegalArgumentException", expression,
                 null, true, false, null, null, false, null, null)).contains("ID:").doesNotContain("Error");
             assertThat(tools.jdwp_resume()).startsWith("Resumed:");
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
@@ -67,6 +78,7 @@ class InterpreterExceptionLogpointLiveTest {
                     assertThat(event.type()).isEqualTo("EXCEPTION_LOG");
                     assertThat(event.details()).containsEntry("result", "fixture exception");
                 }));
+            assertThat(router.diagnostics()).contains(interpreted ? "interpreted 1, compiled 0" : "interpreted 0, compiled 1");
         } finally {
             connection.disconnect();
         }

@@ -11,7 +11,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code and Codex as **50 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
 
 - **See runtime state, not stack traces** — read locals, fields, threads, the entire object graph
-- **Evaluate arbitrary Java in the suspended frame** — compiled to real bytecode, full classpath, including private/package-private members
+- **Evaluate Java in the suspended frame** — read private fields through JDI and compile expressions that require target code
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
 - **Trace without stopping** — line/exception/field logpoints write to an event log; the hitting thread pauses only while the server evaluates the expression, then runs on
@@ -591,14 +591,16 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Compiles arbitrary Java expressions to bytecode using Eclipse JDT, injects them into the target JVM via `ClassLoader.defineClass()`, and executes them in the context of the suspended frame. Full classpath is discovered automatically (including container classloaders like Tomcat). Compiled expressions are cached, so repeated evaluations are fast. Handles Guice/CGLIB proxies automatically. Code that does not finish within 20 s (say, it waits for a lock a suspended thread holds) returns `[STILL_RUNNING]` and keeps running in the target; its result lands in `jdwp_get_events` as `EVALUATION_COMPLETED_LATE`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+
+Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 
 Two input modes:
 
-- **Single expression** — `order.getTotal()`, `x + y`, `list.size() == 5`. The compiler treats the input as the body of `return ...;`.
+- **Single expression** — `order.getTotal()`, `x + y`, `list.size() == 5`. The same expression form works for navigation and compilation.
 - **Block mode** — wrap the input in `{ ... }` to send a multi-statement body with try/catch, intermediate locals, or early `return`. The agent writes explicit `return X;` to yield a value. Available everywhere expressions are accepted: `jdwp_evaluate_expression`, `jdwp_assert_expression`, breakpoint conditions, logpoint expressions, watchers.
 
-See [docs/expression-evaluation.md](docs/expression-evaluation.md) for the compilation pipeline details, or [docs/index.md](docs/index.md) for the full developer reference.
+Set `JDWP_EVAL_ENGINE=auto|compiler|interpreter` in the server environment. `jdwp_diagnose` reports engine counts and why expressions needed compilation. [Expression evaluation](docs/expression-evaluation.md)
 
 ### Assertions
 
@@ -1004,7 +1006,7 @@ mcp-jdwp-java/
 │       ├── DeadlockAnalyzer.java        # Monitor-lock graph + cycle detection
 │       ├── ClassNameMatcher.java        # Glob → JDI ReferenceType matcher
 │       ├── ThreadFormatting.java        # Thread/frame noise filtering
-│       ├── evaluation/                  # Expression compile-and-inject pipeline
+│       ├── evaluation/                  # Expression routing, JDI interpretation and compilation
 │       │   ├── JdiExpressionEvaluator.java
 │       │   ├── RemoteCodeExecutor.java
 │       │   ├── InMemoryJavaCompiler.java
@@ -1065,7 +1067,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 - [memory-and-references.md](docs/memory-and-references.md) — JDI mirrors, the object cache, marks, the compilation cache, byte-array mirroring
 - [event-pipeline.md](docs/event-pipeline.md) — the JDI event listener loop and the suspension decision matrix
 - [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains, fast logpoints and fast breakpoints
-- [expression-evaluation.md](docs/expression-evaluation.md) — the compile-and-inject pipeline (ECJ, `defineClass`, `invokeMethod`)
+- [expression-evaluation.md](docs/expression-evaluation.md) — JDI navigation and the compiled evaluation pipeline
 - [diagnostics.md](docs/diagnostics.md) — `jdwp_diagnose`, JVM discovery, the handshake probe, transport-loss envelopes, logging
 - [testing.md](docs/testing.md) — test architecture for contributors
 

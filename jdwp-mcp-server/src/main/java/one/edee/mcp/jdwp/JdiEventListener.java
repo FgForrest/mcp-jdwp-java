@@ -4,6 +4,7 @@ import com.sun.jdi.*;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.*;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.PinnedMirrors;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -99,6 +100,8 @@ public class JdiEventListener {
     private final BreakpointTracker breakpointTracker;
     private final EventHistory eventHistory;
     private final JdiExpressionEvaluator expressionEvaluator;
+    /** Routes logpoint and condition evaluation between the interpreter and the compiler. */
+    private final EvaluationRouter evaluations;
     private final EvaluationGuard evaluationGuard;
     private final MarkedInstanceRegistry markedInstances;
     /**
@@ -168,14 +171,27 @@ public class JdiEventListener {
     /** Identity and death-hook gate for the active listener, cleared by {@link #stop()}. */
     private volatile @Nullable ListenerConnection listenerConnection;
 
+    /** Creates the listener with a default {@link EvaluationRouter} built on the given compiled evaluator. */
     public JdiEventListener(BreakpointTracker breakpointTracker, EventHistory eventHistory,
                             @Lazy JdiExpressionEvaluator expressionEvaluator,
                             EvaluationGuard evaluationGuard,
                             @Lazy @Nullable JDIConnectionService jdiConnectionService,
                             MarkedInstanceRegistry markedInstances) {
+        this(breakpointTracker, eventHistory, expressionEvaluator, evaluationGuard, jdiConnectionService,
+            markedInstances, new EvaluationRouter(expressionEvaluator));
+    }
+
+    /** Creates the listener with the given evaluation router. */
+    @org.springframework.beans.factory.annotation.Autowired
+    public JdiEventListener(BreakpointTracker breakpointTracker, EventHistory eventHistory,
+                            @Lazy JdiExpressionEvaluator expressionEvaluator,
+                            EvaluationGuard evaluationGuard,
+                            @Lazy @Nullable JDIConnectionService jdiConnectionService,
+                            MarkedInstanceRegistry markedInstances, EvaluationRouter evaluations) {
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.expressionEvaluator = expressionEvaluator;
+        this.evaluations = evaluations;
         this.evaluationGuard = evaluationGuard;
         this.jdiConnectionService = jdiConnectionService;
         this.markedInstances = markedInstances;
@@ -640,9 +656,9 @@ public class JdiEventListener {
         suspensions.beginProcessing(context);
         try {
             keep = !process(eventSet, suspensions, context);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (running) {
-                log.warn("[JDI] Error processing event: {}", e.getMessage());
+                log.warn("[JDI] Error processing event: {}", evaluationFailureMessage(e));
             }
             // Fail-safe, as the handlers: an unexpected error keeps the set for inspection.
             keep = true;
@@ -1429,15 +1445,15 @@ public class JdiEventListener {
                     "expression", expression, "result", resultStr)));
             log.info("[JDI] Exception {} logged at {} with {} = {} on thread {}",
                 exceptionType, throwInfo, expression, resultStr, threadName);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("EXCEPTION_LOG_ERROR",
                 String.format("%s thrown at %s on thread %s — error evaluating '%s': %s",
-                    exceptionType, throwInfo, threadName, expression, e.getMessage()),
+                    exceptionType, throwInfo, threadName, expression, evaluationFailureMessage(e)),
                 Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
                     "thread", threadName, "expression", expression,
-                    "error", String.valueOf(e.getMessage()))));
+                    "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Exception logpoint evaluation failed for '{}': {}",
-                expression, e.getMessage());
+                expression, evaluationFailureMessage(e));
         }
     }
 
@@ -1652,16 +1668,16 @@ public class JdiEventListener {
                     "expression", expression, "result", resultStr)));
             log.info("[JDI] Field {} {} logged on {} with {} = {} (BP #{})",
                 fieldName, modeStr, threadName, expression, resultStr, bpId);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
                 String.format("Field %s.%s %s on thread %s — error evaluating '%s': %s",
-                    className, fieldName, modeStr, threadName, expression, e.getMessage()),
+                    className, fieldName, modeStr, threadName, expression, evaluationFailureMessage(e)),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
                     "expression", expression,
-                    "error", String.valueOf(e.getMessage()))));
+                    "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Field logpoint evaluation failed for {}.{}: {}",
-                className, fieldName, e.getMessage());
+                className, fieldName, evaluationFailureMessage(e));
         }
     }
 
@@ -1687,10 +1703,10 @@ public class JdiEventListener {
                     "line", String.valueOf(lineNumber), "thread", threadName)));
 
             log.info("[JDI] Logpoint {} evaluated: {} = {}", bpId, expression, resultStr);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("LOGPOINT_ERROR",
-                String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, e.getMessage())));
-            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, e.getMessage());
+                String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, evaluationFailureMessage(e))));
+            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, evaluationFailureMessage(e));
         }
     }
 
@@ -1703,11 +1719,8 @@ public class JdiEventListener {
      */
     private String evaluateAndFormat(ThreadReference thread, String expression,
                                      Map<String, Value> extraBindings) throws Exception {
-        expressionEvaluator.configureCompilerClasspathForEvent(thread);
-        final StackFrame frame = thread.frame(0);
-        final Value result = expressionEvaluator.evaluate(frame, expression,
-            mergeMarkedBindings(extraBindings));
-        return formatLogpointResult(result);
+        return evaluations.evaluateEvent(expression, thread, mergeMarkedBindings(extraBindings),
+            JdiEventListener::formatLogpointResult);
     }
 
     /**
@@ -1747,11 +1760,8 @@ public class JdiEventListener {
      * {@link BooleanValue} and the boxed {@code java.lang.Boolean} returned via the wrapper class's
      * {@code (Object)(...)} autoboxing cast.
      *
-     * <p>Fail-open is not the same as fail-silent: a condition that a private-field reference
-     * cannot compile must not masquerade as an always-true filter. On any evaluation failure this
-     * method records a {@code CONDITION_ERROR} event (via {@link #recordConditionError}) BEFORE
-     * returning {@code true}, so an agent driving {@code jdwp_resume_until_event} can see that its
-     * condition never filtered anything instead of silently believing it did.
+     * <p>On failure this method records a {@code CONDITION_ERROR} event before allowing the hit.
+     * A client driving {@code jdwp_resume_until_event} can see which conditions failed to filter.
      *
      * @param breakpointId the synthetic ID of the firing breakpoint, for the error event
      * @param location     a human-readable firing location ({@code Class:line} or exception type),
@@ -1761,40 +1771,50 @@ public class JdiEventListener {
                                                   Map<String, Value> extraBindings,
                                                   int breakpointId, String location) {
         try {
-            expressionEvaluator.configureCompilerClasspathForEvent(thread);
-            final StackFrame frame = thread.frame(0);
-            final Value result = expressionEvaluator.evaluate(frame, condition,
-                mergeMarkedBindings(extraBindings));
-
-            if (result instanceof BooleanValue boolVal) {
-                return boolVal.value();
-            }
-
-            // Boxed java.lang.Boolean — wrapper autoboxes primitive results before returning.
-            if (result instanceof ObjectReference objRef
-                && "java.lang.Boolean".equals(objRef.referenceType().name())) {
-                final Field valueField = objRef.referenceType().fieldByName("value");
-                if (valueField != null) {
-                    final Value innerValue = objRef.getValue(valueField);
-                    if (innerValue instanceof BooleanValue boolVal) {
-                        return boolVal.value();
-                    }
-                }
-            }
-
-            recordConditionError(breakpointId, location, condition,
-                "condition returned a non-boolean value: " + result);
-            return true;
-        } catch (Exception e) {
+            return evaluations.evaluateEvent(condition, thread, mergeMarkedBindings(extraBindings),
+                result -> conditionResult(result, breakpointId, location, condition));
+        } catch (Throwable e) {
             if (e instanceof InterruptedException) {
                 // The dispatcher is being shut down; let the rest of the set's processing see it.
                 Thread.currentThread().interrupt();
             }
             recordConditionError(breakpointId, location, condition,
-                e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+                evaluationFailureMessage(e));
             return true;
         }
     }
+
+    /** Describes an evaluation failure, using its type when no message is available. */
+    private static String evaluationFailureMessage(Throwable failure) {
+        final String message = failure.getMessage();
+        return message == null ? failure.getClass().getSimpleName() : message;
+    }
+
+    /**
+     * Interprets a condition's value as a boolean, also unwrapping a boxed Boolean; a non-boolean value records a condition error and lets the hit through.
+     */
+    private boolean conditionResult(@Nullable Value result, int breakpointId, String location, String condition) {
+        if (result instanceof BooleanValue boolVal) {
+            return boolVal.value();
+        }
+
+        // Boxed java.lang.Boolean — wrapper autoboxes primitive results before returning.
+        if (result instanceof ObjectReference objRef
+            && "java.lang.Boolean".equals(objRef.referenceType().name())) {
+            final Field valueField = objRef.referenceType().fieldByName("value");
+            if (valueField != null) {
+                final Value innerValue = objRef.getValue(valueField);
+                if (innerValue instanceof BooleanValue boolVal) {
+                    return boolVal.value();
+                }
+            }
+        }
+
+        recordConditionError(breakpointId, location, condition,
+            "condition returned a non-boolean value: " + result);
+        return true;
+    }
+
 
     /**
      * Records a {@code CONDITION_ERROR} event for a condition that failed to evaluate (compile

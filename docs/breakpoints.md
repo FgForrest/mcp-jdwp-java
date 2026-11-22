@@ -118,11 +118,11 @@ An explicit disconnect or a connection to a different target clears pending entr
 
 ## 4. Conditions
 
-`BreakpointMetadata.condition` is a Java expression string. When the BP fires, the listener evaluates it via `evaluateConditionWithBindings` (`JdiEventListener.java:919-949`). Three outcomes:
+`BreakpointMetadata.condition` is a Java expression string. When the breakpoint fires, the dispatcher routes it through `evaluateConditionWithBindings`. Supported navigation can read private fields through JDI. The condition has three possible outcomes.
 
 - **`true`** — proceed with the suspending path (logpoint or normal BP).
 - **`false`** — auto-resume. No history entry, no chain effect (the BP didn't meaningfully hit). Documented inline at `JdiEventListener.java:428`.
-- **Exception during evaluation** — return `true` (suspend). Fail-safe.
+- **Evaluation error** — record `CONDITION_ERROR` and proceed as if true.
 
 The fail-safe rule deserves emphasis: a broken condition does **not** silently swallow breakpoint hits. The agent gets the stop, with the error in the event details, and can call `jdwp_evaluate_expression` to see why. The alternative — silent resume on a broken expression — is one of the most-feared failure modes in interactive debugging, so we explicitly avoid it.
 
@@ -136,7 +136,7 @@ The set reply and `jdwp_overview` show configured filters. The request spec carr
 
 ## 5. Logpoints — the auto-resume mechanic
 
-A logpoint is a breakpoint that records an evaluated expression to the event history and does not suspend the thread. The JDI request is still created with `SUSPEND_EVENT_THREAD` because expression evaluation needs `invokeMethod`, which needs a suspended thread at an invocation event. The listener evaluates, records `LOGPOINT`, and returns `false`. The loop's `eventSet.resume()` undoes the JDI-level suspension. From the agent's view, the thread never paused.
+A logpoint is a breakpoint that records an evaluated expression to the event history and does not suspend the thread. The JDI request uses `SUSPEND_EVENT_THREAD` so the frame is readable and compiled expressions can invoke. The dispatcher evaluates, records `LOGPOINT`, and returns `false`. Finishing the set releases its suspension. From the agent's view, the thread never paused.
 
 The flow inside `handleBreakpointEvent`:
 
@@ -163,6 +163,8 @@ All three respect the same fail-safe rule: if the log expression fails to evalua
 
 ### 5a. Fast logpoints — evaluation moved into the target
 
+Fast probes and their arming evaluations compile. If the compiler reports an inaccessible member, an ordinary breakpoint condition or logpoint can interpret supported private-field navigation and incurs debugger round trips on each hit.
+
 "Does not suspend" above is the agent's view; the thread *is* parked for the whole evaluation — several JDWP round trips per hit, one hit at a time on the single event dispatcher thread, and a method with a JVMTI breakpoint stays interpreted. `jdwp_set_fast_logpoint` (package `fastlogpoint`) removes the debugger from the per-hit path. It changes the running application's bytecode and requires the user's explicit approval.
 
 **Standing approval for fast probes.** Call the tool without `userApproved`. If it returns a risk briefing (`FastLogpointRiskBriefing` or `FastBreakpointRiskBriefing`), relay it word for word, ask the user, and repeat the call with `userApproved=true` only after the user agrees to this exact probe at this host:port. The server remembers whether the latest briefing named an endpoint for those probe settings. After a pre-attach briefing, an explicit retry returns a new briefing naming the attached endpoint. An explicit retry at a different endpoint also returns a fresh briefing. An accepted registration or re-arm with `userApproved=true` records a standing approval in server memory. A later matching call can arm directly and reports the original grant time.
@@ -173,7 +175,7 @@ Lifecycle (`FastLogpointService`):
 
 1. **Register** — a one-shot arming breakpoint (`SUSPEND_EVENT_THREAD`, `addCountFilter(1)`, so concurrent hits on other threads are filtered in the target) at the line's first location. ID drawn from the shared space (`BreakpointTracker.allocateId`). A class that is not loaded yet is waited for (`registerWaiting`, listed as `WAITING_FOR_CLASS`): the entry gets its ID at once and a `ClassPrepareRequest` of its own — never the tracker's, whose lifetime follows the tracker's pending breakpoints. Supply the JVM's exact binary class name, such as `com.example.Outer$Inner` or `example.Order-item`. `promoteWaiting` checks the prepared class's exact name before checking the host, leftovers and the line on the dispatcher. It registers the arming breakpoint under the same ID (`FAST_*_CLASS_LOADED`) or marks the entry `FAILED` (`FAST_*_ARM_FAILED`). `forceLoad` cannot help at VM start — no thread can run `Class.forName` there — so a failed force-load waits too. Reconnect and reset drop waiting entries. Call the tool again at the same endpoint to use the standing approval.
 2. **Arm on the first hit** — the listener hands the event to `handleArmingHit` *after* every other event of the set (arming redefines the class, replacing the requests behind those events). While the one thread is parked, under the `EvaluationGuard`:
-   - the hit itself is evaluated through the normal debugger path (it runs the old code) and recorded with `armingHit=true`;
+   - the hit itself is evaluated by the compiled engine through the debugger (it runs the old code) and recorded with `armingHit=true`;
    - the class file is fetched through `Class.getResourceAsStream` in the target and compared, method by method, with `Method.bytecodes()` of the live class (`ClassFileMethods`). Any difference — JaCoCo, the Mockito inline mock maker, an enhancer, a different class file — refuses the arm: redefining from the class file would silently strip those changes;
    - the probe is compiled (`JdiExpressionEvaluator.compileFastLogpointProbe` → `FastLogpointProbeSource`), defined in the **declaring class's own loader** and package, and initialized — **disabled** (`ENABLED=false`); `RemoteCodeExecutor.defineAndInitialize` checks that the loader resolves the probe's name to that class, so the injected call cannot fail to link at the application's call site;
    - `ProbeInstrumenter` (ASM tree API) inserts `xLOAD`s of `this` and the visible locals plus `invokestatic Probe.hit(...)` after the label / line number / stack-map frame of the line's first instruction, and `redefineClasses` installs it;
@@ -345,16 +347,16 @@ When a watchpoint fires, the expression scope gets five extra bindings injected 
 | Binding | Value | Notes |
 |---|---|---|
 | `$oldValue` | `event.valueCurrent()` | Always present |
-| `$newValue` | `((ModificationWatchpointEvent) event).valueToBe()` | Modification events only |
-| `$object` | `event.object()` | `null` for static fields |
+| `$newValue` | `((ModificationWatchpointEvent) event).valueToBe()` | Null on access events |
+| `$object` | `event.object()` | Absent for static fields |
 | `$fieldName` | `vm.mirrorOf(fieldName)` | String mirror |
 | `$mode` | `vm.mirrorOf("access" \| "modification")` | String mirror |
 
 (The `$` sigil is the same one used by marks. Reserved-binding validation refuses to let a mark collide with these names.)
 
-The bindings flow through `mergeMarkedBindings` (`JdiEventListener.java:891-899`) — which combines them with `MarkedInstanceRegistry.buildBindings()` (per-event names win on collision) — and into the evaluator. The user's condition or logpoint expression sees them as ordinary method parameters in the generated wrapper class.
+The bindings flow through `mergeMarkedBindings` (`JdiEventListener.java:891-899`) — which combines them with `MarkedInstanceRegistry.buildBindings()` (per-event names win on collision) — and into the evaluator. The router exposes them as expression names. Compiled wrappers receive them as method parameters.
 
-Conditional presence is **absence in the map** rather than a null sentinel: `$object` is simply not in the bindings for a static-field event. Referencing it in an expression for a static-field event yields a JDT compile error, not a misleading NPE at evaluation time.
+On a static field event, `$object` is absent and reports an unresolved name when referenced. On access events, `$newValue` is present with a null value.
 
 The synthetic bindings on **exception** breakpoints follow the same pattern:
 

@@ -104,6 +104,43 @@ class FastLogpointServiceArmingTest {
 		armingRequest = created.get(0);
 	}
 
+	/** Adds the ordinary-breakpoint hint for a bare inherited private field and leaves a typo alone. */
+	@ParameterizedTest
+	@org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+	void unresolvedArmingNameSuggestsOrdinaryBreakpointOnlyForAKnownField(boolean knownField) throws Exception {
+		final ObjectReference receiver = mock(ObjectReference.class);
+		final ClassType type = mock(ClassType.class);
+		final ClassType parent = mock(ClassType.class);
+		final Field counter = mock(Field.class);
+		when(frame.thisObject()).thenReturn(receiver);
+		when(receiver.referenceType()).thenReturn(type);
+		when(type.superclass()).thenReturn(parent);
+		when(counter.name()).thenReturn("total");
+		when(counter.isPrivate()).thenReturn(true);
+		when(counter.declaringType()).thenReturn(parent);
+		when(type.allFields()).thenReturn(knownField ? List.of(counter) : List.of());
+		when(thread.isSuspended()).thenReturn(true);
+		when(evaluator.readArmingResult(eq(frame), eq("total > 100"), any())).thenThrow(new JdiEvaluationException(
+			"Compilation failed:\nLine 7 (`return total > 100;`): total cannot be resolved to a variable"));
+		final BreakpointEvent event = mock(BreakpointEvent.class);
+		when(event.request()).thenReturn(armingRequest);
+		when(event.thread()).thenReturn(thread);
+		when(event.location()).thenReturn(location);
+
+		assertThat(service.handleArmingHit(event, false)).isEqualTo(FastLogpointService.ArmingOutcome.STOPPED);
+		final List<EventHistory.DebugEvent> errors = history.getRecent(20).stream()
+			.filter(record -> record.type().equals("FAST_BREAKPOINT_ERROR")).toList();
+		assertThat(errors).singleElement().satisfies(error -> {
+			final String reported = error.details().get("error");
+			assertThat(reported).contains("total cannot be resolved to a variable");
+			if (knownField) {
+				assertThat(reported).contains("jdwp_set_breakpoint", "private members");
+			} else {
+				assertThat(reported).doesNotContain("jdwp_set_breakpoint");
+			}
+		});
+	}
+
 	@Test
 	@DisplayName("a mismatched class-prepare event leaves a deferred probe waiting for its exact class")
 	void waitingProbeRequiresExactClassName() throws Exception {
