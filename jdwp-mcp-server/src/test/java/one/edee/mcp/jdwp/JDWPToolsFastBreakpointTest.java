@@ -45,6 +45,9 @@ class JDWPToolsFastBreakpointTest {
 	@BeforeEach
 	void setUp() {
 		jdiService = mock(JDIConnectionService.class);
+		final var endpoint = new JDIConnectionService.TargetEndpoint("localhost", 5005, true);
+		when(jdiService.targetEndpoint()).thenReturn(endpoint);
+		when(jdiService.targetEndpointFor(any())).thenReturn(endpoint);
 		tracker = new BreakpointTracker();
 		fastLogpoints = JDWPToolsTestSupport.fastLogpointsMock();
 		tools = JDWPToolsTestSupport.newTools(jdiService, tracker, new EventHistory(), fastLogpoints);
@@ -53,8 +56,6 @@ class JDWPToolsFastBreakpointTest {
 	@Test
 	@DisplayName("missing or false userApproved returns the risk briefing for the requested policy and mode")
 	void consentGate() throws Exception {
-		when(jdiService.getConnectionStatus()).thenReturn(
-			new JDIConnectionService.ConnectionStatus(true, "localhost", 5005, Instant.now(), null));
 		for (Boolean approval : new Boolean[]{null, false}) {
 			assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", approval, "thread", false, null))
 				.startsWith("[CONSENT REQUIRED] Nothing was armed.")
@@ -89,13 +90,14 @@ class JDWPToolsFastBreakpointTest {
 		when(vm.canRedefineClasses()).thenReturn(true);
 		when(vm.canGetBytecodes()).thenReturn(true);
 		when(vm.canGetConstantPool()).thenReturn(true);
-		when(jdiService.findLoadedClass("com.example.Cart")).thenReturn(type);
+		when(jdiService.findLoadedClass(vm, "com.example.Cart")).thenReturn(type);
 		when(type.name()).thenReturn("com.example.Cart");
 		when(type.classLoader()).thenReturn(mock(com.sun.jdi.ClassLoaderReference.class));
 		when(type.locationsOfLine(42)).thenReturn(List.of(location));
 		when(location.method()).thenReturn(method);
 		when(fastLogpoints.rearmBreakpoint(location, "total < 0", true, EventRequest.SUSPEND_ALL))
-			.thenReturn("Fast breakpoint 7 at com.example.Cart:42 re-armed (ID: 7)");
+			.thenReturn(new FastLogpointService.RearmResult("Fast breakpoint 7 at com.example.Cart:42 re-armed (ID: 7)",
+				true));
 
 		assertThat(tools.jdwp_set_fast_breakpoint("com.example.Cart", 42, "total < 0", true, null, null, null))
 			.isEqualTo("Fast breakpoint 7 at com.example.Cart:42 re-armed (ID: 7)");

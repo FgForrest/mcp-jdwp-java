@@ -93,6 +93,43 @@ class FastProbeLifecycleLiveTest {
 	}
 
 	@Test
+	@DisplayName("a probe's standing approval survives exit, reconnect, reset and disconnect at the same port")
+	void standingApprovalSurvivesSessionChanges() throws Exception {
+		session = LiveSession.start(List.of());
+		final int line = lineOf("// MARK: late", LATE_SOURCE);
+		assertThat(session.tools.jdwp_set_fast_logpoint(LATE, line, "n", "n < 0", true, null, null))
+			.contains("WAITING");
+		session.letTargetExit();
+		assertThat(session.process.waitFor(30, TimeUnit.SECONDS)).isTrue();
+
+		try (LiveSession replacement = LiveSession.start(List.of(), session.port)) {
+			assertThat(replacement.tools.jdwp_set_fast_logpoint(LATE, line, "n", "n < 0", null, null, null))
+				.startsWith("[CONSENT REQUIRED]");
+			replacement.connection.disconnect();
+
+			assertThat(session.tools.jdwp_reconnect()).startsWith("Reconnected to ");
+			assertThat(session.tools.jdwp_set_fast_logpoint(LATE, line, "n", "n < 0", null, null, null))
+				.contains("WAITING", "Standing approval used");
+			assertThat(session.tools.jdwp_reset()).contains("In-target probes cleared:      1");
+			assertThat(session.tools.jdwp_set_fast_logpoint(LATE, line, "n", "n < 0", null, null, null))
+				.contains("WAITING", "Standing approval used");
+			assertThat(session.tools.jdwp_disconnect()).contains("Disconnected");
+			assertThat(session.tools.jdwp_overview("fast_logpoint", null, null))
+				.contains("Standing approvals (1)", "localhost:" + session.port);
+
+			session.connection.connect("localhost", session.port);
+			final int loaded = lineOf("// MARK: probe");
+			final String pending = session.tools.jdwp_set_fast_logpoint(TARGET, loaded, "i", "i < 0", true, null, null);
+			assertThat(pending).contains("PENDING");
+			assertThat(session.tools.jdwp_clear_breakpoint(idOf(pending))).contains("cleared");
+			assertThat(session.tools.jdwp_set_fast_logpoint(TARGET, loaded, "i", "i < 0", null, null, null))
+				.contains("PENDING", "Standing approval used");
+			assertThat(session.tools.jdwp_set_fast_logpoint(LATE, line, "n", "n < 0", null, null, null))
+				.contains("WAITING", "Standing approval used");
+		}
+	}
+
+	@Test
 	@DisplayName("hits nobody read are read when the target exits; the [VM_DEATH] reply says so and names a silent field watch")
 	void hitsAreReadWhenTheTargetExits() throws Exception {
 		session = LiveSession.start(List.of());

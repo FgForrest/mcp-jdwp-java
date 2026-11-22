@@ -123,7 +123,7 @@ class FastBreakpointLiveTest {
 				.contains(TARGET + ':' + probeLine)
 				.contains("suspendPolicy: all")
 				.contains("stops once")
-				.contains("127.0.0.1:" + port)
+				.contains("localhost:" + port)
 				.contains("word for word");
 		}
 		assertThat(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i < 0", true, "none", null, null))
@@ -402,18 +402,20 @@ class FastBreakpointLiveTest {
 
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
 			null, null));
-		assertThat(tools.jdwp_attach_watcher(id, "doubled", "doubled")).startsWith("✓ Watcher [");
+		// The other worker keeps running. Use a cached boxed result so it stays reachable for formatting.
+		final String expression = "(doubled & 1) == 0";
+		assertThat(tools.jdwp_attach_watcher(id, "doubled is even", expression)).startsWith("✓ Watcher [");
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		final long threadId = stoppedThread().uniqueID();
 
 		// The probe frames on top are hidden: the user's frame at the line is frame #0, in both scopes.
 		assertThat(tools.jdwp_evaluate_watchers(threadId, "current_frame", null))
 			.contains("Current Frame #0: " + TARGET + ':' + probeLine + " (Breakpoint ID: " + id + ")")
-			.contains("doubled = ")
+			.contains(expression + " = true")
 			.doesNotContain("[ERROR");
 		assertThat(tools.jdwp_evaluate_watchers(threadId, "full_stack", null))
 			.contains("Frame #0: " + TARGET + ':' + probeLine + " (Breakpoint ID: " + id + ")")
-			.contains("doubled = ")
+			.contains(expression + " = true")
 			.doesNotContain("[ERROR");
 
 		assertThat(tools.jdwp_clear_breakpoint(id)).contains("disabled now").endsWith("1 associated watcher(s) also removed.");

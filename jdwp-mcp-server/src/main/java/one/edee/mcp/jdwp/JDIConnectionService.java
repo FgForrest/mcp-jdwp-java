@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
+import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
@@ -23,6 +24,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -126,6 +130,8 @@ public class JDIConnectionService {
     private String lastHost;
     /** Port of the last SUCCESSFUL attach. See {@link #lastHost} for semantics. */
     private int lastPort = 0;
+    /** Normalized endpoint of the last successful attach, also kept as the auto-reconnect seed's identity. */
+    private @Nullable TargetEndpoint targetEndpoint;
     /**
      * What the target's exit took with it — set by {@link #notifyVmDied}, cleared by the next attach
      * and by {@link #disconnect}. Lets {@code jdwp_reset} and {@code jdwp_disconnect} say that the
@@ -421,27 +427,10 @@ public class JDIConnectionService {
             cleanupSessionState();
         }
 
-        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-        AttachingConnector connector = null;
-
-        for (AttachingConnector ac : vmm.attachingConnectors()) {
-            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                connector = ac;
-                break;
-            }
-        }
-
-        if (connector == null) {
-            lastConnectError = "SocketAttach connector not found";
-            throw new RuntimeException("SocketAttach connector not found");
-        }
-
-        final Map<String, Connector.Argument> args = connector.defaultArguments();
-        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
-
         try {
-            vm = connector.attach(args);
+            final SocketAttachment attached = attachSocket(socketConnector(), host, port);
+            vm = attached.vm();
+            targetEndpoint = attached.endpoint();
         } catch (Exception e) {
             lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             // Do NOT seed lastHost/lastPort on failure — ensureConnected() uses those for the
@@ -552,6 +541,87 @@ public class JDIConnectionService {
         @Nullable Instant lastConnectAttempt,
         @Nullable String lastConnectError
     ) {}
+
+    /** Reads the last successful endpoint without probing or connecting to the JVM. */
+    synchronized @Nullable TargetEndpoint targetEndpoint() {
+        return targetEndpoint;
+    }
+
+    /** Confirms which endpoint produced a particular VM, even if an attach raced with getVM(). */
+    synchronized @Nullable TargetEndpoint targetEndpointFor(VirtualMachine expected) {
+        return vm == expected ? targetEndpoint : null;
+    }
+
+    /** JDWP endpoint for a standing approval. Loopback is determined by the address used to attach. */
+    record TargetEndpoint(String host, int port, boolean loopback) {
+        /** Canonicalizes loopback and host spelling while preserving case-sensitive IPv6 zones. */
+        TargetEndpoint {
+            if (loopback) {
+                host = "localhost";
+            } else {
+                host = stripHostBrackets(host);
+                final int zone = host.contains(":") ? host.indexOf('%') : -1;
+                host = zone < 0 ? host.toLowerCase(Locale.ROOT)
+                    : host.substring(0, zone).toLowerCase(Locale.ROOT) + host.substring(zone);
+            }
+        }
+
+        @Override
+        public String toString() {
+            final String label = host.contains(":") ? "[" + host + "]" : host;
+            return label + ':' + port + (!loopback && host.equals("localhost") ? " (non-loopback)" : "");
+        }
+    }
+
+    /**
+     * A VM attached through {@code SocketAttach}, with the endpoint derived from the same resolved
+     * address the connector used.
+     */
+    record SocketAttachment(VirtualMachine vm, TargetEndpoint endpoint) {
+    }
+
+    /**
+     * The JDK's {@code com.sun.jdi.SocketAttach} connector.
+     */
+    private static AttachingConnector socketConnector() {
+        for (AttachingConnector connector : Bootstrap.virtualMachineManager().attachingConnectors()) {
+            if ("com.sun.jdi.SocketAttach".equals(connector.name())) {
+                return connector;
+            }
+        }
+        throw new IllegalStateException("SocketAttach connector not found");
+    }
+
+    /**
+     * Resolves the destination and passes its numeric address to SocketAttach. For unspecified
+     * addresses, applies the socket's local-host substitution before connecting and keying.
+     * If the local hostname is also unspecified, uses loopback in that address family.
+     */
+    static SocketAttachment attachSocket(AttachingConnector connector, String host, int port)
+        throws IOException, IllegalConnectorArgumentsException {
+        final String unbracketed = stripHostBrackets(host);
+        final InetAddress resolved = unbracketed.isEmpty() || "*".equals(unbracketed)
+            ? InetAddress.getLoopbackAddress() : InetAddress.getByName(unbracketed);
+        final boolean wildcard = resolved.isAnyLocalAddress();
+        InetAddress address = wildcard ? InetAddress.getLocalHost() : resolved;
+        if (address.isAnyLocalAddress()) {
+            address = InetAddress.getByName(address instanceof Inet4Address ? "127.0.0.1" : "::1");
+        }
+        final String numericHost = address.getHostAddress();
+        final String endpointHost = wildcard ? numericHost : unbracketed;
+        final Map<String, Connector.Argument> args = connector.defaultArguments();
+        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument")
+            .setValue(numericHost);
+        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument")
+            .setValue(String.valueOf(port));
+        return new SocketAttachment(connector.attach(args),
+            new TargetEndpoint(endpointHost, port, address.isLoopbackAddress()));
+    }
+
+    /** Removes one pair of address brackets without changing the enclosed address or its zone. */
+    private static String stripHostBrackets(String host) {
+        return host.startsWith("[") && host.endsWith("]") ? host.substring(1, host.length() - 1) : host;
+    }
 
     /**
      * Verifies the VM connection is alive, attempting a single reconnect using the host/port from the
@@ -729,6 +799,7 @@ public class JDIConnectionService {
         targetLookup = null;
         lastHost = null;
         lastPort = 0;
+        targetEndpoint = null;
         lastExit = null;
         healthMonitor.stop();
     }
@@ -823,23 +894,10 @@ public class JDIConnectionService {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
-        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-        AttachingConnector connector = null;
-        for (AttachingConnector ac : vmm.attachingConnectors()) {
-            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                connector = ac;
-                break;
-            }
-        }
-        if (connector == null) {
-            lastConnectError = "SocketAttach connector not found";
-            throw new RuntimeException("SocketAttach connector not found");
-        }
-        final Map<String, Connector.Argument> args = connector.defaultArguments();
-        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
         try {
-            vm = connector.attach(args);
+            final SocketAttachment attached = attachSocket(socketConnector(), host, port);
+            vm = attached.vm();
+            targetEndpoint = attached.endpoint();
         } catch (Exception e) {
             lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             // Tracker is already in pending state from the restore above — the agent's BPs
@@ -1060,8 +1118,7 @@ public class JDIConnectionService {
          */
         public String describe() {
             final String target = host != null ? "the target VM at " + host + ':' + port : "the target VM";
-            return target + " exited at " + DateTimeFormatter.ofPattern("HH:mm:ss z")
-                .format(at.atZone(ZoneId.systemDefault()));
+            return target + " exited at " + formatServerTime(at);
         }
 
         /**
@@ -1085,6 +1142,13 @@ public class JDIConnectionService {
                 parts.add(count + " " + noun + (count == 1 ? "" : "s"));
             }
         }
+    }
+
+    /**
+     * "18:42:10 CET" — a time of day in the server's time zone, the format every reply uses.
+     */
+    static String formatServerTime(Instant at) {
+        return DateTimeFormatter.ofPattern("HH:mm:ss z").format(at.atZone(ZoneId.systemDefault()));
     }
 
     /**
@@ -1688,6 +1752,11 @@ public class JDIConnectionService {
             }
             vmRef = vm;
         }
+        return findLoadedClass(vmRef, className);
+    }
+
+    @Nullable
+    ReferenceType findLoadedClass(VirtualMachine vmRef, String className) {
         try {
             final List<ReferenceType> existing = vmRef.classesByName(className);
             if (!existing.isEmpty()) {
@@ -1741,13 +1810,20 @@ public class JDIConnectionService {
      */
     @Nullable
     public ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread) {
+        return findOrForceLoadClass(className, preferredThread, null);
+    }
+
+    /** With an expected VM, force-load only in the JVM selected by the calling tool. */
+    @Nullable
+    ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread,
+                                       @Nullable VirtualMachine expected) {
         // Phase 1: cheap lookups + force-load preflight, all under the monitor.
         final VirtualMachine vmRef;
         final ThreadReference thread;
         final ClassType classClass;
         final Method forName;
         synchronized (this) {
-            if (vm == null) {
+            if (vm == null || (expected != null && vm != expected)) {
                 return null;
             }
             vmRef = vm;

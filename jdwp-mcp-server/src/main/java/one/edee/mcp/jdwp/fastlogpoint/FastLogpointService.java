@@ -392,11 +392,13 @@ public class FastLogpointService {
         if (probe == null || probe.failure() != null) {
             return;
         }
-        deleteQuietly(probe.request());
         final Kind kind = probe.kind();
         String failure;
         Location location = null;
         try {
+            if (!probe.className().equals(refType.name())) {
+                return;
+            }
             failure = rejectHost(refType, kind);
             if (failure == null) {
                 failure = leftoversIn(refType, kind);
@@ -416,6 +418,7 @@ public class FastLogpointService {
         } catch (Exception e) {
             failure = describe(e);
         }
+        deleteQuietly(probe.request());
         if (location == null) {
             failWaiting(probe, Objects.requireNonNullElse(failure, "the line could not be resolved"));
             return;
@@ -628,7 +631,9 @@ public class FastLogpointService {
     /**
      * Publishes the stop a fast breakpoint probe's {@code stop()} reports, unless it is stale: its
      * fast breakpoint was cleared, or (for a stop that claimed a gate) the gate was re-armed or
-     * cancelled since. Runs on the JDI event dispatcher thread. Never throws.
+     * cancelled since. After an unconfirmed write, reconciles the stop with the target gate and
+     * presents it with an uncertainty note if its generation still cannot be verified.
+     * Runs on the JDI event dispatcher thread. Never throws.
      *
      * @return whether the stop was published and its set stays suspended; otherwise the dispatcher
      * resumes it
@@ -647,7 +652,8 @@ public class FastLogpointService {
             if (logpoints.get(flp.id) != flp || flp.stopRequest != request) {
                 return false;
             }
-            if (stop != null && !isCurrent(flp, stop)) {
+            final StopGeneration generation = stop == null ? StopGeneration.CURRENT : classifyStop(flp, stop);
+            if (generation == StopGeneration.STALE) {
                 eventHistory.record(new EventHistory.DebugEvent("FAST_BREAKPOINT_STALE",
                     String.format("[FastBreakpoint %d] a stop claimed before the breakpoint was re-armed reached the "
                         + "debugger late on thread %s — resumed, not reported", flp.id, thread.name()),
@@ -664,7 +670,8 @@ public class FastLogpointService {
             } else {
                 reason = CONDITION_TRUE;
             }
-            publishStop(flp, thread, location, reason, false);
+            final String uncertainty = generation == StopGeneration.UNCERTAIN ? " (gate generation uncertain)" : "";
+            publishStop(flp, thread, location, reason + uncertainty, false);
             return true;
         }
     }
@@ -672,8 +679,8 @@ public class FastLogpointService {
     /**
      * Handles a stop raised by a thread inside an MCP-driven evaluation, on the JDI listener thread:
      * the listener resumes it without reporting it. The gate the suppressed stop claimed is opened
-     * again (its generation advances) unless it was re-armed meanwhile. Makes JDWP field reads and
-     * writes only, never a method invocation. Never throws.
+     * again (its generation advances) if it is still current, reconciling unconfirmed writes first.
+     * Makes JDWP field reads and writes only, never a method invocation. Never throws.
      */
     public void skipStopHit(BreakpointEvent event) {
         final EventRequest request = event.request();
@@ -702,7 +709,7 @@ public class FastLogpointService {
             }
             // A true stop in every-hit mode claimed no gate; anything else re-opens the gate it claimed.
             final boolean errorGate = stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR;
-            if ((errorGate || flp.stopOnce) && isCurrent(flp, stop)) {
+            if ((errorGate || flp.stopOnce) && classifyStop(flp, stop) == StopGeneration.CURRENT) {
                 advanceEpoch(flp, errorGate);
             }
         }
@@ -3021,54 +3028,74 @@ public class FastLogpointService {
     // ── Fast breakpoints ──
 
     /**
+     * Outcome of {@link #rearmBreakpoint}: the reply line and whether the breakpoint is armed again,
+     * so a standing approval is recorded only for a probe that actually re-armed.
+     *
+     * @param message one-line report for the agent
+     * @param rearmed {@code true} when the gates were reopened, {@code false} for a refusal or failure
+     */
+    public record RearmResult(String message, boolean rearmed) {
+    }
+
+    /**
      * Re-arms the fast breakpoint this session owns at {@code location} with exactly these
      * parameters: both gates move to their next generation, so the next true hit (and the next
      * failure) stops again. A breakpoint spent before its probe was ever installed waits for its
      * first hit again.
      *
-     * @return a one-line report, or {@code null} when this session owns no such fast breakpoint
+     * @return the report and whether re-arming succeeded, or {@code null} when there is no matching location
      */
     @Nullable
-    public synchronized String rearmBreakpoint(Location location, String condition, boolean stopOnce,
-                                               int suspendPolicy) {
+    public synchronized RearmResult rearmBreakpoint(Location location, String condition, boolean stopOnce,
+                                                     int suspendPolicy) {
         for (FastLogpoint flp : logpoints.values()) {
             if (flp.kind != Kind.BREAKPOINT || flp.isLeftover() || flp.state == State.REMOVAL_PENDING
                 || !flp.refType.equals(location.declaringType()) || flp.line != location.lineNumber()) {
                 continue;
             }
             if (!condition.equals(flp.condition) || flp.stopOnce != stopOnce || flp.suspendPolicy != suspendPolicy) {
-                return String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
+                final String message = String.format("Error: fast breakpoint %d is already set at %s:%d with other parameters "
                         + "(condition: %s, %s, suspendPolicy: %s) — clear it with jdwp_clear_breakpoint(%d) first, or call "
                         + "again with exactly its parameters to re-arm it.", flp.id, flp.className(), flp.line,
                     flp.condition, modeLabel(flp.stopOnce), policyLabel(flp.suspendPolicy), flp.id);
+                return new RearmResult(message, false);
             }
             switch (flp.state) {
-                case PENDING -> {
+                case PENDING, ARMED -> {
+                    final String gateFailure = reopenGates(flp);
+                    if (gateFailure != null) {
+                        return new RearmResult("Error: fast breakpoint " + flp.id + " — " + gateFailure, false);
+                    }
+                    if (flp.state == State.ARMED) {
+                        final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s",
+                            flp.id, flp.className(), flp.line, flp.id, stopOnce
+                                ? "the next true hit stops again, and so does the next failure of the condition."
+                                : "every true hit stops as before, and the next failure of the condition stops again.");
+                        return new RearmResult(message, true);
+                    }
                     if (flp.armingRequest != null) {
                         // An arming hit whose condition failed spent the error gate and left the request
                         // in place; no probe exists yet, so opening both generations costs nothing.
-                        reopenGates(flp);
-                        return String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
+                        final String message = String.format("Fast breakpoint %d at %s:%d still waits for its first hit (ID: %d) — "
                             + "re-armed: the next true hit stops, and so does the next failure of the condition.",
                             flp.id, flp.className(), flp.line, flp.id);
+                        return new RearmResult(message, true);
                     }
-                    reopenGates(flp);
                     rearm(flp);
-                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
+                    if (flp.state == State.FAILED) {
+                        return new RearmResult(String.format("Error: fast breakpoint %d could not be re-armed: %s.",
+                            flp.id, flp.failureReason), false);
+                    }
+                    final String message = String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — it stopped before its probe "
                         + "was installed, so it arms again on the next hit of the line.", flp.id, flp.className(),
                         flp.line, flp.id);
-                }
-                case ARMED -> {
-                    reopenGates(flp);
-                    return String.format("Fast breakpoint %d at %s:%d re-armed (ID: %d) — %s", flp.id, flp.className(),
-                        flp.line, flp.id, stopOnce
-                            ? "the next true hit stops again, and so does the next failure of the condition."
-                            : "every true hit stops as before, and the next failure of the condition stops again.");
+                    return new RearmResult(message, true);
                 }
                 default -> {
-                    return String.format("Fast breakpoint %d at %s:%d is %s (ID: %d) — clear it with "
+                    final String message = String.format("Fast breakpoint %d at %s:%d is %s (ID: %d) — clear it with "
                         + "jdwp_clear_breakpoint(%d) and set it again.", flp.id, flp.className(), flp.line, flp.state,
                         flp.id, flp.id);
+                    return new RearmResult(message, false);
                 }
             }
         }
@@ -3076,11 +3103,16 @@ public class FastLogpointService {
     }
 
     /**
-     * Moves both gates of {@code flp} to their next generation; caller holds the monitor.
+     * Attempts both gates and reports their individual outcomes on failure. Caller holds the monitor.
      */
-    private void reopenGates(FastLogpoint flp) {
-        advanceEpoch(flp, false);
-        advanceEpoch(flp, true);
+    private @Nullable String reopenGates(FastLogpoint flp) {
+        final String stopFailure = advanceEpoch(flp, false);
+        final String errorFailure = advanceEpoch(flp, true);
+        if (stopFailure == null && errorFailure == null) {
+            return null;
+        }
+        return (stopFailure == null ? "stop gate reopened" : stopFailure) + ". "
+            + (errorFailure == null ? "error gate reopened" : errorFailure) + ".";
     }
 
     /**
@@ -3307,43 +3339,140 @@ public class FastLogpointService {
                 "armingHit", "true")));
     }
 
-    /**
-     * Whether a stop the probe reported still belongs to its gate's current generation. A true stop
-     * in every-hit mode claims no gate and is always current.
-     */
-    private static boolean isCurrent(FastLogpoint flp, StopArguments stop) {
-        if (stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR) {
-            return stop.epoch() == flp.errorEpoch;
-        }
-        return !flp.stopOnce || stop.epoch() == flp.epoch;
+    /** How a reported stop relates to its gate's current generation. */
+    private enum StopGeneration {
+        /** The stop belongs to the current generation or did not claim a gate. */
+        CURRENT,
+        /** The stop belongs to an obsolete generation. */
+        STALE,
+        /** The stop may still be current, and the gate could not be read. */
+        UNCERTAIN
     }
 
     /**
-     * Opens the next generation of a gate, here and in the probe. Caller holds the monitor.
+     * Classifies a stop against its own gate under the service monitor. A hit claiming the
+     * attempted generation proves the write landed. For other hits the target field settles the
+     * ambiguity, when readable. True hits in every-hit mode claim no gate.
      */
-    private void advanceEpoch(FastLogpoint flp, boolean errorGate) {
-        final int current = errorGate ? flp.errorEpoch : flp.epoch;
-        if (current == Integer.MAX_VALUE) {
-            recordWarning(flp, "its " + (errorGate ? "error" : "stop") + " gate cannot be re-opened any more — clear it "
-                + "and set it again");
-            return;
+    private static StopGeneration classifyStop(FastLogpoint flp, StopArguments stop) {
+        final boolean errorGate = stop.kind() == FastBreakpointProbeSource.STOP_CONDITION_ERROR;
+        if (!errorGate && !flp.stopOnce) {
+            return StopGeneration.CURRENT;
         }
-        if (errorGate) {
-            flp.errorEpoch = current + 1;
-        } else {
-            flp.epoch = current + 1;
+        final int confirmed = errorGate ? flp.errorEpoch : flp.epoch;
+        final int attempted = errorGate ? flp.unconfirmedErrorEpoch : flp.unconfirmedEpoch;
+        if (attempted == 0) {
+            return stop.epoch() == confirmed ? StopGeneration.CURRENT : StopGeneration.STALE;
+        }
+        if (stop.epoch() == attempted) {
+            confirmEpoch(flp, errorGate, attempted);
+            return StopGeneration.CURRENT;
+        }
+        if (stop.epoch() < confirmed) {
+            return StopGeneration.STALE;
         }
         final ClassType probeType = flp.probeType;
+        if (probeType != null) {
+            try {
+                final int actual = readGateEpoch(probeType, gateEpochField(probeType, errorGate));
+                confirmEpoch(flp, errorGate, actual);
+                return stop.epoch() == actual ? StopGeneration.CURRENT : StopGeneration.STALE;
+            } catch (Exception e) {
+                log.debug("[FastBreakpoint] #{} gate generation could not be reconciled: {}", flp.id, describe(e));
+            }
+        }
+        return StopGeneration.UNCERTAIN;
+    }
+
+    /**
+     * Opens the next generation of a gate and returns a failure reason if it could not be opened.
+     * The server acknowledges the generation once the target holds it and remembers attempts
+     * whose write and read-back both failed. Caller holds the monitor.
+     */
+    private @Nullable String advanceEpoch(FastLogpoint flp, boolean errorGate) {
+        final String gate = errorGate ? "error gate" : "stop gate";
+        final ClassType probeType = flp.probeType;
+        final Field field;
+        final int current;
         if (probeType == null) {
-            return;
+            field = null;
+            current = errorGate ? flp.errorEpoch : flp.epoch;
+        } else {
+            try {
+                field = gateEpochField(probeType, errorGate);
+                // A previous write may have landed even if its reply and read-back failed.
+                current = readGateEpoch(probeType, field);
+                confirmEpoch(flp, errorGate, current);
+            } catch (Exception e) {
+                return gateFailure(flp, gate + " did not reopen (could not read the target generation: "
+                    + describe(e) + ")");
+            }
         }
-        try {
-            probeType.setValue(probeField(probeType, errorGate
-                    ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD),
-                flp.vm.mirrorOf(current + 1));
-        } catch (Exception e) {
-            recordWarning(flp, "its gate could not be re-opened in the target JVM: " + describe(e));
+        if (current == Integer.MAX_VALUE) {
+            return gateFailure(flp, gate + " did not reopen (generation limit reached; clear and set the breakpoint again)");
         }
+        final int next = current + 1;
+        if (probeType != null && field != null) {
+            try {
+                probeType.setValue(field, flp.vm.mirrorOf(next));
+            } catch (Exception writeFailure) {
+                final int observed;
+                try {
+                    observed = readGateEpoch(probeType, field);
+                } catch (Exception readFailure) {
+                    if (errorGate) {
+                        flp.unconfirmedErrorEpoch = next;
+                    } else {
+                        flp.unconfirmedEpoch = next;
+                    }
+                    return gateFailure(flp, gate + " reopening could not be verified (" + describe(writeFailure)
+                        + "; read-back failed: " + describe(readFailure) + ")");
+                }
+                if (observed != next) {
+                    confirmEpoch(flp, errorGate, observed);
+                    return gateFailure(flp, gate + " did not reopen (" + describe(writeFailure) + ")");
+                }
+            }
+        }
+        confirmEpoch(flp, errorGate, next);
+        return null;
+    }
+
+    /**
+     * Records a gate that could not be reopened as a warning on the probe and returns the reason.
+     */
+    private String gateFailure(FastLogpoint flp, String failure) {
+        recordWarning(flp, failure);
+        return failure;
+    }
+
+    /**
+     * Adopts the target generation and clears the outstanding write for that gate.
+     */
+    private static void confirmEpoch(FastLogpoint flp, boolean errorGate, int generation) {
+        if (errorGate) {
+            flp.errorEpoch = generation;
+            flp.unconfirmedErrorEpoch = 0;
+        } else {
+            flp.epoch = generation;
+            flp.unconfirmedEpoch = 0;
+        }
+    }
+
+    /** Finds the installed probe's generation field for the selected gate. */
+    private static Field gateEpochField(ClassType probeType, boolean errorGate) throws FastLogpointException {
+        return probeField(probeType, errorGate
+            ? FastBreakpointProbeSource.ERROR_EPOCH_FIELD : FastBreakpointProbeSource.EPOCH_FIELD);
+    }
+
+    /**
+     * Reads a gate generation from the probe class (a plain static field read, no invocation).
+     */
+    private static int readGateEpoch(ClassType probeType, Field field) throws FastLogpointException {
+        if (probeType.getValue(field) instanceof IntegerValue epoch) {
+            return epoch.value();
+        }
+        throw new FastLogpointException("probe field " + field.name() + " is not an int");
     }
 
     /**
@@ -3670,6 +3799,10 @@ public class FastLogpointService {
         // the generations claimed by arming hits.
         int epoch = 1;
         int errorEpoch = 1;
+        /** Attempted stop generation if the write outcome is unknown, or zero. Guarded by the service monitor. */
+        int unconfirmedEpoch;
+        /** Attempted error generation if the write outcome is unknown, or zero. Guarded by the service monitor. */
+        int unconfirmedErrorEpoch;
         int claimedEpoch;
         int errorClaimedEpoch;
         @Nullable

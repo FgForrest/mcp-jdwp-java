@@ -8,6 +8,8 @@ import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
 
 import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 
 import static org.mockito.Mockito.mock;
 
@@ -113,7 +115,7 @@ final class JDIConnectionServiceTestSupport {
 	}
 
 	/**
-	 * Plants the auto-reconnect seed ({@code lastHost} / {@code lastPort} private fields) on the
+	 * Plants the auto-reconnect seed and normalized endpoint on the
 	 * service so tests can verify {@link JDIConnectionService#notifyVmDied()} preserves them
 	 * without requiring a real successful attach.
 	 */
@@ -125,8 +127,20 @@ final class JDIConnectionServiceTestSupport {
 			final Field portField = JDIConnectionService.class.getDeclaredField("lastPort");
 			portField.setAccessible(true);
 			portField.set(service, port);
+			final Field endpointField = JDIConnectionService.class.getDeclaredField("targetEndpoint");
+			endpointField.setAccessible(true);
+			endpointField.set(service, new JDIConnectionService.TargetEndpoint(host, port, isLoopback(host)));
 		} catch (ReflectiveOperationException e) {
-			throw new AssertionError("Failed to plant 'lastHost'/'lastPort' fields via reflection", e);
+			throw new AssertionError("Failed to plant the last successful endpoint via reflection", e);
+		}
+	}
+
+	private static boolean isLoopback(String host) {
+		try {
+			return InetAddress.getByName(host).isLoopbackAddress();
+		} catch (UnknownHostException ignored) {
+			// Some tests plant a fictitious last host.
+			return false;
 		}
 	}
 }

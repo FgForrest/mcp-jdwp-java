@@ -191,12 +191,13 @@ Every `jdwp_set_logpoint` hit pauses the hitting thread for milliseconds while t
 This is a situational tool, not an upgrade: `jdwp_set_logpoint` stays the default. Use the fast variant only when the per-hit pause would distort the behaviour under investigation.
 
 **Consent protocol — mandatory:**
-1. Call `jdwp_set_fast_logpoint(className, lineNumber, expression, condition?)` **without** `userApproved`. Nothing is armed; you get a risk briefing.
-2. Relay the briefing to the user **word for word** and ask whether to proceed.
-3. Only after the user has explicitly agreed **in this conversation**, call again with the same arguments and `userApproved=true`.
-4. Never infer consent ("the user asked me to debug the race" is not consent), never reuse consent given for a different class, line or target VM, and never pass `userApproved=true` on the first call. If the user declines, use `jdwp_set_logpoint`.
+1. Call `jdwp_set_fast_logpoint(className, lineNumber, expression, condition?)` **without** `userApproved`. The server arms directly if it holds a standing approval for this exact probe at this host:port. Its reply gives the grant time.
+2. If the briefing has no endpoint yet, attach and request a named briefing. Relay the named risk briefing to the user **word for word** and ask whether to proceed.
+3. Only after the user has explicitly approved this exact probe at this endpoint **in this conversation**, call again with the same arguments and `userApproved=true`. If the server returns a fresh briefing after an endpoint change, relay it and ask again. Never infer consent. If the user declines, use `jdwp_set_logpoint`.
+4. For later JVMs at the same endpoint, make the same call without `userApproved`. The grant lasts for this MCP server process, including across JVM exit, disconnect, reconnect and reset. `jdwp_overview(types="fast_logpoint")` lists the grants.
 
 **Then:**
+- Use the JVM's exact binary class name, such as `com.example.Outer$Inner` or `example.Order-item`. The approval includes the effective `bufferSize` and `forceLoad` settings. Changing either requires approval for the new settings.
 - A class that is not loaded yet is waited for: the reply says `WAITING`, and `FAST_LOGPOINT_CLASS_LOADED` (or `FAST_LOGPOINT_ARM_FAILED`, when the line cannot host it) follows when it loads — no regular breakpoint or `forceLoad` first (`forceLoad` cannot load anything at VM start anyway). The next hit of the line arms the probe: that one thread pauses briefly, and that hit is logged through the debugger (`armingHit`).
 - Read hits with `jdwp_get_events` — `FAST_LOGPOINT` / `FAST_LOGPOINT_ERROR` entries carry the in-target thread, `seq` and `nanoTime`. Hits still unread when the target exits (a test JVM finishing) are read before it goes: `[VM_DEATH]` lists them, and `FAST_LOGPOINT_READ_AT_EXIT` says how many. The history keeps the last 500 entries — on a busy probe, read while it runs, or narrow the condition. `FAST_LOGPOINT_DROPPED` means entries were overwritten before you read them: read more often, raise `bufferSize` (power of two, ≤ 65536) or narrow the condition. `jdwp_overview(types="fast_logpoint")` shows the state and counters.
 - `FAST_LOGPOINT_ARM_FAILED` explains a refused arm — most often "the class bytes ... differ from the live bytecode": another agent (JaCoCo, Mockito inline mocks, an enhancer) rewrote the class. That refusal is the safety check working; fall back to `jdwp_set_logpoint`.
@@ -205,7 +206,7 @@ This is a situational tool, not an upgrade: `jdwp_set_logpoint` stays the defaul
 - Clear it as soon as you have your answer: `jdwp_clear_breakpoint(id)` restores the original bytecode (so do `jdwp_reset`, `jdwp_disconnect` and server shutdown). Tell the user if a `FAST_LOGPOINT_WARNING` says the bytecode could not be restored — the logpoint then stays listed as `DISABLED` and clearing it again retries.
 
 **Fast logpoints left by an earlier session.** If an attach reply (or `jdwp_overview`, or a `FAST_LOGPOINT_RECOVERED` event) reports fast logpoints left by an earlier debugging session, a previous server died without restoring the class — they keep evaluating in the target. Tell the user what was found (class, line, expression, who armed it when) and **leave them alone unless the user asks**: the earlier investigation may still want them.
-- `RECOVERED` — the class is exactly as that session left it. `jdwp_clear_breakpoint(id)` switches it off without touching the bytecode (no consent needed). `jdwp_restore_fast_logpoints(id)` restores the class's original bytecode, removing every leftover in it — it follows the same consent protocol as arming: call it without `userApproved`, relay the briefing word for word, and pass `userApproved=true` only after the user agreed.
+- `RECOVERED` — the class is exactly as that session left it. `jdwp_clear_breakpoint(id)` switches it off without touching the bytecode (no consent needed). `jdwp_restore_fast_logpoints(id)` restores the class's original bytecode, removing every leftover in it. Get fresh approval for each restore. Call without `userApproved`, relay the briefing word for word, and pass `userApproved=true` only after the user agrees.
 - `STRANDED` — the class changed after the probe was installed, or its wiring is unknown. Only `jdwp_clear_breakpoint(id)` (the kill switch) is offered; the injected call stays until the JVM restarts.
 - A class with leftovers refuses new fast logpoints until they are restored; use `jdwp_set_logpoint` meanwhile.
 
@@ -215,13 +216,13 @@ A conditional `jdwp_set_breakpoint` evaluates its condition through the server o
 
 Same rule as for the fast logpoint: `jdwp_set_breakpoint` with a condition stays the default. Use the fast variant only when going through the debugger on every hit would distort the behaviour under investigation.
 
-**Consent protocol — the fast logpoint's, unchanged:** call it without `userApproved`, relay the risk briefing to the user word for word, and call again with the same arguments and `userApproved=true` only after the user explicitly agreed in this conversation. Never infer or reuse consent. If the user declines, use `jdwp_set_breakpoint` with the condition.
+Follow the fast logpoint's consent protocol. Call without `userApproved` and let the server check for a standing approval for the exact breakpoint, including its condition, suspend policy, stop mode and `forceLoad`, at this host:port. If the tool returns a briefing, relay it word for word and ask before passing `userApproved=true`. See grants with `jdwp_overview(types="fast_breakpoint")`. If the user declines, use `jdwp_set_breakpoint` with the condition.
 
 **Then:**
 - A class that is not loaded yet is waited for (`WAITING`, then `FAST_BREAKPOINT_CLASS_LOADED`). The next hit of the line evaluates the condition through the debugger: if it holds, that hit is the stop; otherwise the probe is installed then.
 - Wait with `jdwp_resume_until_event`. The report says `fast_breakpoint=N, condition true`, or `condition failed: <text>` — a condition that throws stops once; later failures are only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
 - `suspendPolicy="all"` (default) parks every thread, but the other threads a moment after the hitting one, so they may have moved past the state you want; `"thread"` parks only the hitting thread.
-- `stopOnce=true` (default): only the first hit that meets the condition stops. To catch the next one, call the tool again with exactly the same arguments — that re-arms it under the same ID. `stopOnce=false`: every such hit stops.
+- With `stopOnce=true` (default), only the first hit that meets the condition stops. Call again with the same probe settings to re-arm under the same ID. If a gate update fails, the reply identifies the affected gate. With `stopOnce=false`, every true hit stops.
 - At the stop, frame #0 is your method: the probe's frames are hidden. Stack, locals, `jdwp_evaluate_expression`, `jdwp_set_local` and steps work as at any breakpoint; a step first lands on the stop line itself. On a virtual thread, `jdwp_set_local` needs one step first.
 - The condition runs unsynchronized on every thread that passes the line: thread-safe, free of side effects, possibly reading stale values. Locals, `this` and non-private members are reachable; private fields are not.
 - Watchers attach by the fast breakpoint's ID (`jdwp_attach_watcher`) and evaluate at the stop. Chains (`jdwp_set_breakpoint_dependency`, `triggerBreakpointId`) refuse fast breakpoints.
