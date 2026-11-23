@@ -193,7 +193,7 @@ Solution: detect the `$$` pattern and walk up the superclass chain to find the r
 
 ### Non-public type visibility
 
-The compiled evaluator normally uses `mcp.jdi.evaluation`. For a non-public `this` in an addressable package it emits the wrapper into that package, where Java permits access to the type and its package-accessible members. If the target refuses the definition, it retries in the isolated wrapper package. Types unavailable to the wrapper are represented by an accessible supertype or `Object`.
+The compiled evaluator normally uses `mcp.jdi.evaluation`. For a non-public `this` in an addressable package it emits the wrapper into that package, where Java permits access to the type and its package-accessible members. If the target refuses the definition, it retries in the isolated wrapper package. When the compiler builds the initial wrapper signature, frame parameter types unavailable to the wrapper are represented by an accessible supertype or `Object`.
 
 ### `this` field auto-rewriting
 
@@ -248,9 +248,13 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 The wrapper's first compile uses Java access rules. For ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints, ECJ visibility errors can trigger a retry with reflective access on JDK 17 and 21. A loop, `try` block, lambda, switch or anonymous class can read an inaccessible field or call an inaccessible method or constructor. For example, `{ int n = 0; for (Item i : store.items) n += i.qty; return n; }` can read private application fields. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
 
-The retry uses ECJ source positions and bindings. The wrapper looks up and caches each member with its own defining loader, and casts results to their declared type or an accessible supertype. A reflected call rethrows the original target exception. The compiler makes up to four rewrite passes and reports the original diagnostics if the source still fails to compile.
+The retry uses ECJ source positions and bindings. The wrapper looks up and caches each reflected member with its own defining loader. Reads and calls preserve their exact types. If a type cannot be named from the wrapper, the compiler keeps the original diagnostic. An access anywhere in an assignment target, including a receiver or index, also keeps the original diagnostic. This includes compound assignments, increments and decrements.
 
-Private field writes and explicit uses of an inaccessible type name, including in local declarations, can still produce compiler errors. Method references and constructors that need an enclosing instance retain Java access checks. If a member is in a JDK package closed to the wrapper, such as `String.value` with the standard JDK settings, the reply includes the original visibility diagnostic and a module note. Fast probes, including fast-breakpoint captures and arming-hit evaluations, use direct Java access rules and retain their ordinary-tool hint.
+The compiler inlines type-qualified constant variables without initializing their declaring class. A constant qualified by an expression keeps the original diagnostic. A reflected constructor initializes its class before the arguments run. A reflected call rethrows the original target exception. Null-receiver messages name the member and describe method results, static and instance fields, and local variables or parameters. Other shapes use "the receiver". Field reads check for null immediately, and method calls check after evaluating the arguments.
+
+The compiler makes up to four rewrite passes and reports the original diagnostics if the source still fails to compile. The executor attempts companion definitions for local and anonymous classes. If a companion cannot be defined, evaluation can proceed, and the JVM reports the missing class if execution reaches it.
+
+Explicit uses of an inaccessible type name, including in local declarations, can still produce compiler errors. Method references and constructors that need an enclosing instance retain Java access checks. If a member is in a JDK package closed to the wrapper, such as `String.value` with the standard JDK settings, the reply includes the original visibility diagnostic and a module note. Fast probes, including fast-breakpoint captures and arming-hit evaluations, use direct Java access rules and retain their ordinary-tool hint.
 
 ### VMStart suspension
 

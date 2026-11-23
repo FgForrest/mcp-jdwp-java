@@ -223,7 +223,7 @@ public class InMemoryJavaCompiler {
         }
     }
 
-    /** Rewrites at most four rounds, keeping the original failure if any round cannot proceed. */
+    /** Rewrites up to four rounds, carrying receiver wording forward and keeping the original failure on refusal. */
     private EvaluationCompilation retryMemberAccess(String className, String source, Configuration config,
                                                     MemberAccessFailure original) throws JdiEvaluationException {
         try {
@@ -231,9 +231,11 @@ public class InMemoryJavaCompiler {
             final Path file = directory.resolve(className.substring(className.lastIndexOf('.') + 1) + ".java");
             try {
                 String current = source;
+                final Map<String, String> receiverDescriptions = new HashMap<>();
                 for (int round = 0; round < MEMBER_ACCESS_ROUNDS; round++) {
                     Files.writeString(file, current);
-                    final @Nullable String rewritten = MemberAccessRewrite.rewrite(className, file, current, config, round == 0);
+                    final @Nullable String rewritten =
+                        MemberAccessRewrite.rewrite(className, file, current, config, round == 0, receiverDescriptions);
                     if (rewritten == null) {
                         break;
                     }

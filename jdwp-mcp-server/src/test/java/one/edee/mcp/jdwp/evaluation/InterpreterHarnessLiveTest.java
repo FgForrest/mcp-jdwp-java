@@ -22,10 +22,16 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.io.TempDir;
 import tools.jackson.databind.json.JsonMapper;
 
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
+import java.io.File;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -190,7 +196,7 @@ class InterpreterHarnessLiveTest {
                 replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
                     evaluator.configureCompilerClasspath(thread);
                     assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (int i = 0; i < 2; i++) "
-                        + "sum += this.secret; return sum; }")).isEqualTo("42");
+                        + "sum += new " + owner + "().amount; return sum; }")).isEqualTo("14");
                     assertThat(evaluateBlock(evaluator, thread,
                         "((java.util.function.IntSupplier) () -> this.privateMethod()).getAsInt()")).isEqualTo("22");
                     assertThat(evaluateBlock(evaluator, thread, "{ return " + owner + ".hidden().hiddenAmount; }"))
@@ -199,13 +205,14 @@ class InterpreterHarnessLiveTest {
                     assertThat(evaluateBlock(evaluator, thread, "{ return new " + owner + "(5).amount; }"))
                         .isEqualTo("5");
                     final String anonymous = "{ return new java.util.function.IntSupplier() { "
-                        + "public int getAsInt() { return _this.secret; } }.getAsInt(); }";
-                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("21");
-                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("21");
+                        + "public int getAsInt() { return new " + owner + "().amount; } }.getAsInt(); }";
+                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("7");
+                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("7");
                     assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (" + owner + " entry : new "
                         + owner + "().entries) sum += entry.amount; return sum; }")).isEqualTo("7");
-                    assertThat(evaluateBlock(evaluator, thread, "{ return new " + owner + "().hidden.hiddenAmount; }"))
-                        .isEqualTo("41");
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread,
+                        "{ return new " + owner + "().hidden.hiddenAmount; }"))
+                        .hasMessageContaining("is not visible");
                     assertThat(evaluateBlock(evaluator, thread, "{ return switch (n) { case 2 -> new "
                         + owner + "().select(\"abc\"); default -> 0; }; }")).isEqualTo("3");
                     assertThat(evaluateBlock(evaluator, thread, "{ try { new " + owner + "().checked(); "
@@ -230,6 +237,57 @@ class InterpreterHarnessLiveTest {
                             .hasMessageContaining("The member is in a JDK module that is not open.")
                             .hasMessageNotContaining("InaccessibleObjectException");
                     }
+                }, new StringBuilder(), null);
+                return true;
+            });
+        }
+    }
+
+    /** A missing compile-only superclass affects the wrapper only if execution reaches the companion. */
+    @Test
+    void evaluatesWithAnUnavailableCompanion(@TempDir Path directory) throws Exception {
+        final String owner = PrivateMembers.Semantics.class.getCanonicalName();
+        final String dependency = "optionalfixture.Absent";
+        final String allocation = "new " + dependency + "() {}.toString()";
+        final String body = "if (" + owner + ".guard()) return " + allocation + "; return \"ok\";";
+        final Path optionalSource = Files.writeString(directory.resolve("Absent.java"),
+            "package optionalfixture; public class Absent {}");
+        final Path optionalClasses = Files.createDirectory(directory.resolve("compile-only"));
+        final Path goldenSource = Files.writeString(directory.resolve("Golden.java"),
+            "package optionalfixture; public class Golden { public static Object evaluate() { " + body + " } }");
+        final Path goldenClasses = Files.createDirectory(directory.resolve("golden"));
+        final JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        assertThat(javac.run(null, null, null, "-d", optionalClasses.toString(), optionalSource.toString())).isZero();
+        assertThat(javac.run(null, null, null, "-cp", optionalClasses + File.pathSeparator + "target/test-classes",
+            "-d", goldenClasses.toString(), goldenSource.toString())).isZero();
+        try (URLClassLoader loader = new URLClassLoader(
+                new URL[]{goldenClasses.toUri().toURL()}, getClass().getClassLoader())) {
+            PrivateMembers.Semantics.reset();
+            assertThat(loader.loadClass("optionalfixture.Golden").getMethod("evaluate").invoke(null)).isEqualTo("ok");
+            assertThat(PrivateMembers.Semantics.trace().strip()).isEqualTo("guard");
+        }
+        for (final Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler() {
+                    /** Makes the superclass visible only to compilation, irrespective of the target loader. */
+                    @Override
+                    Map<String, byte[]> compile(String name, String source, @Nullable Configuration config)
+                        throws JdiEvaluationException {
+                        if (config == null) {
+                            return super.compile(name, source, null);
+                        }
+                        final Configuration withOptional = new Configuration(config.jdkPath(),
+                            config.classpath() + File.pathSeparator + optionalClasses, config.targetMajorVersion());
+                        return super.compile(name, source, withOptional);
+                    }
+                };
+                final JdiExpressionEvaluator evaluator = fixture.evaluator(compiler);
+                replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
+                    evaluator.configureCompilerClasspath(thread);
+                    assertThat(evaluateBlock(evaluator, thread, "{ " + body + " }")).isEqualTo("ok");
+                    assertThat(evaluateBlock(evaluator, thread, owner + ".trace()").strip()).isEqualTo("guard");
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread, "{ return " + allocation + "; }"))
+                        .hasMessage("Target VM threw exception: java.lang.NoClassDefFoundError");
                 }, new StringBuilder(), null);
                 return true;
             });

@@ -4,25 +4,33 @@ import org.eclipse.jdt.core.compiler.IProblem;
 import org.eclipse.jdt.internal.compiler.ASTVisitor;
 import org.eclipse.jdt.internal.compiler.Compiler;
 import org.eclipse.jdt.internal.compiler.DefaultErrorHandlingPolicies;
-import org.eclipse.jdt.internal.compiler.ast.ASTNode;
 import org.eclipse.jdt.internal.compiler.ast.AbstractMethodDeclaration;
 import org.eclipse.jdt.internal.compiler.ast.AllocationExpression;
+import org.eclipse.jdt.internal.compiler.ast.Assignment;
+import org.eclipse.jdt.internal.compiler.ast.CastExpression;
 import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
+import org.eclipse.jdt.internal.compiler.ast.CompoundAssignment;
 import org.eclipse.jdt.internal.compiler.ast.Expression;
 import org.eclipse.jdt.internal.compiler.ast.FieldReference;
 import org.eclipse.jdt.internal.compiler.ast.ForStatement;
 import org.eclipse.jdt.internal.compiler.ast.Invocation;
 import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
 import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+import org.eclipse.jdt.internal.compiler.ast.PostfixExpression;
+import org.eclipse.jdt.internal.compiler.ast.PrefixExpression;
 import org.eclipse.jdt.internal.compiler.ast.QualifiedNameReference;
+import org.eclipse.jdt.internal.compiler.ast.SingleNameReference;
 import org.eclipse.jdt.internal.compiler.ast.Statement;
+import org.eclipse.jdt.internal.compiler.ast.ThisReference;
 import org.eclipse.jdt.internal.compiler.ast.TypeDeclaration;
 import org.eclipse.jdt.internal.compiler.batch.FileSystem;
 import org.eclipse.jdt.internal.compiler.batch.Main;
 import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+import org.eclipse.jdt.internal.compiler.impl.Constant;
 import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
 import org.eclipse.jdt.internal.compiler.lookup.FieldBinding;
 import org.eclipse.jdt.internal.compiler.lookup.InvocationSite;
+import org.eclipse.jdt.internal.compiler.lookup.LocalVariableBinding;
 import org.eclipse.jdt.internal.compiler.lookup.MethodBinding;
 import org.eclipse.jdt.internal.compiler.lookup.ParameterizedTypeBinding;
 import org.eclipse.jdt.internal.compiler.lookup.ProblemFieldBinding;
@@ -32,19 +40,18 @@ import org.eclipse.jdt.internal.compiler.lookup.ReferenceBinding;
 import org.eclipse.jdt.internal.compiler.lookup.Scope;
 import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
 import org.eclipse.jdt.internal.compiler.lookup.TypeIds;
-import org.eclipse.jdt.internal.compiler.lookup.VariableBinding;
 import org.eclipse.jdt.internal.compiler.lookup.WildcardBinding;
+import org.eclipse.jdt.internal.compiler.util.Util;
 import org.jspecify.annotations.Nullable;
 
 import java.io.PrintWriter;
 import java.io.Writer;
 import java.nio.file.Path;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
 
@@ -61,18 +68,23 @@ final class MemberAccessRewrite extends ASTVisitor {
     private final List<Edit> edits = new ArrayList<>();
     /** Statement expressions whose values the surrounding Java code discards. */
     private final Set<Expression> discarded = new HashSet<>();
-    /** Generated signatures for reflected calls that declare checked exceptions. */
+    /** Original receiver wording keyed by generated calls that later passes may use as receivers. */
+    private final Map<String, String> receiverDescriptions;
+    /** Generated signatures for discarded results and reflected calls that declare checked exceptions. */
     private final StringBuilder bridges = new StringBuilder();
-    /** Next candidate suffix for a checked-exception bridge. */
+    /** Next candidate suffix for a generated call bridge. */
     private int nextBridge;
+    /** A rewrite would change a target or require a different static type. */
+    private boolean refused;
 
     /** Replaces a half-open source range with one complete Java expression. */
     private record Edit(int start, int end, String replacement) {}
 
     /** Collects edits against the original source for this round. */
-    private MemberAccessRewrite(String source, List<IProblem> accessProblems) {
+    private MemberAccessRewrite(String source, List<IProblem> accessProblems, Map<String, String> receiverDescriptions) {
         this.source = source;
         this.accessProblems = accessProblems;
+        this.receiverDescriptions = receiverDescriptions;
     }
 
     /** Identifies ECJ's member-visibility diagnostics, including invisible receiver types. */
@@ -99,10 +111,12 @@ final class MemberAccessRewrite extends ASTVisitor {
     /**
      * Resolves the same source with ECJ's batch name environment, which exposes binding objects
      * and the original problem arguments. JSR-199 hides both behind diagnostic strings.
+     * Keeps receiver descriptions across passes so diagnostics can still name an edited receiver.
      * Returns null when there is no supported safe edit.
      */
     static @Nullable String rewrite(String className, Path file, String source,
-                                    InMemoryJavaCompiler.Configuration config, boolean appendHelpers) {
+                                    InMemoryJavaCompiler.Configuration config, boolean appendHelpers,
+                                    Map<String, String> receiverDescriptions) {
         final List<String> options = InMemoryJavaCompiler.buildCompilerOptions(config);
         options.addAll(List.of("-proc:none", file.toString()));
         final PrintWriter output = new PrintWriter(Writer.nullWriter());
@@ -125,12 +139,47 @@ final class MemberAccessRewrite extends ASTVisitor {
                     return null;
                 }
             }
-            final MemberAccessRewrite rewrite = new MemberAccessRewrite(source, access);
+            final MemberAccessRewrite rewrite = new MemberAccessRewrite(source, access, receiverDescriptions);
             unit.traverse(rewrite, unit.scope, false);
             return rewrite.apply(className, unit.types[0], appendHelpers);
         } finally {
             environment.cleanup();
         }
+    }
+
+    /** Checks the entire assignment target before its receiver and indices are visited. */
+    @Override
+    public boolean visit(Assignment node, BlockScope scope) {
+        return checkTarget(node.lhs);
+    }
+
+    /** Checks the target of a compound assignment. */
+    @Override
+    public boolean visit(CompoundAssignment node, BlockScope scope) {
+        return checkTarget(node.lhs);
+    }
+
+    /** Checks the target of a prefix increment or decrement. */
+    @Override
+    public boolean visit(PrefixExpression node, BlockScope scope) {
+        return checkTarget(node.lhs);
+    }
+
+    /** Checks the target of a postfix increment or decrement. */
+    @Override
+    public boolean visit(PostfixExpression node, BlockScope scope) {
+        return checkTarget(node.lhs);
+    }
+
+    /** Refuses the whole retry if an access diagnostic intersects any part of the target. */
+    private boolean checkTarget(Expression target) {
+        for (final IProblem problem : accessProblems) {
+            if (problem.getSourceStart() <= target.sourceEnd && target.sourceStart <= problem.getSourceEnd()) {
+                refused = true;
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A non-void call in a void-compatible lambda still has to be a statement expression. */
@@ -170,7 +219,7 @@ final class MemberAccessRewrite extends ASTVisitor {
     /** Rewrites a failed field selection whose receiver is an arbitrary Java expression. */
     @Override
     public void endVisit(FieldReference node, BlockScope scope) {
-        if (isWrite(node) || node.receiver.isSuper()) {
+        if (refused || node.receiver.isSuper()) {
             return;
         }
         final @Nullable FieldBinding field = field(node.binding, node.actualReceiverType, node.token);
@@ -185,75 +234,62 @@ final class MemberAccessRewrite extends ASTVisitor {
             && !hasProblem(IProblem.InheritedFieldHidesEnclosingName, node.sourceStart, node.sourceEnd, null, 0)) {
             return;
         }
-        // ECJ can bind again after an ordinary receiver edit. An invisible receiver loses its
-        // type when widened, so keep its outer field binding in the same edit.
-        if (!invisibleReceiver && hasEditIn(node)) {
+        // The next pass can bind this read against the same type after editing its receiver.
+        if (hasEditIn(node)) {
             return;
         }
-        add(node.sourceStart, node.sourceEnd, read(field, receiver(node.receiver, field.isStatic()), scope));
+        rewriteField(node.sourceStart, node.sourceEnd, field, node.receiver.isTypeReference(),
+            text(node.receiver), describeReceiver(node.receiver), node.receiver.resolvedType, scope);
     }
 
-    /** ECJ represents a dotted sequence of bare names as one node, with a separate range for each token. */
+    /** ECJ represents dotted names as one node. Rewrite the first inaccessible selection in that chain. */
     @Override
     public void endVisit(QualifiedNameReference node, BlockScope scope) {
         final int firstField = node.indexOfFirstFieldBinding - 1;
-        if (firstField < 0) {
+        if (refused || firstField < 0) {
             return;
         }
         // ECJ includes enclosing parentheses in sourceStart, so token positions bound this edit.
         final int start = (int) (node.sourcePositions[0] >>> 32);
         @Nullable TypeBinding receiverType = node.actualReceiverType;
-        @Nullable String rewrittenPrefix = null;
-        int rewrittenEnd = start;
         for (int i = firstField; i < node.tokens.length; i++) {
-            final @Nullable FieldBinding bound;
-            if (i == firstField) {
-                if (node.binding instanceof VariableBinding variable && !(variable instanceof FieldBinding)) {
-                    receiverType = variable.type;
-                    continue;
-                }
-                bound = node.binding instanceof FieldBinding f ? f : null;
-            } else {
-                bound = node.otherBindings == null ? null : node.otherBindings[i - firstField - 1];
+            if (i == firstField && node.binding instanceof LocalVariableBinding local) {
+                receiverType = local.type;
+                continue;
             }
-            final @Nullable FieldBinding field = field(bound, receiverType, node.tokens[i]);
+            final @Nullable FieldBinding field = field(fieldAt(node, i), receiverType, node.tokens[i]);
             if (field == null) {
-                break;
+                return;
             }
             final long position = node.sourcePositions[i];
             final int end = (int) position;
             final int receiverEnd = i == 0 ? -1 : (int) node.sourcePositions[i - 1];
-            final boolean receiverWillBeWidened = rewrittenPrefix != null && receiverType != null
-                && !canName(receiverType, scope);
-            if (receiverWillBeWidened
-                || hasProblem(IProblem.NotVisibleField, (int) (position >>> 32), end, field.name, 0)
+            if (hasProblem(IProblem.NotVisibleField, (int) (position >>> 32), end, field.name, 0)
                 || hasProblem(IProblem.InheritedFieldHidesEnclosingName, start, end, null, 0)
                 || hasProblem(IProblem.NotVisibleType, start, receiverEnd,
                     receiverType == null ? null : receiverType.readableName(), 0)) {
-                if (isWrite(node) && i == node.tokens.length - 1) {
-                    return;
+                if (receiverEnd >= start) {
+                    final boolean typeQualifier = i == firstField && node.binding instanceof FieldBinding;
+                    rewriteField(start, end, field, typeQualifier, source.substring(start, receiverEnd + 1),
+                        describeQualifiedName(node, i - 1), receiverType, scope);
                 }
-                final String qualifier;
-                if (i == firstField && field.isStatic()) {
-                    qualifier = "null";
-                } else if (receiverEnd >= start) {
-                    final String prefix = rewrittenPrefix != null ? rewrittenPrefix : source.substring(start, receiverEnd + 1);
-                    qualifier = field.isStatic() ? "__mcpDiscard(" + prefix + ")" : prefix;
-                } else {
-                    break;
-                }
-                rewrittenPrefix = read(field, qualifier, scope);
-                rewrittenEnd = end;
-                // Leave further accesses to ECJ except where widening would lose their receiver.
-                if (canName(field.type, scope)) {
-                    break;
-                }
+                return;
             }
             receiverType = field.type;
         }
-        if (rewrittenPrefix != null) {
-            add(start, rewrittenEnd, rewrittenPrefix);
+    }
+
+    /** Retrieves the field binding for one token in an ECJ qualified name. */
+    private static @Nullable FieldBinding fieldAt(QualifiedNameReference node, int token) {
+        final int firstField = node.indexOfFirstFieldBinding - 1;
+        if (token == firstField && node.binding instanceof FieldBinding field) {
+            return field;
         }
+        final int index = token - firstField - 1;
+        if (node.otherBindings != null && index >= 0 && index < node.otherBindings.length) {
+            return node.otherBindings[index];
+        }
+        return null;
     }
 
     /** Rewrites an inaccessible method using ECJ's selected declaring class and erased signature. */
@@ -265,7 +301,7 @@ final class MemberAccessRewrite extends ASTVisitor {
             || hasProblem(IProblem.InheritedMethodHidesEnclosingName, start, end, node.selector, 1);
         final boolean invisibleReceiver = hasProblem(IProblem.NotVisibleType, node.receiver.sourceStart,
             node.receiver.sourceEnd, null, 0);
-        if ((!inaccessible && !invisibleReceiver) || node.receiver.isSuper() || node.receiver.isImplicitThis()) {
+        if (refused || (!inaccessible && !invisibleReceiver) || node.receiver.isSuper() || node.receiver.isImplicitThis()) {
             return;
         }
         if (!valid(node.argumentTypes)) {
@@ -286,24 +322,39 @@ final class MemberAccessRewrite extends ASTVisitor {
         if (binding == null || (!binding.isStatic() && typeReceiver)) {
             return;
         }
+        if (!canName(binding.returnType, scope)) {
+            refused = true;
+            return;
+        }
         final @Nullable String arguments = arguments(binding, node, node.arguments, node.argumentTypes, scope);
         if (arguments == null) {
             return;
         }
         final boolean returnsVoid = binding.returnType == TypeBinding.VOID;
-        final @Nullable String helper = bridge(binding, returnsVoid ? "__mcpInvokeVoid" : "__mcpInvoke", false, scope);
+        final boolean discardedResult = discardsValue(node) && !returnsVoid;
+        final @Nullable String helper = bridge(binding, returnsVoid ? "__mcpInvokeVoid" : "__mcpInvoke",
+            false, discardedResult ? binding.returnType : null, scope);
         if (helper == null) {
             return;
         }
-        final String invoke = helper + "(" + receiver(node.receiver, binding.isStatic()) + ", "
-            + quote(binaryName(binding.declaringClass)) + ", " + quote(new String(node.selector)) + ", " + arguments + ")";
-        add(node.sourceStart, node.sourceEnd, returnsVoid || discardsValue(node) ? invoke : cast(binding.returnType, invoke, scope));
+        final String member = displayQuoted(describeMethod(node.receiver.resolvedType, binding));
+        final String nullMessage = binding.isStatic() ? "null" : quote(
+            "Cannot invoke " + member + " because " + describeReceiver(node.receiver) + " is null");
+        final String qualifier = receiver(text(node.receiver), typeReceiver, binding.isStatic());
+        final String invoke = helper + "(" + qualifier + ", " + quote(binaryName(binding.declaringClass))
+            + ", " + quote(new String(node.selector)) + ", " + arguments + ", " + nullMessage + ")";
+        if (returnsVoid || discardedResult) {
+            add(node.sourceStart, node.sourceEnd, invoke);
+        } else {
+            receiverDescriptions.put(invoke, "the return value of " + member);
+            add(node.sourceStart, node.sourceEnd, cast(binding.returnType, invoke));
+        }
     }
 
     /** Rewrites ordinary class creation when the constructor alone is inaccessible. */
     @Override
     public void endVisit(AllocationExpression node, BlockScope scope) {
-        if (!hasProblem(IProblem.NotVisibleConstructor, node.sourceStart, node.sourceEnd, null, 0)
+        if (refused || !hasProblem(IProblem.NotVisibleConstructor, node.sourceStart, node.sourceEnd, null, 0)
             || !valid(node.argumentTypes)) {
             return;
         }
@@ -316,10 +367,18 @@ final class MemberAccessRewrite extends ASTVisitor {
         if (arguments == null) {
             return;
         }
-        final @Nullable String helper = bridge(binding, "__mcpConstruct", true, scope);
+        if (!canName(node.resolvedType, scope)) {
+            refused = true;
+            return;
+        }
+        final boolean discardedResult = discardsValue(node);
+        final @Nullable String helper = bridge(binding, "__mcpConstruct", true,
+            discardedResult ? node.resolvedType : null, scope);
         if (helper != null) {
-            final String invoke = helper + "(" + quote(binaryName(binding.declaringClass)) + ", " + arguments + ")";
-            add(node.sourceStart, node.sourceEnd, discardsValue(node) ? invoke : cast(node.resolvedType, invoke, scope));
+            // Java initializes the class at new, before evaluating constructor arguments.
+            final String owner = "__mcpInitialize(" + quote(binaryName(binding.declaringClass)) + ")";
+            final String invoke = helper + "(" + owner + ", " + arguments + ")";
+            add(node.sourceStart, node.sourceEnd, discardedResult ? invoke : cast(node.resolvedType, invoke));
         }
     }
 
@@ -369,8 +428,9 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
     }
 
-    /** Preserves checked-exception reachability in surrounding catches, lambdas and methods. */
-    private @Nullable String bridge(MethodBinding method, String helper, boolean constructor, BlockScope scope) {
+    /** Keeps checked-exception reachability and types discarded results without making them cast statements. */
+    private @Nullable String bridge(MethodBinding method, String helper, boolean constructor,
+                                    @Nullable TypeBinding discardedType, BlockScope scope) {
         final StringJoiner exceptions = new StringJoiner(", ");
         for (ReferenceBinding exception : method.thrownExceptions) {
             if (!exception.isUncheckedException(false)) {
@@ -380,15 +440,21 @@ final class MemberAccessRewrite extends ASTVisitor {
                 exceptions.add(new String(exception.readableName()));
             }
         }
-        if (exceptions.length() == 0) {
+        if (exceptions.length() == 0 && discardedType == null) {
             return helper;
         }
         String name;
         do {
-            name = "__mcpChecked" + nextBridge++;
+            name = "__mcpBridge" + nextBridge++;
         } while (source.contains(" " + name + "("));
         final boolean returnsVoid = method.returnType == TypeBinding.VOID && !constructor;
-        bridges.append("\nprivate static ").append(returnsVoid ? "void " : "java.lang.Object ").append(name).append('(');
+        final String returnType;
+        if (discardedType != null) {
+            returnType = new String(discardedType.readableName());
+        } else {
+            returnType = returnsVoid ? "void" : "java.lang.Object";
+        }
+        bridges.append("\nprivate static ").append(returnType).append(' ').append(name).append('(');
         if (!constructor) {
             bridges.append("java.lang.Object receiver, ");
         }
@@ -396,18 +462,31 @@ final class MemberAccessRewrite extends ASTVisitor {
         if (!constructor) {
             bridges.append("java.lang.String name, ");
         }
-        bridges.append("java.lang.String[] signature, java.lang.Object[] args) throws ")
-            .append(exceptions).append(" {\n    ");
+        bridges.append("java.lang.String[] signature, java.lang.Object[] args");
+        if (!constructor) {
+            bridges.append(", java.lang.String nullMessage");
+        }
+        bridges.append(')');
+        if (exceptions.length() != 0) {
+            bridges.append(" throws ").append(exceptions);
+        }
+        bridges.append(" {\n    ");
         if (!returnsVoid) {
             bridges.append("return ");
         }
-        bridges.append(helper).append('(');
+        final StringBuilder call = new StringBuilder(helper).append('(');
         if (constructor) {
-            bridges.append("owner, ");
+            call.append("owner, ");
         } else {
-            bridges.append("receiver, owner, name, ");
+            call.append("receiver, owner, name, ");
         }
-        bridges.append("signature, args);\n}\n");
+        call.append("signature, args");
+        if (!constructor) {
+            call.append(", nullMessage");
+        }
+        call.append(')');
+        final String invocation = call.toString();
+        bridges.append(discardedType == null ? invocation : cast(discardedType, invocation)).append(";\n}\n");
         return name;
     }
 
@@ -423,11 +502,6 @@ final class MemberAccessRewrite extends ASTVisitor {
             }
         }
         return false;
-    }
-
-    /** Keeps writes, compound updates and increments subject to the original access checks. */
-    private static boolean isWrite(ASTNode node) {
-        return (node.bits & (ASTNode.IsStrictlyAssigned | ASTNode.IsCompoundAssigned)) != 0;
     }
 
     /** Gets the compiler's field binding, including a declared member on a non-public receiver. */
@@ -511,61 +585,189 @@ final class MemberAccessRewrite extends ASTVisitor {
     }
 
     /** Evaluates an expression qualifier to a static member once, then passes a null receiver. */
-    private String receiver(Expression expression, boolean isStatic) {
-        if (expression.isTypeReference()) {
+    private static String receiver(String expression, boolean typeQualifier, boolean isStatic) {
+        if (typeQualifier) {
             return "null";
         }
-        final String receiver = text(expression);
-        return isStatic ? "__mcpDiscard(" + receiver + ")" : receiver;
+        return isStatic ? "__mcpDiscard(" + expression + ")" : expression;
     }
 
-    /** Renders a field read retaining the declared type when the wrapper can name it. */
-    private static String read(FieldBinding field, String receiver, BlockScope scope) {
-        final String invoke = "__mcpGet(" + receiver + ", " + quote(binaryName(field.declaringClass)) + ", "
-            + quote(new String(field.name)) + ")";
-        return cast(field.type, invoke, scope);
-    }
-
-    /** Casts a reflection result to the closest accessible Java type. */
-    private static String cast(TypeBinding type, String invoke, BlockScope scope) {
-        final TypeBinding castType = accessibleType(type, scope);
-        return "((" + new String(castType.readableName()) + ") " + invoke + ")";
-    }
-
-    /** Searches supertypes by distance, using Object as a last resort. */
-    private static TypeBinding accessibleType(TypeBinding type, BlockScope scope) {
-        if (canName(type, scope)) {
-            return type;
+    /** Emits a constant or a read of the exact field type. Other reads retain their original diagnostic. */
+    private void rewriteField(int start, int end, FieldBinding field, boolean typeQualifier, String qualifier,
+                              String receiverDescription, @Nullable TypeBinding qualifierType, BlockScope scope) {
+        if (!canName(field.type, scope)) {
+            refused = true;
+            return;
         }
-        if (type.isArrayType()) {
-            return scope.createArrayType(accessibleType(type.leafComponentType(), scope), type.dimensions());
+        final Constant constant = field.constant(scope);
+        if (constant != Constant.NotAConstant) {
+            if (!typeQualifier) {
+                refused = true;
+                return;
+            }
+            add(start, end, cast(field.type, constantLiteral(constant)));
+            return;
         }
-        final Deque<TypeBinding> queue = new ArrayDeque<>();
-        final Set<TypeBinding> seen = new HashSet<>();
-        queue.add(type);
-        while (!queue.isEmpty()) {
-            final TypeBinding next = queue.removeFirst();
-            if (!seen.add(next)) {
+        final String name = new String(field.name);
+        final String nullMessage = field.isStatic() ? "null"
+            : quote("Cannot read field " + displayQuoted(name) + " because " + receiverDescription + " is null");
+        final String invoke = "__mcpGet(" + receiver(qualifier, typeQualifier, field.isStatic()) + ", "
+            + quote(binaryName(field.declaringClass)) + ", " + quote(name) + ", " + nullMessage + ")";
+        receiverDescriptions.put(invoke, describeFieldValue(field, qualifierType, receiverDescription));
+        add(start, end, cast(field.type, invoke));
+    }
+
+    /** Describes a field result if a later member access uses it as a receiver. */
+    private static String describeFieldValue(FieldBinding field, @Nullable TypeBinding qualifier, String receiver) {
+        final String member = new String(field.name);
+        if (field.isStatic()) {
+            return displayQuoted(displayType(qualifier == null ? field.declaringClass : qualifier) + "." + member);
+        }
+        if (receiver.startsWith("\"")) {
+            return receiver.substring(0, receiver.length() - 1) + "." + member + "\"";
+        }
+        return "the receiver";
+    }
+
+    /** Writes an ECJ constant as a Java constant expression without reading its declaring class. */
+    private static String constantLiteral(Constant constant) {
+        return switch (constant.typeID()) {
+            case TypeIds.T_boolean -> Boolean.toString(constant.booleanValue());
+            case TypeIds.T_byte, TypeIds.T_short, TypeIds.T_char, TypeIds.T_int -> Integer.toString(constant.intValue());
+            case TypeIds.T_long -> constant.longValue() + "L";
+            case TypeIds.T_float -> floatingLiteral(constant.floatValue(), "f");
+            case TypeIds.T_double -> floatingLiteral(constant.doubleValue(), "d");
+            case TypeIds.T_JavaLangString -> quote(constant.stringValue());
+            default -> throw new IllegalArgumentException("Unsupported constant type: " + constant.typeID());
+        };
+    }
+
+    /** Preserves signed zero and non-finite constants with expressions of the original precision. */
+    private static String floatingLiteral(double value, String suffix) {
+        if (Double.isFinite(value)) {
+            return Double.toHexString(value) + suffix;
+        }
+        final String numerator;
+        if (Double.isNaN(value)) {
+            numerator = "0.0";
+        } else {
+            numerator = value < 0 ? "-1.0" : "1.0";
+        }
+        return "(" + numerator + suffix + " / 0.0" + suffix + ")";
+    }
+
+    /** Renders a fixed cast to a type the source can name without erasure or widening. */
+    private static String cast(TypeBinding type, String expression) {
+        return "((" + new String(type.readableName()) + ") " + expression + ")";
+    }
+
+    /** Describes locals, fields and method results using the JVM's helpful-null wording. */
+    private String describeReceiver(Expression expression) {
+        if (expression instanceof CastExpression cast && cast.expression instanceof MessageSend call) {
+            // A previous edit preserved the receiver's static type in a cast around this helper call.
+            return receiverDescriptions.getOrDefault(source.substring(call.sourceStart, call.sourceEnd + 1),
+                "the receiver");
+        }
+        if (expression instanceof MessageSend call) {
+            final @Nullable MethodBinding binding = method(call.binding);
+            if (binding != null) {
+                return "the return value of " + displayQuoted(describeMethod(call.receiver.resolvedType, binding));
+            }
+        } else if (expression instanceof SingleNameReference name) {
+            if (name.binding instanceof LocalVariableBinding) {
+                return displayQuoted(displayLocal(name.token));
+            }
+            if (name.binding instanceof FieldBinding field) {
+                return displayQuoted(fieldQualifier(field, null, "this") + "." + new String(field.name));
+            }
+        } else if (expression instanceof QualifiedNameReference name) {
+            return describeQualifiedName(name, name.tokens.length - 1);
+        } else if (expression instanceof FieldReference reference) {
+            final @Nullable FieldBinding binding = field(reference.binding, reference.actualReceiverType, reference.token);
+            if (binding != null) {
+                if (binding.isStatic()) {
+                    return displayQuoted(fieldQualifier(binding, reference.receiver.resolvedType, "this")
+                        + "." + new String(reference.token));
+                }
+                if (reference.receiver instanceof ThisReference) {
+                    return displayQuoted("this." + new String(reference.token));
+                }
+                if (reference.receiver instanceof SingleNameReference name && name.binding instanceof LocalVariableBinding) {
+                    return displayQuoted(displayLocal(name.token) + "." + new String(reference.token));
+                }
+            }
+        }
+        return "the receiver";
+    }
+
+    /** Formats a dotted local or field path, restarting at the owning type for static fields. */
+    private static String describeQualifiedName(QualifiedNameReference node, int end) {
+        final int first = node.indexOfFirstFieldBinding - 1;
+        final StringBuilder path = new StringBuilder();
+        if (node.binding instanceof LocalVariableBinding) {
+            path.append(displayLocal(node.tokens[0]));
+        } else if (first == 0) {
+            path.append("this");
+        }
+        for (int i = Math.max(first, 0); i <= end; i++) {
+            if (i == 0 && node.binding instanceof LocalVariableBinding) {
                 continue;
             }
-            if (next.id != TypeIds.T_JavaLangObject) {
-                if (canName(next, scope)) {
-                    return next;
-                }
-                final TypeBinding erased = next.erasure();
-                if (canName(erased, scope)) {
-                    return erased;
-                }
+            final @Nullable FieldBinding bound = fieldAt(node, i);
+            if (bound != null && bound.isStatic()) {
+                path.setLength(0);
+                path.append(fieldQualifier(bound, i == first ? node.actualReceiverType : null, "this"));
             }
-            final @Nullable ReferenceBinding parent = next.superclass();
-            if (parent != null) {
-                queue.add(parent);
+            if (path.length() != 0) {
+                path.append('.');
             }
-            for (ReferenceBinding face : next.superInterfaces()) {
-                queue.add(face);
-            }
+            path.append(node.tokens[i]);
         }
-        return scope.getJavaLangObject();
+        return path.length() == 0 ? "the receiver" : displayQuoted(path.toString());
+    }
+
+    /** Names a static field by its owner and an instance field by its qualifier. */
+    private static String fieldQualifier(FieldBinding binding, @Nullable TypeBinding qualifier, String instance) {
+        if (!binding.isStatic()) {
+            return instance;
+        }
+        return displayType(qualifier == null ? binding.declaringClass : qualifier);
+    }
+
+    /** Renders the wrapper's synthetic frame receiver using the source name the user wrote. */
+    private static String displayLocal(char[] name) {
+        final String local = new String(name);
+        return local.matches("_this\\$*") ? "this" : local;
+    }
+
+    /** Prints the invocation owner and parameter types, as read from a JVM method descriptor. */
+    private static String describeMethod(@Nullable TypeBinding receiver, MethodBinding binding) {
+        final MethodBinding original = binding.original();
+        final TypeBinding owner = receiver == null ? original.declaringClass : receiver;
+        final StringJoiner result = new StringJoiner(", ", displayType(owner) + "." + new String(binding.selector) + "(", ")");
+        for (final TypeBinding parameter : original.parameters) {
+            result.add(displayType(parameter));
+        }
+        return result.toString();
+    }
+
+    /** Prints descriptor types using the abbreviated names used by the JVM for common JDK classes. */
+    private static String displayType(TypeBinding type) {
+        final TypeBinding erased = type.erasure();
+        if (erased.isArrayType()) {
+            return displayType(erased.leafComponentType()) + "[]".repeat(erased.dimensions());
+        }
+        final String binary = binaryName(erased);
+        return switch (binary) {
+            case "java.lang.Object" -> "Object";
+            case "java.lang.String" -> "String";
+            default -> binary;
+        };
+    }
+
+    /** Quotes a name for display inside an exception message. */
+    private static String displayQuoted(String text) {
+        return '"' + text + '"';
     }
 
     /** A generated cast can name a type only if its qualifiers and type arguments are nameable too. */
@@ -613,7 +815,17 @@ final class MemberAccessRewrite extends ASTVisitor {
 
     /** Quotes a compiler-supplied Java name for the generated helper invocation. */
     private static String quote(String value) {
-        return "\"" + value + "\"";
+        final StringBuilder literal = new StringBuilder().append('"');
+        for (int i = 0; i < value.length(); i++) {
+            final char character = value.charAt(i);
+            if (Character.isSurrogate(character)) {
+                // The temporary source is UTF-8. Preserve isolated UTF-16 code units through it.
+                literal.append("\\u").append(Integer.toHexString(character));
+            } else {
+                Util.appendEscapedChar(literal, character, true);
+            }
+        }
+        return literal.append('"').toString();
     }
 
     /** Detects a constituent access that the next compiler pass can resolve before this one. */
@@ -639,7 +851,7 @@ final class MemberAccessRewrite extends ASTVisitor {
 
     /** Applies non-overlapping edits in reverse order and appends the support code once. */
     private @Nullable String apply(String className, TypeDeclaration wrapper, boolean appendHelpers) {
-        if (edits.isEmpty()) {
+        if (refused || edits.isEmpty()) {
             return null;
         }
         final StringBuilder rewritten = new StringBuilder(source);
@@ -700,6 +912,16 @@ final class MemberAccessRewrite extends ASTVisitor {
                 };
             }
 
+            /** Reproduces the initialization triggered by new before the argument array is evaluated. */
+            private static java.lang.String __mcpInitialize(java.lang.String owner) {
+                try {
+                    java.lang.Class.forName(owner, true, %s.class.getClassLoader());
+                    return owner;
+                } catch (java.lang.ClassNotFoundException failure) {
+                    return (java.lang.String) __mcpThrow(failure);
+                }
+            }
+
             private static java.lang.Object __mcpDiscard(java.lang.Object qualifier) {
                 return null;
             }
@@ -736,7 +958,10 @@ final class MemberAccessRewrite extends ASTVisitor {
                 return member;
             }
 
-            private static java.lang.Object __mcpGet(java.lang.Object receiver, java.lang.String owner, java.lang.String name) {
+            /** Checks the receiver before looking up or reading the field. */
+            private static java.lang.Object __mcpGet(java.lang.Object receiver, java.lang.String owner,
+                                                     java.lang.String name, java.lang.String nullMessage) {
+                __mcpCheckReceiver(receiver, nullMessage);
                 try {
                     return ((java.lang.reflect.Field) __mcpMember(owner, name, null)).get(receiver);
                 } catch (java.lang.ReflectiveOperationException failure) {
@@ -744,8 +969,11 @@ final class MemberAccessRewrite extends ASTVisitor {
                 }
             }
 
+            /** Checks the receiver after the call site has evaluated the arguments. */
             private static java.lang.Object __mcpInvoke(java.lang.Object receiver, java.lang.String owner, java.lang.String name,
-                                              java.lang.String[] signature, java.lang.Object[] args) {
+                                                        java.lang.String[] signature, java.lang.Object[] args,
+                                                        java.lang.String nullMessage) {
+                __mcpCheckReceiver(receiver, nullMessage);
                 try {
                     return ((java.lang.reflect.Method) __mcpMember(owner, name, signature)).invoke(receiver, args);
                 } catch (java.lang.reflect.InvocationTargetException target) {
@@ -755,9 +983,18 @@ final class MemberAccessRewrite extends ASTVisitor {
                 }
             }
 
+            /** Preserves the void type of calls that cannot appear in a value context. */
             private static void __mcpInvokeVoid(java.lang.Object receiver, java.lang.String owner, java.lang.String name,
-                                               java.lang.String[] signature, java.lang.Object[] args) {
-                __mcpInvoke(receiver, owner, name, signature, args);
+                                                java.lang.String[] signature, java.lang.Object[] args,
+                                                java.lang.String nullMessage) {
+                __mcpInvoke(receiver, owner, name, signature, args, nullMessage);
+            }
+
+            /** A null message marks static access, where a null qualifier is valid. */
+            private static void __mcpCheckReceiver(java.lang.Object receiver, java.lang.String nullMessage) {
+                if (receiver == null && nullMessage != null) {
+                    throw new java.lang.NullPointerException(nullMessage);
+                }
             }
 
             private static java.lang.Object __mcpConstruct(java.lang.String owner, java.lang.String[] signature, java.lang.Object[] args) {
@@ -774,6 +1011,6 @@ final class MemberAccessRewrite extends ASTVisitor {
             private static <E extends java.lang.Throwable> java.lang.Object __mcpThrow(java.lang.Throwable cause) throws E {
                 throw (E) cause;
             }
-            """.formatted(simpleName, simpleName, MODULE_FAILURE);
+            """.formatted(simpleName, simpleName, simpleName, MODULE_FAILURE);
     }
 }
