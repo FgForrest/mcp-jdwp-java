@@ -10,6 +10,8 @@ import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.evaluation.fixture.CompanionTrackingLoader;
+import one.edee.mcp.jdwp.evaluation.fixture.PrivateMembers;
 import one.edee.mcp.jdwp.evaluation.fixture.TypeBindingFixture;
 import one.edee.mcp.jdwp.evaluation.fixture.InvocationTarget;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
@@ -22,14 +24,18 @@ import org.assertj.core.api.SoftAssertions;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.io.TempDir;
+import org.objectweb.asm.ClassReader;
 import tools.jackson.databind.json.JsonMapper;
 
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
+import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -58,7 +64,6 @@ class InterpreterHarnessLiveTest {
     private static final int COLD_TRIALS = 5;
     private static final int HITS_PER_TRIAL = 5;
     private static final JsonMapper JSON = JsonMapper.builder().build();
-    /** Rows with an independent javac-compiled oracle in the fixture. */
     /** Rows whose expected observation comes from a javac-compiled fixture method. */
     private static final Set<String> FIXTURE_GOLDENS = Set.of("private-field", "private-map", "private-map-call",
         "private-session", "private-method", "super-call", "super-field", "erased-field-navigation",
@@ -197,6 +202,133 @@ class InterpreterHarnessLiveTest {
         }
     }
 
+    /** Verifies private access in ordinary compiled blocks and lambdas on each target JDK. */
+    @Test
+    void compilesPrivateMembersAndPreservesTargetFailures() throws Exception {
+        final String owner = PrivateMembers.class.getName();
+        final String internal = "{ for (int i = 0; i < 1; i++) return text.value; return null; }";
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final JdiExpressionEvaluator evaluator = fixture.evaluator(new InMemoryJavaCompiler());
+                replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
+                    evaluator.configureCompilerClasspath(thread);
+                    assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (int i = 0; i < 2; i++) "
+                        + "sum += new " + owner + "().amount; return sum; }")).isEqualTo("14");
+                    assertThat(evaluateBlock(evaluator, thread,
+                        "((java.util.function.IntSupplier) () -> this.privateMethod()).getAsInt()")).isEqualTo("22");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return " + owner + ".hidden().hiddenAmount; }"))
+                        .isEqualTo("41");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return " + owner + ".TOTAL; }")).isEqualTo("12");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return new " + owner + "(5).amount; }"))
+                        .isEqualTo("5");
+                    assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (" + owner + " entry : new "
+                        + owner + "().entries) sum += entry.amount; return sum; }")).isEqualTo("7");
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread,
+                        "{ return new " + owner + "().hidden.hiddenAmount; }"))
+                        .hasMessageContaining("is not visible");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return switch (n) { case 2 -> new "
+                        + owner + "().select(\"abc\"); default -> 0; }; }")).isEqualTo("3");
+                    assertThat(evaluateBlock(evaluator, thread, "{ try { new " + owner + "().checked(); "
+                        + "} catch (java.io.IOException expected) { return 45; } return 0; }")).isEqualTo("45");
+                    assertThat(evaluateBlock(evaluator, thread, "{ " + owner + ".receiver().ordered("
+                        + owner + ".argument(\"A\"), " + owner + ".argument(\"B\")); return " + owner + ".trace(); }"))
+                        .isEqualTo("RABM");
+                    final String direct = "{ new " + owner + "().throwDirectly(); return null; }";
+                    final String reflected = "{ ((Runnable) () -> new " + owner + "().fail()).run(); return null; }";
+                    final Throwable directFailure = org.assertj.core.api.Assertions.catchThrowable(
+                        () -> evaluateBlock(evaluator, thread, direct));
+                    assertThat(directFailure).hasMessage("Target VM threw exception: java.lang.IllegalStateException");
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread, reflected))
+                        .hasMessage(directFailure.getMessage());
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread,
+                        "{ new " + owner + "().failInaccessible(); return null; }"))
+                        .hasMessage("Target VM threw exception: java.lang.reflect.InaccessibleObjectException");
+                    final String caught = "{ try { return text.value; } catch (RuntimeException e) { return null; } }";
+                    for (String inaccessible : List.of(internal, internal, caught)) {
+                        assertThatThrownBy(() -> evaluateBlock(evaluator, thread, inaccessible))
+                            .hasMessageContaining("The field java.lang.String.value is not visible")
+                            .hasMessageContaining("The member is in a JDK module that is not open.")
+                            .hasMessageNotContaining("InaccessibleObjectException");
+                    }
+                }, new StringBuilder(), null);
+                return true;
+            });
+        }
+    }
+
+    /** Compares an untaken branch with the primary-only execution used on main. */
+    @Test
+    void untakenCompanionsDoNotRunTheTargetLoader(@TempDir Path directory) throws Exception {
+        final String owner = PrivateMembers.AccessSites.class.getCanonicalName();
+        final String body = "if (" + owner + ".companionGuard()) { Object first = new "
+            + CompanionTrackingLoader.ABSENT + "() {}; Object second = new Object() {}; "
+            + "return first.toString() + second.toString(); } "
+            + "return ((java.util.function.Supplier<String>) () -> " + owner + ".companionLambda()).get();";
+        final Path optional = Files.writeString(directory.resolve("Absent.java"),
+            "package optionalfixture; public class Absent {}");
+        final Path optionalClasses = Files.createDirectory(directory.resolve("compile-only"));
+        final JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        assertThat(javac.run(null, null, null, "-d", optionalClasses.toString(), optional.toString())).isZero();
+        for (final Path home : InterpreterTargetVm.javaHomes()) {
+            final String main = evaluateUntakenCompanion(home, optionalClasses, body, true);
+            assertThat(main).as("primary-only execution on %s", home).isEqualTo("ok | guard -> lambda");
+            assertThat(evaluateUntakenCompanion(home, optionalClasses, body, false))
+                .as("ordinary evaluation on %s", home).isEqualTo(main);
+        }
+    }
+
+    /** Executes in a fresh target, seeding the compiler with a superclass absent from the target loader. */
+    private static String evaluateUntakenCompanion(Path javaHome, Path optionalClasses, String body, boolean primaryOnly)
+        throws Exception {
+        return withFixture(javaHome, fixture -> {
+            // The primary-only variant gives the comparison the same bytecode input as the original evaluator.
+            final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler() {
+                /** Gives ECJ the absent superclass and optionally exposes only the primary output. */
+                @Override
+                Map<String, byte[]> compile(String name, String source, @Nullable Configuration config)
+                    throws JdiEvaluationException {
+                    final @Nullable Configuration optional = config == null ? null : new Configuration(config.jdkPath(),
+                        config.classpath() + File.pathSeparator + optionalClasses, config.targetMajorVersion());
+                    final Map<String, byte[]> classes = super.compile(name, source, optional);
+                    if (!primaryOnly || classes.size() < 2) {
+                        return classes;
+                    }
+                    for (final byte[] bytes : classes.values()) {
+                        if (new ClassReader(bytes).getClassName().replace('/', '.').equals(name)) {
+                            return Map.of(name, bytes);
+                        }
+                    }
+                    throw new AssertionError("Missing primary wrapper");
+                }
+            };
+            final JdiExpressionEvaluator evaluator = fixture.evaluator(compiler);
+            final StringBuilder result = new StringBuilder();
+            replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
+                evaluator.configureCompilerClasspath(thread);
+                result.append(evaluateBlock(evaluator, thread, "{ " + body + " }")).append(" | ")
+                    .append(evaluateBlock(evaluator, thread,
+                        "System.getProperty(\"" + CompanionTrackingLoader.TRACE + "\", \"\")"));
+            }, new StringBuilder(), null);
+            return result.toString();
+        }, "-Djava.system.class.loader=" + CompanionTrackingLoader.class.getName());
+    }
+
+    /** Evaluates with a fresh frame after each prior invocation invalidated its mirror. */
+    private static String evaluateBlock(JdiExpressionEvaluator evaluator, ThreadReference thread, String source)
+        throws Exception {
+        final Value value = evaluator.evaluate(thread.frame(0), source);
+        if (value instanceof StringReference string) {
+            return string.value();
+        }
+        if (value instanceof ObjectReference boxed) {
+            final Field field = boxed.referenceType().fieldByName("value");
+            if (field != null) {
+                return String.valueOf(boxed.getValue(field));
+            }
+        }
+        return String.valueOf(value);
+    }
+
     private static Entry mainRow(String id, String expression) {
         return new Entry(id, "jdwp_evaluate_expression", "expression", expression, "main", null, null);
     }
@@ -257,12 +389,13 @@ class InterpreterHarnessLiveTest {
             new StringBuilder(), null));
     }
 
-    private static <T> T withFixture(Path javaHome, FixtureAction<T> action) throws Exception {
-        try (var target = InterpreterTargetVm.start(javaHome);
-             var wire = CountingJdwpConnection.attach(target.port())) {
-            final var vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
+    /** Attaches to a fresh fixture started with the given target JVM options. */
+    private static <T> T withFixture(Path javaHome, FixtureAction<T> action, String... options) throws Exception {
+        try (InterpreterTargetVm target = InterpreterTargetVm.startWithOptions(javaHome, options);
+             CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+            final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
             try {
-                final var guard = new EvaluationGuard();
+                final EvaluationGuard guard = new EvaluationGuard();
                 return action.run(new AttachedFixture(vm, wire, guard, connectionFor(vm, guard)));
             } finally {
                 try {

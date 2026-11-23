@@ -591,7 +591,9 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. An ordinary call with one applicable signature can reach a private or package-private method. Same-arity overloads, varargs, generic methods and lambdas use compilation. Code still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+
+On JDK 17 and 21, ordinary compilation can retry visibility errors on private application field reads, method calls and constructors through reflection. The retry preserves exact value types and inlines type-qualified constants without class initialization. Assignment targets, inaccessible types, expression-qualified constants and closed JDK packages can still produce access errors. Fast probes and their arming evaluations use Java access rules.
 
 The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath, the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
 

@@ -148,6 +148,27 @@ public final class RemoteCodeExecutor {
         return new JdiEvaluationException("Target VM threw exception: " + type, failure);
     }
 
+    /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */
+    static @Nullable String closedMemberAccessModule(JdiEvaluationException failure, String wrapper) {
+        if (!(failure.getCause() instanceof InvocationException invocation)) {
+            return null;
+        }
+        final @Nullable ObjectReference exception = invocation.exception();
+        if (exception == null || !exception.referenceType().name().equals("java.lang.reflect.InaccessibleObjectException")) {
+            return null;
+        }
+        // The wrapper marker distinguishes reflection failures from exceptions thrown by the application.
+        final String marker = wrapper + MemberAccessRewrite.MODULE_FAILURE;
+        for (Field field : exception.referenceType().allFields()) {
+            if (field.name().equals("detailMessage") && field.declaringType().name().equals("java.lang.Throwable")
+                && exception.getValue(field) instanceof StringReference message) {
+                final String detail = message.value();
+                return detail.startsWith(marker) ? detail.substring(marker.length()) : null;
+            }
+        }
+        return null;
+    }
+
     /**
      * Defines {@code bytecode} as {@code className} through {@code classLoader} and initializes it,
      * without invoking anything on it. Used for fast-logpoint probes, which must be resolvable and
@@ -180,7 +201,7 @@ public final class RemoteCodeExecutor {
     /**
      * Defines `bytecode` as `className` in the target VM via the supplied classloader. Idempotent:
      * if the class is already loaded (cached compilation reuse), the existing definition is
-     * returned unchanged — calling `defineClass` twice would throw `LinkageError`.
+     * returned unchanged. A duplicate definition would throw LinkageError.
      */
     private static ClassType loadClass(VirtualMachine vm, ThreadReference thread, ClassLoaderReference classLoader,
                                        String className, byte[] bytecode) throws JdiEvaluationException {

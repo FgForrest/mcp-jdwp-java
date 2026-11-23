@@ -31,6 +31,9 @@ public class FastLogpointTarget implements DefaultMethodTarget {
      */
     int base = 7;
 
+    /** A member an ordinary evaluation can read but an installed probe cannot. */
+    private final int privateBase = 8;
+
     /**
      * Starts the workers, including calls into the default-method fixture, and handles test commands on
      * the main thread, including starting a virtual worker and explicit GC. Propagates failure to read a

@@ -106,7 +106,7 @@ Wraps Eclipse JDT (ECJ) via JSR-199. Output is captured in memory through a cust
 
 ### `RemoteCodeExecutor`
 
-Three-phase injection: `defineClass` → `Class.forName` → `invokeMethod`. Idempotent — checks `vm.classesByName()` before defining (`evaluation/RemoteCodeExecutor.java:119-123`), so cached compilations that reuse the same class name skip the define step. Without that check, a second `defineClass` with the same name would throw `LinkageError`.
+The executor defines the primary wrapper, initializes it with `Class.forName` and calls `invokeMethod`. It checks `vm.classesByName()` first, so cached compilations that reuse the same class name skip the definition.
 
 ### `ClasspathDiscoverer`
 
@@ -225,7 +225,7 @@ Solution: detect the `$$` pattern and walk up the superclass chain to find the r
 
 ### Non-public type visibility
 
-The compiled evaluator normally uses `mcp.jdi.evaluation`. For a non-public `this` in an addressable package it emits the wrapper into that package, where Java permits access to the type and its package-accessible members. If the target refuses the definition, it retries in the isolated wrapper package. Types unavailable to the wrapper are represented by an accessible supertype or `Object`.
+The compiled evaluator normally uses `mcp.jdi.evaluation`. For a non-public `this` in an addressable package it emits the wrapper into that package, where Java permits access to the type and its package-accessible members. If the target refuses the definition, it retries in the isolated wrapper package. When the compiler builds the initial wrapper signature, frame parameter types unavailable to the wrapper are represented by an accessible supertype or `Object`.
 
 ### `this` field auto-rewriting
 
@@ -246,7 +246,7 @@ Same tokenizer technique for `this` → `_this`. The wrapper's `evaluate()` is a
 
 ### Compilation cache
 
-The cache key includes the wrapper package, the ordered frame and binding types and names, and the expression source.
+The cache key includes the wrapper package, the wrapper mode, the ordered frame and binding types and names, and the expression source.
 
 Eviction: full flush at 100 entries. LRU bookkeeping is not worth the complexity when the miss cost (compile + inject) dwarfs the cost of recompiling a few hot entries. A connection reset or a change to the compiler classpath also replaces the cache. Full discussion in [memory-and-references.md](memory-and-references.md) § 6.
 
@@ -278,7 +278,13 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. The interpreter can read private fields and call supported private methods. A compiled expression needs a member access path that is legal in the wrapper.
+The interpreter reads private fields and handles supported private calls in expressions and blocks. The compiled wrapper starts with Java access rules for its package. When ECJ finds eligible visibility errors on JDK 17 or 21, ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints can retry private field reads, method calls and constructors through reflection. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
+
+The retry uses ECJ bindings and caches reflected members with the wrapper's defining loader. Values retain their exact types. Statements and void-compatible lambdas can discard the result. Assignment targets, inaccessible types, method references, constructors requiring an enclosing instance, and lambdas whose overload selection could change keep their original access checks.
+
+Type-qualified constants are inlined without class initialization. Expression-qualified constants keep their original diagnostic. A reflected constructor initializes its class before argument evaluation, and reflected calls rethrow the original target exception. Null-receiver errors name the member. Fields check for null immediately, while calls check after evaluating the arguments.
+
+The compiler makes up to four rewrite passes and reports the original diagnostics if compilation still fails. A closed package such as the one containing `String.value` also produces a module note. The executor defines only the primary wrapper, so reaching a separately emitted local or anonymous class can produce `NoClassDefFoundError`. Lambdas use JVM linkage. Fast probes, including fast-breakpoint captures and arming-hit evaluations, use direct Java access rules and retain their ordinary-tool hint.
 
 ### VMStart suspension
 

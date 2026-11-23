@@ -37,16 +37,28 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
 
     /** Starts a fixture with the same classpath and JDWP transport as the interpreter target. */
     static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... arguments) throws Exception {
+        return launch(javaHome, mainClass, List.of(), List.of(arguments));
+    }
+
+    /** Starts the interpreter target with JVM options before its classpath. */
+    static InterpreterTargetVm startWithOptions(Path javaHome, String... options) throws Exception {
+        return launch(javaHome, InterpreterTarget.class, List.of(options), List.of());
+    }
+
+    private static InterpreterTargetVm launch(Path javaHome, Class<?> mainClass, List<String> options,
+                                               List<String> arguments) throws Exception {
         final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
         final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
-            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, mainClass.getName()));
-        command.addAll(List.of(arguments));
+            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0"));
+        command.addAll(options);
+        command.addAll(List.of("-cp", classpath, mainClass.getName()));
+        command.addAll(arguments);
         final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<>();
+        // Keep draining output after startup so a full pipe cannot block the fixture.
         final Thread drain = new Thread(() -> {
             try (final BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {
