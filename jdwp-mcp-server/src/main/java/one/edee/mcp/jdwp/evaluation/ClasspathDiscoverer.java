@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
 import one.edee.mcp.jdwp.EvaluationGuard;
+import one.edee.mcp.jdwp.InvocationRunner;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,7 +13,7 @@ import java.util.*;
 
 /**
  * Reads the launch classpath and the context and defining loader chains. Only overrides of
- * Thread.getContextClassLoader() and the public URLClassLoader.getURLs() contract may invoke.
+ * Thread.getContextClassLoader() on a tool worker and the public URLClassLoader.getURLs() contract may invoke.
  */
 public class ClasspathDiscoverer {
 
@@ -25,6 +26,8 @@ public class ClasspathDiscoverer {
 
     private final VirtualMachine vm;
     private final EvaluationGuard guard;
+    /** Reuses a completed accessor call if this attempt loses a cache-publication race. */
+    private @Nullable ContextOutcome contextOutcome;
 
     /** Binds discovery and optional invocation admission to the target connection. */
     public ClasspathDiscoverer(VirtualMachine vm, EvaluationGuard guard) {
@@ -33,11 +36,20 @@ public class ClasspathDiscoverer {
     }
 
     /**
-     * Extends the previous walk with the selected frame's loader and retries unreadable parts.
-     * The caller publishes the result only if it still owns the VM and the previous snapshot.
+     * Extends the previous walk without invoking a thread's context getter.
      */
     public DiscoveryResult discoverClasspath(ThreadReference thread, @Nullable ClassLoaderReference definingLoader,
                                              @Nullable DiscoveryResult previous)
+        throws JdkDiscoveryService.JdkNotFoundException {
+        return discoverClasspath(thread, definingLoader, previous, false);
+    }
+
+    /**
+     * Extends the previous walk with the selected frame's loader and retries transient failures.
+     * Only a bounded tool worker can opt into invoking its own pending context getter.
+     */
+    public DiscoveryResult discoverClasspath(ThreadReference thread, @Nullable ClassLoaderReference definingLoader,
+                                             @Nullable DiscoveryResult previous, boolean tool)
         throws JdkDiscoveryService.JdkNotFoundException {
         final String jdkPath;
         final int targetMajor;
@@ -50,8 +62,13 @@ public class ClasspathDiscoverer {
             targetMajor = previous.targetMajorVersion();
         }
         final Walk walk = new Walk(previous);
-        walk.discover(thread, definingLoader);
+        walk.discover(thread, definingLoader, tool && InvocationRunner.isWorkerFor(thread));
         return new DiscoveryResult(jdkPath, targetMajor, walk);
+    }
+
+    /** Whether this call must still publish a getter outcome after the connection cache changed. */
+    public boolean hasContextOutcome() {
+        return contextOutcome != null;
     }
 
     /** Reads only the declaring class to avoid fetching inherited and interface metadata. */
@@ -125,14 +142,35 @@ public class ClasspathDiscoverer {
     /** The known entries from a completed URL read and whether they mirror the launch path. */
     private record LoaderUrls(Set<String> entries, boolean builtin) {}
 
+    /** A deferred getter and its diagnostic, owned by the thread that supplied it. */
+    private record PendingContext(ThreadReference thread, Method getter, String owner, String problem) {
+        /** A collected mirror or known dead thread can no longer service a pending getter. */
+        boolean active() {
+            try {
+                return thread.status() != ThreadReference.THREAD_STATUS_ZOMBIE;
+            } catch (ObjectCollectedException | IllegalThreadStateException e) {
+                return false;
+            } catch (RuntimeException e) {
+                // A failed status query gives no evidence of thread death.
+                return true;
+            }
+        }
+    }
+
+    /** The outcome of one getter call, including a successful null result. */
+    private record ContextOutcome(PendingContext lookup, @Nullable ClassLoaderReference loader,
+                                  @Nullable String failure) {}
+
     /**
      * A single attempt, seeded from successful reads in the previous attempt. The published walk is
      * read-only. Replaying the roots preserves child-to-parent order even when a parent is found later.
      */
     private final class Walk {
         private @Nullable Set<String> launch;
-        private @Nullable ClassLoaderReference context;
         private boolean contextComplete;
+        private final Map<Long, @Nullable ClassLoaderReference> contexts = new LinkedHashMap<>();
+        private final Map<Long, PendingContext> pendingContexts = new LinkedHashMap<>();
+        private final Map<Long, String> unsupported = new LinkedHashMap<>();
         private final Set<ClassLoaderReference> definingRoots = new LinkedHashSet<>();
         private final Map<ClassLoaderReference, LoaderUrls> urls = new HashMap<>();
         private final Map<ClassLoaderReference, @Nullable ClassLoaderReference> parents = new HashMap<>();
@@ -146,8 +184,11 @@ public class ClasspathDiscoverer {
             if (previous != null) {
                 final Walk old = previous.walk;
                 launch = old.launch;
-                context = old.context;
                 contextComplete = old.contextComplete;
+                contexts.putAll(old.contexts);
+                pendingContexts.putAll(old.pendingContexts);
+                pendingContexts.values().removeIf(lookup -> !lookup.active());
+                unsupported.putAll(old.unsupported);
                 definingRoots.addAll(old.definingRoots);
                 urls.putAll(old.urls);
                 parents.putAll(old.parents);
@@ -155,7 +196,7 @@ public class ClasspathDiscoverer {
         }
 
         /** Visits the initial context chain followed by defining chains in first-seen order. */
-        private void discover(ThreadReference thread, @Nullable ClassLoaderReference definingLoader) {
+        private void discover(ThreadReference thread, @Nullable ClassLoaderReference definingLoader, boolean tool) {
             if (launch == null) {
                 readLaunch();
             }
@@ -164,13 +205,15 @@ public class ClasspathDiscoverer {
                 entries.addAll(launchEntries);
             }
             final boolean hasLaunchEntries = !entries.isEmpty();
-            if (!contextComplete) {
-                readContext(thread);
+            if (!contextComplete || tool) {
+                readContext(thread, tool);
             }
             if (definingLoader != null) {
                 definingRoots.add(definingLoader);
             }
-            visit(context, thread, hasLaunchEntries);
+            for (final ClassLoaderReference context : contexts.values()) {
+                visit(context, thread, hasLaunchEntries);
+            }
             for (final ClassLoaderReference root : definingRoots) {
                 visit(root, thread, hasLaunchEntries);
             }
@@ -197,30 +240,66 @@ public class ClasspathDiscoverer {
             }
         }
 
-        /** Resolves the effective context loader, keeping a field value as provisional on refusal. */
-        private void readContext(ThreadReference thread) {
-            final ReferenceType type = thread.referenceType();
-            final String owner = type.name();
-            boolean effective = true;
-            try {
-                if (type instanceof ClassType threadClass) {
-                    final Method getter = override(threadClass, THREAD, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
-                    if (getter != null) {
-                        context = asLoader(invokeAccessor(thread, thread, getter));
+        /** Captures the inherited field and retries an effective getter only on its owning tool job. */
+        private void readContext(ThreadReference thread, boolean tool) {
+            final long id = thread.uniqueID();
+            String owner = THREAD;
+            boolean knownGetter = true;
+            if (!contextComplete && !pendingContexts.containsKey(id)) {
+                try {
+                    final ReferenceType type = thread.referenceType();
+                    owner = type.name();
+                    if (type instanceof ClassType threadClass) {
+                        final Method getter = override(threadClass, THREAD, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+                        if (getter != null) {
+                            final String problem = owner + ": getContextClassLoader() pending for tool evaluation";
+                            pendingContexts.put(id, new PendingContext(thread, getter, owner, problem));
+                            log.debug("[Discoverer] {}", problem);
+                        }
+                    }
+                } catch (RuntimeException e) {
+                    incomplete(owner, "could not inspect getContextClassLoader(): " + describe(e));
+                    knownGetter = false;
+                }
+            }
+            if (tool) {
+                final PendingContext lookup = pendingContexts.get(id);
+                if (contextOutcome == null && lookup != null) {
+                    contextOutcome = invokeContextGetter(lookup);
+                }
+                final ContextOutcome outcome = contextOutcome;
+                if (outcome != null) {
+                    if (outcome.failure() == null) {
+                        contexts.put(id, outcome.loader());
+                        pendingContexts.remove(id);
                         contextComplete = true;
                         return;
                     }
+                    final PendingContext attempted = outcome.lookup();
+                    pendingContexts.put(id, new PendingContext(thread, attempted.getter(), attempted.owner(),
+                        outcome.failure()));
                 }
-            } catch (Exception e) {
-                log.debug("[Discoverer] Using {}'s contextClassLoader field after getter invocation or lookup failed", owner);
-                incomplete(owner, "could not use getContextClassLoader(): " + describe(e));
-                effective = false;
             }
+            if (!contextComplete) {
+                try {
+                    contexts.put(id, asLoader(thread.getValue(requiredField(THREAD, "contextClassLoader"))));
+                    contextComplete = knownGetter;
+                } catch (RuntimeException e) {
+                    incomplete(owner, "could not read contextClassLoader: " + describe(e));
+                }
+            }
+        }
+
+        /** Invokes one getter and keeps a refused or failed lookup pending for the same thread. */
+        private ContextOutcome invokeContextGetter(PendingContext lookup) {
+            final ThreadReference thread = lookup.thread();
             try {
-                context = asLoader(thread.getValue(requiredField(THREAD, "contextClassLoader")));
-                contextComplete = effective;
-            } catch (RuntimeException e) {
-                incomplete(owner, "could not read contextClassLoader: " + describe(e));
+                return new ContextOutcome(lookup, asLoader(invokeAccessor(thread, thread, lookup.getter())), null);
+            } catch (Exception e) {
+                final String problem = lookup.owner() + ": getContextClassLoader() pending after " + describe(e);
+                log.warn("[Discoverer] Classpath discovery was incomplete: {}", problem);
+                log.debug("[Discoverer] Using the inherited contextClassLoader after the getter failed");
+                return new ContextOutcome(lookup, null, problem);
             }
         }
 
@@ -228,33 +307,58 @@ public class ClasspathDiscoverer {
         private void visit(@Nullable ClassLoaderReference root, ThreadReference thread, boolean hasLaunchEntries) {
             for (ClassLoaderReference loader = root; loader != null && visited.add(loader); ) {
                 LoaderUrls paths = urls.get(loader);
-                if (paths == null || !parents.containsKey(loader)) {
-                    final ClassType type = (ClassType) loader.referenceType();
-                    if (paths == null) {
-                        final Set<String> found = new LinkedHashSet<>();
-                        try {
-                            paths = readUrls(loader, type, thread, hasLaunchEntries, found);
-                            urls.put(loader, paths);
-                        } catch (Exception e) {
-                            incomplete(type.name(), "could not read loader URLs: " + describe(e));
-                            entries.addAll(found);
+                final boolean needsUrls = paths == null && !unsupported.containsKey(loader.uniqueID());
+                if (needsUrls || !parents.containsKey(loader)) {
+                    try {
+                        final ClassType type = (ClassType) loader.referenceType();
+                        if (needsUrls) {
+                            paths = readLoaderUrls(loader, type, thread, hasLaunchEntries);
                         }
-                    }
-                    if (!parents.containsKey(loader)) {
-                        try {
-                            if (parentField == null) {
-                                parentField = requiredField(LOADER, "parent");
-                            }
-                            parents.put(loader, asLoader(loader.getValue(parentField)));
-                        } catch (RuntimeException e) {
-                            incomplete(type.name(), "could not read parent: " + describe(e));
+                        if (!parents.containsKey(loader)) {
+                            readParent(loader, type);
                         }
+                    } catch (ObjectCollectedException e) {
+                        incomplete("loader #" + loader.uniqueID(), "could not read loader type: " + describe(e));
                     }
                 }
                 if (paths != null && (!paths.builtin() || !hasLaunchEntries)) {
                     entries.addAll(paths.entries());
                 }
                 loader = parents.get(loader);
+            }
+        }
+
+        /** Caches supported URL reads and terminal layouts, leaving failed JDI reads retryable. */
+        private @Nullable LoaderUrls readLoaderUrls(ClassLoaderReference loader, ClassType type, ThreadReference thread,
+                                                    boolean hasLaunchEntries) {
+            final Set<String> found = new LinkedHashSet<>();
+            try {
+                final LoaderUrls paths = readUrls(loader, type, thread, hasLaunchEntries, found);
+                if (paths != null) {
+                    urls.put(loader, paths);
+                    return paths;
+                }
+                final String problem = type.name() + ": no readable URLClassPath layout";
+                if (!unsupported.containsValue(problem)) {
+                    log.warn("[Discoverer] Classpath discovery was incomplete: {}", problem);
+                }
+                unsupported.put(loader.uniqueID(), problem);
+            } catch (Exception e) {
+                incomplete(type.name(), "could not read loader URLs: " + describe(e));
+                entries.addAll(found);
+            }
+            return null;
+        }
+
+        /** Stores a successful parent read, including a genuine null. */
+        private void readParent(ClassLoaderReference loader, ClassType type) {
+            try {
+                if (parentField == null) {
+                    parentField = requiredField(LOADER, "parent");
+                }
+                parents.put(loader, asLoader(loader.getValue(parentField)));
+            } catch (RuntimeException e) {
+                incomplete(type.name(), "could not read parent: " + describe(e));
             }
         }
 
@@ -266,8 +370,8 @@ public class ClasspathDiscoverer {
         }
     }
 
-    /** Reads a loader's URLs, invoking only the standard public URLClassLoader contract. */
-    private LoaderUrls readUrls(ClassLoaderReference loader, ClassType type, ThreadReference thread,
+    /** Reads a loader's URLs, returning null for a terminal layout without a public fallback. */
+    private @Nullable LoaderUrls readUrls(ClassLoaderReference loader, ClassType type, ThreadReference thread,
                                 boolean hasLaunchEntries, Set<String> entries) throws Exception {
         Field ucp = null;
         ClassType urlBase = null;
@@ -307,47 +411,42 @@ public class ClasspathDiscoverer {
                 return new LoaderUrls(entries, false);
             }
         }
-        throw new IllegalStateException("no readable URLClassPath layout");
+        return null;
     }
 
     /** Reads URLClassPath.path in insertion order, excluding the ArrayList's spare capacity. */
     private static boolean addFieldUrls(ClassLoaderReference loader, Field ucp, boolean builtin, Set<String> entries) {
-        try {
-            final Value ucpValue = loader.getValue(ucp);
-            if (ucpValue == null) {
-                // The platform loader has no URL path on current JDKs.
-                return builtin;
-            }
-            if (!(ucpValue instanceof ObjectReference classpath)) {
-                return false;
-            }
-            final ReferenceType type = classpath.referenceType();
-            if (!"jdk.internal.loader.URLClassPath".equals(type.name()) && !"sun.misc.URLClassPath".equals(type.name())) {
-                return false;
-            }
-            final Field path = declaredField(type, "path");
-            if (path == null || !(classpath.getValue(path) instanceof ObjectReference list)) {
-                return false;
-            }
-            final ReferenceType listType = list.referenceType();
-            final Field size = declaredField(listType, "size");
-            final Field elementData = declaredField(listType, "elementData");
-            if (size == null || elementData == null) {
-                return false;
-            }
-            final Map<Field, Value> fields = list.getValues(List.of(size, elementData));
-            if (!(fields.get(size) instanceof IntegerValue count) || !(fields.get(elementData) instanceof ArrayReference data)) {
-                return false;
-            }
-            final int length = count.value();
-            if (length > 0) {
-                addUrlPaths(data.getValues(0, length), entries);
-            }
-            return true;
-        } catch (RuntimeException e) {
-            log.debug("[Discoverer] Could not read URLClassPath: {}", e.getMessage());
+        final Value ucpValue = loader.getValue(ucp);
+        if (ucpValue == null) {
+            // The platform loader has no URL path on current JDKs.
+            return builtin;
+        }
+        if (!(ucpValue instanceof ObjectReference classpath)) {
             return false;
         }
+        final ReferenceType type = classpath.referenceType();
+        if (!"jdk.internal.loader.URLClassPath".equals(type.name()) && !"sun.misc.URLClassPath".equals(type.name())) {
+            return false;
+        }
+        final Field path = declaredField(type, "path");
+        if (path == null || !(classpath.getValue(path) instanceof ObjectReference list)) {
+            return false;
+        }
+        final ReferenceType listType = list.referenceType();
+        final Field size = declaredField(listType, "size");
+        final Field elementData = declaredField(listType, "elementData");
+        if (size == null || elementData == null) {
+            return false;
+        }
+        final Map<Field, Value> fields = list.getValues(List.of(size, elementData));
+        if (!(fields.get(size) instanceof IntegerValue count) || !(fields.get(elementData) instanceof ArrayReference data)) {
+            return false;
+        }
+        final int length = count.value();
+        if (length > 0) {
+            addUrlPaths(data.getValues(0, length), entries);
+        }
+        return true;
     }
 
     /** Reads the URLs supplied by a guarded call to the public accessor. */
@@ -416,15 +515,13 @@ public class ClasspathDiscoverer {
         private final String localJdkPath;
         private final int targetMajorVersion;
         private final Walk walk;
-        private final @Nullable String problem;
 
-        /** Captures the walk and combines its problems for reporting. */
+        /** Captures the walk and its diagnostics for reporting. */
         private DiscoveryResult(String localJdkPath, int targetMajorVersion, Walk walk) {
             this.localJdkPath = localJdkPath;
             this.targetMajorVersion = targetMajorVersion;
             this.walk = walk;
-            problem = walk.problems.isEmpty() ? null
-                : "classpath discovery was incomplete: " + String.join("; ", walk.problems);
+
         }
 
         /** Returns the local system image used by ECJ. */
@@ -442,14 +539,45 @@ public class ClasspathDiscoverer {
             return Collections.unmodifiableSet(walk.entries);
         }
 
-        /** Reports the missing parts of the last attempt, if any. */
+        /** Reports distinct class and reason pairs, including pending getters whose threads are alive. */
         public @Nullable String problem() {
-            return problem;
+            final Map<String, Integer> counts = new LinkedHashMap<>();
+            for (final PendingContext lookup : walk.pendingContexts.values()) {
+                if (lookup.active()) {
+                    counts.merge(lookup.problem(), 1, Integer::sum);
+                }
+            }
+            for (final String issue : walk.problems) {
+                counts.merge(issue, 1, Integer::sum);
+            }
+            for (final String issue : walk.unsupported.values()) {
+                counts.merge(issue, 1, Integer::sum);
+            }
+            if (counts.isEmpty()) {
+                return null;
+            }
+            final StringJoiner details = new StringJoiner("; ", "classpath discovery was incomplete: ", "");
+            int shown = 0;
+            for (final Map.Entry<String, Integer> entry : counts.entrySet()) {
+                if (shown == 4) {
+                    details.add((counts.size() - shown) + " more issues");
+                    break;
+                }
+                final int count = entry.getValue();
+                details.add(count == 1 ? entry.getKey() : entry.getKey() + " (" + count + ")");
+                shown++;
+            }
+            return details.toString();
         }
 
-        /** Tests whether an input is incomplete or the selected loader has never been walked. */
+        /** Tests whether a transient read failed or the selected loader has never been walked. */
         public boolean needsWalk(@Nullable ClassLoaderReference loader) {
-            return problem != null || (loader != null && !walk.visited.contains(loader));
+            return !walk.problems.isEmpty() || (loader != null && !walk.visited.contains(loader));
+        }
+
+        /** Tests whether this thread has a pending effective-context lookup. */
+        public boolean hasPendingContext(ThreadReference thread) {
+            return walk.pendingContexts.containsKey(thread.uniqueID());
         }
     }
 }

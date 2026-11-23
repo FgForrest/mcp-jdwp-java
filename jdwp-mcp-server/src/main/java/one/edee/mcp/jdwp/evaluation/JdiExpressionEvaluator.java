@@ -1,8 +1,10 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
+import one.edee.mcp.jdwp.JDIConnectionService.RemoteClasspath;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import one.edee.mcp.jdwp.evaluation.exceptions.LocalClasspathPendingException;
@@ -96,17 +98,18 @@ public class JdiExpressionEvaluator {
      * so a concurrent compilation can only populate the cache it started with.
      */
     private volatile CompilerState compilerState =
-        new CompilerState(null, null, false, null, null, null, new ConcurrentHashMap<>());
+        new CompilerState(null, null, false, null, null, null, null, new ConcurrentHashMap<>());
 
     /**
      * Binds the VM and discovery snapshot to the options and wrapper cache. A tool worker or
      * dispatcher captures one state so each compilation uses the options that own its cache.
      * {@code localEntriesAdded} records whether the merge changed the remote-only classpath. The
-     * remote problem belongs to these options, even if another compile later recovers the walk.
+     * remote snapshot belongs to these options, even if a tool publishes a new classpath in parallel.
      */
     private record CompilerState(@Nullable VirtualMachine vm, @Nullable Snapshot snapshot,
                                  boolean localEntriesAdded,
-                                 @Nullable String remoteClasspath, @Nullable String remoteProblem,
+                                 @Nullable RemoteClasspath remote, @Nullable String remoteClasspath,
+                                 @Nullable String remoteProblem,
                                  InMemoryJavaCompiler.@Nullable Configuration options,
                                  Map<String, CachedCompilation> cache) {}
 
@@ -1589,12 +1592,16 @@ public class JdiExpressionEvaluator {
         configureCompilerClasspath(suspendedThread, (ClassLoaderReference) null);
     }
 
-    /** Configures a tool compile against the selected frame's defining loader. */
+    /** Resolves tool-only context getters before taking the compiler configuration monitor. */
     public void configureCompilerClasspath(ThreadReference suspendedThread, @Nullable ClassLoaderReference loader)
         throws JdiEvaluationException {
         final VirtualMachine vm = suspendedThread.virtualMachine();
         localClasspathProvider.awaitDiscovery(vm);
-        configureCompilerClasspath(suspendedThread, vm, loader);
+        final boolean toolWorker = InvocationRunner.isWorkerFor(suspendedThread);
+        if (toolWorker) {
+            jdiConnectionService.discoverClasspathForTool(suspendedThread, loader);
+        }
+        configureCompilerClasspath(suspendedThread, vm, loader, toolWorker);
     }
 
     /**
@@ -1615,7 +1622,7 @@ public class JdiExpressionEvaluator {
     /** Configures a dispatcher compile against the selected frame's defining loader. */
     public void configureCompilerClasspathForEvent(ThreadReference suspendedThread,
                                                    @Nullable ClassLoaderReference loader) throws JdiEvaluationException {
-        configureCompilerClasspath(suspendedThread, suspendedThread.virtualMachine(), loader);
+        configureCompilerClasspath(suspendedThread, suspendedThread.virtualMachine(), loader, false);
     }
 
     /**
@@ -1626,18 +1633,22 @@ public class JdiExpressionEvaluator {
      * @param suspendedThread an event-suspended target thread usable by a custom loader fallback
      * @param vm the connection that owns the suspended thread
      * @param loader the selected frame's defining loader, or null for the bootstrap loader
+     * @param prepared whether the tool worker already ran discovery outside this monitor
      * @throws JdiEvaluationException if the matching JDK or a usable classpath is unavailable
      */
     private synchronized void configureCompilerClasspath(ThreadReference suspendedThread,
                                                          @Nullable VirtualMachine vm,
-                                                         @Nullable ClassLoaderReference loader)
+                                                         @Nullable ClassLoaderReference loader, boolean prepared)
         throws JdiEvaluationException {
         final Snapshot first = requireClasspathSnapshot(vm);
         final boolean jdkReady = jdiConnectionService.getDiscoveredJdkPath() != null;
         final CompilerState configured = compilerState;
         final Snapshot previous = configured.snapshot();
+        final RemoteClasspath published = jdiConnectionService.remoteClasspathFor(vm);
+        final boolean remoteUnchanged = Objects.equals(configured.remote(), published)
+            && (prepared || !jdiConnectionService.classpathNeedsDiscovery(loader));
         if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(first, true)
-            && !jdiConnectionService.classpathNeedsDiscovery(loader)
+            && remoteUnchanged
             && localClasspathProvider.publishIfCurrent(vm, first, () -> {})) {
             return;
         }
@@ -1646,14 +1657,23 @@ public class JdiExpressionEvaluator {
         // Reset before trying again so a failure cannot leave the previous target's options
         // or wrappers available. Once the JDK is known, preserve the remote discovery while
         // updating the local options. Successful reconfiguration replaces the wrapper cache.
-        if (!jdkReady) {
+        if (!jdkReady || configured.vm() != vm) {
             compiler.reset();
-            compilerState = new CompilerState(null, null, false, null, null, null, new ConcurrentHashMap<>());
+            compilerState = new CompilerState(null, null, false, null, null, null, null, new ConcurrentHashMap<>());
         }
 
-        final String remoteClasspath = loader == null ? jdiConnectionService.discoverClasspath(suspendedThread)
-            : jdiConnectionService.discoverClasspath(suspendedThread, loader);
-        final String remoteProblem = jdiConnectionService.getClasspathDiscoveryProblem();
+        final String discovered;
+        if (prepared) {
+            discovered = null;
+        } else if (loader == null) {
+            discovered = jdiConnectionService.discoverClasspath(suspendedThread);
+        } else {
+            discovered = jdiConnectionService.discoverClasspath(suspendedThread, loader);
+        }
+        final RemoteClasspath remote = jdiConnectionService.remoteClasspathFor(vm);
+        final String remoteClasspath = remote == null ? discovered : remote.path();
+        final String remoteProblem = remote == null ? jdiConnectionService.getClasspathDiscoveryProblem()
+            : remote.discovery().problem();
         final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
         Snapshot snapshot = first;
         // Directory reports and local results can arrive during the remote walk or while
@@ -1677,11 +1697,11 @@ public class JdiExpressionEvaluator {
                     if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(candidate, true)
                         && Objects.equals(configured.remoteClasspath(), remoteClasspath)) {
                         // A retried walk can update diagnostics without changing compiler inputs.
-                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remoteClasspath,
+                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remote, remoteClasspath,
                             remoteProblem, configured.options(), configured.cache());
                     } else {
                         compiler.configure(jdkPath, mergedClasspath, version);
-                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remoteClasspath,
+                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remote, remoteClasspath,
                             remoteProblem, compiler.currentConfiguration(), new ConcurrentHashMap<>());
                     }
                 }
@@ -1764,9 +1784,11 @@ public class JdiExpressionEvaluator {
                 : compiler.compile(className, sourceCode);
             return new Compilation(classes, true);
         } catch (JdiEvaluationException failure) {
+            final RemoteClasspath remote = state.remote();
+            final String remoteProblem = remote == null ? state.remoteProblem() : remote.discovery().problem();
             final Snapshot captured = state.snapshot();
             if (captured == null) {
-                throw withDiscoveryProblem(failure, null, state.remoteProblem());
+                throw withDiscoveryProblem(failure, null, remoteProblem);
             }
             final boolean missingFromRemote = !state.localEntriesAdded()
                 && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes;
@@ -1774,22 +1796,22 @@ public class JdiExpressionEvaluator {
             // lets this evaluation defer against the replacement without waiting for Maven.
             final Snapshot current = localClasspathProvider.snapshotFor(state.vm(), missingFromRemote);
             if (current == null || (!missingFromRemote && !captured.sameInput(current, false))) {
-                throw withDiscoveryProblem(failure, null, state.remoteProblem());
+                throw withDiscoveryProblem(failure, null, remoteProblem);
             }
             final DiscoveryStatus status = current.status();
             if (missingFromRemote) {
                 if (status.running()) {
-                    final JdiEvaluationException reported = withDiscoveryProblem(failure, null, state.remoteProblem());
+                    final JdiEvaluationException reported = withDiscoveryProblem(failure, null, remoteProblem);
                     throw new LocalClasspathPendingException(reported.getMessage()
                         + "\nLocal classpath discovery is still running. See jdwp_diagnose.", reported);
                 }
                 final LocalProjectClasspathProvider.Breakdown ready = status.breakdown();
                 if (ready != null && options != null) {
                     return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready,
-                        state.remoteProblem());
+                        remoteProblem);
                 }
             }
-            throw withDiscoveryProblem(failure, status.problem(), state.remoteProblem());
+            throw withDiscoveryProblem(failure, status.problem(), remoteProblem);
         }
     }
 

@@ -11,12 +11,14 @@ public final class ClasspathTarget {
     private static final CountDownLatch REPOSITORIES_READY = new CountDownLatch(1);
     /** Read by JDI to detect an accidental invocation of the private helper. */
     public static volatile boolean privateAccessorEntered;
+    /** Read by JDI to detect an invocation of the blocking getter. */
+    public static volatile boolean contextGetterEntered;
 
     /** Runs the selected loader scenario and keeps the VM available for inspection. */
     public static void main(String[] args) throws Exception {
         switch (args[0]) {
             case "standard", "lazy", "later", "override" -> exerciseIsolatedCode(args[0], Path.of(args[1]));
-            case "private-accessor" -> {
+            case "private-accessor", "blocking-context-getter" -> {
                 final CountDownLatch acquired = new CountDownLatch(1);
                 final Thread repositoryWorker = new Thread(() -> {
                     acquired.countDown();
@@ -30,8 +32,26 @@ public final class ClasspathTarget {
                 repositoryWorker.setDaemon(true);
                 repositoryWorker.start();
                 acquired.await();
-                Thread.currentThread().setContextClassLoader(new IsolatingLoader());
-                conditionStop();
+                if (args[0].equals("blocking-context-getter")) {
+                    final Thread thread = new Thread(ClasspathTarget::conditionStop, "blocking-context-thread") {
+                        /** Waits for the repository worker to finish before returning the loader. */
+                        @Override
+                        public ClassLoader getContextClassLoader() {
+                            contextGetterEntered = true;
+                            try {
+                                REPOSITORIES_READY.await();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return super.getContextClassLoader();
+                        }
+                    };
+                    thread.start();
+                    thread.join();
+                } else {
+                    Thread.currentThread().setContextClassLoader(new IsolatingLoader());
+                    conditionStop();
+                }
             }
             default -> throw new IllegalArgumentException(args[0]);
         }

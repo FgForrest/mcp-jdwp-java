@@ -159,6 +159,12 @@ public final class InvocationRunner {
         }
     }
 
+    /** Whether the calling worker is running a bounded tool job for this target thread. */
+    public static boolean isWorkerFor(ThreadReference thread) {
+        final Job<?> job = CURRENT_JOB.get();
+        return job != null && thread.equals(job.thread);
+    }
+
     /** Marks a bounded host-side wait so a tool deadline can explain what its job is doing. */
     public static void duringLocalClasspathWait(Runnable wait) {
         final Job<?> job = CURRENT_JOB.get();

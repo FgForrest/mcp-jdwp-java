@@ -159,14 +159,8 @@ public class JDIConnectionService {
      */
     @Nullable
     private volatile String lastConnectError;
-    /**
-     * Last published path-separated classpath. Its walk tracks whether it needs a retry or extension.
-     * Both are cleared on disconnect.
-     */
-    @Nullable
-    private volatile String cachedClasspath;
-    /** Walk results and the successfully read loaders, published under the connection monitor. */
-    private volatile @Nullable DiscoveryResult classpathDiscovery;
+    /** Last published walk and its path, cleared together when the connection ends. */
+    private volatile @Nullable RemoteClasspath classpathDiscovery;
     /**
      * Filesystem path to a local JDK matching the target JVM version. Populated as a side effect of
      * {@link #discoverClasspath} and consumed by {@link InMemoryJavaCompiler}
@@ -744,7 +738,6 @@ public class JDIConnectionService {
         watcherManager.clearAll();
         markedInstances.clearAll();
         objectCache.clear();
-        cachedClasspath = null;
         classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
@@ -791,7 +784,6 @@ public class JDIConnectionService {
         watcherManager.clearAll();
         markedInstances.clearAll();
         objectCache.clear();
-        cachedClasspath = null;
         classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
@@ -887,7 +879,6 @@ public class JDIConnectionService {
         }
         markedInstances.clearAll();
         objectCache.clear();
-        cachedClasspath = null;
         classpathDiscovery = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
@@ -1625,14 +1616,35 @@ public class JDIConnectionService {
 
     /** Checks whether a compile needs to extend or retry the current connection's walk. */
     public boolean classpathNeedsDiscovery(@Nullable ClassLoaderReference definingLoader) {
-        final DiscoveryResult current = classpathDiscovery;
-        return current == null || current.needsWalk(definingLoader);
+        final RemoteClasspath current = classpathDiscovery;
+        return current == null || current.discovery().needsWalk(definingLoader);
     }
 
-    /** Returns the last incomplete walk's problem without talking to the target. */
+    /** Reports incomplete reads and pending getters whose threads are still alive. */
     public @Nullable String getClasspathDiscoveryProblem() {
-        final DiscoveryResult current = classpathDiscovery;
-        return current == null ? null : current.problem();
+        final RemoteClasspath current = classpathDiscovery;
+        return current == null ? null : current.discovery().problem();
+    }
+
+    /** Runs tool discovery outside the compiler monitor so a getter cannot block the dispatcher. */
+    public @Nullable String discoverClasspathForTool(ThreadReference thread,
+                                                      @Nullable ClassLoaderReference definingLoader) {
+        return discoverClasspath(thread, definingLoader, InvocationRunner.isWorkerFor(thread));
+    }
+
+    /** A published classpath and the discovery snapshot that produced it. */
+    public record RemoteClasspath(VirtualMachine vm, @Nullable String path, DiscoveryResult discovery) {}
+
+    /** Reads the published classpath without taking the connection monitor. */
+    public @Nullable RemoteClasspath remoteClasspathFor(@Nullable VirtualMachine expected) {
+        final RemoteClasspath current = classpathDiscovery;
+        return current != null && current.vm() == expected ? current : null;
+    }
+
+    /** Discovers the frame's loader using the inherited context field during dispatcher evaluation. */
+    public @Nullable String discoverClasspath(@Nullable ThreadReference thread,
+                                               @Nullable ClassLoaderReference definingLoader) {
+        return discoverClasspath(thread, definingLoader, false);
     }
 
     /**
@@ -1640,8 +1652,8 @@ public class JDIConnectionService {
      * Walks outside the connection monitor so the listener can drain events raised by an accessor.
      * Publishes only against the VM and previous result that the walk started from.
      */
-    public @Nullable String discoverClasspath(@Nullable ThreadReference thread,
-                                               @Nullable ClassLoaderReference definingLoader) {
+    private @Nullable String discoverClasspath(@Nullable ThreadReference thread,
+                                               @Nullable ClassLoaderReference definingLoader, boolean tool) {
         if (thread == null) {
             log.error("[JDI] discoverClasspath() requires a suspended compilation thread");
             return null;
@@ -1650,23 +1662,25 @@ public class JDIConnectionService {
         final long startTime = System.currentTimeMillis();
         try {
             final VirtualMachine currentVm = thread.virtualMachine();
+            final ClasspathDiscoverer discoverer = new ClasspathDiscoverer(currentVm, evaluationGuard);
             while (true) {
-                final DiscoveryResult previous;
+                final RemoteClasspath previous;
                 synchronized (this) {
                     if (vm != currentVm) {
                         return null;
                     }
                     previous = classpathDiscovery;
-                    if (previous != null && !previous.needsWalk(definingLoader)) {
-                        return cachedClasspath;
+                    if (previous != null && !previous.discovery().needsWalk(definingLoader)
+                        && !(tool && (previous.discovery().hasPendingContext(thread) || discoverer.hasContextOutcome()))) {
+                        return previous.path();
                     }
                 }
                 if (previous == null && getVM() != currentVm) {
                     return null;
                 }
 
-                final DiscoveryResult result = new ClasspathDiscoverer(currentVm, evaluationGuard)
-                    .discoverClasspath(thread, definingLoader, previous);
+                final DiscoveryResult result = discoverer.discoverClasspath(thread, definingLoader,
+                    previous == null ? null : previous.discovery(), tool);
                 final Set<String> entries = result.applicationClasspath();
                 final String resolved;
                 if (entries.isEmpty()) {
@@ -1683,10 +1697,9 @@ public class JDIConnectionService {
                     if (classpathDiscovery != previous) {
                         continue;
                     }
-                    cachedClasspath = resolved;
                     discoveredJdkPath = result.localJdkPath();
                     targetMajorVersion = result.targetMajorVersion();
-                    classpathDiscovery = result;
+                    classpathDiscovery = new RemoteClasspath(currentVm, resolved, result);
                 }
                 log.info("[JDI] {} classpath ({} entries) in {}ms",
                     result.problem() == null ? "Discovered" : "Using partial",

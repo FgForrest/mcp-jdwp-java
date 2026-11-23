@@ -15,6 +15,7 @@ import one.edee.mcp.jdwp.BreakpointTracker;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.EventHistory;
 import one.edee.mcp.jdwp.JDIConnectionService;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.JdiEventListener;
 import one.edee.mcp.jdwp.SuspensionSession;
 import one.edee.mcp.jdwp.evaluation.CountingJdwpConnection.Command;
@@ -39,6 +40,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -176,10 +178,25 @@ class ClasspathDiscoveryLiveTest {
                             connection::formatFieldValue)).isEqualTo("2");
                     }
                     if (mode.equals("override")) {
+                        assertThat(router.evaluateEvent("1 + 1", initial.thread(), Map.of(),
+                            connection::formatFieldValue)).isEqualTo("2");
+                        assertThat(connection.getClasspathDiscoveryProblem()).contains("getContextClassLoader()", "pending");
                         // This app-loader frame can see the repository only through the overridden getter.
                         // ECJ still resolves the short-circuited type reference.
-                        assertThat(router.evaluateEvent("true || classpath.fixture.Dependency.answer() == 42",
-                            initial.thread(), Map.of(), connection::formatFieldValue)).isEqualTo("true");
+                        final ExecutorService pool = InvocationRunner.newPool();
+                        try {
+                            final ThreadReference thread = initial.thread();
+                            final InvocationRunner runner = new InvocationRunner(pool, InvocationRunner.TIMEOUT_MS,
+                                history, () -> session);
+                            final EvaluationRouter.ToolJob job = router.toolJob(thread, () -> {});
+                            final EvaluationRouter.Input input = router.parse("true || classpath.fixture.Dependency.answer() == 42");
+                            assertThat(runner.run(thread, "evaluating a repository dependency",
+                                () -> job.evaluate(input, () -> thread.frame(0), Map.of(), connection::formatFieldValue)))
+                                .isEqualTo("true");
+                            assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+                        } finally {
+                            pool.shutdownNow();
+                        }
                     }
                     final ReferenceType isolatedType = vm.classesByName("classpath.fixture.Isolated").get(0);
                     final int isolatedStop = arm(vm, tracker, isolatedType, "stop", EventRequest.SUSPEND_EVENT_THREAD);
@@ -218,6 +235,29 @@ class ClasspathDiscoveryLiveTest {
                     assertThat(holder.isSuspended()).isTrue();
                     assertThat(history.getRecent(12).stream().map(EventHistory.DebugEvent::type))
                         .doesNotContain("CONDITION_ERROR");
+                });
+        }
+    }
+
+    /** A trivial condition should publish a stop even if a context getter can wait on a bystander. */
+    @Test
+    void stopAllConditionPublishesWhenContextGetterDependsOnBystander() throws Exception {
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withTarget(javaHome, "blocking-context-getter", "", "conditionStop", EventRequest.SUSPEND_ALL,
+                (vm, tracker, history, router, connection, session, type) -> {
+                    final com.sun.jdi.Field entered = Objects.requireNonNull(type.fieldByName("contextGetterEntered"));
+                    await().atMost(Duration.ofSeconds(15)).until(() ->
+                        session.unseenCount() == 1 || ((BooleanValue) type.getValue(entered)).value());
+                    final ThreadReference worker = vm.allThreads().stream()
+                        .filter(thread -> thread.name().equals("repository-worker")).findFirst().orElseThrow();
+                    System.out.printf("JDK %s: context getter entered=%s, repository worker suspended=%s, "
+                            + "unseen stops=%d, events=%s%n", vm.version(), ((BooleanValue) type.getValue(entered)).value(),
+                        worker.isSuspended(), session.unseenCount(),
+                        history.getRecent(12).stream().map(EventHistory.DebugEvent::type).toList());
+                    assertThat(session.unseenCount()).as("published stop-all condition").isEqualTo(1);
+                    assertThat(((BooleanValue) type.getValue(entered)).value()).isFalse();
+                    assertThat(worker.isSuspended()).isTrue();
+                    assertThat(connection.getClasspathDiscoveryProblem()).contains("getContextClassLoader()", "pending");
                 });
         }
     }
@@ -267,7 +307,7 @@ class ClasspathDiscoveryLiveTest {
                 final ReferenceType type = ((ClassPrepareEvent) prepared.iterator().next()).referenceType();
                 vm.eventRequestManager().deleteEventRequest(prepare);
                 final int first = arm(vm, tracker, type, stopMethod, policy);
-                if (mode.equals("private-accessor")) {
+                if (mode.equals("private-accessor") || mode.equals("blocking-context-getter")) {
                     tracker.setCondition(first, "java.lang.Integer.parseInt(\"1\") == 1");
                 }
                 listener.start(vm);

@@ -19,6 +19,8 @@ import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.Value;
 import one.edee.mcp.jdwp.EvaluationGuard;
+import one.edee.mcp.jdwp.EventHistory;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.EvaluationRefusedException;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,7 +40,9 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -61,6 +65,8 @@ class ClasspathDiscovererTest {
     @BeforeEach
     void setUp() {
         when(thread.virtualMachine()).thenReturn(vm);
+        when(thread.uniqueID()).thenReturn(1L);
+        when(thread.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING);
         when(vm.version()).thenReturn(Runtime.version().toString());
         when(vm.classesByName("java.lang.System")).thenReturn(List.of(systemType));
         when(vm.classesByName("java.lang.Thread")).thenReturn(List.of(threadType));
@@ -143,6 +149,7 @@ class ClasspathDiscovererTest {
     void skipsAccessorOnUnknownLoader(boolean hasUnexpectedUcp) throws Exception {
         final ClassType customType = type("example.CustomLoader");
         final ClassLoaderReference custom = mirror(ClassLoaderReference.class, customType);
+        when(custom.uniqueID()).thenReturn(100L);
         final ClassLoaderReference ancestor = loader(urlLoaderType, urlLoaderType, url("/parent.jar"));
         if (hasUnexpectedUcp) {
             final Field unknownUcp = field(customType, "ucp");
@@ -259,11 +266,135 @@ class ClasspathDiscovererTest {
         final EvaluationGuard guard = mock(EvaluationGuard.class);
         when(guard.lease(thread)).thenThrow(new EvaluationRefusedException("thread has no invocation event"));
 
-        final ClasspathDiscoverer.DiscoveryResult result = new ClasspathDiscoverer(vm, guard)
-            .discoverClasspath(thread, null, null);
+        final ClasspathDiscoverer.DiscoveryResult result = toolRunner().run(thread, "discovering classpath",
+            () -> new ClasspathDiscoverer(vm, guard).discoverClasspath(thread, null, null, true));
         assertThat(result.applicationClasspath()).containsExactly("/from-field.jar");
         assertThat(result.problem()).contains("example.ChildThread", "getContextClassLoader", "no invocation event");
         verify(thread, never()).invokeMethod(any(), any(), any(), anyInt());
+    }
+
+    /** Retains the failed getter for retry when a different compilation thread intervenes. */
+    @Test
+    void aDifferentContextThreadMustNotEraseThePendingGetterRetry() throws Exception {
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final ClassType customThread = type("example.CustomThread");
+        when(customThread.superclass()).thenReturn(threadType);
+        when(thread.referenceType()).thenReturn(customThread);
+        final Method getter = mock(Method.class);
+        when(getter.isPublic()).thenReturn(true);
+        when(getter.name()).thenReturn("getContextClassLoader");
+        when(getter.signature()).thenReturn("()Ljava/lang/ClassLoader;");
+        when(customThread.methods()).thenReturn(List.of(getter));
+
+        final ClassLoaderReference definingLoader = loader(urlLoaderType, urlLoaderType, url("/app.jar"));
+        final ClassLoaderReference overrideLoader = loader(urlLoaderType, urlLoaderType, url("/override-only.jar"));
+        when(thread.getValue(context)).thenReturn(definingLoader);
+        when(thread.invokeMethod(thread, getter, List.of(), ObjectReference.INVOKE_SINGLE_THREADED))
+            .thenThrow(new IncompatibleThreadStateException()).thenReturn(overrideLoader);
+        final ThreadReference other = mirror(ThreadReference.class, threadType);
+        when(other.virtualMachine()).thenReturn(vm);
+        when(other.uniqueID()).thenReturn(2L);
+        when(other.getValue(context)).thenReturn(definingLoader);
+
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+        final InvocationRunner runner = toolRunner();
+        assertThat(runner.run(thread, "discovering classpath", () -> connection.discoverClasspathForTool(thread, definingLoader)))
+            .doesNotContain("/override-only.jar");
+        assertThat(connection.getClasspathDiscoveryProblem()).contains("example.CustomThread", "getContextClassLoader");
+        assertThat(connection.discoverClasspath(other, definingLoader)).doesNotContain("/override-only.jar");
+        final String interveningProblem = connection.getClasspathDiscoveryProblem();
+        assertThat(interveningProblem).contains("example.CustomThread", "getContextClassLoader");
+        assertThat(connection.discoverClasspath(thread, definingLoader)).doesNotContain("/override-only.jar");
+        final String retried = runner.run(thread, "retrying classpath", () -> connection.discoverClasspathForTool(thread, definingLoader));
+        System.out.printf("after intervening compile: problem=%s, original thread retry=%s%n", interveningProblem, retried);
+        assertThat(retried).contains("/override-only.jar");
+        assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+    }
+
+    /** A structurally incompatible URL layout must not be re-read on every unrelated compile. */
+    @Test
+    void doesNotKeepProbingUnsupportedHistoricalLoaderLayouts() throws Exception {
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final ClassType customType = type("example.PluginLoader");
+        when(customType.superclass()).thenReturn(classLoaderType);
+        final Field ucp = field(customType, "ucp");
+        final ObjectReference layout = mirror(ObjectReference.class, type("example.PluginIndex"));
+        final ClassLoaderReference app = loader(urlLoaderType, urlLoaderType, url("/app.jar"));
+        when(thread.getValue(context)).thenReturn(app);
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+        final List<ClassLoaderReference> plugins = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            final ClassLoaderReference plugin = mirror(ClassLoaderReference.class, customType);
+            plugins.add(plugin);
+            when(plugin.uniqueID()).thenReturn(100L + i);
+            when(plugin.getValue(ucp)).thenReturn(layout);
+            when(plugin.getValue(parent)).thenReturn(app);
+            assertThat(connection.discoverClasspath(thread, plugin)).contains("/app.jar");
+        }
+        for (final ClassLoaderReference plugin : plugins) {
+            clearInvocations(plugin);
+        }
+        for (int i = 0; i < 3; i++) {
+            assertThat(connection.classpathNeedsDiscovery(app)).isFalse();
+            assertThat(connection.discoverClasspath(thread, app)).contains("/app.jar");
+        }
+        final long repeatedFieldReads = plugins.stream().flatMap(plugin -> mockingDetails(plugin).getInvocations().stream())
+            .filter(invocation -> invocation.getMethod().getName().equals("getValue")).count();
+        final String diagnostic = connection.getClasspathDiscoveryProblem();
+        assertThat(diagnostic).contains("example.PluginLoader", "no readable URLClassPath layout", "(32)")
+            .hasSizeLessThan(150);
+        System.out.printf("3 app compiles, historical loader field reads=%d, diagnose characters=%d%n",
+            repeatedFieldReads, diagnostic.length());
+        assertThat(repeatedFieldReads).as("repeated JDWP field reads solely for historical unsupported loaders").isZero();
+    }
+
+    /** Retires a pending getter once its target thread has died or its mirror has been collected. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retiredContextThreadClearsPendingDiagnostic(boolean collected) {
+        final ClassType owner = type("example.ShortLivedThread");
+        when(thread.referenceType()).thenReturn(owner);
+        when(owner.superclass()).thenReturn(threadType);
+        final Method getter = mock(Method.class);
+        when(getter.isPublic()).thenReturn(true);
+        when(getter.name()).thenReturn("getContextClassLoader");
+        when(getter.signature()).thenReturn("()Ljava/lang/ClassLoader;");
+        when(owner.methods()).thenReturn(List.of(getter));
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+
+        assertThat(connection.discoverClasspath(thread)).isEqualTo("/launch.jar");
+        assertThat(connection.getClasspathDiscoveryProblem()).contains("ShortLivedThread", "pending");
+        if (collected) {
+            when(thread.status()).thenThrow(new ObjectCollectedException());
+        } else {
+            when(thread.status()).thenReturn(ThreadReference.THREAD_STATUS_ZOMBIE);
+        }
+
+        assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+    }
+
+    /** Retries a failed URL field read even when the layout has no permitted accessor fallback. */
+    @Test
+    void collectedUrlFieldReadRemainsRetryable() {
+        final ClassType owner = type("example.FieldBasedLoader");
+        final ClassLoaderReference loader = loader(owner, owner, url("/from-fields.jar"));
+        final Field ucp = owner.fieldByName("ucp");
+        final Value value = loader.getValue(ucp);
+        when(loader.getValue(ucp)).thenThrow(new ObjectCollectedException()).thenReturn(value);
+        when(thread.getValue(context)).thenReturn(loader);
+        when(vm.classPath()).thenReturn(List.of("/launch.jar"));
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, new EvaluationGuard());
+
+        assertThat(connection.discoverClasspath(thread)).isEqualTo("/launch.jar");
+        assertThat(connection.getClasspathDiscoveryProblem()).contains("FieldBasedLoader", "ObjectCollectedException");
+        assertThat(connection.discoverClasspath(thread)).contains("/from-fields.jar");
+        assertThat(connection.getClasspathDiscoveryProblem()).isNull();
+    }
+
+    /** Runs synchronous mock calls inside the same job scope used by evaluation tools. */
+    private static InvocationRunner toolRunner() {
+        return new InvocationRunner(Runnable::run, 1000, new EventHistory(), () -> null);
     }
 
     /** Publishes both declared and visible mirrors for a public instance URL accessor. */

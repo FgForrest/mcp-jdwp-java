@@ -29,7 +29,7 @@ When connected, an inline breakpoint-and-events sub-report is appended (`JDWPToo
 
 ### Remote classpath
 
-When a connected target's most recent classpath walk was incomplete, this block names the affected loader and the failed read or invocation. Compilation can use partial entries, and the next compile retries the missing parts. Diagnose reads the last published result immediately.
+This block reports transient classpath discovery failures, unsupported URL layouts, and context getters pending for live threads. It groups matching class names and reasons with counts. A compiled tool evaluation can retry a pending getter only on its originating thread. Pending getters disappear after success, thread retirement, or teardown. Unsupported layout diagnostics stay for the connection. Diagnose reads the published discovery state and checks pending threads for retirement.
 
 ### Local project classpath
 
