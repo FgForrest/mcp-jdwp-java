@@ -62,6 +62,10 @@ public final class InvocationTarget extends InvocationParent {
 
     /** Explicit upper capture bound. */
     public static Box<? extends Service> source = new Box<Service>(new ServiceImpl());
+    /** Loads a subtype whose generic supertype is disjoint from the source field. */
+    public static StringBox stringBox = new StringBox();
+    /** Supplies both bounds of a cast from a plain Object static type. */
+    public static Object bothChoices = new BothChoices();
     /** Capture bound inherited from the formal declaration. */
     public static BoundedBox<?> unbounded = new BoundedBox<Service>(new ServiceImpl());
     /** Lower-bounded wildcard with a narrower declared upper bound than Object. */
@@ -224,6 +228,14 @@ public final class InvocationTarget extends InvocationParent {
         public T get() {
             record("Box.get");
             return content;
+        }
+    }
+
+    /** A concrete box of Strings for the disjoint generic pattern test. */
+    public static final class StringBox extends Box<String> {
+        /** Stores a String in the box. */
+        StringBox() {
+            super("string");
         }
     }
 

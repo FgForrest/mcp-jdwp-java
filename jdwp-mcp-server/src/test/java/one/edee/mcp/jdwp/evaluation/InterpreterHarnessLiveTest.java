@@ -466,7 +466,7 @@ class InterpreterHarnessLiveTest {
                                     stop.enable();
                                 } else if (event instanceof BreakpointEvent breakpoint) {
                                     requests.deleteEventRequest(breakpoint.request());
-                                    checkStop(vm, breakpoint, wire, target, gcResult);
+                                    checkStop(vm, breakpoint, wire, target, gcResult, javaHome);
                                     checked = true;
                                 } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
                                     throw new AssertionError("fixture exited before the stop");
@@ -485,7 +485,7 @@ class InterpreterHarnessLiveTest {
 
     /** Runs each engine from the same fixture state at the stop. */
     private static void checkStop(VirtualMachine vm, BreakpointEvent breakpoint, CountingJdwpConnection wire,
-                                  InterpreterTargetVm target, Path gcResult) throws Exception {
+                                  InterpreterTargetVm target, Path gcResult, Path javaHome) throws Exception {
         final ThreadReference thread = breakpoint.thread();
         final ClassType owner = (ClassType) breakpoint.location().declaringType();
         final ObjectReference receiver = thread.frame(0).thisObject();
@@ -500,6 +500,7 @@ class InterpreterHarnessLiveTest {
         final EvaluationRouter compiler = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
         final EvaluationRouter.ToolJob compiledJob = compiler.toolJob(thread, () -> {});
         final SoftAssertions checks = new SoftAssertions();
+        checkPatternApplicability(vm, thread, owner, trace, calls, reset, auto, javaHome, gcResult.getParent(), checks);
         for (InvocationRow row : INVOCATION_ROWS) {
             owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
             final String expected = observe(owner, trace, calls, () -> renderInvocationValue(receiver.invokeMethod(thread, golden,
@@ -575,6 +576,74 @@ class InterpreterHarnessLiveTest {
             }
         }
         checks.assertAll();
+    }
+
+    /** A binding pattern and its expected routing on each supported target. */
+    private record PatternRow(String id, String source, Planner.KindOfPlan java17, Planner.KindOfPlan java21,
+                              @Nullable String javac17Diagnostic, @Nullable String javac21Diagnostic) {
+        /** Expands the fixture's short type qualifier to a name in scope for both compilers. */
+        String expression() {
+            return source.replace("T.", INVOCATION_PREFIX);
+        }
+    }
+
+    /** Patterns that require source-type or target-version checks. */
+    private static final List<PatternRow> PATTERN_ROWS = List.of(
+        new PatternRow("disjoint-generic-pattern", "T.source instanceof T.StringBox matched ? 1 : T.later()",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "cannot be converted to", "cannot be converted to"),
+        new PatternRow("intersection-pattern", "(T.ChoiceBound & T.ExtraChoice) T.bothChoices instanceof "
+            + "T.ExtraChoice matched ? 1 : 2",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "is a subtype of pattern type", null),
+        new PatternRow("raw-pattern", "((T.Box) T.source) instanceof T.StringBox matched ? 1 : 2",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, null, null),
+        new PatternRow("captured-result-pattern", "T.source.get() instanceof T.Service matched ? 1 : T.later()",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "is a subtype of pattern type", null),
+        new PatternRow("unconditional-pattern", "T.shadow instanceof T.Payload matched && matched.flag",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.NAVIGATE, "is a subtype of pattern type", null),
+        new PatternRow("plain-instanceof", "T.shadow instanceof T.Payload",
+            Planner.KindOfPlan.NAVIGATE, Planner.KindOfPlan.NAVIGATE, null, null)
+    );
+
+    /** Checks both flow scopes, target-version gating, and rejection before any target call. */
+    private static void checkPatternApplicability(VirtualMachine vm, ThreadReference thread, ClassType owner,
+                                                   Field trace, Field calls, Method reset, EvaluationRouter auto,
+                                                   Path javaHome, Path scratch, SoftAssertions checks) throws Exception {
+        final boolean java17 = Runtime.Version.parse(vm.version()).feature() == 17;
+        for (PatternRow row : PATTERN_ROWS) {
+            final String source = row.expression();
+            final String diagnostic = java17 ? row.javac17Diagnostic() : row.javac21Diagnostic();
+            if (diagnostic != null) {
+                assertPatternRejectedByJavac(javaHome, scratch, source, diagnostic);
+            }
+            owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
+            final Planner.Plan plan = auto.prepare(auto.parse(source), thread, () -> thread.frame(0), Map.of());
+            checks.assertThat(plan.kind()).as(row.id()).isEqualTo(java17 ? row.java17() : row.java21());
+            final int suspendCount = thread.suspendCount();
+            if (diagnostic != null || row.id().equals("plain-instanceof") || row.id().equals("unconditional-pattern")) {
+                final String actual = observe(owner, trace, calls,
+                    () -> auto.evaluateEvent(source, thread, Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
+                if (diagnostic != null) {
+                    checks.assertThat(actual).as(row.id()).contains("Compilation failed").endsWith("[0 ]");
+                } else {
+                    checks.assertThat(actual).as(row.id()).isEqualTo("true [0 ]");
+                }
+                checks.assertThat(thread.suspendCount()).as(row.id()).isEqualTo(suspendCount);
+            }
+        }
+    }
+
+    /** Checks the exact rejected expression against the target JDK's javac. */
+    private static void assertPatternRejectedByJavac(Path javaHome, Path scratch, String source, String diagnostic)
+        throws Exception {
+        final Path input = scratch.resolve("PatternSnippet.java");
+        Files.writeString(input, "class PatternSnippet { Object evaluate() { return " + source + "; } }");
+        final String classpath = Path.of(InvocationTarget.class.getProtectionDomain().getCodeSource()
+            .getLocation().toURI()).toString();
+        final Process javac = new ProcessBuilder(javaHome.resolve("bin/javac").toString(), "-classpath", classpath,
+            "-d", scratch.toString(), input.toString()).directory(scratch.toFile()).redirectErrorStream(true).start();
+        final String output = new String(javac.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(javac.waitFor()).as(output).isNotZero();
+        assertThat(output).contains(diagnostic);
     }
 
     /** Wakes the running GC worker and waits for it to confirm collection before forwarding the pin. */

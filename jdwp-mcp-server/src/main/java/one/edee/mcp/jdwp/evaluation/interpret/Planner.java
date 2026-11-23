@@ -342,7 +342,7 @@ public final class Planner {
         return node(expression);
     }
 
-    /** Evaluates the tested operand once and shares the successful match with downstream uses. */
+    /** Proves pattern applicability, then reads the operand once and shares the successful match. */
     private Node instanceOf(InstanceOfExpression test, boolean exports) throws ClassNotLoadedException {
         final Node value = node(test.expression);
         final Pattern pattern = test.pattern;
@@ -351,7 +351,11 @@ public final class Planner {
         }
         final TypeReference syntax = pattern instanceof TypePattern typePattern ? typePattern.local.type : test.type;
         final ReferenceType target = reference(syntax);
-        checkReferenceCast(value.type(), target);
+        if (pattern == null) {
+            checkReferenceCast(value.type(), target);
+        } else {
+            checkPatternApplicability(value.type(), target);
+        }
         if (target instanceof ArrayType) {
             requireNavigation("array type test needs runtime component metadata");
         }
@@ -386,6 +390,23 @@ public final class Planner {
             }
             return ctx.mirror(matches);
         });
+    }
+
+    /** Proves a checked casting conversion and excludes unconditional patterns on older targets. */
+    private void checkPatternApplicability(StaticType from, ReferenceType to) throws ClassNotLoadedException {
+        if (!types.plainPatternType(from) || !types.plainPatternReference(to)) {
+            throw compile("binding pattern requires provable source types");
+        }
+        final ReferenceType source = from.reference();
+        final boolean unconditional = source == null || JdiTypes.assignable(source, to);
+        // Ordered, non-generic reference types prove a checked conversion. For unrelated types
+        // JDI cannot fully prove the narrowing rules in JLS 5.5, including sealed hierarchies.
+        if (!unconditional && source != null && !JdiTypes.assignable(to, source)) {
+            throw compile("binding pattern requires a provable casting conversion");
+        }
+        if (unconditional && !types.supportsUnconditionalPatterns()) {
+            throw compile("unconditional binding pattern requires Java 21 or later");
+        }
     }
 
     /** Extracts the operator id stored in the node's bits. */

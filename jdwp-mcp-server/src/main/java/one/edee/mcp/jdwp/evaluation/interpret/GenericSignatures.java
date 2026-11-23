@@ -81,16 +81,17 @@ final class GenericSignatures {
         final String substituted = substitute(signature, bindings);
         // Keep variance in nested type arguments. Only a value read from a capture has
         // the capture's upper bound as its member-lookup type.
-        final String resolved = upperBounds && substituted.startsWith("+") ? substituted.substring(1) : substituted;
+        final boolean captured = upperBounds && substituted.startsWith("+");
+        final String resolved = captured ? substituted.substring(1) : substituted;
         if (resolved.startsWith("T") || resolved.startsWith("+") || resolved.startsWith("-") || resolved.equals("*")) {
             return new StaticType(null, erasedReference, true);
         }
         if (resolved.equals(signature) && !resolved.startsWith("[")) {
-            return JdiTypes.of(erased, resolved);
+            return JdiTypes.of(erased, resolved, captured);
         }
         final String binary = binaryName(resolved);
         if (binary.equals(erased.name())) {
-            return JdiTypes.of(erased, resolved);
+            return JdiTypes.of(erased, resolved, captured);
         }
         if (binary.isEmpty()) {
             return new StaticType(null, erasedReference, true);
@@ -99,7 +100,7 @@ final class GenericSignatures {
         if (precise == null) {
             throw Planner.compile("type is not loaded: " + binary);
         }
-        return JdiTypes.of(precise, resolved);
+        return JdiTypes.of(precise, resolved, captured);
     }
 
     /** Checks whether widening to a parameterized formal can be proven from declaration signatures. */
