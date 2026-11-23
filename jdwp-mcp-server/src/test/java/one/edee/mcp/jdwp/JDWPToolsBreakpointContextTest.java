@@ -10,6 +10,7 @@ import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.Value;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.spec.McpSchema;
@@ -22,10 +23,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.ai.mcp.annotation.provider.tool.SyncMcpToolProvider;
 
+import java.net.ConnectException;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -38,6 +41,8 @@ class JDWPToolsBreakpointContextTest {
 	private JDIConnectionService jdi;
 	/** The tracker that supplies the connection's suspension session. */
 	private BreakpointTracker tracker;
+	/** The event history shared by the connection, session, and tools. */
+	private EventHistory history;
 	/** The current session where the fixture publishes stops. */
 	private SuspensionSession session;
 	/** The same tool instance used to compare stack and context errors. */
@@ -52,7 +57,7 @@ class JDWPToolsBreakpointContextTest {
 		jdi = mock(JDIConnectionService.class);
 		when(jdi.getVM()).thenReturn(model.vm);
 		tracker = new BreakpointTracker();
-		final EventHistory history = new EventHistory();
+		history = new EventHistory();
 		session = tracker.openSuspensionSession(model.vm, history);
 		tools = JDWPToolsTestSupport.newTools(jdi, tracker, mock(WatcherManager.class),
 			mock(JdiExpressionEvaluator.class), history, new EvaluationGuard(), new JvmDiscoveryService());
@@ -148,7 +153,7 @@ class JDWPToolsBreakpointContextTest {
 		assertThat(session.unseenCount()).isEqualTo(1);
 	}
 
-	/** Preserves the selected thread's stop and capture if its session closes before lookup. */
+	/** Preserves a closed session's capture only when the call fetched its VM. */
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	void reportsClosedSessionWithSelectedThreadsPublishedStop(boolean vmAvailable) throws Exception {
@@ -164,9 +169,15 @@ class JDWPToolsBreakpointContextTest {
 			return model.vm;
 		});
 
-		assertThat(context(target.ref.uniqueID())).startsWith("[VM_DEATH]")
-			.contains("target", "breakpoint=71", "target capture").doesNotContain("other capture");
-		assertThat(session.unseenCount()).isOne();
+		final String reply = context(target.ref.uniqueID());
+		if (vmAvailable) {
+			assertThat(reply).startsWith("[VM_DEATH]")
+				.contains("target", "breakpoint=71", "target capture").doesNotContain("other capture");
+			assertThat(session.unseenCount()).isOne();
+		} else {
+			assertThat(reply).isEqualTo("Error: connection closed");
+			assertThat(session.unseenCount()).isEqualTo(2);
+		}
 	}
 
 	/** Reports closure during enumeration for both a lookup miss and a stale lookup result. */
@@ -189,6 +200,54 @@ class JDWPToolsBreakpointContextTest {
 		when(model.vm.allThreads()).thenThrow(new VMDisconnectedException("transport closed"));
 
 		assertThat(context(target.ref.uniqueID())).startsWith("[VM_GONE]");
+	}
+
+	/** A fresh inspection after explicit disconnect uses the ordinary disconnected reply. */
+	@Test
+	void freshCallAfterExplicitDisconnectUsesStackInspectionReply() {
+		final FakeSuspendModel.FakeThread target = model.thread("discarded-target");
+		publish(target, 71, "discarded capture");
+		final JdiEventListener listener = mock(JdiEventListener.class);
+		doAnswer(invocation -> {
+			session.close();
+			return null;
+		}).when(listener).stop();
+		when(model.vm.eventRequestManager()).thenReturn(mock(EventRequestManager.class));
+		final WatcherManager watchers = new WatcherManager();
+		final EvaluationGuard guard = new EvaluationGuard();
+		final JDIConnectionService connection = JDIConnectionServiceTestSupport.newServiceWithCollaborators(
+			listener, tracker, history, watchers, guard);
+		JDIConnectionServiceTestSupport.setVm(connection, model.vm);
+		final JDWPTools inspection = JDWPToolsTestSupport.newTools(connection, tracker, watchers,
+			mock(JdiExpressionEvaluator.class), history, guard, new JvmDiscoveryService());
+
+		assertThat(connection.disconnect().wasConnected()).isTrue();
+		assertThat(tracker.getLastBreakpoint()).isNull();
+		final long threadId = target.ref.uniqueID();
+		final String stack = inspection.jdwp_get_stack(threadId, null, null);
+		assertThat(stack).contains("Not connected to JDWP server");
+		assertThat(inspection.jdwp_get_breakpoint_context(null, null, threadId)).isEqualTo(stack);
+	}
+
+	/** A failed VM lookup leaves a closed replacement connection's stop unseen. */
+	@Test
+	void failedVmLookupDoesNotPresentClosedReplacementWithReusedThreadId() throws Exception {
+		final long threadId = model.thread("original-target").ref.uniqueID();
+		session.close();
+		final FakeSuspendModel replacement = new FakeSuspendModel();
+		final FakeSuspendModel.FakeThread unrelated = replacement.thread("replacement-target");
+		assertThat(unrelated.ref.uniqueID()).isEqualTo(threadId);
+		when(jdi.getVM()).thenAnswer(invocation -> {
+			history.beginNewSession();
+			model = replacement;
+			session = tracker.openSuspensionSession(replacement.vm, history);
+			publish(unrelated, 92, "replacement capture");
+			session.close();
+			throw new ConnectException("Connection refused");
+		});
+
+		assertThat(context(threadId)).isEqualTo("Error: Connection refused");
+		assertThat(session.unseenCount()).isOne();
 	}
 
 	/** Publishes a thread-policy breakpoint with a distinct capture. */

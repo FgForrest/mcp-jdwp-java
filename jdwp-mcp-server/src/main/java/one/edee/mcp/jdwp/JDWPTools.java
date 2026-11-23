@@ -5975,7 +5975,7 @@ public class JDWPTools {
         }
     }
 
-    /** Resolves and inspects the selected thread, preserving its published stop if the connection ends. */
+    /** Resolves and inspects the selected thread, recovering a stop only from the matched session. */
     private String renderTargetedContext(String tool, long threadId, int frameLimit, boolean includeThis,
                                          StopGetter getter) throws Exception {
         @Nullable SuspensionSession session = null;
@@ -6004,13 +6004,15 @@ public class JDWPTools {
             final String closedAfterRead = closedContextReply(session, threadId);
             return closedAfterRead == null ? live : closedAfterRead;
         } catch (Exception e) {
-            final SuspensionSession failed = session == null ? breakpointTracker.suspensionSession() : session;
-            final String closed = closedContextReply(failed, threadId);
+            if (session == null) {
+                throw e;
+            }
+            final String closed = closedContextReply(session, threadId);
             if (closed != null) {
                 return closed;
             }
             if (e instanceof IllegalStateException || isVmGone(e)) {
-                final SuspensionSession.StopReport report = session == null ? null : session.presentPublishedStop(threadId);
+                final SuspensionSession.StopReport report = session.presentPublishedStop(threadId);
                 return vmGoneEnvelope(tool, e) + (report == null ? "" : selectedStopNote(report));
             }
             throw e;
