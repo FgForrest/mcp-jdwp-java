@@ -14,6 +14,52 @@ public final class InvocationTarget extends InvocationParent {
     private static volatile WeakReference<Payload> freshWeak;
     /** Decoy for out-of-scope simple-name lookup. */
     public static Payload shadow = new DecoyPayload();
+    /** An unchecked conversion lets a read encounter a value outside the capture bound. */
+    public static Box<? extends Payload> polluted = pollutedBox();
+
+    /** Builds a legacy box whose contents violate its generic type. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Box<? extends Payload> pollutedBox() {
+        final Box raw = new Box<>("legacy value");
+        return raw;
+    }
+
+    /** Polluted concrete type argument. */
+    public static Box<Payload> substitutedPolluted = substitutedPollutedBox();
+    /** Polluted concrete type argument whose value still satisfies the argument's interface. */
+    public static Box<Payload> interfacePolluted = interfacePollutedBox();
+    /** Polluted declared bound projected through an inherited erased result. */
+    public static PayloadBox<?> boundedPolluted = pollutedBoundedBox();
+    /** Explicit class bound narrower than the declared interface. */
+    public static InterfaceBox<? extends Payload> ordered = new InterfaceBox<>(new Payload());
+    /** Declared class bound narrower than the explicit interface. */
+    public static PayloadBox<? extends Tagged> declaredSpecific = new PayloadBox<>(new Payload());
+    /** Unbounded capture whose declaration has multiple bounds. */
+    public static MultiBox<?> multiple = new MultiBox<>(new BothChoices());
+
+    /** Builds a box with a polluted concrete type argument. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Box<Payload> substitutedPollutedBox() {
+        final Box raw = new Box<>("legacy value");
+        return raw;
+    }
+
+    /** Supplies a value that passes a checkcast to the argument's interface. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Box<Payload> interfacePollutedBox() {
+        final Box raw = new Box<>(new TaggedOnly());
+        return raw;
+    }
+
+    /** Pollutes the erased storage through an unbounded generic supertype. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static PayloadBox<?> pollutedBoundedBox() {
+        final PayloadBox<Payload> box = new PayloadBox<>(null);
+        final Box raw = box;
+        raw.replace("legacy value");
+        return box;
+    }
+
     /** Explicit upper capture bound. */
     public static Box<? extends Service> source = new Box<Service>(new ServiceImpl());
     /** Capture bound inherited from the formal declaration. */
@@ -40,6 +86,16 @@ public final class InvocationTarget extends InvocationParent {
     public static DefaultApi api = new InvocationTarget();
     /** Null boxed input for argument-order checks. */
     public static Integer missing;
+    /** The explicit interface bound and the declared class bound both contribute members. */
+    public static IntersectionBox<? extends ExtraChoice> intersection = new IntersectionBox<>(new BothChoices());
+    /** Interface receiver whose parent declares a private overload. */
+    public static ChildPrivateApi childPrivate = new ChildPrivateImpl();
+    /** Receiver with a private method declared directly on its static class. */
+    public static OwnPrivate ownPrivate = new OwnPrivate();
+    /** Type used to check static method hiding. */
+    public static HidingChild hiding = new HidingChild();
+    /** Ensures the external constant holder is prepared in the target. */
+    public static String externalDynamic = Tokens.DYNAMIC;
     /** Double operand for target-version formatting. */
     public static double decimal = 1e23;
     /** Float operand for target-version formatting. */
@@ -53,11 +109,14 @@ public final class InvocationTarget extends InvocationParent {
         final Path result = Path.of(args[0]);
         final Thread collector = new Thread(() -> {
             try {
-                System.in.read();
-                for (int attempt = 0; attempt < 32; attempt++) {
-                    System.gc();
+                while (System.in.read() >= 0) {
+                    for (int attempt = 0; attempt < 32; attempt++) {
+                        System.gc();
+                    }
+                    final WeakReference<Payload> freshResult = freshWeak;
+                    Files.writeString(result, freshResult == null || freshResult.get() == null
+                        ? "collected" : "retained");
                 }
-                Files.writeString(result, freshWeak.get() == null ? "collected" : "retained");
             } catch (Exception e) {
                 throw new AssertionError(e);
             }
@@ -112,7 +171,7 @@ public final class InvocationTarget extends InvocationParent {
     }
 
     /** Value used for call-result and pattern tests. */
-    public static class Payload {
+    public static class Payload implements Tagged {
         /** Field read in a generic result chain. */
         public boolean flag = true;
         /** Records a call on the correct payload. */
@@ -149,11 +208,16 @@ public final class InvocationTarget extends InvocationParent {
     /** Container with a readable generic result. */
     public static class Box<T> {
         /** Stored value returned by the getter. */
-        private final T content;
+        private T content;
 
         /** Captures the initial content. */
         public Box(T content) {
             this.content = content;
+        }
+
+        /** Replaces the value, allowing the fixture to exercise unchecked legacy writes. */
+        void replace(T value) {
+            content = value;
         }
 
         /** Returns a generic value and records the getter call. */
@@ -325,9 +389,202 @@ public final class InvocationTarget extends InvocationParent {
         return "this target";
     }
 
+    /** Interface implemented by the narrower payload bound. */
+    public interface Tagged {}
+
+    /** Satisfies the interface cast without being the getter's substituted type. */
+    public static final class TaggedOnly implements Tagged {}
+
+    /** Box with a class bound on a method inherited from an erased superclass. */
+    public static final class PayloadBox<T extends Payload> extends Box<T> {
+        /** Stores the value for the inherited getter. */
+        public PayloadBox(T value) {
+            super(value);
+        }
+    }
+
+    /** Box whose declared bound is an interface. */
+    public static final class InterfaceBox<T extends Tagged> extends Box<T> {
+        /** Stores the value for an inherited getter. */
+        public InterfaceBox(T value) {
+            super(value);
+        }
+    }
+
+    /** Box whose wildcard retains both declared bounds. */
+    public static final class MultiBox<T extends ChoiceBound & ExtraChoice> extends Box<T> {
+        /** Stores a value that implements both bounds. */
+        public MultiBox(T value) {
+            super(value);
+        }
+    }
+
+    /** Accepts an erased result without needing a cast. */
+    public static String takesObject(Object value) {
+        record("takesObject");
+        return value.toString();
+    }
+
+    /** Accepts any value that passes the interface cast. */
+    public static boolean takesTagged(Tagged value) {
+        record("takesTagged");
+        return value instanceof TaggedOnly;
+    }
+
+    /** Receives a narrowed argument only after its cast succeeds. */
+    public static int takesPayload(Payload payload, int otherwise) {
+        record("takesPayload");
+        return (payload.flag ? 1 : 0) + otherwise;
+    }
+
+    /** Declares the class-bound overload. */
+    public static class ChoiceBound {
+        /** Records the selected capture-bound overload. */
+        public String chooseBound(String input) {
+            record("ChoiceBound.chooseBound(String)");
+            return "class bound";
+        }
+    }
+
+    /** Declares the interface-bound overload. */
+    public interface ExtraChoice {
+        /** Records the selected capture-bound overload. */
+        default String chooseBound(Object input) {
+            record("ExtraChoice.chooseBound(Object)");
+            return "interface bound";
+        }
+    }
+
+    /** Implements the two unrelated capture bounds. */
+    public static final class BothChoices extends ChoiceBound implements ExtraChoice {}
+
+    /** Inherits a getter with an erased Object return. */
+    public static final class IntersectionBox<T extends ChoiceBound> extends Box<T> {
+        /** Stores a value for the inherited getter. */
+        public IntersectionBox(T value) {
+            super(value);
+        }
+    }
+
+    /** Declares a private method that is not inherited. */
+    public interface ParentPrivateApi {
+        /** Records the selected probe. */
+        private String probe(int input) {
+            record("ParentPrivateApi.probe(int)");
+            return "private";
+        }
+    }
+
+    /** Supplies the inherited public varargs control. */
+    public interface ChildPrivateApi extends ParentPrivateApi {
+        /** Records the selected probe. */
+        default String probe(int... input) {
+            record("ChildPrivateApi.probe(int...)");
+            return "varargs";
+        }
+    }
+
+    /** Instantiates the varargs control receiver. */
+    public static final class ChildPrivateImpl implements ChildPrivateApi {}
+
+    /** Declares the hidden static method. */
+    public static class HidingParent {
+        /** Records the selected static member. */
+        public static String hidden(int input) {
+            record("HidingParent.hidden(int)");
+            return "parent";
+        }
+    }
+
+    /** Hides the parent static method. */
+    public static final class HidingChild extends HidingParent {
+        /** Records the selected static member. */
+        public static String hidden(int input) {
+            record("HidingChild.hidden(int)");
+            return "child";
+        }
+    }
+
+    /** Declares the private member on the receiver type. */
+    public static final class OwnPrivate {
+        /** Records access to a private member. */
+        private String own(int input) {
+            record("OwnPrivate.own(int)");
+            return "private";
+        }
+    }
+
+    /** Holds both compile-time and runtime-initialized strings. */
+    public static final class Tokens {
+        /** Compile-time string field. */
+        public static final String TOKEN = "token";
+        /** Final field initialized at runtime. */
+        public static final String DYNAMIC = new String(TOKEN);
+    }
+
+    /** Provides a primitive outside the Integer cache. */
+    public static int uncachedInteger() {
+        record("uncachedInteger");
+        return 10000;
+    }
+
+    /** Reads the boxed argument after conversion. */
+    public static int takesInteger(Integer value) {
+        record("takesInteger");
+        return value;
+    }
+
+    /** Observes the text passed to the target. */
+    public static String reflectString(String value) {
+        record("reflectString");
+        return value;
+    }
+
+    /** Records the evaluated charAt result. */
+    public static int takesCodeUnit(int value) {
+        record("takesCodeUnit");
+        return value;
+    }
+
+    /** Compares against the interned form of a dynamic concatenation. */
+    public static boolean sameOne(String value) {
+        record("sameOne");
+        return value == "1";
+    }
+
     /** Evaluates each equivalent expression as ordinary javac-compiled code. */
     public Object invocationGolden(String id) {
         return switch (id) {
+            case "helper-retry" -> takesInteger(uncachedInteger());
+            case "float-constant" -> reflectString("x" + 1e23);
+            case "polluted-receiver" -> polluted.get().mark();
+            case "polluted-field" -> polluted.get().flag;
+            case "polluted-argument" -> takesPayload(substitutedPolluted.get(), later());
+            case "polluted-widening-argument" -> takesObject(substitutedPolluted.get());
+            case "polluted-interface-argument" -> takesTagged(interfacePolluted.get());
+            case "polluted-declared-bound" -> boundedPolluted.get().flag;
+            case "capture-ordered-interface" -> ordered.get().mark();
+            case "capture-ordered-declared" -> declaredSpecific.get().mark();
+            case "capture-multiple-declared" -> multiple.get().chooseBound(1);
+            case "pattern-target-field" -> (Object) TOKEN instanceof String p && sameToken(p);
+            case "pattern-target-result" -> (Object) reflectString("token") instanceof String p && sameToken(p);
+            case "pattern-string-receiver" -> (Object) ("to" + "ken") instanceof String p && sameToken(p.toString());
+            case "float-fragment" -> reflectString(("x" + 1e23) + later());
+            case "float-conditional-constant" -> reflectString(1.25f > 0 ? "token" : "other");
+            case "capture-intersection" -> intersection.get().chooseBound(null);
+            case "pattern-constant" -> (Object) ("to" + "ken") instanceof String p && sameToken(p);
+            case "pattern-surrogate" -> (Object) ("" + isolatedChar()) instanceof String p ? codeUnit(p) : -1;
+            case "interface-private" -> childPrivate.probe(1);
+            case "own-private" -> ownPrivate.own(1);
+            case "static-hiding" -> HidingChild.hidden(1);
+            case "nested-negation" -> (!(!(slot instanceof Payload shadow))) && shadow.mark();
+            case "false-pattern" -> (!(slot instanceof Payload shadow)) ? false : shadow.mark();
+            case "parenthesised-and" -> (((slot instanceof Payload p))) && (p.mark());
+            case "external-constant" -> sameToken(Tokens.TOKEN);
+            case "external-dynamic" -> sameToken(Tokens.DYNAMIC);
+            case "constant-conditional" -> sameToken((2 > 1 ? ("to" + "ken") : "different"));
+            case "dynamic-integer-concat" -> sameOne("" + (later() - 2));
+            case "string-method-rebind" -> takesCodeUnit(("a" + "").charAt(8));
             case "result-gc" -> fresh().mark();
             case "pattern-pin" -> slot instanceof Payload p && clearAndCollect() && p.mark();
             case "pattern-shadow" -> !(slot instanceof Payload shadow) || shadow.mark();

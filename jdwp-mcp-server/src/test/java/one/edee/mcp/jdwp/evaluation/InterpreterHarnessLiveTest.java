@@ -354,6 +354,48 @@ class InterpreterHarnessLiveTest {
 
     /** Regressions and controls for target calls. */
     private static final List<InvocationRow> INVOCATION_ROWS = List.of(
+        new InvocationRow("helper-retry", INVOCATION_PREFIX + "takesInteger(" + INVOCATION_PREFIX + "uncachedInteger())"),
+        new InvocationRow("float-constant", INVOCATION_PREFIX + "reflectString(\"x\" + 1e23)"),
+        new InvocationRow("polluted-receiver", INVOCATION_PREFIX + "polluted.get().mark()"),
+        new InvocationRow("polluted-field", INVOCATION_PREFIX + "polluted.get().flag"),
+        new InvocationRow("polluted-argument", INVOCATION_PREFIX + "takesPayload(" + INVOCATION_PREFIX
+            + "substitutedPolluted.get(), " + INVOCATION_PREFIX + "later())"),
+        new InvocationRow("polluted-widening-argument", INVOCATION_PREFIX + "takesObject(" + INVOCATION_PREFIX
+            + "substitutedPolluted.get())"),
+        new InvocationRow("polluted-interface-argument", INVOCATION_PREFIX + "takesTagged(" + INVOCATION_PREFIX
+            + "interfacePolluted.get())"),
+        new InvocationRow("polluted-declared-bound", INVOCATION_PREFIX + "boundedPolluted.get().flag"),
+        new InvocationRow("capture-ordered-interface", INVOCATION_PREFIX + "ordered.get().mark()"),
+        new InvocationRow("capture-ordered-declared", INVOCATION_PREFIX + "declaredSpecific.get().mark()"),
+        new InvocationRow("capture-multiple-declared", INVOCATION_PREFIX + "multiple.get().chooseBound(1)"),
+        new InvocationRow("pattern-target-field", "(Object) " + INVOCATION_PREFIX
+            + "TOKEN instanceof java.lang.String p && " + INVOCATION_PREFIX + "sameToken(p)"),
+        new InvocationRow("pattern-target-result", "(Object) " + INVOCATION_PREFIX
+            + "reflectString(\"token\") instanceof java.lang.String p && " + INVOCATION_PREFIX + "sameToken(p)"),
+        new InvocationRow("pattern-string-receiver", "(Object) (\"to\" + \"ken\") instanceof java.lang.String p && "
+            + INVOCATION_PREFIX + "sameToken(p.toString())"),
+        new InvocationRow("float-fragment", INVOCATION_PREFIX + "reflectString((\"x\" + 1e23) + "
+            + INVOCATION_PREFIX + "later())"),
+        new InvocationRow("float-conditional-constant", INVOCATION_PREFIX + "reflectString((1.25f > 0 ? \"token\" : \"other\"))"),
+        new InvocationRow("capture-intersection", INVOCATION_PREFIX + "intersection.get().chooseBound(null)"),
+        new InvocationRow("pattern-constant", "(Object) (\"to\" + \"ken\") instanceof java.lang.String p && "
+            + INVOCATION_PREFIX + "sameToken(p)"),
+        new InvocationRow("pattern-surrogate", "(Object) (\"\" + " + INVOCATION_PREFIX
+            + "isolatedChar()) instanceof java.lang.String p ? " + INVOCATION_PREFIX + "codeUnit(p) : -1"),
+        new InvocationRow("interface-private", INVOCATION_PREFIX + "childPrivate.probe(1)"),
+        new InvocationRow("own-private", INVOCATION_PREFIX + "ownPrivate.own(1)"),
+        new InvocationRow("static-hiding", INVOCATION_PREFIX + "HidingChild.hidden(1)"),
+        new InvocationRow("nested-negation", "(!(!(" + INVOCATION_PREFIX + "slot instanceof "
+            + INVOCATION_PREFIX + "Payload shadow))) && shadow.mark()"),
+        new InvocationRow("false-pattern", "(!(" + INVOCATION_PREFIX + "slot instanceof "
+            + INVOCATION_PREFIX + "Payload shadow)) ? false : shadow.mark()"),
+        new InvocationRow("parenthesised-and", "(((" + INVOCATION_PREFIX + "slot instanceof "
+            + INVOCATION_PREFIX + "Payload p))) && (p.mark())"),
+        new InvocationRow("external-constant", INVOCATION_PREFIX + "sameToken(" + INVOCATION_PREFIX + "Tokens.TOKEN)"),
+        new InvocationRow("external-dynamic", INVOCATION_PREFIX + "sameToken(" + INVOCATION_PREFIX + "Tokens.DYNAMIC)"),
+        new InvocationRow("constant-conditional", INVOCATION_PREFIX + "sameToken((2 > 1 ? (\"to\" + \"ken\") : \"different\"))"),
+        new InvocationRow("dynamic-integer-concat", INVOCATION_PREFIX + "sameOne(\"\" + (" + INVOCATION_PREFIX + "later() - 2))"),
+        new InvocationRow("string-method-rebind", INVOCATION_PREFIX + "takesCodeUnit((\"a\" + \"\").charAt(8))"),
         new InvocationRow("pattern-pin", INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX + "Payload p && "
             + INVOCATION_PREFIX + "clearAndCollect() && p.mark()"),
         new InvocationRow("pattern-false", INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX
@@ -465,11 +507,18 @@ class InterpreterHarnessLiveTest {
             owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
             final Planner.Plan plan = auto.prepare(auto.parse(row.expression()), thread, () -> thread.frame(0), Map.of());
             final int before = thread.suspendCount();
-            if (row.id().equals("result-gc")) {
+            final CountingJdwpConnection.Command staticInvoke = new CountingJdwpConnection.Command(3, 3);
+            final long invokesBefore = wire.snapshot().getOrDefault(staticInvoke, 0L);
+            if (row.id().equals("result-gc") || row.id().equals("helper-retry")) {
+                Files.deleteIfExists(gcResult);
                 wire.beforeNextPin(() -> collectBeforePin(target, gcResult));
             }
             final String actual = observe(owner, trace, calls,
                 () -> auto.evaluateEvent(row.expression(), thread, Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
+            if (row.id().equals("helper-retry")) {
+                final long invokes = wire.snapshot().getOrDefault(staticInvoke, 0L) - invokesBefore;
+                checks.assertThat(invokes).as("user methods once and Integer.valueOf retried").isEqualTo(4);
+            }
             assertThat(thread.suspendCount()).as(row.id()).isEqualTo(before);
             assertThat(guard.isEvaluating(thread)).as(row.id()).isFalse();
             owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
@@ -477,6 +526,28 @@ class InterpreterHarnessLiveTest {
                 () -> thread.frame(0), Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
             checks.assertThat(thread.suspendCount()).as(row.id() + " suspend count").isEqualTo(before);
             switch (row.id()) {
+                case "capture-intersection", "capture-multiple-declared", "pattern-constant", "pattern-surrogate",
+                     "pattern-string-receiver", "float-constant", "float-fragment", "float-conditional-constant",
+                     "interface-private" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id()).isEqualTo(expected).isEqualTo(compiled);
+                }
+                case "polluted-receiver", "polluted-field", "polluted-argument", "polluted-declared-bound" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.INVOKE);
+                    checks.assertThat(actual).as(row.id()).contains("Interpreter raised java.lang.ClassCastException")
+                        .endsWith("[1 Box.get>]");
+                    checks.assertThat(expected).contains("ClassCastException").endsWith("[1 Box.get>]");
+                    checks.assertThat(compiled).contains("ClassCastException").endsWith("[1 Box.get>]");
+                }
+                case "nested-negation", "false-pattern" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id()).endsWith("[0 ]");
+                }
+                case "string-method-rebind" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.INVOKE);
+                    checks.assertThat(actual).as(row.id()).contains("IndexOutOfBoundsException").endsWith("[0 ]");
+                    checks.assertThat(expected).contains("IndexOutOfBoundsException").endsWith("[0 ]");
+                }
                 case "result-gc" -> {
                     checks.assertThat(plan.kind()).isEqualTo(Planner.KindOfPlan.INVOKE);
                     checks.assertThat(actual).isEqualTo("JdiEvaluationException: The result was collected by the target's "
@@ -546,7 +617,7 @@ class InterpreterHarnessLiveTest {
         } catch (InvocationException e) {
             value = RemoteCodeExecutor.targetException(e).getMessage();
         } catch (Exception e) {
-            final String message = e.getMessage().replaceAll("\\R+", " ").trim();
+            final String message = String.valueOf(e.getMessage()).replaceAll("\\R+", " ").trim();
             value = message.startsWith("Target VM threw exception:") ? message
                 : e.getClass().getSimpleName() + ": " + message;
         }

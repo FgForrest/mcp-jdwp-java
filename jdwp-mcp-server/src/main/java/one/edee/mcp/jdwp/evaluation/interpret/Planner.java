@@ -63,10 +63,21 @@ public final class Planner {
     /**
      * A typed value reader. Constant metadata preserves Java folding and identity rules.
      * The target preparation binds provenance-sensitive reads before target code runs.
+     * Floating-point provenance tracks constant subexpressions, and the erased result type
+     * identifies the generic reads that may require a cast at their use.
      */
     private record Node(StaticType type, Interpreter.Read read, @Nullable Object constant,
                         boolean constantCandidate, boolean stringIdentity, @Nullable ReferenceType runtimeType,
-                        @Nullable TargetUse targetUse, boolean losslessConcat) {
+                        @Nullable TargetUse targetUse, boolean losslessConcat, boolean floatingOperand,
+                        @Nullable ReferenceType erasedResult) {
+        /** Creates a node with string boundary information and no erased result. */
+        Node(StaticType type, Interpreter.Read read, @Nullable Object constant, boolean constantCandidate,
+             boolean stringIdentity, @Nullable ReferenceType runtimeType, @Nullable TargetUse targetUse,
+             boolean losslessConcat) {
+            this(type, read, constant, constantCandidate, stringIdentity, runtimeType, targetUse, losslessConcat,
+                isFloating(type), null);
+        }
+
         /** Creates an ordinary node whose value needs no string boundary conversion. */
         Node(StaticType type, Interpreter.Read read, @Nullable Object constant, boolean constantCandidate,
              boolean stringIdentity, @Nullable ReferenceType runtimeType) {
@@ -352,8 +363,13 @@ public final class Planner {
             }
             if (exports) {
                 final Object key = new Object();
-                patterns = new PatternBinding(name, new Node(JdiTypes.of(target, null), ctx -> ctx.pattern(key)),
-                    patterns);
+                // Preserve the single scrutinee read. Compile if a debugger-created String escapes.
+                final TargetUse boundary = value.targetUse() == null ? null : () -> {
+                    throw compile("pattern binding carries a debugger-created String into a call");
+                };
+                final Node binding = new Node(JdiTypes.of(target, null), ctx -> ctx.pattern(key),
+                    null, false, false, null, boundary, false);
+                patterns = new PatternBinding(name, binding, patterns);
                 slot = key;
             } else {
                 slot = null;
@@ -598,8 +614,9 @@ public final class Planner {
     private Node select(Node instance, String name) throws ClassNotLoadedException {
         final StaticType type = instance.type();
         if (type.reference() instanceof ArrayType && name.equals("length")) {
+            final Interpreter.Read read = memberRead(instance, instance.read());
             return new Node(JdiTypes.primitive(Kind.INT), ctx -> ctx.mirror(
-                ((ArrayReference) Objects.requireNonNull(instance.read().run(ctx))).length()));
+                ((ArrayReference) Objects.requireNonNull(read.run(ctx))).length()));
         }
         final ReferenceType lookup = type.imprecise() ? instance.runtimeType() : type.reference();
         if (lookup == null) {
@@ -669,16 +686,19 @@ public final class Planner {
         if (!isStatic && instance == null) {
             throw compile("instance field requires a receiver: " + field.name());
         }
-        final StaticType type = GenericSignatures.resultType(types, field.type(), field.genericSignature(),
+        final Type erased = field.type();
+        final StaticType type = GenericSignatures.resultType(types, erased, field.genericSignature(),
             instance == null ? null : instance.type(), declaring);
+        final Interpreter.Read read = instance == null ? ctx -> null : memberRead(instance, instance.read());
         // JDI omits the ConstantValue attribute. A final primitive or String field can be
         // inlined by Java. Track the possibility where it affects identity or numeric narrowing.
         final boolean constantCandidate = field.isFinal() && (type.kind() != null || type.isString());
         return new Node(type, ctx -> {
-            final @Nullable Value value = instance == null ? null : instance.read().run(ctx);
+            final @Nullable Value value = read.run(ctx);
             return isStatic ? declaring.getValue(field)
                 : ((ObjectReference) Objects.requireNonNull(value)).getValue(field);
-        }, null, constantCandidate, type.isString() && constantCandidate, null);
+        }, null, constantCandidate, type.isString() && constantCandidate, null, null, false,
+            isFloating(type), erasureForCast(type, erased));
     }
 
     /** Resolves a source type, requiring a binding for an array's simple reference component name. */
@@ -764,9 +784,11 @@ public final class Planner {
         final Field unbox = unbox(index);
         final String signature = array.type().genericSignature();
         final String component = signature != null && signature.startsWith("[") ? signature.substring(1) : null;
+        final Interpreter.Read read = memberRead(array, array.read());
+        final Interpreter.Read readIndex = unboxRead(index, unbox);
         return new Node(JdiTypes.of(type.componentType(), component), ctx -> {
-            final @Nullable Value receiver = ctx.keep(array.read().run(ctx));
-            final int i = (Integer) Kind.INT.convert(Interpreter.primitive(index.read().run(ctx), unbox));
+            final @Nullable Value receiver = ctx.keep(read.run(ctx));
+            final int i = (Integer) Kind.INT.convert(Interpreter.primitive(readIndex.run(ctx), unbox));
             final ArrayReference ref = (ArrayReference) Objects.requireNonNull(receiver);
             if (i < 0 || i >= ref.length()) {
                 throw new ArrayIndexOutOfBoundsException(i);
@@ -797,6 +819,16 @@ public final class Planner {
         return value;
     }
 
+    /** Checks the receiver of a wrapper value-field read before using it for unboxing. */
+    private static Interpreter.Read unboxRead(Node node, @Nullable Field unbox) {
+        return unbox == null ? node.read() : memberRead(node, node.read());
+    }
+
+    /** Whether this static type is a floating-point primitive. */
+    private static boolean isFloating(StaticType type) {
+        return type.kind() == Kind.FLOAT || type.kind() == Kind.DOUBLE;
+    }
+
     /** Plans a unary operator and folds it for a constant operand. */
     private static Node unary(int op, Node operand) {
         final Kind kind = primitiveKind(operand).promote();
@@ -805,10 +837,11 @@ public final class Planner {
             throw compile("invalid unary operand type");
         }
         final Field unbox = unbox(operand);
+        final Interpreter.Read read = unboxRead(operand, unbox);
         final Object folded = operand.constant() == null ? null : PrimitiveOps.unary(op, kind, operand.constant());
         return new Node(JdiTypes.primitive(kind),
-            ctx -> ctx.mirror(PrimitiveOps.unary(op, kind, Interpreter.primitive(operand.read().run(ctx), unbox))),
-            folded, operand.potentiallyConstant(), false, null);
+            ctx -> ctx.mirror(PrimitiveOps.unary(op, kind, Interpreter.primitive(read.run(ctx), unbox))),
+            folded, operand.potentiallyConstant(), false, null, null, false, operand.floatingOperand(), null);
     }
 
     /** Plans a binary operator: concatenation, reference equality, or primitive arithmetic, comparison and logic. */
@@ -842,15 +875,17 @@ public final class Planner {
         final Kind result = PrimitiveOps.comparison(op) ? Kind.BOOLEAN : promoted;
         final Field unboxLeft = unbox(left);
         final Field unboxRight = unbox(right);
+        final Interpreter.Read readLeft = unboxRead(left, unboxLeft);
+        final Interpreter.Read readRight = unboxRead(right, unboxRight);
         return new Node(JdiTypes.primitive(result), ctx -> {
-            final Object first = Interpreter.primitive(left.read().run(ctx), unboxLeft);
+            final Object first = Interpreter.primitive(readLeft.run(ctx), unboxLeft);
             if ((op == AND_AND && !((Boolean) first)) || (op == OR_OR && (Boolean) first)) {
                 return ctx.mirror(first);
             }
-            final Object second = Interpreter.primitive(right.read().run(ctx), unboxRight);
+            final Object second = Interpreter.primitive(readRight.run(ctx), unboxRight);
             return ctx.mirror(PrimitiveOps.binary(op, promoted, first, second));
         }, foldBinary(op, promoted, left, right), left.potentiallyConstant() && right.potentiallyConstant(),
-            false, null);
+            false, null, null, false, left.floatingOperand() || right.floatingOperand(), null);
     }
 
     /** Folds a binary operation on constant operands, or returns null when it cannot be folded. */
@@ -876,6 +911,7 @@ public final class Planner {
         final boolean constant = left.potentiallyConstant() && right.potentiallyConstant();
         final StaticType type = left.type().isString() ? left.type() : right.type();
         final boolean lossless = losslessOperand(left) && losslessOperand(right);
+        final boolean floating = left.floatingOperand() || right.floatingOperand();
         final Interpreter.Read read = ctx -> {
             final String first = concatOperand(readLeft, leftFormat, ctx);
             final String second = concatOperand(readRight, rightFormat, ctx);
@@ -885,6 +921,10 @@ public final class Planner {
         // operands in the target, since the host may use a different JDK.
         final String folded = a == null || b == null ? null : checkedStringLiteral(a.toString() + b);
         return new Node(type, read, folded, constant, constant, null, () -> {
+            // A nonconstant concatenation can still contain a folded floating-point fragment.
+            if (floating) {
+                throw compile("String concatenation contains a floating-point operand");
+            }
             if (!lossless) {
                 throw compile("String concatenation may lose code units before a call");
             }
@@ -895,7 +935,7 @@ public final class Planner {
                 throw compile("String concatenation may depend on a constant field");
             }
             return read;
-        }, lossless);
+        }, lossless, floating, null);
     }
 
     /** Whether a concatenation operand can round-trip through the host without losing code units. */
@@ -908,9 +948,12 @@ public final class Planner {
             || kind == Kind.BOOLEAN || (kind != null && kind.integral() && kind != Kind.CHAR);
     }
 
-    /** Prepares an operand that will be handed to String.valueOf in the target. */
+    /** Reads a concatenation operand as a String or prepares it for target formatting. */
     private static Interpreter.Read formatInput(Node node, @Nullable Method format) {
-        return format == null ? node.read() : targetRead(node);
+        if (format != null) {
+            return targetRead(node);
+        }
+        return node.type().isString() ? memberRead(node, node.read()) : node.read();
     }
 
     /** Selects target formatting for object and floating-point operands. */
@@ -959,19 +1002,32 @@ public final class Planner {
         final Object folded = constantType && condition.constant() instanceof Boolean test
             && yes.constant() != null && no.constant() != null
             ? foldConditional(test, yes, no, type) : null;
-        final Interpreter.Read read = conditionalRead(condition, unboxCondition, takenYes.read(), takenNo.read());
-        final TargetUse boundary = takenYes.targetUse() == null && takenNo.targetUse() == null
-            ? null : () -> conditionalRead(condition, unboxCondition, targetRead(takenYes), targetRead(takenNo));
-        return new Node(type, read, folded,
-            constantType && condition.potentiallyConstant() && yes.potentiallyConstant() && no.potentiallyConstant(),
-            yes.stringIdentity() || no.stringIdentity(), null, boundary, false);
+        if (takenYes.erasedResult() != null || takenNo.erasedResult() != null) {
+            throw compile("conditional branches need a context-dependent generic cast");
+        }
+        final boolean constant = constantType && condition.potentiallyConstant()
+            && yes.potentiallyConstant() && no.potentiallyConstant();
+        final boolean floating = condition.floatingOperand() || yes.floatingOperand() || no.floatingOperand();
+        final Interpreter.Read readCondition = unboxRead(condition, unboxCondition);
+        final Interpreter.Read read = conditionalRead(readCondition, unboxCondition, takenYes.read(), takenNo.read());
+        final TargetUse boundary;
+        if (type.isString() && constant && floating) {
+            boundary = () -> {
+                throw compile("String constant has a floating-point operand");
+            };
+        } else {
+            boundary = takenYes.targetUse() == null && takenNo.targetUse() == null
+                ? null : () -> conditionalRead(readCondition, unboxCondition, targetRead(takenYes), targetRead(takenNo));
+        }
+        return new Node(type, read, folded, constant, yes.stringIdentity() || no.stringIdentity(), null,
+            boundary, false, floating, null);
     }
 
     /** Reads the condition and only the selected branch in either value mode. */
-    private static Interpreter.Read conditionalRead(Node condition, @Nullable Field unbox,
+    private static Interpreter.Read conditionalRead(Interpreter.Read condition, @Nullable Field unbox,
                                                      Interpreter.Read yes, Interpreter.Read no) {
         return ctx -> {
-            final boolean test = (Boolean) Interpreter.primitive(condition.read().run(ctx), unbox);
+            final boolean test = (Boolean) Interpreter.primitive(condition.run(ctx), unbox);
             return (test ? yes : no).run(ctx);
         };
     }
@@ -1051,7 +1107,8 @@ public final class Planner {
         }
         final Kind to = type.kind();
         final Field unbox = unbox(node);
-        return new Node(type, ctx -> ctx.mirror(to.convert(Interpreter.primitive(node.read().run(ctx), unbox))));
+        final Interpreter.Read read = unboxRead(node, unbox);
+        return new Node(type, ctx -> ctx.mirror(to.convert(Interpreter.primitive(read.run(ctx), unbox))));
     }
 
     /** Plans a primitive or reference cast, checking reference casts when the node runs. */
@@ -1073,10 +1130,10 @@ public final class Planner {
                     throw compile("invalid unboxing cast");
                 }
                 final Field unbox = unbox(node);
-                return new Node(target,
-                    ctx -> ctx.mirror(kind.convert(Interpreter.primitive(node.read().run(ctx), unbox))),
+                final Interpreter.Read read = unboxRead(node, unbox);
+                return new Node(target, ctx -> ctx.mirror(kind.convert(Interpreter.primitive(read.run(ctx), unbox))),
                     node.constant() == null ? null : kind.convert(node.constant()), node.potentiallyConstant(),
-                    false, null);
+                    false, null, null, false, node.floatingOperand() || isFloating(target), null);
             }
             final StaticType box = JdiTypes.of(types.box(kind), null);
             final Node checked = cast(node, box);
@@ -1103,7 +1160,34 @@ public final class Planner {
         }
         final TargetUse boundary = node.targetUse() == null ? null : () -> checkedCast(targetRead(node), bounds);
         return new Node(target, checkedCast(node.read(), bounds), target.isString() ? node.constant() : null,
-            target.isString() && node.potentiallyConstant(), node.stringIdentity(), null, boundary, node.losslessConcat());
+            target.isString() && node.potentiallyConstant(), node.stringIdentity(), null, boundary,
+            node.losslessConcat(), node.floatingOperand(), null);
+    }
+
+    /** Records when a member read has a static type narrower than its JVM descriptor. */
+    private static @Nullable ReferenceType erasureForCast(StaticType type, Type erased) {
+        final ReferenceType narrowed = type.reference();
+        if (type.imprecise() || narrowed == null || !(erased instanceof ReferenceType reference)
+            || narrowed.equals(reference)) {
+            return null;
+        }
+        return reference;
+    }
+
+    /** Inserts the generic cast at a use that needs the narrowed reference. */
+    private static Interpreter.Read memberRead(Node node, Interpreter.Read read) {
+        if (node.erasedResult() == null) {
+            return read;
+        }
+        return checkedGenericCast(read, Objects.requireNonNull(node.type().reference()));
+    }
+
+    /** Checks a generic conversion with a bound whose subtype test requires no array component lookup. */
+    private static Interpreter.Read checkedGenericCast(Interpreter.Read read, ReferenceType bound) {
+        if (bound instanceof ArrayType) {
+            throw compile("generic array cast needs runtime component metadata");
+        }
+        return checkedCast(read, List.of(bound));
     }
 
     /** Reads a value and enforces a Java reference cast before further evaluation. */
@@ -1315,16 +1399,18 @@ public final class Planner {
             // The unqualified call has an applicable method, but the frame is static.
             throw error("Cannot make a static reference to the non-static method " + method.name());
         }
-        final StaticType result = constructor ? JdiTypes.of(owner, null) : GenericSignatures.resultType(
-            types, method.returnType(), generic == null ? null : generic.result(), receiverType, owner);
+        final Type erased = constructor ? owner : method.returnType();
+        final String resultSignature = generic == null ? null : generic.result();
+        final StaticType result = constructor ? JdiTypes.of(owner, null)
+            : GenericSignatures.resultType(types, erased, resultSignature, receiverType, owner);
         invokes = true;
         final Interpreter.Read receiverRead;
         if (qualifier == null) {
             receiverRead = ctx -> null;
         } else if (method.isStatic()) {
-            receiverRead = qualifier.read();
+            receiverRead = memberRead(qualifier, qualifier.read());
         } else {
-            receiverRead = targetRead(qualifier);
+            receiverRead = memberRead(qualifier, targetRead(qualifier));
         }
         final List<Interpreter.Read> argumentReads = new ArrayList<>(converted.size());
         for (Node argument : converted) {
@@ -1333,7 +1419,7 @@ public final class Planner {
         return new Node(result, ctx -> {
             final Value object = ctx.keep(receiverRead.run(ctx));
             return ctx.call(method, object, readArguments(argumentReads, ctx), nonvirtual, constructor);
-        });
+        }, null, false, false, null, null, false, isFloating(result), erasureForCast(result, erased));
     }
 
     /** Checks argument applicability using declared types, preserving conversion order during execution. */
@@ -1343,15 +1429,16 @@ public final class Planner {
         final List<Node> converted = new ArrayList<>(arguments.size());
         for (int i = 0; i < arguments.size(); i++) {
             final String signature = generic == null ? null : generic.parameters().get(i);
-            final StaticType formal = GenericSignatures.memberType(types, parameters.get(i), signature,
+            final Type erased = parameters.get(i);
+            final StaticType formal = GenericSignatures.memberType(types, erased, signature,
                 receiverType, method.declaringType());
-            converted.add(convertArgument(arguments.get(i), formal, method.name()));
+            converted.add(convertArgument(arguments.get(i), formal, erased, method.name()));
         }
         return converted;
     }
 
     /** Plans an invocation conversion, declining conversions that depend on an unknown argument type. */
-    private Node convertArgument(Node argument, StaticType formal, String name) {
+    private Node convertArgument(Node argument, StaticType formal, Type erased, String name) {
         final StaticType actual = argument.type();
         if (!formal.imprecise()) {
             final Kind from = JdiTypes.unboxed(actual);
@@ -1361,8 +1448,8 @@ public final class Planner {
                     return argument;
                 }
                 final Field unbox = unbox(argument);
-                return new Node(formal, ctx -> ctx.mirror(
-                    to.convert(Interpreter.primitive(argument.read().run(ctx), unbox))));
+                final Interpreter.Read read = unboxRead(argument, unbox);
+                return new Node(formal, ctx -> ctx.mirror(to.convert(Interpreter.primitive(read.run(ctx), unbox))));
             }
             final ReferenceType reference = formal.reference();
             if (reference != null && from != Kind.VOID) {
@@ -1373,6 +1460,12 @@ public final class Planner {
                     return box(argument);
                 }
                 if (actual.reference() != null && referenceWidening(actual, formal, reference)) {
+                    final ReferenceType erasedResult = argument.erasedResult();
+                    // javac checks the erased parameter's type, which can be wider than the source argument.
+                    if (erasedResult != null && erased instanceof ReferenceType parameter
+                        && !JdiTypes.assignable(erasedResult, parameter)) {
+                        return new Node(actual, checkedGenericCast(argument.read(), parameter));
+                    }
                     return argument;
                 }
             }
@@ -1477,8 +1570,9 @@ public final class Planner {
                 }
                 final Field unbox = unbox(arg);
                 // Unbox the argument before checking whether the receiver is null, as invocation does.
+                final Interpreter.Read read = unboxRead(arg, unbox);
                 final Node position = new Node(JdiTypes.primitive(Kind.INT),
-                    ctx -> ctx.mirror(Kind.INT.convert(Interpreter.primitive(arg.read().run(ctx), unbox))));
+                    ctx -> ctx.mirror(Kind.INT.convert(Interpreter.primitive(read.run(ctx), unbox))));
                 return intrinsic(Kind.CHAR, receiver, position,
                     (self, index) -> intrinsicString(self).charAt(((IntegerValue) Objects.requireNonNull(index)).value()));
             }
@@ -1535,8 +1629,9 @@ public final class Planner {
                 if (field == null) {
                     throw compile("Enum intrinsic field is unavailable");
                 }
+                final Interpreter.Read read = memberRead(receiver, receiver.read());
                 return new Node(JdiTypes.of(field.type(), null), ctx ->
-                    ((ObjectReference) Objects.requireNonNull(receiver.read().run(ctx))).getValue(field));
+                    ((ObjectReference) Objects.requireNonNull(read.run(ctx))).getValue(field));
             }
         }
         return null;
@@ -1570,8 +1665,9 @@ public final class Planner {
 
     /** Wraps an intrinsic as a node that evaluates the receiver and argument first. */
     private static Node intrinsic(Kind kind, Node receiver, @Nullable Node argument, Intrinsic intrinsic) {
+        final Interpreter.Read read = memberRead(receiver, receiver.read());
         return new Node(JdiTypes.primitive(kind), ctx -> {
-            final @Nullable Value self = ctx.keep(receiver.read().run(ctx));
+            final @Nullable Value self = ctx.keep(read.run(ctx));
             final @Nullable Value arg = argument == null ? null : argument.read().run(ctx);
             return ctx.mirror(intrinsic.run(Objects.requireNonNull(self), arg));
         });
