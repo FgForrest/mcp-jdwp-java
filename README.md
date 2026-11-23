@@ -513,7 +513,7 @@ jdwp_set_breakpoint(className="com.example.LazyService", lineNumber=15)
 
 `jdwp_overview()` shows pending breakpoints with their status; `jdwp_get_events()` records a `CLASS_PREPARE` entry when a load activates them.
 
-Deferred replies can suggest similar loaded class names. When the server and target use the same Java major version, a fully qualified name found in the server's JDK image suppresses the suggestion. Exception breakpoints need a fully qualified class name. For a bare exception name, a matching `java.lang` name appears ahead of loaded application matches.
+Deferred replies can suggest similar loaded class names. When the server and target use the same Java major version, a fully qualified name found in the server's JDK image suppresses the suggestion. Exception breakpoints need a fully qualified class name. For a bare exception name, an exact `java.lang` match appears first if it is loaded in the target or found in the server's JDK at the same Java major version.
 
 This works from VM start, so it is the attach prologue for a failing test: launch the JVM suspended (`-Dmaven.surefire.debug`), call `jdwp_wait_for_attach(requireVmStart=true)`, set every line BP, logpoint, exception BP and field BP while the JVM is parked, then `jdwp_resume_until_event`. Each one activates when its class loads — JDK classes included, so an exception BP on `java.lang.AssertionError` set at VM start stops on the first failing JUnit assertion.
 

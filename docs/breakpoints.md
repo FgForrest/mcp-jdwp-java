@@ -83,7 +83,7 @@ The line-BP path is canonical; the others follow the same shape. `JDWPTools.java
 3. The tool creates a `ClassPrepareRequest` filtered by the class name with policy `SUSPEND_EVENT_THREAD`. Only one CPR per class (`hasClassPrepareRequest` check at line 1866; registry on `BreakpointTracker.java:66, 445-462`).
 4. Race guard: re-check `classesByName` after CPR registration, in case the class loaded between the original lookup and the CPR enable.
 
-Deferred replies can suggest similar loaded classes. For a fully qualified binary name, the server skips the hint when the Java major versions match and the server's system modules contain the `.class` resource. A bare exception name gets a reminder to use the fully qualified name, with a matching `java.lang` spelling before any loaded application matches. The resource lookup runs entirely on the server.
+Deferred replies can suggest similar loaded classes. For a fully qualified binary name, the server skips the hint when the Java major versions match and the server's system modules contain the `.class` resource. A bare exception name gets a reminder to use the fully qualified name. An exact `java.lang` match appears before loaded application matches if the target has loaded it or the server's JDK has it at the same Java major version. The resource lookup runs entirely on the server.
 
 ### Promotion path 1 — `ClassPrepareEvent`
 

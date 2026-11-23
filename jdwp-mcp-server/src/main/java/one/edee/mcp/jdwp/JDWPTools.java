@@ -3224,8 +3224,9 @@ public class JDWPTools {
     /**
      * Builds a best-effort hint from similar loaded names using {@link ClassNameMatcher}.
      * A fully qualified binary name found in the server JDK suppresses the hint when the target
-     * uses the same Java major version. For a bare exception name, suggest a known {@code java.lang}
-     * spelling before any loaded matches and explain that registration needs the qualified name.
+     * uses the same Java major version. For a bare exception name, suggest an exact {@code java.lang}
+     * match from the target's loaded classes or the server's matching JDK before application matches.
+     * Explain that exception registration needs the qualified name.
      */
     private String deferredClassSuggestion(VirtualMachine vm, String className, boolean exceptionTool) {
         final boolean dottedName = className.indexOf('.') >= 0;
@@ -3237,23 +3238,25 @@ public class JDWPTools {
         final boolean bareExceptionName = exceptionTool && !dottedName && slashFree;
         final String qualificationNote = bareExceptionName
             ? "\n  Exception breakpoints need a fully qualified class name." : "";
+        final String javaLangName = bareExceptionName ? "java.lang." + className : "";
         final List<String> suggestions = new ArrayList<>();
-        if (bareExceptionName) {
-            final String javaLangName = "java.lang." + className;
-            if (hasSystemClassResource(javaLangName)) {
-                suggestions.add(javaLangName);
-            }
+        if (bareExceptionName && targetUsesServerJavaMajor(vm) && hasSystemClassResource(javaLangName)) {
+            suggestions.add(javaLangName);
         }
         try {
-            // Only consider JDK suggestions for names in JDK packages.
             final boolean platformTarget = isPlatformClassName(className);
-            final List<String> loaded = vm.allClasses().stream()
-                .map(ReferenceType::name)
-                .filter(name -> platformTarget || !isPlatformClassName(name))
-                .toList();
+            final List<String> loaded = new ArrayList<>();
+            for (ReferenceType type : vm.allClasses()) {
+                final String name = type.name();
+                if (platformTarget || !isPlatformClassName(name)) {
+                    loaded.add(name);
+                } else if (bareExceptionName && suggestions.isEmpty() && javaLangName.equals(name)) {
+                    suggestions.add(name);
+                }
+            }
             suggestions.addAll(ClassNameMatcher.suggest(loaded, className, 3));
         } catch (Exception ignored) {
-            // Keep the local java.lang suggestion if the target's class list cannot be read.
+            // Keep any exact java.lang suggestion already found if the target's class list cannot be read.
         }
         if (suggestions.isEmpty()) {
             return qualificationNote;

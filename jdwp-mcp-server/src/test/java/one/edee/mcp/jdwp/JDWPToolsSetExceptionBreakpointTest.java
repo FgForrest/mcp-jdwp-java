@@ -197,6 +197,30 @@ class JDWPToolsSetExceptionBreakpointTest {
 		assertThat(deferException("java.lang.MatchException")).contains("Did you mean: com.acme.MatchException");
 	}
 
+	/** A bare name on Java 17 keeps its loaded match without suggesting the server's Java 21 class. */
+	@Test
+	void shouldKeepLoadedApplicationMatchForABareExceptionOnADifferentJdk() {
+		assumeTrue(Runtime.version().feature() >= 21);
+		when(vm.version()).thenReturn("17.0.18");
+		final ClassPrepareRequest cpr = mockDeferredException("com.acme.MatchException");
+
+		assertThat(deferException("MatchException"))
+			.contains("Did you mean: com.acme.MatchException", "Exception breakpoints need a fully qualified class name")
+			.doesNotContain("java.lang.MatchException");
+		verify(cpr).addClassFilter("MatchException");
+	}
+
+	/** An exact `java.lang` match loaded by the target is valid across JDK versions. */
+	@Test
+	void shouldSuggestAnExactLoadedJavaLangMatchOnADifferentJdk() {
+		when(vm.version()).thenReturn(Runtime.version().feature() == 17 ? "21.0.1" : "17.0.18");
+		final ClassPrepareRequest cpr = mockDeferredException("java.lang.NumberFormatException");
+
+		assertThat(deferException("NumberFormatException")).contains(
+			"Did you mean: java.lang.NumberFormatException", "Exception breakpoints need a fully qualified class name");
+		verify(cpr).addClassFilter("NumberFormatException");
+	}
+
 	/** A denied JDK resource check must leave the loaded-class matcher available. */
 	@Test
 	@SuppressWarnings("removal")
