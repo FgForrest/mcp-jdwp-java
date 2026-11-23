@@ -26,8 +26,11 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /** Exercises ECJ's diagnostic spans and the residual Java compiled after each rewrite. */
 class MemberAccessRewriteTest {
+    /** Binary name of the generated test wrapper. */
     private static final String NAME = "wrapper.Probe";
+    /** Binary name of the fixture in generated source. */
     private static final String OWNER = PrivateMembers.class.getName();
+    /** Compiler settings for wrappers that reference test fixtures. */
     private static final InMemoryJavaCompiler.Configuration CONFIG =
         new InMemoryJavaCompiler.Configuration(System.getProperty("java.home"), "target/test-classes", 17);
 
@@ -86,12 +89,18 @@ class MemberAccessRewriteTest {
         assertOriginalFailure(new InMemoryJavaCompiler(), source("receiver.amount = 4; return null;"));
     }
 
-    /** A fresh loader gives each javac or ECJ run its own class-initialization state and trace. */
+    /**
+     * Captures the observable behavior of one evaluation.
+     *
+     * @param outcome displayed result, exception, or compiler error
+     * @param calls application events in the order they occurred
+     */
     private record Observation(String outcome, String calls) {}
 
     /** Runs one comparison against a fixture type from the current isolated loader. */
     @FunctionalInterface
     private interface Evaluation {
+        /** Executes the test expression against the isolated fixture. */
         Object evaluate(Class<?> fixture) throws Throwable;
     }
 
@@ -237,6 +246,7 @@ class MemberAccessRewriteTest {
 
     /** Loads the generated classes and calls them without wrapping application exceptions. */
     private static Object run(Map<String, byte[]> classes, Class<?> fixture, String id) throws Throwable {
+        // Delegate fixture lookups so the wrapper and the trace reader share the same class state.
         final ClassLoader loader = new ClassLoader(fixture.getClassLoader()) {
             /** Defines a class file from the ECJ result, using the binary name from its header. */
             @Override

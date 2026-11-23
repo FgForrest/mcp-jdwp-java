@@ -13,6 +13,12 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Owns a forked interpreter fixture and its debugger endpoint.
+ *
+ * @param process forked target JVM
+ * @param port loopback port for the target JDWP agent
+ */
 record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
     static final String CLASS = InterpreterTarget.class.getName();
 
@@ -35,6 +41,7 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
         final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<Integer>();
+        // Keep draining output after startup so a full pipe cannot block the fixture.
         final Thread drain = new Thread(() -> {
             try (BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {

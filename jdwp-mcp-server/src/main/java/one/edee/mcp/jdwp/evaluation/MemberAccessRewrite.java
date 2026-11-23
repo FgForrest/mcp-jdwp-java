@@ -69,7 +69,7 @@ final class MemberAccessRewrite extends ASTVisitor {
     private final List<Edit> edits = new ArrayList<>();
     /** Statement expressions whose values the surrounding Java code discards. */
     private final Set<Expression> discarded = new HashSet<>();
-    /** Source-site indexes survive each pass as integer arguments on the generated calls. */
+    /** Original null-receiver wording indexed by source site across rewrite passes. */
     private final List<String> receiverDescriptions;
     /** The binary name of the wrapper that owns the generated helpers. */
     private final String wrapperName;
@@ -81,10 +81,16 @@ final class MemberAccessRewrite extends ASTVisitor {
     private final StringBuilder bridges = new StringBuilder();
     /** Next candidate suffix for a generated call bridge. */
     private int nextBridge;
-    /** A rewrite would change a target or require a different static type. */
+    /** Whether any site prevents a retry from preserving Java semantics. */
     private boolean refused;
 
-    /** Replaces a half-open source range with one complete Java expression. */
+    /**
+     * Describes one change to the wrapper source.
+     *
+     * @param start inclusive source offset
+     * @param end exclusive source offset
+     * @param replacement text to insert in that range
+     */
     private record Edit(int start, int end, String replacement) {}
 
     /** Collects edits against the original source for this round. */
@@ -118,10 +124,8 @@ final class MemberAccessRewrite extends ASTVisitor {
     }
 
     /**
-     * Resolves the same source with ECJ's batch name environment, which exposes binding objects
-     * and the original problem arguments. JSR-199 hides both behind diagnostic strings.
-     * Keeps receiver descriptions across passes so diagnostics can still name an edited receiver.
-     * Returns null when there is no supported safe edit.
+     * Produces one round of member-access rewrites, or null if the source cannot be safely edited.
+     * The receiver descriptions preserve the original null-receiver wording across rounds.
      */
     static @Nullable String rewrite(String className, Path file, String source,
                                     InMemoryJavaCompiler.Configuration config, boolean appendHelpers,
@@ -133,6 +137,7 @@ final class MemberAccessRewrite extends ASTVisitor {
         batch.configure(options.toArray(String[]::new));
         final FileSystem environment = batch.getLibraryAccess();
         try {
+            // The batch API exposes resolved bindings and problem arguments hidden by JSR-199.
             final Compiler compiler = new Compiler(environment, DefaultErrorHandlingPolicies.proceedWithAllProblems(),
                 new CompilerOptions(batch.options), result -> {}, batch.getProblemFactory());
             final CompilationUnitDeclaration unit = compiler.resolve(batch.getCompilationUnits()[0], true, false, false);
@@ -182,6 +187,7 @@ final class MemberAccessRewrite extends ASTVisitor {
 
     /** Refuses the whole retry if an access diagnostic intersects any part of the target. */
     private boolean checkTarget(Expression target) {
+        // A diagnostic on a receiver or index can affect the target just as one on its final field can.
         for (final IProblem problem : accessProblems) {
             if (problem.getSourceStart() <= target.sourceEnd && target.sourceStart <= problem.getSourceEnd()) {
                 refused = true;
@@ -195,6 +201,7 @@ final class MemberAccessRewrite extends ASTVisitor {
     @Override
     public boolean visit(LambdaExpression node, BlockScope scope) {
         if (node.body() instanceof Expression body && body instanceof Invocation) {
+            // A call-shaped body can affect overload selection through its void or value compatibility.
             if (node.descriptor == null || (node.getExpressionContext() == ExpressionContext.INVOCATION_CONTEXT
                 && !fixedLambdaArguments.contains(node))) {
                 overloadSensitiveBodies.add(body);
@@ -387,6 +394,7 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
         final boolean typeReceiver = node.receiver.isTypeReference();
         @Nullable MethodBinding binding = method(node.binding);
+        // An inaccessible receiver type can stop ECJ before it resolves the method.
         if (invisibleReceiver && node.actualReceiverType instanceof ReferenceBinding type) {
             final @Nullable MethodBinding resolved = scope.findMethod(type, node.selector, node.argumentTypes, node, false);
             if (resolved != null && resolved.isValidBinding()) {
@@ -462,15 +470,13 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
     }
 
-    /**
-     * ECJ's inaccessible candidate can be the first applicable overload rather than the most specific.
-     * Resolve the selected owner's overloads through ECJ's compatibility and specificity checks.
-     */
+    /** Determines which overload to use when an access error leaves an incomplete binding. */
     private static @Nullable MethodBinding selectOverload(@Nullable MethodBinding candidate, Invocation site,
                                                            TypeBinding[] types, BlockScope scope, boolean staticOnly) {
         if (candidate == null) {
             return null;
         }
+        // ECJ can report the first applicable inaccessible candidate instead of the most specific one.
         final MethodBinding[] overloads = candidate.declaringClass.getMethods(candidate.selector);
         if (overloads.length <= 1) {
             return candidate;
@@ -616,6 +622,7 @@ final class MemberAccessRewrite extends ASTVisitor {
         if (compatibility == Scope.NOT_COMPATIBLE) {
             return null;
         }
+        // Reflection needs the erased declaration, while argument conversions use the selected binding.
         final StringJoiner signature = new StringJoiner(", ", "new java.lang.String[]{", "}");
         for (TypeBinding parameter : binding.original().parameters) {
             signature.add(quote(binaryName(parameter)));
@@ -670,6 +677,7 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
         final Constant constant = field.constant(scope);
         if (constant != Constant.NotAConstant) {
+            // A literal avoids static initialization but would skip an expression qualifier.
             if (!typeQualifier) {
                 refused = true;
                 return;
@@ -828,7 +836,7 @@ final class MemberAccessRewrite extends ASTVisitor {
         return local.matches("_this\\$*") ? "this" : local;
     }
 
-    /** Prints the invocation owner and parameter types, as read from a JVM method descriptor. */
+    /** Names the invocation's symbolic owner and erased parameter types in a null-receiver message. */
     private static String describeMethod(@Nullable TypeBinding receiver, MethodBinding binding) {
         final MethodBinding original = binding.original();
         final TypeBinding owner = receiver == null ? original.declaringClass : receiver;
@@ -949,6 +957,7 @@ final class MemberAccessRewrite extends ASTVisitor {
             guardModuleFailure(wrapper);
         }
         rewritten.insert(wrapper.bodyEnd, bridges);
+        // Applying edits from the end keeps the remaining source offsets valid.
         edits.sort(Comparator.comparingInt(Edit::start).reversed());
         for (Edit edit : edits) {
             rewritten.replace(edit.start(), edit.end(), edit.replacement());

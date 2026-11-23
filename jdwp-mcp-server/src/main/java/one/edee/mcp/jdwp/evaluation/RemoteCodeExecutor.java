@@ -142,7 +142,7 @@ public final class RemoteCodeExecutor {
         }
     }
 
-    /** Reads the generated module marker while leaving user-thrown exceptions of the same type intact. */
+    /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */
     static @Nullable String closedMemberAccessModule(JdiEvaluationException failure, String wrapper) {
         if (!(failure.getCause() instanceof InvocationException invocation)) {
             return null;
@@ -151,6 +151,7 @@ public final class RemoteCodeExecutor {
         if (exception == null || !exception.referenceType().name().equals("java.lang.reflect.InaccessibleObjectException")) {
             return null;
         }
+        // The wrapper marker distinguishes reflection failures from exceptions thrown by the application.
         final String marker = wrapper + MemberAccessRewrite.MODULE_FAILURE;
         for (Field field : exception.referenceType().allFields()) {
             if (field.name().equals("detailMessage") && field.declaringType().name().equals("java.lang.Throwable")

@@ -7,11 +7,17 @@ import java.util.function.Supplier;
 
 /** Binary fixture for the compiler's private-member binding tests. */
 public class PrivateMembers {
+    /** Supplies a static compile-time constant for the rewrite. */
     private static final int TOTAL = 12;
+    /** Supplies another receiver for a chain of private reads. */
     private final PrivateMembers next = this;
+    /** Supplies the instance value read by the wrapper. */
     private final int amount;
+    /** Supplies a receiver whose declared type is package-private. */
     private final HiddenMembers hidden = new HiddenMembers();
+    /** Supplies the values used by the compiled loop. */
     private final java.util.List<PrivateMembers> entries = java.util.List.of(this);
+    /** Records the order of receiver, argument, and method evaluation. */
     private static String trace = "";
 
     /** Public path used by the wrapper to construct a receiver. */
@@ -29,7 +35,7 @@ public class PrivateMembers {
         fail();
     }
 
-    /** Throws a target exception through reflection. */
+    /** Supplies a target exception for both direct and reflective calls. */
     private void fail() {
         throw new IllegalStateException("fixture failure");
     }
@@ -72,12 +78,12 @@ public class PrivateMembers {
         throw new IOException("checked fixture failure");
     }
 
-    /** An applicable but less specific overload for a String argument. */
+    /** Supplies the less specific reference overload in the selection test. */
     private int select(Object argument) {
         return -1;
     }
 
-    /** Distinguishes this overload from the primitive overload. */
+    /** Supplies the most specific overload for a string argument. */
     private int select(String argument) {
         return argument.length();
     }
@@ -89,24 +95,38 @@ public class PrivateMembers {
 
     /** Supplies javac observations for order, null checks, and accesses that the rewrite must refuse. */
     public static final class Semantics {
+        /** Records the application events for the direct comparison. */
         private static String trace = "";
+        /** Makes a field read depend on an inaccessible static type. */
         private final Hidden hidden = new Hidden();
+        /** Supplies an array with an inaccessible component type. */
         private final Hidden[] hiddenArray = {hidden};
+        /** Supplies a collection whose element type is inaccessible. */
         private final java.util.List<Hidden> hiddenList = java.util.List.of(hidden);
+        /** Provides the member named in null-field diagnostics. */
         private int value = 10;
+        /** Provides a null receiver through a public static field. */
         public static Semantics staticNull;
+        /** Provides a null receiver through a public instance field. */
         public Semantics instanceNull;
+        /** Provides a null receiver through a rewritten static field. */
         private static Semantics privateStaticNull;
+        /** Provides a null receiver through a rewritten instance field. */
         private Semantics privateInstanceNull;
+        /** Supplies the receiver chain for the guarded assignment cases. */
         private final HiddenChild child = new HiddenChild();
+        /** Supplies a control receiver for an accessible assignment. */
         private final VisibleParent visibleChild = new VisibleParent();
 
         /** Owns the public field that must never substitute for the hidden field. */
         public static class VisibleParent {
+            /** Makes accidental selection of the parent field observable. */
             public int shared = 11;
         }
 
+        /** Supplies an inaccessible receiver type with a shadowing field. */
         private static final class HiddenChild extends VisibleParent {
+            /** Holds the subclass value that is distinct from the inherited one. */
             private int shared = 22;
         }
 
@@ -121,7 +141,6 @@ public class PrivateMembers {
             static {
                 mark("ColdConstruct.initialize");
             }
-            /** Records when initialization and construction happen. */
             /** Records construction after the class and the argument are ready. */
             private ColdConstruct(Integer ignored) {
                 mark("ColdConstruct.constructor");
@@ -280,10 +299,15 @@ public class PrivateMembers {
 
         /** Provides a constant without requiring class initialization. */
         public static final class Cold {
+            /** Supplies the ordinary integer constant case. */
             private static final int CONSTANT = 42;
+            /** Exercises string literal quoting and preservation of isolated UTF-16 code units. */
             private static final String TEXT = "quotes \"' and line\n\\u000a / \ud800";
+            /** Exercises escaping of a character constant. */
             private static final char CHARACTER = '\n';
+            /** Exposes whether the literal preserves the sign of zero. */
             private static final double NEGATIVE_ZERO = -0.0;
+            /** Exercises emission of an infinite floating-point constant. */
             private static final float INFINITY = -1.0f / 0.0f;
             static {
                 initialize();
@@ -296,6 +320,7 @@ public class PrivateMembers {
 
         /** Declares a private field hidden by a subclass declaration. */
         public static class Base {
+            /** Supplies the field read through the receiver’s explicit base type. */
             private final int shadowed;
 
             /** Initializes a nonconstant field to exercise a reflective read of the base declaration. */
@@ -312,6 +337,7 @@ public class PrivateMembers {
 
         /** Shadows the base field and emits a bridge for its covariant override. */
         public static final class Child extends Base {
+            /** Supplies the constant selected by a subclass-qualified expression. */
             private final int shadowed = 30;
             /** Returns the covariant value even though javac also emits a bridge. */
             @Override protected Integer bridge() { mark("Child.bridge"); return 30; }
@@ -382,6 +408,7 @@ public class PrivateMembers {
                 case "generic" -> x.generic("g").length();
                 case "shadow" -> ((Base) new Child()).shadowed;
                 case "bridge" -> new Child().bridge();
+                // An empty implementation provides the receiver for the interface's private method.
                 case "interface" -> ((Face) new Face() {}).own();
                 case "lazy" -> false && x.get("receiver").value > 0;
                 case "nested-lambda" -> ((java.util.function.Supplier<java.util.function.Supplier<Integer>>) () -> () -> x.get("receiver").select("s")).get().get();
@@ -397,10 +424,15 @@ public class PrivateMembers {
     public static final class AccessSites {
         /** Ordered application calls observed in one isolated loader. */
         private static String trace = "";
+        /** Supplies both an assignment target and an array-typed overload argument. */
         private final int[] array = {11};
+        /** Makes a private read part of an array assignment target. */
         private final int index = 0;
+        /** Selects the boxed overload in the direct comparison. */
         private final Integer boxed = 4;
+        /** Selects the primitive overload in the direct comparison. */
         private int primitive = 3;
+        /** Provides the field named by null checks at distinct source sites. */
         private int value = 17;
         /** Supplies the inherited return type in the discarded-result cases. */
         public final GenericChild genericChild = new GenericChild();
@@ -511,6 +543,7 @@ public class PrivateMembers {
 
         /** Declares members inherited under two distinct source qualifiers. */
         public static class Base {
+            /** Provides the null receiver shared by the two static field qualifiers. */
             protected static AccessSites empty;
             /** Returns a null result for an inherited static method. */
             protected static AccessSites noReceiver() {
@@ -526,7 +559,9 @@ public class PrivateMembers {
 
         /** Supplies folded constants and records any class initialization. */
         public static class Cold {
+            /** Supplies an integer folded inside a larger constant expression. */
             private static final int CONSTANT = 7 * 6;
+            /** Supplies a string folded before the identity check. */
             private static final String STRING = "str" + "ing";
             static {
                 mark("Cold.<clinit>");
@@ -535,6 +570,7 @@ public class PrivateMembers {
 
         /** Supplies a constant whose enclosing type cannot be named. */
         private static final class HiddenCold {
+            /** Supplies a type-qualified constant through an inaccessible owner. */
             public static final int CONSTANT = 8 * 6;
             static {
                 mark("HiddenCold.<clinit>");
@@ -547,7 +583,7 @@ public class PrivateMembers {
                 mark("Parent.<clinit>");
             }
 
-            /** Records superclass initialization and construction. */
+            /** Records the superclass constructor call. */
             public Parent() {
                 mark("Parent.<init>");
             }
@@ -559,7 +595,7 @@ public class PrivateMembers {
                 mark("Inner.<clinit>");
             }
 
-            /** Records initialization of the class used as a constructor argument. */
+            /** Records construction during argument evaluation. */
             private Inner(int n) {
                 mark("Inner.<init>");
             }
@@ -571,7 +607,7 @@ public class PrivateMembers {
                 mark("Outer.<clinit>");
             }
 
-            /** Records initialization of the class being constructed first. */
+            /** Records the call after superclass construction and argument evaluation. */
             private Outer(Inner inner) {
                 mark("Outer.<init>");
             }
@@ -653,6 +689,7 @@ public class PrivateMembers {
                     ((Runnable) () -> x.genericChild.retrieve()).run();
                     yield "ok";
                 }
+                // Both branches resolve to the same declaration but use distinct source qualifiers.
                 case "method-description" -> {
                     try {
                         if (takeFirst()) yield A.noReceiver().value;
@@ -679,6 +716,7 @@ public class PrivateMembers {
 
 /** A receiver whose type cannot be named from the generated wrapper's package. */
 class HiddenMembers {
+    /** Supplies a private value on a package-private receiver. */
     private final int hiddenAmount;
 
     /** Sets a nonconstant private field so the test exercises the reflective receiver binding. */

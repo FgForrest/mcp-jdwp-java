@@ -9,6 +9,7 @@ public final class CompanionTrackingLoader extends URLClassLoader {
     public static final String ABSENT = "optionalfixture.Absent";
     /** Process-local trace shared by the loader and the fixtures it defines. */
     public static final String TRACE = "jdwp.fixture.companion.trace";
+    /** Package prefix for fixtures owned by this loader. */
     private static final String FIXTURES = CompanionTrackingLoader.class.getPackageName() + ".";
 
     /** Uses the fixture classpath while letting the parent load ordinary application classes. */

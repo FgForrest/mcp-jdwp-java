@@ -264,6 +264,7 @@ class InterpreterHarnessLiveTest {
     private static String evaluateUntakenCompanion(Path javaHome, Path optionalClasses, String body, boolean primaryOnly)
         throws Exception {
         return withFixture(javaHome, fixture -> {
+            // The primary-only variant gives the comparison the same bytecode input as the original evaluator.
             final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler() {
                 /** Gives ECJ the absent superclass and optionally exposes only the primary output. */
                 @Override
