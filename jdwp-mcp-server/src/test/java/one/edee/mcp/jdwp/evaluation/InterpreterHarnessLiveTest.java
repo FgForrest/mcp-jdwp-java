@@ -711,10 +711,12 @@ class InterpreterHarnessLiveTest {
                     checks.assertThat(actual).as(row.id()).isEqualTo(expected).isEqualTo(compiled);
                 }
                 case "float-constant", "float-fragment" -> {
-                    // The fixture golden uses javac's build JDK, which can fold floating-point text differently from ECJ's host JDK.
-                    final String traceSuffix = row.id().equals("float-constant") ? "[1 reflectString>]" : "[2 later>reflectString>]";
+                    // Format at runtime in ECJ's host JVM, independently of the shared wrapper and javac's fixture folding.
+                    final String runtimeExpected = "x" + Double.toString(1e23)
+                        + (row.id().equals("float-constant") ? " [1 reflectString>]" : "3 [2 later>reflectString>]");
                     checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
-                    checks.assertThat(actual).as(row.id()).isEqualTo(compiled).endsWith(traceSuffix);
+                    checks.assertThat(actual).as(row.id() + " auto").isEqualTo(runtimeExpected);
+                    checks.assertThat(compiled).as(row.id() + " compiled").isEqualTo(runtimeExpected);
                 }
                 case "polluted-receiver", "polluted-field", "polluted-argument", "polluted-declared-bound",
                      "block-store-explicit", "block-store-inferred", "block-store-assignment", "block-store-before-call" -> {
