@@ -14,6 +14,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.List;
 
@@ -168,6 +170,20 @@ class JDWPToolsSetBreakpointTest {
 			assertThat(result).startsWith("Breakpoint deferred for com.example.Foo:10");
 			verify(cpr).addClassFilter("com.example.Foo");
 			verify(cpr).enable();
+		}
+
+		/** Keeps loaded-name corrections for simple line targets and dotted nested names. */
+		@ParameterizedTest
+		@CsvSource({"String, com.acme.String", "java.util.Map.Entry, java.util.Map$Entry"})
+		void shouldSuggestTheLoadedBinaryName(String className, String loadedName) {
+			final ReferenceType loaded = mock(ReferenceType.class);
+			when(loaded.name()).thenReturn(loadedName);
+			when(vm.allClasses()).thenReturn(List.of(loaded));
+			when(vm.version()).thenReturn(Runtime.version().toString());
+			when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+
+			assertThat(tools.jdwp_set_breakpoint(className, 42, null, null, null, null, null))
+				.contains("Did you mean: " + loadedName);
 		}
 
 		/**

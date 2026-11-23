@@ -29,6 +29,9 @@ import org.springframework.stereotype.Service;
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.lang.module.ModuleFinder;
+import java.lang.module.ModuleReader;
+import java.lang.module.ModuleReference;
 import java.lang.reflect.Modifier;
 import java.net.SocketException;
 import java.time.Duration;
@@ -80,6 +83,8 @@ public class JDWPTools {
      * Packages of the JDK — see {@link #isPlatformClassName}.
      */
     private static final String[] PLATFORM_PACKAGE_PREFIXES = {"java.", "javax.", "jdk.", "sun.", "com.sun."};
+    /** Lazily indexed packages in the server's system modules, guarded by {@link #indexedSystemModules()}. */
+    private static @Nullable Map<String, List<ModuleReference>> systemModulesByPackage;
     /**
      * The {@code monitorenter} opcode — see {@link #displayedLine}.
      */
@@ -3211,34 +3216,96 @@ public class JDWPTools {
         return prefix + progress + " " + renderReleaseFailures(release.failures(), release.closed());
     }
 
-    /**
-     * Builds a "did you mean…" hint for a breakpoint that just deferred because its class isn't
-     * loaded. Scans the loaded classes for names resembling {@code className} (see
-     * {@link ClassNameMatcher}) and returns a one-line note, or {@code ""} when nothing is close.
-     * Best-effort: a misspelled fully-qualified name otherwise defers forever with no signal, so
-     * this is the cheap guard against that footgun — and it never fails a BP set if the lookup
-     * throws (e.g. the VM died between the deferral and this scan).
-     */
+    /** Builds a deferred-breakpoint hint using the class name as supplied. */
     private String deferredClassSuggestion(VirtualMachine vm, String className) {
-        try {
-            // Compare with the application's classes only: at VM start nothing but JDK classes is
-            // loaded, and a JDK name that happens to share a word is a false alarm.
-            final boolean platformTarget = isPlatformClassName(className);
-            final List<String> loaded = vm.allClasses().stream()
-                .map(ReferenceType::name)
-                .filter(name -> platformTarget || !isPlatformClassName(name))
-                .toList();
-            final List<String> suggestions = ClassNameMatcher.suggest(loaded, className, 3);
-            if (suggestions.isEmpty()) {
-                return "";
-            }
-            return String.format(
-                "%n  ⚠ No loaded class matches '%s'. Did you mean: %s ? "
-                + "(If the class genuinely hasn't loaded yet, ignore this.)",
-                className, String.join(", ", suggestions));
-        } catch (Exception e) {
+        return deferredClassSuggestion(vm, className, false);
+    }
+
+    /**
+     * Builds a best-effort hint from similar loaded names using {@link ClassNameMatcher}.
+     * A fully qualified binary name found in the server JDK suppresses the hint when the target
+     * uses the same Java major version. For a bare exception name, suggest an exact {@code java.lang}
+     * match from the target's loaded classes or the server's matching JDK before application matches.
+     * Explain that exception registration needs the qualified name.
+     */
+    private String deferredClassSuggestion(VirtualMachine vm, String className, boolean exceptionTool) {
+        final boolean dottedName = className.indexOf('.') >= 0;
+        final boolean slashFree = className.indexOf('/') < 0;
+        if (dottedName && slashFree && targetUsesServerJavaMajor(vm) && hasSystemClassResource(className)) {
             return "";
         }
+
+        final boolean bareExceptionName = exceptionTool && !dottedName && slashFree;
+        final String qualificationNote = bareExceptionName
+            ? "\n  Exception breakpoints need a fully qualified class name." : "";
+        final String javaLangName = bareExceptionName ? "java.lang." + className : "";
+        final List<String> suggestions = new ArrayList<>();
+        if (bareExceptionName && targetUsesServerJavaMajor(vm) && hasSystemClassResource(javaLangName)) {
+            suggestions.add(javaLangName);
+        }
+        try {
+            final boolean platformTarget = isPlatformClassName(className);
+            final List<String> loaded = new ArrayList<>();
+            for (ReferenceType type : vm.allClasses()) {
+                final String name = type.name();
+                if (platformTarget || !isPlatformClassName(name)) {
+                    loaded.add(name);
+                } else if (bareExceptionName && suggestions.isEmpty() && javaLangName.equals(name)) {
+                    suggestions.add(name);
+                }
+            }
+            suggestions.addAll(ClassNameMatcher.suggest(loaded, className, 3));
+        } catch (Exception ignored) {
+            // Keep any exact java.lang suggestion already found if the target's class list cannot be read.
+        }
+        if (suggestions.isEmpty()) {
+            return qualificationNote;
+        }
+        final String hint = String.format("%n  ⚠ No loaded class matches '%s'. Did you mean: %s ?",
+            className, String.join(", ", suggestions));
+        return hint + (bareExceptionName ? qualificationNote : " (If the class genuinely hasn't loaded yet, ignore this.)");
+    }
+
+    /** Compares the target's reported Java major version to the server's, when the report can be read and parsed. */
+    private static boolean targetUsesServerJavaMajor(VirtualMachine vm) {
+        try {
+            final @Nullable String version = vm.version();
+            return version != null && Runtime.Version.parse(version).feature() == Runtime.version().feature();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /** Looks for a qualified binary name in the server JDK image using resources alone. */
+    private static boolean hasSystemClassResource(String className) {
+        final String packageName = className.substring(0, className.lastIndexOf('.'));
+        final String resourceName = className.replace('.', '/') + ".class";
+        try {
+            for (ModuleReference module : indexedSystemModules().getOrDefault(packageName, List.of())) {
+                try (ModuleReader reader = module.open()) {
+                    if (reader.find(resourceName).isPresent()) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Resource lookup failures leave the loaded-class matcher available.
+        }
+        return false;
+    }
+
+    /** Caches package ownership in the system image after successful discovery. */
+    private static synchronized Map<String, List<ModuleReference>> indexedSystemModules() {
+        if (systemModulesByPackage == null) {
+            final Map<String, List<ModuleReference>> index = new HashMap<>();
+            for (ModuleReference module : ModuleFinder.ofSystem().findAll()) {
+                for (String packageName : module.descriptor().packages()) {
+                    index.computeIfAbsent(packageName, name -> new ArrayList<>()).add(module);
+                }
+            }
+            systemModulesByPackage = Map.copyOf(index);
+        }
+        return systemModulesByPackage;
     }
 
     /**
@@ -4424,6 +4491,7 @@ public class JDWPTools {
      * public tools differ only in their parameter validation and the rendered summary; everything
      * inside (trigger validation, eager class load, deferred path with {@code ClassPrepareRequest},
      * active path with the chain-disable-then-enable ordering) is identical and lives here.
+     * A bare name gets a qualification hint while the request retains the supplied name.
      *
      * @param expression when non-null, switches the helper into log-only mode and is rendered on a dedicated line
      * @param condition  non-null persists a metadata condition under the synthetic ID; evaluated by
@@ -4520,7 +4588,7 @@ public class JDWPTools {
                     filterLine,
                     chainInfo,
                     forceLoadFailedNote(effectiveForceLoad))
-                    + deferredClassSuggestion(vm, exceptionClass)
+                    + deferredClassSuggestion(vm, exceptionClass, true)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 

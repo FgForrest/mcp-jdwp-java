@@ -2837,6 +2837,7 @@ public class FastLogpointService {
             EventHistory.DebugEvent.UNSTAMPED));
     }
 
+    /** Records why hits were dropped and how to avoid overrunning the buffer or read limit. */
     private void recordDropped(FastLogpoint flp, long overrun, long skipped, long lost) {
         final List<String> reasons = new ArrayList<>();
         if (overrun > 0) {
@@ -2844,8 +2845,12 @@ public class FastLogpointService {
                 + "more often, raise bufferSize or narrow the condition)");
         }
         if (skipped > 0) {
-            reasons.add(skipped + " skipped because one read ingests at most " + EventHistory.MAX_EVENTS
-                + " entries (the event-history capacity)");
+            reasons.add(skipped + " skipped (one read ingests up to " + EventHistory.MAX_EVENTS
+                + " of the newest hits per ring. The shared history keeps the newest " + EventHistory.MAX_EVENTS
+                + " events across all sources. jdwp_get_events returns at most the newest 100 events."
+                + " To keep rare evidence visible, narrow the logpoint's condition to log only the anomaly."
+                + " To avoid ingest skips, call jdwp_get_events before more than " + EventHistory.MAX_EVENTS
+                + " hits pile up)");
         }
         if (lost > 0) {
             reasons.add(lost + " never completed by the writing thread");

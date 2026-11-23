@@ -70,6 +70,21 @@ class JDWPToolsGetEventsSessionTest {
 			.doesNotContain("new VM attachment");
 	}
 
+	/** Returning the newest 100 shared events can hide a rare hit that still fits in the history. */
+	@Test
+	void shouldReturnOnlyNewestEventsEvenWhenAnotherReadRetainsTheRareHit() {
+		final String rareHit = "rare fast logpoint hit";
+		eventHistory.record(new EventHistory.DebugEvent("FAST_LOGPOINT", rareHit));
+		for (int i = 0; i < 100; i++) {
+			eventHistory.record(new EventHistory.DebugEvent("LOGPOINT", "ordinary hit " + i));
+		}
+
+		assertThat(eventHistory.getRecent(101)).hasSize(101).extracting(EventHistory.DebugEvent::summary)
+			.contains(rareHit);
+		assertThat(tools.jdwp_get_events(500)).contains("100 of 101 total", "ordinary hit 99").doesNotContain(rareHit);
+		assertThat(tools.jdwp_get_events(500)).contains("100 of 101 total", "ordinary hit 99").doesNotContain(rareHit);
+	}
+
 	@Test
 	@DisplayName("an event timestamped on a whole second renders a full time without collapsing into an error")
 	void shouldRenderWholeSecondTimestamp() {

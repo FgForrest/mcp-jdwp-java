@@ -20,6 +20,7 @@ import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -45,6 +46,8 @@ class FastLogpointServiceLookupTest {
 
 	private JdiExpressionEvaluator evaluator;
 	private FastLogpointService service;
+	/** Receives the recorded events from the registered probes. */
+	private EventHistory history;
 	private EventRequestManager requests;
 	private final Map<Integer, Location> locations = new HashMap<>();
 	/**
@@ -55,11 +58,12 @@ class FastLogpointServiceLookupTest {
 	private int breakpointId;
 	private int logpointId;
 
-	/** Registers fast probes with mocked JDI requests for lookup and removal checks. */
+	/** Registers fast probes with mocked JDI requests and a real event history. */
 	@BeforeEach
 	void setUp() throws Exception {
 		evaluator = mock(JdiExpressionEvaluator.class);
-		service = new FastLogpointService(new BreakpointTracker(), new EventHistory(), new EvaluationGuard(), evaluator,
+		history = new EventHistory();
+		service = new FastLogpointService(new BreakpointTracker(), history, new EvaluationGuard(), evaluator,
 			mock(JdiEventListener.class), mock(JDIConnectionService.class));
 		vm = mock(VirtualMachine.class);
 		requests = mock(EventRequestManager.class);
@@ -85,6 +89,35 @@ class FastLogpointServiceLookupTest {
 		breakpointId = service.registerBreakpoint(vm, locations.get(BREAKPOINT_LINE), "total > 100", null, true,
 			EventRequest.SUSPEND_ALL, FastLogpointService.BREAKPOINT_ERROR_BUFFER_SIZE);
 		logpointId = service.register(vm, locations.get(LOGPOINT_LINE), "total", null, 256);
+	}
+
+	/** Describes the shared history and makes anomaly filtering the advice for keeping a hit visible. */
+	@Test
+	void skippedEntriesGiveReadLimitAdvice() {
+		assertThat(droppedSummary(0, 646, 0)).containsSubsequence(
+			"646 entries dropped: 646 skipped",
+			"one read ingests up to 500 of the newest hits per ring",
+			"shared history keeps the newest 500 events",
+			"jdwp_get_events returns at most the newest 100",
+			"narrow the logpoint's condition to log only the anomaly",
+			"To avoid ingest skips, call jdwp_get_events before more than 500 hits pile up")
+			.doesNotContain("bufferSize");
+	}
+
+	/** Preserves the messages for overwritten slots and writes that never completed. */
+	@Test
+	void overrunAndLostReasonsAreUnchanged() {
+		assertThat(droppedSummary(3, 0, 2)).isEqualTo("[FastLogpoint " + logpointId
+			+ "] 5 entries dropped: 3 overwritten before they were read (buffer overrun — call jdwp_get_events "
+			+ "more often, raise bufferSize or narrow the condition); 2 never completed by the writing thread");
+	}
+
+	/** Records a drop for the registered logpoint and returns its event summary. */
+	private String droppedSummary(long overrun, long skipped, long lost) {
+		final Map<?, ?> entries = (Map<?, ?>) ReflectionTestUtils.getField(service, "logpoints");
+		ReflectionTestUtils.invokeMethod(service, "recordDropped", entries.get(logpointId), overrun, skipped, lost);
+		return history.getRecent(10).stream().filter(event -> event.type().equals("FAST_LOGPOINT_DROPPED"))
+			.findFirst().orElseThrow().summary();
 	}
 
 	@Test

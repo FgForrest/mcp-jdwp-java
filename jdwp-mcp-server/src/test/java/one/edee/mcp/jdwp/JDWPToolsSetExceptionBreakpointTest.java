@@ -12,8 +12,15 @@ import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.security.Permission;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -138,6 +145,128 @@ class JDWPToolsSetExceptionBreakpointTest {
 		assertThat(result).contains("com.example.MyException");
 		verify(cpr).addClassFilter("com.example.MyException");
 		verify(cpr).enable();
+	}
+
+	/** Exercises the hint through exception registration while the requested class is still unloaded. */
+	@ParameterizedTest
+	@CsvSource({
+		"java.lang.NumberFormatException, java.lang.Number, false",
+		"com.sun.jdi.AbsentInformationException, com.acme.AbsentInformationException, false",
+		"java.lang.NumberFormatExeption, java.lang.Number, true",
+		"java.lang/NumberFormatException, java.lang.NumberFormatException, true",
+		"com.example.NumberFormatException, com.example.Number, true",
+		"one.edee.mcp.jdwp.EventHistory, com.acme.EventHistory, true"
+	})
+	@DisplayName("only valid JDK binary names suppress suggestions on a matching JDK")
+	void shouldSuppressSuggestionsForKnownJdkExceptions(String className, String loadedName, boolean suggest) {
+		when(vm.version()).thenReturn(Runtime.version().toString());
+		final ClassPrepareRequest cpr = mockDeferredException(loadedName);
+		final String reply = deferException(className);
+
+		assertThat(reply).startsWith("Exception breakpoint deferred");
+		if (suggest) {
+			assertThat(reply).contains("Did you mean: " + loadedName);
+		} else {
+			assertThat(reply).doesNotContain("Did you mean:");
+		}
+		verify(cpr).addClassFilter(className);
+	}
+
+	/** Warns about the exact filter while suggesting both the JDK spelling and a loaded application match. */
+	@Test
+	void shouldSuggestQualifiedNamesForABareExceptionName() {
+		final String applicationException = "com.acme.NumberFormatException";
+		final ClassPrepareRequest cpr = mockDeferredException(applicationException);
+		when(vm.version()).thenReturn(Runtime.version().toString());
+
+		final String reply = deferException("NumberFormatException");
+
+		assertThat(reply).contains("Exception breakpoints need a fully qualified class name",
+			"Did you mean: java.lang.NumberFormatException, " + applicationException);
+		assertThat(tracker.getPendingExceptionBreakpointsForClass(applicationException)).isEmpty();
+		verify(cpr).addClassFilter("NumberFormatException");
+	}
+
+	/** Retains a loaded alternative when the target uses an older Java release. */
+	@Test
+	void shouldKeepSuggestionsForADifferentTargetJdk() {
+		assumeTrue(Runtime.version().feature() >= 21);
+		when(vm.version()).thenReturn("17.0.18");
+		mockDeferredException("com.acme.MatchException");
+
+		assertThat(deferException("java.lang.MatchException")).contains("Did you mean: com.acme.MatchException");
+	}
+
+	/** A bare name on Java 17 keeps its loaded match without suggesting the server's Java 21 class. */
+	@Test
+	void shouldKeepLoadedApplicationMatchForABareExceptionOnADifferentJdk() {
+		assumeTrue(Runtime.version().feature() >= 21);
+		when(vm.version()).thenReturn("17.0.18");
+		final ClassPrepareRequest cpr = mockDeferredException("com.acme.MatchException");
+
+		assertThat(deferException("MatchException"))
+			.contains("Did you mean: com.acme.MatchException", "Exception breakpoints need a fully qualified class name")
+			.doesNotContain("java.lang.MatchException");
+		verify(cpr).addClassFilter("MatchException");
+	}
+
+	/** An exact `java.lang` match loaded by the target is valid across JDK versions. */
+	@Test
+	void shouldSuggestAnExactLoadedJavaLangMatchOnADifferentJdk() {
+		when(vm.version()).thenReturn(Runtime.version().feature() == 17 ? "21.0.1" : "17.0.18");
+		final ClassPrepareRequest cpr = mockDeferredException("java.lang.NumberFormatException");
+
+		assertThat(deferException("NumberFormatException")).contains(
+			"Did you mean: java.lang.NumberFormatException", "Exception breakpoints need a fully qualified class name");
+		verify(cpr).addClassFilter("NumberFormatException");
+	}
+
+	/** A denied JDK resource check must leave the loaded-class matcher available. */
+	@Test
+	@SuppressWarnings("removal")
+	void shouldKeepSuggestionsWhenResourceAccessIsDenied() {
+		assumeTrue(Runtime.version().feature() < 24 && "allow".equals(System.getProperty("java.security.manager")));
+		mockDeferredException("com.acme.NumberFormatException");
+		when(vm.version()).thenReturn(Runtime.version().toString());
+		final SecurityManager previous = System.getSecurityManager();
+		final AtomicBoolean denied = new AtomicBoolean();
+		final SecurityManager denyJdkLookup = new SecurityManager() {
+			/** Denies access to system modules and the platform loader used by the earlier lookup. */
+			@Override
+			public void checkPermission(Permission permission) {
+				if ("accessSystemModules".equals(permission.getName()) || "getClassLoader".equals(permission.getName())
+					&& StackWalker.getInstance().walk(frames -> frames.anyMatch(frame ->
+						frame.getMethodName().equals("getPlatformClassLoader")))) {
+					denied.set(true);
+					throw new SecurityException("JDK resource access denied");
+				}
+			}
+		};
+		final String reply;
+		System.setSecurityManager(denyJdkLookup);
+		try {
+			reply = deferException("java.lang.NumberFormatException");
+		} finally {
+			System.setSecurityManager(previous);
+		}
+
+		assertThat(denied.get()).isTrue();
+		assertThat(reply).contains("Did you mean: com.acme.NumberFormatException");
+	}
+
+	/** Supplies a loaded alternative and a request for the exact name supplied by the caller. */
+	private ClassPrepareRequest mockDeferredException(String loadedName) {
+		final ReferenceType loaded = mock(ReferenceType.class);
+		when(loaded.name()).thenReturn(loadedName);
+		when(vm.allClasses()).thenReturn(List.of(loaded));
+		final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
+		when(erm.createClassPrepareRequest()).thenReturn(cpr);
+		return cpr;
+	}
+
+	/** Sets a regular exception breakpoint with default options. */
+	private String deferException(String className) {
+		return tools.jdwp_set_exception_breakpoint(className, null, null, null, null, null, null, null, null, null);
 	}
 
 	@Test
