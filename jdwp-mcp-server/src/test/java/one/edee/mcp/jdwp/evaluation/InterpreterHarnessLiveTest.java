@@ -704,11 +704,19 @@ class InterpreterHarnessLiveTest {
             checks.assertThat(thread.suspendCount()).as(row.id() + " suspend count").isEqualTo(before);
             switch (row.id()) {
                 case "capture-intersection", "capture-multiple-declared", "pattern-constant", "pattern-surrogate",
-                     "pattern-string-receiver", "block-pattern-constant", "float-constant", "float-fragment",
+                     "pattern-string-receiver", "block-pattern-constant",
                      "float-conditional-constant", "block-store-float", "interface-private", "block-dead-call",
                      "block-dead-boxing", "block-dead-consumer", "block-constant-reachability" -> {
                     checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
                     checks.assertThat(actual).as(row.id()).isEqualTo(expected).isEqualTo(compiled);
+                }
+                case "float-constant", "float-fragment" -> {
+                    // Format at runtime in ECJ's host JVM, independently of the shared wrapper and javac's fixture folding.
+                    final String runtimeExpected = "x" + Double.toString(1e23)
+                        + (row.id().equals("float-constant") ? " [1 reflectString>]" : "3 [2 later>reflectString>]");
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id() + " auto").isEqualTo(runtimeExpected);
+                    checks.assertThat(compiled).as(row.id() + " compiled").isEqualTo(runtimeExpected);
                 }
                 case "polluted-receiver", "polluted-field", "polluted-argument", "polluted-declared-bound",
                      "block-store-explicit", "block-store-inferred", "block-store-assignment", "block-store-before-call" -> {
