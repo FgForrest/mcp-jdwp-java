@@ -2845,10 +2845,12 @@ public class FastLogpointService {
                 + "more often, raise bufferSize or narrow the condition)");
         }
         if (skipped > 0) {
-            reasons.add(skipped + " skipped (one read keeps only the newest " + EventHistory.MAX_EVENTS
-                + " entries. jdwp_get_events shows at most 100 events. To keep rare evidence, narrow the logpoint's"
-                + " condition to log only the anomaly, or call jdwp_get_events before more than "
-                + EventHistory.MAX_EVENTS + " hits pile up)");
+            reasons.add(skipped + " skipped (one read ingests up to " + EventHistory.MAX_EVENTS
+                + " of the newest hits per ring. The shared history keeps the newest " + EventHistory.MAX_EVENTS
+                + " events across all sources. jdwp_get_events returns at most the newest 100 events."
+                + " To keep rare evidence visible, narrow the logpoint's condition to log only the anomaly."
+                + " To avoid ingest skips, call jdwp_get_events before more than " + EventHistory.MAX_EVENTS
+                + " hits pile up)");
         }
         if (lost > 0) {
             reasons.add(lost + " never completed by the writing thread");

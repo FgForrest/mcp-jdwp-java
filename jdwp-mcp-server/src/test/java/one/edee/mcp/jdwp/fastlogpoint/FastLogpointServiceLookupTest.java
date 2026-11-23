@@ -91,15 +91,16 @@ class FastLogpointServiceLookupTest {
 		logpointId = service.register(vm, locations.get(LOGPOINT_LINE), "total", null, 256);
 	}
 
-	/** Reports both read limits and explains how to preserve rare hits when a read skips entries. */
+	/** Describes the shared history and makes anomaly filtering the advice for keeping a hit visible. */
 	@Test
 	void skippedEntriesGiveReadLimitAdvice() {
-		assertThat(droppedSummary(0, 646, 0)).contains(
+		assertThat(droppedSummary(0, 646, 0)).containsSubsequence(
 			"646 entries dropped: 646 skipped",
-			"one read keeps only the newest 500 entries",
-			"jdwp_get_events shows at most 100",
+			"one read ingests up to 500 of the newest hits per ring",
+			"shared history keeps the newest 500 events",
+			"jdwp_get_events returns at most the newest 100",
 			"narrow the logpoint's condition to log only the anomaly",
-			"call jdwp_get_events before more than 500 hits pile up")
+			"To avoid ingest skips, call jdwp_get_events before more than 500 hits pile up")
 			.doesNotContain("bufferSize");
 	}
 
