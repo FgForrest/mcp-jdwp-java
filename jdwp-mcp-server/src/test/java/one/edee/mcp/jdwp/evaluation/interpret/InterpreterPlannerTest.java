@@ -28,7 +28,7 @@ class InterpreterPlannerTest {
         this.value         | NAVIGATE
         missing            | ERROR
         item +             | ERROR
-        { return item; }   | COMPILE
+        { return item; }   | NAVIGATE
         item++             | COMPILE
         item = 7           | COMPILE
         item.toString()    | COMPILE
@@ -65,6 +65,188 @@ class InterpreterPlannerTest {
             assertThat(error.message()).contains("Visible names", "item", "$tag");
         }
         verifyNoInteractions(self);
+    }
+
+    /** Checks whole-block flow and fallback reasons using only frame values and declared JDI types. */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+        { int x; if (flag) x = 1; else x = 2; return x; } | NAVIGATE | -
+        { int x; if (flag) return 1; else x = 2; return x; } | NAVIGATE | -
+        { int x; if (flag) x = 1; else return 2; return x; } | NAVIGATE | -
+        { int x; if (true) x = 1; return x; } | COMPILE | constant block condition
+        { int x; if (false) return x; return 0; } | COMPILE | constant block condition
+        '{ int x; if (flag || true) x = 1; return x; }' | COMPILE | constant block condition
+        '{ int x; if ((flag || true) && true) x = 1; return x; }' | COMPILE | constant block condition
+        { boolean x; if (false && x) return 1; return 0; } | COMPILE | constant block condition
+        { int x; return true ? 1 : x; } | COMPILE | constant block condition
+        { if (false) { int count; return count; } return 1; } | COMPILE | constant block condition
+        { if (true) return 1; int count; return count; } | COMPILE | constant block condition
+        { final int count; if (false) { count = 1; count = 2; } return 1; } | COMPILE | constant block condition
+        { if (1 == 1) return 1; return 2; } | COMPILE | constant block condition
+        { if (ALWAYS) perform(); return 1; } | COMPILE | constant block condition
+        { final boolean folded = true; if (!folded) perform(); return 1; } | COMPILE | constant block condition
+        { int count; if (true ? true : boxedFlag) count = 1; return count; } | COMPILE | conditional expression
+        { int count; if ((true ? false : boxedFlag) && count == 0) return 1; return 2; } | COMPILE | conditional expression
+        '{ if (slot instanceof String matched || slot instanceof String matched) return 1; return 2; }' | COMPILE | repeated pattern name
+        { if (!(slot instanceof String matched)) return 0; if (slot instanceof String matched) return 1; return 2; } | COMPILE | repeated pattern name
+        { if (!(slot instanceof String matched)) return 0; else { if (slot instanceof String matched) return 1; } return 2; } | COMPILE | repeated pattern name
+        { int x; if (flag) x = 1; return x; } | COMPILE | not definitely assigned
+        { int x; if (flag) x = 1; else { x = x + 1; } return x; } | COMPILE | not definitely assigned
+        { int x; return x; } | COMPILE | not definitely assigned
+        { int x = x; return x; } | COMPILE | not definitely assigned
+        { int x = 1, y = x; return y; } | NAVIGATE | -
+        { int x; { x = 1; } return x; } | NAVIGATE | -
+        { { int x = 1; } { int x = 2; return x; } } | NAVIGATE | -
+        { if (flag) { int x = 1; } return x; } | COMPILE | Unresolved variable
+        { int x = 1; { int x = 2; return x; } } | COMPILE | redeclares
+        { int flag = 1; return flag; } | COMPILE | redeclares
+        { int $exception = 1; return $exception; } | COMPILE | redeclares
+        { int $mark = 1; return $mark; } | COMPILE | redeclares
+        { flag = false; return flag; } | COMPILE | block local
+        { if (flag) return 1; return 2; } | NAVIGATE | -
+        { if (flag) return 1; } | COMPILE | missing return
+        { return 1; int x = 2; } | COMPILE | unreachable
+        { if (flag) return 1; else return 2; return 3; } | COMPILE | unreachable
+        { return; } | COMPILE | return requires a value
+        { return perform(); } | COMPILE | return requires a value
+        { if (1) return 1; return 2; } | COMPILE | condition requires boolean
+        { var x = 1; return x; } | NAVIGATE | -
+        { var x = unknown; return x; } | COMPILE | precise initializer
+        { var x = null; return x; } | COMPILE | precise initializer
+        { var x; return x; } | COMPILE | precise initializer
+        { var x = perform(); return x; } | COMPILE | precise initializer
+        { var x = 1, y = 2; return x; } | COMPILE | single declaration
+        { byte x = 3; long y = x; return y; } | NAVIGATE | -
+        { int x = false; return x; } | COMPILE | incompatible assignment
+        { int x = 1; x = 1L; return x; } | COMPILE | incompatible assignment
+        { Byte x = 3; return x; } | INVOKE | -
+        { final int x; if (flag) x = 1; else x = 2; return x; } | NAVIGATE | -
+        { final int x; if (flag) x = 1; x = 2; return x; } | COMPILE | final local
+        { final int x = 1; x = 2; return x; } | COMPILE | final local
+        { perform(); return flag; } | INVOKE | -
+        { if (flag) perform(); return 0; } | INVOKE | -
+        { return 1; perform(); } | COMPILE | unreachable
+        { perform(); return flag + 1; } | COMPILE | invalid binary operand types
+        { perform(); return missing; } | COMPILE | Unresolved variable
+        { perform(); return candidate(1); } | COMPILE | multiple candidates
+        { int x = 1; return x = 2; } | COMPILE | assignment
+        { int x = 1; x += 1; return x; } | COMPILE | compound assignment
+        { int x = 1; ++x; return x; } | COMPILE | increment or decrement
+        { int x = 1; x--; return x; } | COMPILE | increment or decrement
+        { this.value = 2; return 1; } | COMPILE | assignment
+        { value = 2; return 1; } | COMPILE | block local
+        { items[0] = 2; return 1; } | COMPILE | assignment
+        { for (;;) {} return 1; } | COMPILE | loop
+        { for (int x : items) {} return 1; } | COMPILE | loop
+        { while (flag) {} return 1; } | COMPILE | loop
+        { do {} while (flag); return 1; } | COMPILE | loop
+        { try { return 1; } finally {} } | COMPILE | try statement
+        { switch (1) { default: return 1; } } | COMPILE | switch statement
+        { return switch (1) { default -> 1; }; } | COMPILE | switch expression
+        { throw null; } | COMPILE | throw statement
+        { synchronized (this) { return 1; } } | COMPILE | synchronized
+        { mark: { return 1; } } | COMPILE | labeled statement
+        { break; return 1; } | COMPILE | break statement
+        { continue; return 1; } | COMPILE | continue statement
+        { return switch (1) { default -> { yield 1; } }; } | COMPILE | switch expression
+        { assert flag; return 1; } | COMPILE | assert statement
+        { class Temporary {} return 1; } | COMPILE | local type
+        { return () -> 1; } | COMPILE | lambda
+        { return this::perform; } | COMPILE | method reference
+        { new Object(); return 1; } | COMPILE | statement
+        { return new int[1]; } | COMPILE | array creation
+        { String a = "x"; String b = "x"; return a == b; } | COMPILE | String constant identity
+        """)
+    void plansBlocksBeforeRunningAnyStatement(String source, Planner.KindOfPlan expected, String reason)
+        throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final ClassType owner = type(vm, "app.Example", null);
+        type(vm, "java.lang.String", null);
+        final ClassType boxedByte = type(vm, "java.lang.Byte", null);
+        when(boxedByte.signature()).thenReturn("Ljava/lang/Byte;");
+        when(boxedByte.isInitialized()).thenReturn(true);
+        final ByteType byteType = mock(ByteType.class);
+        final Method box = call(boxedByte, "valueOf", "(B)Ljava/lang/Byte;", boxedByte, List.of(byteType));
+        when(box.isStatic()).thenReturn(true);
+        when(boxedByte.methodsByName("valueOf", "(B)Ljava/lang/Byte;")).thenReturn(List.of(box));
+
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final ObjectReference self = mock(ObjectReference.class);
+        when(frame.thisObject()).thenReturn(self);
+        final LocalVariable flag = mock(LocalVariable.class);
+        final LocalVariable slot = mock(LocalVariable.class);
+        final LocalVariable boxedFlag = mock(LocalVariable.class);
+        final ClassType booleanBox = type(vm, "java.lang.Boolean", null);
+        when(slot.name()).thenReturn("slot");
+        when(slot.type()).thenReturn(object);
+        when(boxedFlag.name()).thenReturn("boxedFlag");
+        when(boxedFlag.type()).thenReturn(booleanBox);
+        final LocalVariable unknown = mock(LocalVariable.class);
+        final BooleanType bool = mock(BooleanType.class);
+        final BooleanValue snapshot = mock(BooleanValue.class);
+        when(bool.name()).thenReturn("boolean");
+        when(flag.name()).thenReturn("flag");
+        when(flag.type()).thenReturn(bool);
+        when(unknown.name()).thenReturn("unknown");
+        when(unknown.type()).thenReturn(object);
+        when(unknown.genericSignature()).thenReturn("TT;");
+        when(frame.visibleVariables()).thenReturn(List.of(flag, unknown, slot, boxedFlag));
+        when(frame.getValues(List.of(flag, unknown, slot, boxedFlag))).thenReturn(Map.of(flag, snapshot));
+        final Field always = field(owner, "ALWAYS");
+        when(always.type()).thenReturn(bool);
+        when(always.isFinal()).thenReturn(true);
+        when(always.isStatic()).thenReturn(true);
+        when(owner.fields()).thenReturn(List.of(always));
+        when(owner.isInitialized()).thenReturn(true);
+        final VoidType voidType = mock(VoidType.class);
+        when(voidType.name()).thenReturn("void");
+        final IntegerType integer = mock(IntegerType.class);
+        when(integer.name()).thenReturn("int");
+        final Method perform = call(owner, "perform", "()V", voidType, List.of());
+        final Method first = call(owner, "candidate", "(I)I", integer, List.of(integer));
+        final Method second = call(owner, "candidate", "(J)I", integer, List.of(mock(LongType.class)));
+        when(owner.methods()).thenReturn(List.of(perform, first, second));
+
+        final Planner.Plan plan = Planner.plan(vm, frame, Map.of("$exception", snapshot, "$mark", snapshot),
+            ExpressionParser.parse(source));
+        assertThat(plan.kind()).as(source + " -> " + plan).isEqualTo(expected);
+        if (plan instanceof Planner.Compile fallback) {
+            assertThat(fallback.reason()).contains(reason);
+        }
+        verifyNoInteractions(self);
+    }
+
+    /** Checks proof of reference typing when an erased class alone cannot determine the source type. */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+        { return first == second; } | generic reference comparison
+        { var choice = flag ? first : second; return choice; } | generic conditional type
+        """)
+    void requiresPreciseGenericReferenceTypesInABlock(String source, String reason) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final InterfaceType list = mock(InterfaceType.class);
+        when(list.name()).thenReturn("java.util.List");
+        when(list.genericSignature()).thenReturn("<E:Ljava/lang/Object;>Ljava/lang/Object;");
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final LocalVariable first = mock(LocalVariable.class);
+        final LocalVariable second = mock(LocalVariable.class);
+        final LocalVariable flag = mock(LocalVariable.class);
+        final BooleanType bool = mock(BooleanType.class);
+        when(bool.name()).thenReturn("boolean");
+        when(flag.name()).thenReturn("flag");
+        when(flag.type()).thenReturn(bool);
+        when(first.name()).thenReturn("first");
+        when(first.type()).thenReturn(list);
+        when(first.genericSignature()).thenReturn("Ljava/util/List<Ljava/lang/String;>;");
+        when(second.name()).thenReturn("second");
+        when(second.type()).thenReturn(list);
+        when(second.genericSignature()).thenReturn("Ljava/util/List<Ljava/lang/Integer;>;");
+        when(frame.visibleVariables()).thenReturn(List.of(first, second, flag));
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(source)))
+            .isInstanceOfSatisfying(Planner.Compile.class, failure -> assertThat(failure.reason()).contains(reason));
     }
 
     /** Applies the single-candidate rule before executing any expression steps. */

@@ -102,7 +102,7 @@ public final class EvaluationRouter {
     }
 
     /**
-     * Plans the evaluation; with {@code retry} a frame invalidated during planning is re-read from the anchored location.
+     * Plans an expression or block; with {@code retry} an invalidated frame is re-read from the anchored location.
      */
     private Planner.Plan prepare(Input input, ThreadReference thread, FrameSource frames,
                                  Map<String, Value> bindings, boolean retry) throws Exception {
@@ -128,7 +128,7 @@ public final class EvaluationRouter {
                 if (retry) {
                     anchor = location;
                 }
-                return Planner.navigation(vm, frame, location, bindings, Objects.requireNonNull(parsed.expression()));
+                return Planner.bind(vm, frame, location, bindings, parsed);
             } catch (InvalidStackFrameException invalidated) {
                 if (!retry || attempt == FRAME_READ_ATTEMPTS) {
                     throw invalidated;

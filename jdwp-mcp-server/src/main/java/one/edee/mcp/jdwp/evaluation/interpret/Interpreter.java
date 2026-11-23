@@ -27,7 +27,34 @@ public final class Interpreter {
         @Nullable Value run(Context context);
     }
 
-    /** Per-run mirrors, pattern bindings and invocation state. */
+    /** A block step that yields a return or completes normally. */
+    @FunctionalInterface
+    interface Statement {
+        /** Runs the statement, returning null when execution should continue. */
+        @Nullable Return run(Context context);
+    }
+
+    /**
+     * Distinguishes returning Java null from a statement that completes normally.
+     *
+     * @param value the returned mirror, or null for an explicit Java null
+     */
+    record Return(@Nullable Value value) {}
+
+    /** Runs statements in order until a return, including one from a nested block. */
+    static Statement sequence(List<Statement> statements) {
+        return context -> {
+            for (final Statement statement : statements) {
+                final Return result = statement.run(context);
+                if (result != null) {
+                    return result;
+                }
+            }
+            return null;
+        };
+    }
+
+    /** Per-run mirrors, block locals, pattern bindings and invocation state. */
     static final class Context {
         /** Target VM used to mirror values. */
         private final VirtualMachine vm;
@@ -35,6 +62,8 @@ public final class Interpreter {
         private final PinnedMirrors pins;
         /** Thread admitted to invoke, or null for a navigation plan. */
         private final @Nullable ThreadReference thread;
+        /** Lazily allocated slots for block locals, including Java null values. */
+        private @Nullable Map<Object, @Nullable Value> locals;
         /** Lazily allocated slots for successful instanceof matches. */
         private @Nullable Map<Object, Value> patterns;
         /** Count of completed target calls, including helpers and calls that threw in the target. */
@@ -50,6 +79,19 @@ public final class Interpreter {
         /** Retains a value across subsequent invocations. */
         @Nullable Value keep(@Nullable Value value) {
             return thread != null && value instanceof ObjectReference object ? pins.keep(object) : value;
+        }
+
+        /** Assigns a block slot and pins an object mirror through the rest of the evaluation. */
+        void store(Object slot, @Nullable Value value) {
+            if (locals == null) {
+                locals = new HashMap<>();
+            }
+            locals.put(slot, value instanceof ObjectReference object ? pins.keep(object) : value);
+        }
+
+        /** Reads a slot whose assignment was proved by the planner. */
+        @Nullable Value local(Object slot) {
+            return Objects.requireNonNull(locals).get(slot);
         }
 
         /** Stores a successful pattern match. */

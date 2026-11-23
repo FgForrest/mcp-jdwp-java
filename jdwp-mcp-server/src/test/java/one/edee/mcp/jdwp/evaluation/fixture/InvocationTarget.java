@@ -600,6 +600,86 @@ public final class InvocationTarget extends InvocationParent {
             case "result-gc" -> fresh().mark();
             case "pattern-pin" -> slot instanceof Payload p && clearAndCollect() && p.mark();
             case "pattern-shadow" -> !(slot instanceof Payload shadow) || shadow.mark();
+            // The narrowing stores must check the erased result before the next operation.
+            case "block-store-explicit", "block-store-inferred" -> {
+                final Payload item = polluted.get();
+                yield later();
+            }
+            case "block-store-assignment" -> {
+                Payload item = null;
+                item = polluted.get();
+                yield later();
+            }
+            case "block-store-before-call" -> {
+                final Payload item = polluted.get();
+                yield item.mark();
+            }
+            case "block-store-wide" -> {
+                final Object item = polluted.get();
+                yield item;
+            }
+            case "block-store-float" -> {
+                final int exponent = (int) 3.5;
+                final String text = "x" + exponent;
+                yield reflectString(text);
+            }
+            case "block-dead-call" -> {
+                if (false) {
+                    later();
+                }
+                yield 1;
+            }
+            case "block-dead-boxing" -> {
+                if (false) {
+                    final Object count = 3;
+                    yield count;
+                }
+                yield 1;
+            }
+            case "block-dead-consumer" -> {
+                final String text = "token";
+                if (false) {
+                    yield sameToken(text);
+                }
+                yield 1;
+            }
+            case "block-constant-reachability" -> {
+                final int count;
+                if (false) {
+                    yield explode();
+                }
+                if (true) {
+                    count = 3;
+                }
+                yield count;
+            }
+            case "block-call-condition" -> {
+                final String text = isolatedString();
+                yield sameToken("token") ? text.length() : 0;
+            }
+            case "block-local-constant" -> {
+                final String text = "to" + "ken";
+                final Object alias = text;
+                yield sameToken((String) alias);
+            }
+            case "block-pattern-constant" -> {
+                final Object text = "token";
+                yield text instanceof String matched && sameToken(matched);
+            }
+            case "block-unsafe-concat" -> {
+                final String text = yes ? "" + isolatedChar() : "safe";
+                final String alias = text;
+                yield codeUnit(alias);
+            }
+            case "block-safe-concat" -> {
+                final int value = later();
+                yield codeUnit("" + value);
+            }
+            case "block-after-guard" -> slot instanceof Payload matched && matched.mark();
+            case "block-inherited-membership" -> {
+                final ChoiceChild copy = choice;
+                yield copy.pick(1);
+            }
             case "literal-identity" -> sameToken("token");
             case "constant-concat-identity" -> sameToken("to" + "ken");
             case "wildcard-overload" -> source.get().ping();

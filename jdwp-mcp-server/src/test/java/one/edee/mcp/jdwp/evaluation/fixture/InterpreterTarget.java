@@ -178,10 +178,14 @@ public class InterpreterTarget extends InterpreterTargetBase {
         return step("I", 1);
     }
 
-    /** javac oracle for expressions the separately compiled evaluation wrapper cannot see. */
+    /** javac oracle for expressions and blocks the separately compiled evaluation wrapper cannot see. */
     public Object golden(String id) {
         return switch (id) {
             case "private-field" -> this.secret;
+            case "block-private-field" -> {
+                final int number = this.secret;
+                yield number + 1;
+            }
             case "classpath-import-shadow" -> ProcessBuilder.class;
             case "inherited-type-shadow" -> StringBuilder.class;
             case "unloaded-hiding-member" -> HiddenBadge.tag;

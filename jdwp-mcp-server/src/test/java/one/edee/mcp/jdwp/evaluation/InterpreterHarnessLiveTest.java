@@ -15,6 +15,7 @@ import one.edee.mcp.jdwp.evaluation.fixture.InvocationTarget;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.interpret.Interpreter;
 import one.edee.mcp.jdwp.evaluation.interpret.Planner;
+import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.assertj.core.api.SoftAssertions;
@@ -26,16 +27,20 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -54,10 +59,11 @@ class InterpreterHarnessLiveTest {
     private static final int HITS_PER_TRIAL = 5;
     private static final JsonMapper JSON = JsonMapper.builder().build();
     /** Rows with an independent javac-compiled oracle in the fixture. */
+    /** Rows whose expected observation comes from a javac-compiled fixture method. */
     private static final Set<String> FIXTURE_GOLDENS = Set.of("private-field", "private-map", "private-map-call",
         "private-session", "private-method", "super-call", "super-field", "erased-field-navigation",
         "generic-receiver", "outer-this", "outer-implicit", "nested-class-literal", "exception-detail",
-        "unqualified-instance", "concat-evaluation-order");
+        "unqualified-instance", "concat-evaluation-order", "block-private-field");
     private static final String COLD_CLASS = TARGET + "$Cold";
 
     /** A candidate engine can read a fresh frame and use the same bindings the oracle saw. */
@@ -440,6 +446,37 @@ class InterpreterHarnessLiveTest {
         new InvocationRow("target-exception", INVOCATION_PREFIX + "explode()"),
         new InvocationRow("cold-null-object", "new " + one.edee.mcp.jdwp.evaluation.fixture.InterpreterTarget.class.getName() + ".NullString() + " + INVOCATION_PREFIX + "ownString()"),
         new InvocationRow("boxing-cache", "this.choose(127) == this.choose(127) && this.choose(128) != this.choose(128)"),
+        new InvocationRow("block-store-explicit", "{ " + INVOCATION_PREFIX + "Payload item = " + INVOCATION_PREFIX
+            + "polluted.get(); return " + INVOCATION_PREFIX + "later(); }"),
+        new InvocationRow("block-store-inferred", "{ var item = " + INVOCATION_PREFIX + "polluted.get(); return "
+            + INVOCATION_PREFIX + "later(); }"),
+        new InvocationRow("block-store-assignment", "{ " + INVOCATION_PREFIX + "Payload item = null; item = "
+            + INVOCATION_PREFIX + "polluted.get(); return " + INVOCATION_PREFIX + "later(); }"),
+        new InvocationRow("block-store-before-call", "{ var item = " + INVOCATION_PREFIX + "polluted.get(); return item.mark(); }"),
+        new InvocationRow("block-store-wide", "{ Object item = " + INVOCATION_PREFIX + "polluted.get(); return item; }"),
+        new InvocationRow("block-store-float", "{ final int exponent = (int) 3.5; String text = \"x\" + exponent; return "
+            + INVOCATION_PREFIX + "reflectString(text); }"),
+        new InvocationRow("block-dead-call", "{ if (false) " + INVOCATION_PREFIX + "later(); return 1; }"),
+        new InvocationRow("block-dead-boxing", "{ if (false) { Object count = 3; return count; } return 1; }"),
+        new InvocationRow("block-dead-consumer", "{ String text = \"token\"; if (false) return "
+            + INVOCATION_PREFIX + "sameToken(text); return 1; }"),
+        new InvocationRow("block-constant-reachability", "{ int count; if (false) return " + INVOCATION_PREFIX
+            + "explode(); if (true) count = 3; return count; }"),
+        new InvocationRow("block-call-condition", "{ String text = " + INVOCATION_PREFIX + "isolatedString(); if ("
+            + INVOCATION_PREFIX + "sameToken(\"token\")) return text.length(); return 0; }"),
+        new InvocationRow("block-local-constant", "{ String text = \"to\" + \"ken\"; Object alias = text; return "
+            + INVOCATION_PREFIX + "sameToken((String) alias); }"),
+        new InvocationRow("block-pattern-constant", "{ Object text = \"token\"; if (text instanceof String matched) return "
+            + INVOCATION_PREFIX + "sameToken(matched); return false; }"),
+        new InvocationRow("block-unsafe-concat", "{ String text; if (" + INVOCATION_PREFIX + "yes) text = \"\" + "
+            + INVOCATION_PREFIX + "isolatedChar(); else text = \"safe\"; String alias = text; return "
+            + INVOCATION_PREFIX + "codeUnit(alias); }"),
+        new InvocationRow("block-safe-concat", "{ int value = " + INVOCATION_PREFIX + "later(); return "
+            + INVOCATION_PREFIX + "codeUnit(\"\" + value); }"),
+        new InvocationRow("block-after-guard", "{ if (!(" + INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX
+            + "Payload shadow)) return false; return shadow.mark(); }"),
+        new InvocationRow("block-inherited-membership", "{ " + INVOCATION_PREFIX + "ChoiceChild copy = "
+            + INVOCATION_PREFIX + "choice; return copy.pick(1); }"),
         new InvocationRow("result-gc", INVOCATION_PREFIX + "fresh().mark()")
     );
 
@@ -534,12 +571,14 @@ class InterpreterHarnessLiveTest {
             checks.assertThat(thread.suspendCount()).as(row.id() + " suspend count").isEqualTo(before);
             switch (row.id()) {
                 case "capture-intersection", "capture-multiple-declared", "pattern-constant", "pattern-surrogate",
-                     "pattern-string-receiver", "float-constant", "float-fragment", "float-conditional-constant",
-                     "interface-private" -> {
+                     "pattern-string-receiver", "block-pattern-constant", "float-constant", "float-fragment",
+                     "float-conditional-constant", "block-store-float", "interface-private", "block-dead-call",
+                     "block-dead-boxing", "block-dead-consumer", "block-constant-reachability" -> {
                     checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
                     checks.assertThat(actual).as(row.id()).isEqualTo(expected).isEqualTo(compiled);
                 }
-                case "polluted-receiver", "polluted-field", "polluted-argument", "polluted-declared-bound" -> {
+                case "polluted-receiver", "polluted-field", "polluted-argument", "polluted-declared-bound",
+                     "block-store-explicit", "block-store-inferred", "block-store-assignment", "block-store-before-call" -> {
                     checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.INVOKE);
                     checks.assertThat(actual).as(row.id()).contains("Interpreter raised java.lang.ClassCastException")
                         .endsWith("[1 Box.get>]");
@@ -567,6 +606,14 @@ class InterpreterHarnessLiveTest {
                     checks.assertThat(actual).as(row.id()).endsWith("[0 ]");
                 }
                 case "surrogate-object", "surrogate-char", "surrogate-constructor", "surrogate-folded-char", "private-varargs" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id()).isEqualTo(expected);
+                }
+                case "block-after-guard" -> {
+                    checks.assertThat(plan).isEqualTo(new Planner.Compile("pattern variable is outside the supported scope: shadow"));
+                    checks.assertThat(actual).as(row.id()).isEqualTo(expected);
+                }
+                case "block-unsafe-concat", "block-inherited-membership" -> {
                     checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
                     checks.assertThat(actual).as(row.id()).isEqualTo(expected);
                 }
@@ -609,6 +656,16 @@ class InterpreterHarnessLiveTest {
         new PatternRow("intersection-pattern", "(T.ChoiceBound & T.ExtraChoice) T.bothChoices instanceof "
             + "T.ExtraChoice matched ? 1 : 2",
             Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "is a subtype of pattern type", null),
+        new PatternRow("block-disjoint-generic-pattern",
+            "{ var value = T.source; if (value instanceof T.StringBox matched) return 1; return T.later(); }",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "cannot be converted to", "cannot be converted to"),
+        new PatternRow("block-intersection-pattern",
+            "{ var value = (T.ChoiceBound & T.ExtraChoice) T.bothChoices; "
+                + "if (value instanceof T.ExtraChoice matched) return 1; return 2; }",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, "is a subtype of pattern type", null),
+        new PatternRow("block-unconditional-pattern",
+            "{ if (T.shadow instanceof T.Payload matched) return matched.flag; return false; }",
+            Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.NAVIGATE, "is a subtype of pattern type", null),
         new PatternRow("raw-pattern", "((T.Box) T.source) instanceof T.StringBox matched ? 1 : 2",
             Planner.KindOfPlan.COMPILE, Planner.KindOfPlan.COMPILE, null, null),
         new PatternRow("captured-result-pattern", "T.source.get() instanceof T.Service matched ? 1 : T.later()",
@@ -619,28 +676,31 @@ class InterpreterHarnessLiveTest {
             Planner.KindOfPlan.NAVIGATE, Planner.KindOfPlan.NAVIGATE, null, null)
     );
 
-    /** Checks both flow scopes, target-version gating, and rejection before any target call. */
+    /** Checks expression and block pattern routing, Java version gating, and fixture call counts. */
     private static void checkPatternApplicability(VirtualMachine vm, ThreadReference thread, ClassType owner,
                                                    Field trace, Field calls, Method reset, EvaluationRouter auto,
                                                    Path javaHome, Path scratch, SoftAssertions checks) throws Exception {
         final boolean java17 = Runtime.Version.parse(vm.version()).feature() == 17;
-        for (PatternRow row : PATTERN_ROWS) {
+        for (final PatternRow row : PATTERN_ROWS) {
             final String source = row.expression();
+            final boolean block = JdiExpressionEvaluator.isBlockMode(source);
+            final Planner.KindOfPlan expectedPlan = java17 ? row.java17() : row.java21();
             final String diagnostic = java17 ? row.javac17Diagnostic() : row.javac21Diagnostic();
             if (diagnostic != null) {
                 assertPatternRejectedByJavac(javaHome, scratch, source, diagnostic);
             }
             owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
             final Planner.Plan plan = auto.prepare(auto.parse(source), thread, () -> thread.frame(0), Map.of());
-            checks.assertThat(plan.kind()).as(row.id()).isEqualTo(java17 ? row.java17() : row.java21());
+            checks.assertThat(plan.kind()).as(row.id()).isEqualTo(expectedPlan);
             final int suspendCount = thread.suspendCount();
-            // Replay rejected rows and the read-only controls. The other cases assert routing only.
-            if (diagnostic != null || row.id().equals("plain-instanceof") || row.id().equals("unconditional-pattern")) {
+            // Replay blocks, rejected rows and read-only controls. The other cases assert routing only.
+            if (block || diagnostic != null || expectedPlan == Planner.KindOfPlan.NAVIGATE) {
                 final String actual = observe(owner, trace, calls,
                     () -> auto.evaluateEvent(source, thread, Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
+                checks.assertThat(actual).as(row.id()).endsWith("[0 ]");
                 if (diagnostic != null) {
-                    checks.assertThat(actual).as(row.id()).contains("Compilation failed").endsWith("[0 ]");
-                } else {
+                    checks.assertThat(actual).as(row.id()).contains("Compilation failed");
+                } else if (expectedPlan == Planner.KindOfPlan.NAVIGATE) {
                     checks.assertThat(actual).as(row.id()).isEqualTo("true [0 ]");
                 }
                 checks.assertThat(thread.suspendCount()).as(row.id()).isEqualTo(suspendCount);
@@ -648,11 +708,12 @@ class InterpreterHarnessLiveTest {
         }
     }
 
-    /** Checks the exact rejected expression against the target JDK's javac. */
+    /** Checks the exact rejected expression or block against the target JDK's javac. */
     private static void assertPatternRejectedByJavac(Path javaHome, Path scratch, String source, String diagnostic)
         throws Exception {
         final Path input = scratch.resolve("PatternSnippet.java");
-        Files.writeString(input, "class PatternSnippet { Object evaluate() { return " + source + "; } }");
+        final String body = JdiExpressionEvaluator.isBlockMode(source) ? source : "{ return " + source + "; }";
+        Files.writeString(input, "class PatternSnippet { Object evaluate() " + body + " }");
         final String classpath = Path.of(InvocationTarget.class.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
         final Process javac = new ProcessBuilder(javaHome.resolve("bin/javac").toString(), "-classpath", classpath,
@@ -660,6 +721,82 @@ class InterpreterHarnessLiveTest {
         final String output = new String(javac.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertThat(javac.waitFor()).as(output).isNotZero();
         assertThat(output).contains(diagnostic);
+    }
+
+    /** The public tool evaluates a read-only block on a manually held thread without invoking. */
+    @Test
+    void readsABlockOnAManualHold(@TempDir Path temp) throws Exception {
+        for (final Path javaHome : InterpreterTargetVm.javaHomes()) {
+            try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome, INVOCATION_TARGET,
+                temp.resolve("gc-done").toString())) {
+                checkManualHold(target.port());
+            }
+        }
+    }
+
+    /** Replays the read-only control and the constant dead branches on an actual manual hold. */
+    private static void checkManualHold(int port) throws Exception {
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
+        final MarkedInstanceRegistry marks = new MarkedInstanceRegistry();
+        final WatcherManager watchers = new WatcherManager();
+        final JdiHealthMonitor health = new JdiHealthMonitor();
+        final LocalProjectClasspathProvider classpath = noLocalClasspath();
+        final JvmDiscoveryService discovery = mock(JvmDiscoveryService.class);
+        // The listener needs an evaluator before the evaluator can use the connection.
+        final AtomicReference<JdiExpressionEvaluator> delegate = new AtomicReference<>();
+        final JdiExpressionEvaluator lazy = mock(JdiExpressionEvaluator.class, invocation -> {
+            try {
+                return invocation.getMethod().invoke(delegate.get(), invocation.getArguments());
+            } catch (InvocationTargetException e) {
+                throw e.getCause();
+            }
+        });
+        final EvaluationRouter router = new EvaluationRouter(lazy, EvaluationRouter.Mode.AUTO);
+        final JdiEventListener listener = new JdiEventListener(tracker, history, lazy, guard, null, marks, router);
+        final JDIConnectionService connection = new JDIConnectionService(listener, tracker, history, watchers, guard,
+            marks, health, discovery);
+        final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection,
+            guard, classpath);
+        delegate.set(evaluator);
+        final FastLogpointService fast = new FastLogpointService(tracker, history, guard, evaluator, listener, connection);
+        final JDWPTools tools = new JDWPTools(connection, tracker, watchers, router, history, guard, discovery,
+            marks, health, classpath, fast);
+        try {
+            assertThat(connection.connect("127.0.0.1", port)).startsWith("Connected");
+            assertThat(tools.jdwp_resume_until_event(10_000)).contains("via=vm_start");
+            assertThat(tools.jdwp_resume()).startsWith("Resumed:");
+            final VirtualMachine vm = connection.getVM();
+            final ThreadReference main = vm.allThreads().stream().filter(t -> t.name().equals("main"))
+                .findFirst().orElseThrow();
+            await().atMost(Duration.ofSeconds(15)).until(() -> main.status() == ThreadReference.THREAD_STATUS_WAIT
+                && vm.allThreads().stream().anyMatch(t -> t.name().equals("fixture-gc")));
+            assertThat(tools.jdwp_suspend_thread(main.uniqueID())).contains("suspended.");
+            // Evaluate in the fixture frame beneath the frames that implement the wait.
+            final List<StackFrame> frames = main.frames();
+            int index = 0;
+            while (!frames.get(index).location().declaringType().name().equals(INVOCATION_TARGET)) {
+                index++;
+            }
+            final int frameIndex = index;
+            final int suspendCount = main.suspendCount();
+            final String control = "{ boolean copy = " + INVOCATION_PREFIX + "yes; if (copy) return 1; return 2; }";
+            assertThat(tools.jdwp_evaluate_expression(main.uniqueID(), control, frameIndex)).endsWith(": 1");
+            for (final InvocationRow row : INVOCATION_ROWS) {
+                if (row.id().equals("block-dead-call") || row.id().equals("block-dead-boxing")) {
+                    final Planner.Plan plan = router.prepare(router.parse(row.expression()), main,
+                        () -> main.frame(frameIndex), Map.of());
+                    assertThat(plan).isEqualTo(new Planner.Compile("constant block condition"));
+                    assertThat(tools.jdwp_evaluate_expression(main.uniqueID(), row.expression(), frameIndex))
+                        .contains("constant block condition");
+                }
+            }
+            assertThat(router.diagnostics()).contains("interpreted 1, compiled 0", "with invocations 0");
+            assertThat(main.suspendCount()).isEqualTo(suspendCount);
+        } finally {
+            connection.disconnect();
+        }
     }
 
     /** Wakes the running GC worker and waits for it to confirm collection before forwarding the pin. */
@@ -1421,6 +1558,14 @@ class InterpreterHarnessLiveTest {
             case "call-future-stop" -> {
                 assertThat(observation.outcome().rendered()).isEqualTo("1");
                 assertThat(observation.calls()).isEqualTo(new Calls(1, "I"));
+            }
+            case "block-call-order" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo("5");
+                assertThat(observation.calls()).isEqualTo(new Calls(4, "ABCR"));
+            }
+            case "block-skipped-call" -> {
+                assertThat(observation.outcome().rendered()).isEqualTo("2");
+                assertThat(observation.calls()).isEqualTo(new Calls(0, ""));
             }
             case "block-assign-frame-local" -> assertThat(observation.outcome().rendered()).isEqualTo("7");
             case "block-keeps-frame-local" -> assertThat(observation.outcome().rendered()).isEqualTo("2");

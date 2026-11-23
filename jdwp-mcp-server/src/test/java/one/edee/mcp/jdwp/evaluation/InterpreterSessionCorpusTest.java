@@ -10,6 +10,7 @@ import org.eclipse.jdt.internal.compiler.ast.ConditionalExpression;
 import org.eclipse.jdt.internal.compiler.ast.Expression;
 import org.eclipse.jdt.internal.compiler.ast.FieldReference;
 import org.eclipse.jdt.internal.compiler.ast.MessageSend;
+import org.eclipse.jdt.internal.compiler.ast.Statement;
 import org.eclipse.jdt.internal.compiler.lookup.BlockScope;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
@@ -27,7 +28,7 @@ import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Reports aggregate phase-2 syntax coverage without storing any source from the optional corpus. */
+/** Reports aggregate interpreter syntax coverage without storing any source from the optional corpus. */
 @EnabledIfSystemProperty(named = "jdwp.live.corpus", matches = ".+")
 class InterpreterSessionCorpusTest {
 
@@ -45,7 +46,9 @@ class InterpreterSessionCorpusTest {
                     continue;
                 }
                 final JsonNode row = json.readTree(line);
-                final ExpressionParser.Parsed parsed = ExpressionParser.parse(row.path("expression").asString());
+                final String source = row.path("expression").asString();
+                final ExpressionParser.Parsed parsed = ExpressionParser.parse(source);
+                final boolean block = JdiExpressionEvaluator.isBlockMode(source);
                 final SyntaxShape.Classification category = SyntaxShape.classify(parsed);
                 boolean callBearing = category.phase() == SyntaxShape.Phase.CALLS;
                 for (JsonNode tag : row.path("constructs")) {
@@ -59,11 +62,11 @@ class InterpreterSessionCorpusTest {
                         default -> { }
                     }
                 }
-                final ResultUses uses = ResultUses.inspect(category, parsed.expression());
+                final ResultUses uses = ResultUses.inspect(category, parsed);
                 final String tool = row.path("tool").asString();
                 switch (row.path("agent").asString()) {
-                    case "claude" -> observed.add(category, callBearing, uses, tool);
-                    case "docs", "synthetic" -> topUp.add(category, callBearing, uses, tool);
+                    case "claude" -> observed.add(category, callBearing, block, uses, tool);
+                    case "docs", "synthetic" -> topUp.add(category, callBearing, block, uses, tool);
                     default -> throw new AssertionError("Unexpected corpus source");
                 }
             }
@@ -71,7 +74,8 @@ class InterpreterSessionCorpusTest {
         assertThat(taggedErrors).isEqualTo(2);
         final String report = """
             NAVIGATE and INVOKE are syntax candidates. Actual coverage requires each row's original JDI frame,
-            including receiver signatures, class initialization and argument types.
+            including local and binding names, receiver signatures, class initialization and argument types.
+            Block candidates also need frame-aware checks for declaration types and definite assignment.
             """ + observed.render("Observed") + topUp.render("Top-up");
         System.out.print(report);
         final Path reports = Path.of("..", "target");
@@ -87,10 +91,18 @@ class InterpreterSessionCorpusTest {
         private boolean unknownArgument;
 
         /** Visits supported call syntax independent of private names and target metadata. */
-        static ResultUses inspect(SyntaxShape.Classification category, @Nullable Expression expression) {
+        static ResultUses inspect(SyntaxShape.Classification category, ExpressionParser.Parsed parsed) {
             final ResultUses uses = new ResultUses();
-            if (category.phase() == SyntaxShape.Phase.CALLS && expression != null) {
-                expression.traverse(uses, (BlockScope) null);
+            if (category.phase() != SyntaxShape.Phase.CALLS) {
+                return uses;
+            }
+            if (parsed.expression() != null) {
+                parsed.expression().traverse(uses, (BlockScope) null);
+            }
+            if (parsed.statements() != null) {
+                for (final Statement statement : parsed.statements()) {
+                    statement.traverse(uses, (BlockScope) null);
+                }
             }
             return uses;
         }
@@ -148,6 +160,10 @@ class InterpreterSessionCorpusTest {
         private final Map<KindOfPlan, Integer> plans = new EnumMap<>(KindOfPlan.class);
         /** Syntax plans for rows containing calls, constructors or invoking concatenation. */
         private final Map<KindOfPlan, Integer> callPlans = new EnumMap<>(KindOfPlan.class);
+        /** Syntax plans for block rows. */
+        private final Map<KindOfPlan, Integer> blockPlans = new EnumMap<>(KindOfPlan.class);
+        /** Compile reasons across block rows. */
+        private final Map<String, Integer> blockReasons = new TreeMap<>();
         /** Compile reasons across all rows. */
         private final Map<String, Integer> reasons = new TreeMap<>();
         /** Compile reasons across call-bearing rows. */
@@ -159,11 +175,11 @@ class InterpreterSessionCorpusTest {
         private final Map<String, Integer> possibleUses = new TreeMap<>();
 
         /** Counts one row and records its generic frontend reason when it needs the compiler. */
-        void add(SyntaxShape.Classification category, boolean callBearing, ResultUses uses, String tool) {
+        void add(SyntaxShape.Classification category, boolean callBearing, boolean block, ResultUses uses, String tool) {
             final KindOfPlan kind = switch (category.phase()) {
                 case NAVIGATION -> KindOfPlan.NAVIGATE;
                 case CALLS -> KindOfPlan.INVOKE;
-                case BLOCKS, COMPILED -> KindOfPlan.COMPILE;
+                case COMPILED -> KindOfPlan.COMPILE;
                 case ERROR -> KindOfPlan.ERROR;
             };
             plans.merge(kind, 1, Integer::sum);
@@ -175,6 +191,12 @@ class InterpreterSessionCorpusTest {
             }
             if (kind == KindOfPlan.COMPILE) {
                 reasons.merge(category.reason(), 1, Integer::sum);
+            }
+            if (block) {
+                blockPlans.merge(kind, 1, Integer::sum);
+                if (kind == KindOfPlan.COMPILE) {
+                    blockReasons.merge(category.reason(), 1, Integer::sum);
+                }
             }
             if (callBearing) {
                 callPlans.merge(kind, 1, Integer::sum);
@@ -190,6 +212,8 @@ class InterpreterSessionCorpusTest {
             for (KindOfPlan kind : KindOfPlan.values()) {
                 out.append("  ").append(kind).append(' ').append(plans.getOrDefault(kind, 0)).append('\n');
             }
+            out.append("  Block rows ").append(blockPlans).append('\n');
+            out.append("  Top block COMPILE reasons ").append(top(blockReasons)).append('\n');
             out.append("  Call-bearing rows ").append(callPlans).append('\n');
             out.append("  Top COMPILE reasons ").append(top(reasons)).append('\n');
             out.append("  Top call-bearing COMPILE reasons ").append(top(callReasons)).append('\n');
