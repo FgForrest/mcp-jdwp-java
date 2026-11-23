@@ -468,7 +468,9 @@ jdwp_set_fast_logpoint(
 )
 ```
 
-On the next hit of the line the server compiles a small probe class, defines it in the class's own class loader, and redefines the class (`VirtualMachine.redefineClasses`) with a call to the probe at that line. From then on the probe evaluates the condition and expression on the application thread and appends the result to a lock-free ring buffer in the target; `jdwp_get_events` reads that buffer through plain field reads — no thread is ever suspended — and reports entries lost to a buffer overrun as `FAST_LOGPOINT_DROPPED`. Hits nobody read before the target exits — a test JVM finishing its run — are read as it exits: the target waits at its exit until the server has drained the buffer, and the `[VM_DEATH]` reply says how many were recorded. A class that is not loaded yet is waited for: the fast logpoint arms once the class loads, so it can be set at VM start (where `forceLoad` cannot load anything). Clearing the logpoint, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode.
+On the next hit of the line the server compiles a small probe class, defines it in the class's own class loader, and redefines the class (`VirtualMachine.redefineClasses`) with a call to the probe at that line. From then on the probe evaluates the condition and expression on the application thread and appends the result to a lock-free ring buffer in the target; `jdwp_get_events` reads that buffer through plain field reads — no thread is ever suspended — and reports overwritten, skipped or incomplete entries as `FAST_LOGPOINT_DROPPED`. Hits nobody read before the target exits — a test JVM finishing its run — are read as it exits: the target waits at its exit until the server has drained the buffer, and the `[VM_DEATH]` reply says how many were recorded. A class that is not loaded yet is waited for: the fast logpoint arms once the class loads, so it can be set at VM start (where `forceLoad` cannot load anything). Clearing the logpoint, `jdwp_reset`, `jdwp_disconnect` and a clean server shutdown restore the original bytecode.
+
+Each read keeps only the newest 500 entries per fast logpoint, and `jdwp_get_events` shows at most 100 events. If `FAST_LOGPOINT_DROPPED` reports skipped entries, narrow the `condition` to log only the anomaly or call `jdwp_get_events` before more than 500 hits pile up.
 
 Because this **rewrites the running application's bytecode**, the tool requires explicit user consent. Call without `userApproved`. If there's no standing grant, the tool returns a risk briefing (instrumentation that outlives a crashed server, user code on application threads, interaction with other bytecode agents, breakpoint re-creation, two stop-the-world pauses). Relay the briefing word for word and ask the user before retrying with `userApproved=true`.
 
@@ -510,6 +512,8 @@ jdwp_set_breakpoint(className="com.example.LazyService", lineNumber=15)
 ```
 
 `jdwp_overview()` shows pending breakpoints with their status; `jdwp_get_events()` records a `CLASS_PREPARE` entry when a load activates them.
+
+Deferred replies can suggest similar loaded class names. A matching class resource in the server's JDK suppresses the suggestion.
 
 This works from VM start, so it is the attach prologue for a failing test: launch the JVM suspended (`-Dmaven.surefire.debug`), call `jdwp_wait_for_attach(requireVmStart=true)`, set every line BP, logpoint, exception BP and field BP while the JVM is parked, then `jdwp_resume_until_event`. Each one activates when its class loads — JDK classes included, so an exception BP on `java.lang.AssertionError` set at VM start stops on the first failing JUnit assertion.
 
@@ -836,7 +840,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                | Parameters | Description                                               |
 |---------------------|------------|-----------------------------------------------------------|
-| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, fast logpoint hits, fast-breakpoint stops with captures, chain events, late evaluation results) |
+| `jdwp_get_events`   | `count?`   | Up to 100 recent events (breakpoints, steps, exceptions, logpoints, exception logs, fast logpoint hits, fast-breakpoint stops with captures, chain events, late evaluation results) |
 | `jdwp_clear_events` | —          | Clear event history                                       |
 
 ### Diagnostics (1)

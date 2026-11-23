@@ -12,6 +12,10 @@ import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -138,6 +142,34 @@ class JDWPToolsSetExceptionBreakpointTest {
 		assertThat(result).contains("com.example.MyException");
 		verify(cpr).addClassFilter("com.example.MyException");
 		verify(cpr).enable();
+	}
+
+	/** Exercises the hint through exception registration while the requested class is still unloaded. */
+	@ParameterizedTest
+	@CsvSource({
+		"java.lang.NumberFormatException, java.lang.Number, false",
+		"NumberFormatException, com.example.Number, false",
+		"java.lang.NumberFormatExeption, java.lang.Number, true",
+		"com.example.NumberFormatException, com.example.Number, true"
+	})
+	@DisplayName("deferred exceptions suggest similar loaded classes only for unrecognised names")
+	void shouldSuppressSuggestionsForKnownJdkExceptions(String className, String loadedName, boolean suggest) {
+		final ReferenceType loaded = mock(ReferenceType.class);
+		when(loaded.name()).thenReturn(loadedName);
+		when(vm.allClasses()).thenReturn(List.of(loaded));
+		final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
+		when(erm.createClassPrepareRequest()).thenReturn(cpr);
+
+		final String reply = tools.jdwp_set_exception_breakpoint(
+			className, null, null, null, null, null, null, null, null, null);
+
+		assertThat(reply).startsWith("Exception breakpoint deferred");
+		if (suggest) {
+			assertThat(reply).contains("Did you mean: " + loadedName);
+		} else {
+			assertThat(reply).doesNotContain("Did you mean:");
+		}
+		verify(cpr).addClassFilter(className);
 	}
 
 	@Test

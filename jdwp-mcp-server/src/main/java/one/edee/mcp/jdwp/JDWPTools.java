@@ -3211,18 +3211,25 @@ public class JDWPTools {
         return prefix + progress + " " + renderReleaseFailures(release.failures(), release.closed());
     }
 
-    /**
-     * Builds a "did you mean…" hint for a breakpoint that just deferred because its class isn't
-     * loaded. Scans the loaded classes for names resembling {@code className} (see
-     * {@link ClassNameMatcher}) and returns a one-line note, or {@code ""} when nothing is close.
-     * Best-effort: a misspelled fully-qualified name otherwise defers forever with no signal, so
-     * this is the cheap guard against that footgun — and it never fails a BP set if the lookup
-     * throws (e.g. the VM died between the deferral and this scan).
-     */
+    /** Builds a deferred-breakpoint hint using the class name as supplied. */
     private String deferredClassSuggestion(VirtualMachine vm, String className) {
+        return deferredClassSuggestion(vm, className, false);
+    }
+
+    /**
+     * Builds a best-effort hint from similar loaded names using {@link ClassNameMatcher}.
+     * Skips the hint when the server's platform loader finds the class resource.
+     * For exception tools, also checks {@code java.lang} for unqualified names.
+     * A resource lookup leaves class loading and initialization to the target.
+     */
+    private String deferredClassSuggestion(VirtualMachine vm, String className, boolean checkJavaLang) {
         try {
-            // Compare with the application's classes only: at VM start nothing but JDK classes is
-            // loaded, and a JDK name that happens to share a word is a false alarm.
+            final String resourceClassName = checkJavaLang && className.indexOf('.') < 0
+                ? "java.lang." + className : className;
+            if (ClassLoader.getPlatformClassLoader().getResource(resourceClassName.replace('.', '/') + ".class") != null) {
+                return "";
+            }
+            // Only consider JDK suggestions for names in JDK packages.
             final boolean platformTarget = isPlatformClassName(className);
             final List<String> loaded = vm.allClasses().stream()
                 .map(ReferenceType::name)
@@ -4424,6 +4431,7 @@ public class JDWPTools {
      * public tools differ only in their parameter validation and the rendered summary; everything
      * inside (trigger validation, eager class load, deferred path with {@code ClassPrepareRequest},
      * active path with the chain-disable-then-enable ordering) is identical and lives here.
+     * An unqualified name is checked under {@code java.lang} for the deferral hint only.
      *
      * @param expression when non-null, switches the helper into log-only mode and is rendered on a dedicated line
      * @param condition  non-null persists a metadata condition under the synthetic ID; evaluated by
@@ -4520,7 +4528,7 @@ public class JDWPTools {
                     filterLine,
                     chainInfo,
                     forceLoadFailedNote(effectiveForceLoad))
-                    + deferredClassSuggestion(vm, exceptionClass)
+                    + deferredClassSuggestion(vm, exceptionClass, true)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
