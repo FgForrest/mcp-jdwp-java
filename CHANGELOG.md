@@ -5,6 +5,59 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.15.0] — 2026-11-23
+
+### New — thread-targeted context, and a thread wait that outlasts event processing (#83)
+
+Agents debugging a race reported two problems. `jdwp_get_breakpoint_context(threadId=…)`
+returned another thread's context, because the tool had no `threadId` and the argument
+was dropped without a word. `jdwp_resume_until_event(threadId=…)` answered "try again"
+while that thread's own breakpoint was still being processed, for example while its
+condition was evaluated.
+
+- **`jdwp_get_breakpoint_context` takes `threadId`** — it renders that thread only.
+  A published stop of the thread comes with its event tag and captures. A suspended
+  thread with no stop of its own (a manual hold, a stop-all bystander) gets its frames,
+  locals and `this`. It never shows another thread's stop. Without `threadId`, nothing
+  changes.
+- **Unknown parameters are reported** — a call with a parameter the tool does not
+  declare still runs. The reply then ends with
+  `⚠ Ignored unknown parameter(s): … <tool> accepts: …`.
+- **The thread wait outlasts processing**:
+  - An unseen stop of the thread is still returned at once.
+  - A set that covers the thread and is still queued or processed is no longer a
+    refusal. The wait lets it settle, then releases the thread and waits as before.
+  - No release starts after the wait's deadline, and a timeout names the set still
+    being processed.
+  - An evaluation that starts on the thread ends the wait with the usual refusal at
+    once.
+
+### Fixed — no misleading spelling hint for JDK exceptions (#82)
+
+An exception breakpoint on `java.lang.NumberFormatException`, not loaded yet, answered
+`Did you mean: java.lang.Number ?`. A class that exists in the JDK of the target's Java
+version no longer gets a hint. A bare `NumberFormatException` never activates, because
+the class-prepare filter takes the name as given. For such a name, the hint now suggests
+the qualified `java.lang` name first and says that exception breakpoints need a fully
+qualified name.
+
+### Fixed — the fast-logpoint read limit says how to keep rare hits (#82)
+
+When more than 500 hits pile up between two reads, `FAST_LOGPOINT_DROPPED` now separates
+three limits:
+- one read ingests up to 500 of a ring's newest hits;
+- the shared history keeps 500 events;
+- `jdwp_get_events` shows the newest 100.
+
+It advises narrowing the logpoint's `condition` to keep rare evidence visible. Reading
+sooner only avoids skipped entries.
+
+### Tests
+
+- **Float-folding rows (#81)** — the interpreter harness's float-folding rows no longer
+  depend on the build JDK. They failed when javac 21 built the tests and a JDK 17 JVM
+  ran them.
+
 ## [2.14.0] — 2026-11-23
 
 ### New — method calls are interpreted over JDI when javac's choice is provable (#77)
