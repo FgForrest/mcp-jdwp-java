@@ -5,6 +5,129 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.14.0] — 2026-11-23
+
+### New — method calls are interpreted over JDI when javac's choice is provable (#77)
+
+In 2.13.0 an expression with a method call, such as `store.map.size()` or
+`session.getRole()` on a package-private class, was still compiled, injected and
+invoked. That cost 229 JDWP round trips (about 65 ms) on first use, and a private
+method failed as "not visible". Now the interpreter runs such a call itself as a JDI
+invocation: 27 round trips (about 2.5 ms) for a first evaluation, 12 (about 1.3 ms)
+for a repeat. Private and package-private methods are reachable.
+
+- **Only when javac's choice is provable** — the receiver's static type has exactly
+  one Java member of that name and arity, it is applicable to the arguments, and it is
+  neither varargs nor generic. Same-arity overloads, varargs, generic methods and
+  lambdas compile as before. Runtime types never select a method.
+- **Also interpreted**:
+  - constructors of initialized, concrete top-level or static classes;
+  - boxing;
+  - object and `float`/`double` concatenation;
+  - `super.m()`;
+  - pattern `instanceof` where javac accepts it (an unconditional pattern only on a
+    Java 21 target).
+- **Java semantics kept**:
+  - String constants are interned in the target, so `==` inside called code behaves
+    as in javac.
+  - Erased generic results get Java's cast check.
+  - A constant that folds a `float` or `double` compiles, because its text depends on
+    the JDK that compiles it.
+- **A call never runs twice** — every decision to compile is made before the first
+  call, and all frame values are read before it.
+- **Invocation rules as in the compiled path** — tool evaluations run in the bounded
+  invocation job (20 s, `[STILL_RUNNING]`) with one invocation lease. Conditions and
+  logpoints take one lease on the event dispatcher. A manual hold, a bystander or a
+  thread blocked on a monitor is refused as before.
+- **Known limitation** — under a breakpoint that suspends only its own thread, an
+  object a call returns can, rarely, be garbage-collected before the debugger pins it.
+  The evaluation then fails with a message that says how many target calls already
+  ran. A stop-all breakpoint closes this window.
+
+### New — blocks with locals, `if`/`else` and `return` are interpreted (#79)
+
+Block mode (`{ ...; return X; }`) was always compiled. Now the interpreter runs a block
+with these statements:
+- local declarations, typed or `var`;
+- assignments to those locals;
+- calls under the rules above;
+- `if`/`else` and nested blocks;
+- `return`.
+
+The planner checks the whole block before anything runs: scope, definite assignment,
+reachability and return types. A block that javac would reject never yields a value.
+
+- **Leases** — a block without calls takes no lease and works on manual holds and
+  blocked threads. A block with a call anywhere needs a thread that can run code and
+  takes one lease, even when that call sits in a branch that does not run.
+- **What still compiles** — the whole block goes to the compiler for:
+  - loops, `try`, `switch`, `throw`, lambdas and local classes;
+  - writes to fields, array elements or frame locals;
+  - conditions whose definite-assignment rules the planner does not model.
+
+### New — the classpath is read without invoking target code, and only when a compile needs it (#76)
+
+Classpath discovery for compiled evaluation invoked target code, such as
+`System.getProperty`, `getContextClassLoader` and `URLClassLoader.getURLs`. The event
+dispatcher ran it at every connection's first suspending stop: about a dozen
+invocations, each resuming the thread, although most expressions are now interpreted.
+The first stop now costs 5 round trips and no invocation, where it cost 98 round trips
+and 12 invocations.
+
+- **Read through JDWP and fields** — the launch classpath comes from JDWP
+  `ClassPaths`, and loader URLs from JDI field reads. The walk covers the context class
+  loader and the defining loader of the frame being evaluated. A later frame with a new
+  loader extends it.
+- **On demand** — discovery runs at the first compiled evaluation or fast-probe arming
+  compile, not at the first stop. Local Maven discovery still starts at attach.
+- **Two guarded invocations remain**:
+  - The public `URLClassLoader.getURLs()`, or an override such as Tomcat's, runs for a
+    loader whose fields do not give its URLs.
+  - An overridden `getContextClassLoader()` is invoked only by a tool evaluation, in a
+    bounded job. Conditions and logpoints never invoke it, and `jdwp_diagnose` shows
+    the lookup as pending.
+- **Incomplete reads are not cached** — a failed or partial loader read is retried on
+  the next compile. `jdwp_diagnose` and missing-type compile errors name it.
+- **One difference** — `java.class.path` is the value captured when the JDWP agent
+  started. The previous code read it at the first stop.
+
+### New — compiled expressions reach private members through reflection (#78)
+
+A private member inside code the interpreter does not run, such as a loop, `try`, a
+lambda or a `switch`, failed with an ECJ "not visible" error. When ECJ reports only
+access errors, ordinary compiled evaluation on JDK 17 and 21 now rewrites those sites
+into reflective field reads, calls and constructors, and compiles again. The rewrite
+only does what javac's code would do; otherwise the original diagnostic stands.
+
+- **Kept exact**:
+  - values keep their declared types;
+  - a type-qualified constant is inlined without initializing its class;
+  - a reflected constructor initializes its class before evaluating its arguments;
+  - receiver and argument order is kept;
+  - a target exception reads as itself;
+  - a null receiver throws an NPE that names the member.
+- **Still limited**:
+  - writes to private fields;
+  - inaccessible type names and result types;
+  - expression-qualified constants;
+  - private method references;
+  - constructors that need an enclosing instance;
+  - closed JDK packages such as `String.value`, which add a module note.
+- **Fast probes unchanged** — fast logpoints, fast breakpoints, their arming hits and
+  their captures keep Java access rules.
+
+### New — test flight #11 The Missing Pickup (#75)
+
+The sandbox has an eleventh flight: The Missing Pickup, moderate, par 3. The sandbox
+README, `AGENTS.md` and the scorecards count eleven flights and 33 stars.
+
+### Docs
+
+- **The `java-debug` skill** covers interpreted calls and blocks, field paths through
+  package-private classes in other packages, and the compiled reflection retry.
+- **`docs/expression-evaluation.md`** and the troubleshooting reference describe which
+  expressions and blocks are interpreted, which compile, and why.
+
 ## [2.13.0] — 2026-11-22
 
 ### New — expressions that only read are interpreted over JDI, without compiling or invoking
