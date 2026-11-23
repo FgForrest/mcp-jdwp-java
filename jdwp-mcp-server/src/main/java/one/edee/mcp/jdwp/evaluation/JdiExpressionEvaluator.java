@@ -1,8 +1,10 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
+import one.edee.mcp.jdwp.JDIConnectionService.RemoteClasspath;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
+import one.edee.mcp.jdwp.InvocationRunner;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import one.edee.mcp.jdwp.evaluation.exceptions.LocalClasspathPendingException;
@@ -90,22 +92,31 @@ public class JdiExpressionEvaluator {
     private final LocalProjectClasspathProvider localClasspathProvider;
 
     /**
-     * Compilation cache keyed by wrapper package, context signature, and expression. Frames with
-     * the same local types and names can reuse the compiled wrapper in the same package.
+     * The current compiler inputs and their wrapper cache. Frames with the same local types and
+     * names can reuse a compiled wrapper for the same package and expression.
      * Flushes the whole map at {@link #MAX_CACHE_SIZE}. Compiler reconfiguration replaces the map
      * so a concurrent compilation can only populate the cache it started with.
      */
     private volatile CompilerState compilerState =
-        new CompilerState(null, null, null, false, null, new ConcurrentHashMap<>());
+        new CompilerState(null, null, false, null, null, null, null, new ConcurrentHashMap<>());
 
     /**
      * Binds the VM and discovery snapshot to the options and wrapper cache. A tool worker or
      * dispatcher captures one state so each compilation uses the options that own its cache.
-     * {@code localEntriesAdded} records whether the merge changed the remote-only classpath.
+     *
+     * @param vm the target connection for these inputs
+     * @param snapshot the local project discovery state
+     * @param localEntriesAdded whether local discovery expanded the remote classpath
+     * @param remote the remote snapshot used to build these options
+     * @param remoteClasspath the remote entries before merging the local project
+     * @param remoteProblem the discovery diagnostic captured at configuration time
+     * @param options the ECJ options for this state
+     * @param cache the compiled wrappers reusable with these options
      */
     private record CompilerState(@Nullable VirtualMachine vm, @Nullable Snapshot snapshot,
-                                 LocalProjectClasspathProvider.@Nullable Breakdown mergedLocal,
                                  boolean localEntriesAdded,
+                                 @Nullable RemoteClasspath remote, @Nullable String remoteClasspath,
+                                 @Nullable String remoteProblem,
                                  InMemoryJavaCompiler.@Nullable Configuration options,
                                  Map<String, CachedCompilation> cache) {}
 
@@ -1590,9 +1601,19 @@ public class JdiExpressionEvaluator {
      *     and points to diagnostics the user can check.
      */
     public void configureCompilerClasspath(ThreadReference suspendedThread) throws JdiEvaluationException {
+        configureCompilerClasspath(suspendedThread, (ClassLoaderReference) null);
+    }
+
+    /** Resolves tool-only context getters before taking the compiler configuration monitor. */
+    public void configureCompilerClasspath(ThreadReference suspendedThread, @Nullable ClassLoaderReference loader)
+        throws JdiEvaluationException {
         final VirtualMachine vm = suspendedThread.virtualMachine();
         localClasspathProvider.awaitDiscovery(vm);
-        configureCompilerClasspath(suspendedThread, vm, true);
+        final boolean toolWorker = InvocationRunner.isWorkerFor(suspendedThread);
+        if (toolWorker) {
+            jdiConnectionService.discoverClasspathForTool(suspendedThread, loader);
+        }
+        configureCompilerClasspath(suspendedThread, vm, loader, toolWorker);
     }
 
     /**
@@ -1607,97 +1628,120 @@ public class JdiExpressionEvaluator {
      *     a discovery failure when relevant, as an evaluation error such as {@code LOGPOINT_ERROR}.
      */
     public void configureCompilerClasspathForEvent(ThreadReference suspendedThread) throws JdiEvaluationException {
-        configureCompilerClasspath(suspendedThread, suspendedThread.virtualMachine(), true);
+        configureCompilerClasspathForEvent(suspendedThread, null);
+    }
+
+    /** Configures a dispatcher compile against the selected frame's defining loader. */
+    public void configureCompilerClasspathForEvent(ThreadReference suspendedThread,
+                                                   @Nullable ClassLoaderReference loader) throws JdiEvaluationException {
+        configureCompilerClasspath(suspendedThread, suspendedThread.virtualMachine(), loader, false);
     }
 
     /**
-     * Shared configuration for tool evaluations, dispatcher evaluations, and
-     * {@link #prewarmClasspath}. Evaluations pass {@code includeLocal=true} to merge a ready local
-     * result or reuse the current remote-only configuration while discovery is pending.
-     * Prewarm passes {@code false} because the first suspending stop needs to warm only the
-     * remote classloader walk and JDK detection. Discovery started independently at attach.
+     * Configures the compiler on demand for tool evaluations, dispatcher evaluations, and probe
+     * arming. Merges a ready local result or uses the remote classpath while discovery is pending.
      * Publication retries with the finished local result if it arrived during the remote walk.
      *
-     * @param suspendedThread an event-suspended target thread for JDI method invocations
+     * @param suspendedThread an event-suspended target thread usable by a custom loader fallback
      * @param vm the connection that owns the suspended thread
-     * @param includeLocal whether to merge an available local result
+     * @param loader the selected frame's defining loader, or null for the bootstrap loader
+     * @param prepared whether the tool worker already ran discovery outside this monitor
      * @throws JdiEvaluationException if the matching JDK or a usable classpath is unavailable
      */
     private synchronized void configureCompilerClasspath(ThreadReference suspendedThread,
-                                                         @Nullable VirtualMachine vm, boolean includeLocal)
+                                                         @Nullable VirtualMachine vm,
+                                                         @Nullable ClassLoaderReference loader, boolean prepared)
         throws JdiEvaluationException {
-        final Snapshot first = requireClasspathSnapshot(vm, includeLocal);
+        final Snapshot first = requireClasspathSnapshot(vm);
         final boolean jdkReady = jdiConnectionService.getDiscoveredJdkPath() != null;
         final CompilerState configured = compilerState;
         final Snapshot previous = configured.snapshot();
-        if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(first, includeLocal)
-            && (!includeLocal || configured.mergedLocal() == first.status().breakdown())
-            && localClasspathProvider.publishIfCurrent(vm, first, includeLocal, () -> {})) {
+        final RemoteClasspath published = jdiConnectionService.remoteClasspathFor(vm);
+        final boolean remoteUnchanged = Objects.equals(configured.remote(), published)
+            && (prepared || !jdiConnectionService.classpathNeedsDiscovery(loader));
+        if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(first, true)
+            && remoteUnchanged
+            && localClasspathProvider.publishIfCurrent(vm, first, () -> {})) {
             return;
         }
 
-        // The lease lets the remote classloader walk borrow the target thread's suspension for
-        // invokeMethod. The EvaluationGuard tells the listener to suppress any breakpoint the
-        // call hits. Suspending the thread again there would prevent the invocation from finishing.
-        try (EvaluationGuard.Lease lease = evaluationGuard.lease(suspendedThread)) {
-            // An absent JDK path marks first use, a fresh connection, or a failed discovery.
-            // Reset before trying again so a failure cannot leave the previous target's options
-            // or wrappers available. Once the JDK is known, preserve the remote discovery while
-            // updating the local options. Successful reconfiguration replaces the wrapper cache.
-            if (!jdkReady) {
-                compiler.reset();
-                compilerState = new CompilerState(null, null, null, false, null, new ConcurrentHashMap<>());
-            }
-
-            final String remoteClasspath = jdiConnectionService.discoverClasspath(suspendedThread);
-            final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
-            Snapshot snapshot = first;
-            // Directory reports and local results can arrive during the remote walk or while
-            // assembling options. Retry with a fresh snapshot without repeating either discovery.
-            for (int attempt = 0; attempt < 3; attempt++) {
-                final DiscoveryStatus localStatus = snapshot.status();
-                final LocalProjectClasspathProvider.Breakdown local = includeLocal ? localStatus.breakdown() : null;
-                final String problem = localStatus.problem();
-                final String localHint = problem == null ? "" : " " + problem;
-                // ECJ resolves entries left to right. Put the live target's entries first so they
-                // win over stale local copies. Append local-only entries to fill classloader gaps.
-                final Set<String> localEntries = local == null ? Set.of() : local.all();
-                final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
-                final boolean localEntriesAdded = !localEntries.isEmpty()
-                    && !mergedClasspath.equals(mergeClasspaths(remoteClasspath, Set.of()));
-                final int version = jdiConnectionService.getTargetMajorVersion();
-                final Snapshot candidate = snapshot;
-                if (localClasspathProvider.publishIfCurrent(vm, candidate, includeLocal, () -> {
-                    if (jdkPath != null && !mergedClasspath.isEmpty()) {
-                        compiler.configure(jdkPath, mergedClasspath, version);
-                        compilerState = new CompilerState(vm, candidate, local, localEntriesAdded,
-                            compiler.currentConfiguration(), new ConcurrentHashMap<>());
-                    }
-                })) {
-                    // Remote discovery signals unavailable inputs by leaving the JDK or classpath
-                    // empty. Report that here with actionable context before trying to compile.
-                    if (jdkPath == null || mergedClasspath.isEmpty()) {
-                        throw classpathFailure(jdkPath, localStatus, localHint, includeLocal);
-                    }
-                    // The first two counts show each input before merging. The third is the
-                    // deduplicated union passed to ECJ. Overlap makes it smaller than the sum.
-                    log.info("[LocalClasspath] Compiler classpath: {} remote + {} local entries → {} configured{}",
-                        countEntries(remoteClasspath), localEntries.size(), countEntries(mergedClasspath), localHint);
-                    return;
-                }
-                snapshot = requireClasspathSnapshot(vm, includeLocal);
-            }
-            throw new JdiEvaluationException("The project directory changed during classpath configuration. Retry the evaluation.");
+        // An absent JDK path marks first use, a fresh connection, or a failed discovery.
+        // Reset before trying again so a failure cannot leave the previous target's options
+        // or wrappers available. Once the JDK is known, preserve the remote discovery while
+        // updating the local options. Successful reconfiguration replaces the wrapper cache.
+        if (!jdkReady || configured.vm() != vm) {
+            compiler.reset();
+            compilerState = new CompilerState(null, null, false, null, null, null, null, new ConcurrentHashMap<>());
         }
+
+        final String discovered;
+        // Tool preparation already ran remote discovery outside the compiler monitor.
+        if (prepared) {
+            discovered = null;
+        } else if (loader == null) {
+            discovered = jdiConnectionService.discoverClasspath(suspendedThread);
+        } else {
+            discovered = jdiConnectionService.discoverClasspath(suspendedThread, loader);
+        }
+        final RemoteClasspath remote = jdiConnectionService.remoteClasspathFor(vm);
+        final String remoteClasspath = remote == null ? discovered : remote.path();
+        final String remoteProblem = remote == null ? jdiConnectionService.getClasspathDiscoveryProblem()
+            : remote.discovery().problem();
+        final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
+        Snapshot snapshot = first;
+        // Directory reports and local results can arrive during the remote walk or while
+        // assembling options. Retry with a fresh snapshot without repeating either discovery.
+        for (int attempt = 0; attempt < 3; attempt++) {
+            final DiscoveryStatus localStatus = snapshot.status();
+            final LocalProjectClasspathProvider.Breakdown local = localStatus.breakdown();
+            final String problem = localStatus.problem();
+            final String localHint = problem == null ? "" : " " + problem;
+            final String remoteHint = remoteProblem == null ? "" : " " + remoteProblem;
+            // ECJ resolves entries left to right. Put the live target's entries first so they
+            // win over stale local copies. Append local-only entries to fill classloader gaps.
+            final Set<String> localEntries = local == null ? Set.of() : local.all();
+            final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
+            final boolean localEntriesAdded = !localEntries.isEmpty()
+                && !mergedClasspath.equals(mergeClasspaths(remoteClasspath, Set.of()));
+            final int version = jdiConnectionService.getTargetMajorVersion();
+            final Snapshot candidate = snapshot;
+            if (localClasspathProvider.publishIfCurrent(vm, candidate, () -> {
+                if (jdkPath != null && !mergedClasspath.isEmpty()) {
+                    if (jdkReady && configured.vm() == vm && previous != null && previous.sameInput(candidate, true)
+                        && Objects.equals(configured.remoteClasspath(), remoteClasspath)) {
+                        // A retried walk can update diagnostics without changing compiler inputs.
+                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remote, remoteClasspath,
+                            remoteProblem, configured.options(), configured.cache());
+                    } else {
+                        compiler.configure(jdkPath, mergedClasspath, version);
+                        compilerState = new CompilerState(vm, candidate, localEntriesAdded, remote, remoteClasspath,
+                            remoteProblem, compiler.currentConfiguration(), new ConcurrentHashMap<>());
+                    }
+                }
+            })) {
+                // Remote discovery signals unavailable inputs by leaving the JDK or classpath
+                // empty. Report that here with actionable context before trying to compile.
+                if (jdkPath == null || mergedClasspath.isEmpty()) {
+                    throw classpathFailure(jdkPath, localStatus, localHint + remoteHint);
+                }
+                // The first two counts show each input before merging. The third is the
+                // deduplicated union passed to ECJ. Overlap makes it smaller than the sum.
+                log.info("[LocalClasspath] Compiler classpath: {} remote + {} local entries → {} configured{}",
+                    countEntries(remoteClasspath), localEntries.size(), countEntries(mergedClasspath), localHint);
+                return;
+            }
+            snapshot = requireClasspathSnapshot(vm);
+        }
+        throw new JdiEvaluationException("The project directory changed during classpath configuration. Retry the evaluation.");
     }
 
     /**
      * Gets the current discovery snapshot for compiler configuration on a tool worker or the
      * dispatcher without waiting. Throws {@link JdiEvaluationException} if the VM no longer owns it.
      */
-    private Snapshot requireClasspathSnapshot(@Nullable VirtualMachine vm, boolean includeLocal)
+    private Snapshot requireClasspathSnapshot(@Nullable VirtualMachine vm)
         throws JdiEvaluationException {
-        final Snapshot snapshot = localClasspathProvider.snapshotFor(vm, includeLocal);
+        final Snapshot snapshot = localClasspathProvider.snapshotFor(vm, true);
         if (snapshot == null) {
             throw new JdiEvaluationException("The target connection ended during classpath configuration.");
         }
@@ -1709,14 +1753,14 @@ public class JdiExpressionEvaluator {
      * {@link LocalClasspathPendingException} when an empty classpath may recover after discovery.
      */
     private static JdiEvaluationException classpathFailure(@Nullable String jdkPath, DiscoveryStatus status,
-                                                             String localHint, boolean includeLocal) {
+                                                             String localHint) {
         final String prefix = "Classpath discovery failed for the current connection: ";
         if (jdkPath == null) {
             return new JdiEvaluationException(prefix + "no local JDK matching the target VM could be located, "
                 + "so application types cannot be resolved." + localHint
                 + " Check the server log (search '[JDI]') for the underlying cause.");
         }
-        final String reason = !includeLocal || status.breakdown() == null
+        final String reason = status.breakdown() == null
             ? "the target VM classloader hierarchy yielded no classpath entries and no local result is available."
             : "neither the target VM classloader hierarchy nor the local project yielded any classpath entries.";
         final String message = prefix + reason + localHint + " Local project directory: '" + status.directory() + "' ("
@@ -1724,7 +1768,7 @@ public class JdiExpressionEvaluator {
                 : "the directory the MCP server was launched from") + "). "
             + "Run jdwp_diagnose to check the discovery status. To supply missing entries, start the "
             + "agent session in the Maven project or set the JDWP_EXTRA_CLASSPATH environment variable.";
-        return includeLocal && status.running()
+        return status.running()
             ? new LocalClasspathPendingException(message, null) : new JdiEvaluationException(message);
     }
 
@@ -1753,9 +1797,12 @@ public class JdiExpressionEvaluator {
                 : compiler.compile(className, sourceCode);
             return new Compilation(classes, true);
         } catch (JdiEvaluationException failure) {
+            // Recheck pending getter diagnostics against the snapshot used for this compile.
+            final RemoteClasspath remote = state.remote();
+            final String remoteProblem = remote == null ? state.remoteProblem() : remote.discovery().problem();
             final Snapshot captured = state.snapshot();
             if (captured == null) {
-                throw failure;
+                throw withDiscoveryProblem(failure, null, remoteProblem);
             }
             final boolean missingFromRemote = !state.localEntriesAdded()
                 && failure instanceof InMemoryJavaCompiler.MissingClasspathTypes;
@@ -1763,27 +1810,30 @@ public class JdiExpressionEvaluator {
             // lets this evaluation defer against the replacement without waiting for Maven.
             final Snapshot current = localClasspathProvider.snapshotFor(state.vm(), missingFromRemote);
             if (current == null || (!missingFromRemote && !captured.sameInput(current, false))) {
-                throw failure;
+                throw withDiscoveryProblem(failure, null, remoteProblem);
             }
             final DiscoveryStatus status = current.status();
             if (missingFromRemote) {
                 if (status.running()) {
-                    throw new LocalClasspathPendingException(failure.getMessage()
-                        + "\nLocal classpath discovery is still running. See jdwp_diagnose.", failure);
+                    final JdiEvaluationException reported = withDiscoveryProblem(failure, null, remoteProblem);
+                    throw new LocalClasspathPendingException(reported.getMessage()
+                        + "\nLocal classpath discovery is still running. See jdwp_diagnose.", reported);
                 }
                 final LocalProjectClasspathProvider.Breakdown ready = status.breakdown();
                 if (ready != null && options != null) {
-                    return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready);
+                    return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready,
+                        remoteProblem);
                 }
             }
-            throw withDiscoveryProblem(failure, status);
+            throw withDiscoveryProblem(failure, status.problem(), remoteProblem);
         }
     }
 
     /** Retries once with local entries and accepts the result only while its snapshot is current. */
     private Compilation retryWithLocalClasspath(String className, String sourceCode, @Nullable VirtualMachine vm,
                                                InMemoryJavaCompiler.Configuration remote, Snapshot current,
-                                               LocalProjectClasspathProvider.Breakdown ready)
+                                               LocalProjectClasspathProvider.Breakdown ready,
+                                               @Nullable String remoteProblem)
         throws JdiEvaluationException {
         final InMemoryJavaCompiler.Configuration merged = new InMemoryJavaCompiler.Configuration(
             remote.jdkPath(), mergeClasspaths(remote.classpath(), ready.all()), remote.targetMajorVersion());
@@ -1793,7 +1843,7 @@ public class JdiExpressionEvaluator {
             classes = compiler.compile(className, sourceCode, merged);
         } catch (JdiEvaluationException failure) {
             requireCurrentRetryClasspath(vm, current);
-            throw withDiscoveryProblem(failure, current.status());
+            throw withDiscoveryProblem(failure, current.status().problem(), remoteProblem);
         }
         // The retry does not populate the cache tied to the captured remote-only options.
         requireCurrentRetryClasspath(vm, current);
@@ -1803,45 +1853,23 @@ public class JdiExpressionEvaluator {
     /** Rejects superseded options or results without waiting on discovery or invoking the target. */
     private void requireCurrentRetryClasspath(@Nullable VirtualMachine vm, Snapshot snapshot)
         throws LocalClasspathPendingException {
-        if (!localClasspathProvider.publishIfCurrent(vm, snapshot, true, () -> {})) {
+        if (!localClasspathProvider.publishIfCurrent(vm, snapshot, () -> {})) {
             throw new LocalClasspathPendingException(
                 "The local classpath changed during compilation. Retry with the current project classpath.", null);
         }
     }
 
-    /** Preserves ECJ's failure and adds a diagnostic only when discovery has one. */
-    private static JdiEvaluationException withDiscoveryProblem(JdiEvaluationException failure, DiscoveryStatus status) {
-        final String problem = status.problem();
-        return problem == null ? failure : new JdiEvaluationException(failure.getMessage() + "\n" + problem, failure);
-    }
-
-    /**
-     * Best-effort pre-warm of the compiler classpath at the first thread suspension, so the agent's
-     * first {@code evaluate_expression} (or the first logpoint/condition hit) does not pay the
-     * one-time remote classpath discovery cost — which can take 1-3s while it walks the target VM's
-     * classloader hierarchy via {@code invokeMethod} — on the critical path. Discovery is paid once
-     * per connection; subsequent calls short-circuit on the cached JDK path.
-     * <p>
-     * Warms only remote discovery and JDK detection. The local scan starts independently at
-     * attach and is merged by evaluation when ready.
-     * <p>
-     * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
-     * event dispatcher while a thread is parked for inspection, and a warming failure must not disrupt
-     * the breakpoint flow. Any failure is logged at debug and left for the real evaluation call to
-     * re-attempt and surface with a precise error.
-     *
-     * @param suspendedThread a thread already suspended at a breakpoint/step/exception/watchpoint
-     */
-    public void prewarmClasspath(ThreadReference suspendedThread) {
-        if (jdiConnectionService.getDiscoveredJdkPath() != null) {
-            return;
+    /** Adds local problems and associates missing types with the captured remote classpath gap. */
+    private static JdiEvaluationException withDiscoveryProblem(JdiEvaluationException failure,
+                                                               @Nullable String localProblem,
+                                                               @Nullable String remoteProblem) {
+        final String remote = failure instanceof InMemoryJavaCompiler.MissingClasspathTypes ? remoteProblem : null;
+        if (localProblem == null && remote == null) {
+            return failure;
         }
-        try {
-            configureCompilerClasspath(suspendedThread, suspendedThread.virtualMachine(), false);
-        } catch (Exception e) {
-            log.debug("[Evaluator] Classpath pre-warm failed (will retry on first evaluation): {}",
-                e.getMessage());
-        }
+        final String message = failure.getMessage() + (localProblem == null ? "" : "\n" + localProblem)
+            + (remote == null ? "" : "\n" + remote);
+        return new JdiEvaluationException(message, failure);
     }
 
     /**

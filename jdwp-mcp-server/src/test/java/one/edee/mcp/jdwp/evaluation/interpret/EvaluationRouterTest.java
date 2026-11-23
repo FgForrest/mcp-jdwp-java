@@ -81,26 +81,63 @@ class EvaluationRouterTest {
         verify(thread).frame(0);
     }
 
-    /** Reports the compiler error with the precise planning reason. */
+    /** Refreshes the frame after loader discovery and retains the reason for falling back to compilation. */
     @Test
     void compiledErrorsKeepTheirDiagnosticAndTheFallbackReason() throws Exception {
         final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
         final EvaluationRouter auto = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
         final ThreadReference thread = mock(ThreadReference.class);
-        final StackFrame frame = mock(StackFrame.class);
-        when(thread.frame(0)).thenReturn(frame);
+        final StackFrame planningFrame = mock(StackFrame.class);
+        final StackFrame discoveryFrame = mock(StackFrame.class);
+        final StackFrame compilationFrame = mock(StackFrame.class);
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        final ClassLoaderReference definingLoader = mock(ClassLoaderReference.class);
+        when(thread.frame(0)).thenReturn(planningFrame, discoveryFrame, compilationFrame);
         when(thread.virtualMachine()).thenReturn(mock(VirtualMachine.class));
-        when(compiler.evaluate(frame, "fetch()", Map.of()))
+        when(discoveryFrame.location()).thenReturn(location);
+        when(location.declaringType()).thenReturn(owner);
+        when(owner.classLoader()).thenReturn(definingLoader);
+        when(compiler.evaluate(compilationFrame, "fetch()", Map.of()))
             .thenThrow(new JdiEvaluationException("Compilation failed: missing member"));
         assertThatThrownBy(() -> auto.evaluateEvent("fetch()", thread, Map.of(), String::valueOf))
             .isInstanceOf(JdiEvaluationException.class)
             .hasMessage("Compilation failed: missing member\nnot interpreted: unqualified method name is absent from the frame class: fetch");
-        final InOrder order = inOrder(compiler, thread);
+        final InOrder order = inOrder(planningFrame, discoveryFrame, owner, compiler, thread);
         order.verify(thread).frame(0);
-        order.verify(compiler).configureCompilerClasspathForEvent(thread);
+        order.verify(planningFrame).location();
         order.verify(thread).frame(0);
-        order.verify(compiler).evaluate(frame, "fetch()", Map.of());
+        order.verify(discoveryFrame).location();
+        order.verify(owner).classLoader();
+        order.verify(compiler).configureCompilerClasspathForEvent(thread, definingLoader);
+        order.verify(thread).frame(0);
+        order.verify(compiler).evaluate(compilationFrame, "fetch()", Map.of());
         assertThat(auto.diagnostics()).contains("interpreted 0, compiled 1", "unqualified method name is absent from the frame class (1)");
+    }
+
+    /** Checks each selected frame in a batch even when the tool is on the same target thread. */
+    @Test
+    void compiledToolJobUsesEachSelectedFramesDefiningLoader() throws Exception {
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.COMPILER);
+        final ThreadReference thread = mock(ThreadReference.class);
+        final EvaluationRouter.ToolJob job = router.toolJob(thread, () -> {});
+        final EvaluationRouter.Input input = router.parse("fetch()");
+        for (final ClassLoaderReference definingLoader :
+            List.of(mock(ClassLoaderReference.class), mock(ClassLoaderReference.class))) {
+            final StackFrame frame = mock(StackFrame.class);
+            final Location location = mock(Location.class);
+            final ClassType owner = mock(ClassType.class);
+            when(frame.location()).thenReturn(location);
+            when(location.declaringType()).thenReturn(owner);
+            when(owner.classLoader()).thenReturn(definingLoader);
+
+            job.evaluate(input, () -> frame, Map.of(), String::valueOf);
+
+            verify(compiler).configureCompilerClasspath(thread, definingLoader);
+            verify(compiler).evaluate(frame, "fetch()", Map.of());
+        }
+        verifyNoInteractions(thread);
     }
 
     @Test

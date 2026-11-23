@@ -485,7 +485,7 @@ class InterpreterHarnessLiveTest {
     void preservesJavaInvocationSemantics(@TempDir Path temp) throws Exception {
         for (Path javaHome : InterpreterTargetVm.javaHomes()) {
             final Path gcResult = Files.createTempDirectory(temp, "target-").resolve("gc-done");
-            try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome, INVOCATION_TARGET, gcResult.toString());
+            try (InterpreterTargetVm target = InterpreterTargetVm.startClass(javaHome, InvocationTarget.class, gcResult.toString());
                  CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
                 final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
                 try {
@@ -727,7 +727,7 @@ class InterpreterHarnessLiveTest {
     @Test
     void readsABlockOnAManualHold(@TempDir Path temp) throws Exception {
         for (final Path javaHome : InterpreterTargetVm.javaHomes()) {
-            try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome, INVOCATION_TARGET,
+            try (InterpreterTargetVm target = InterpreterTargetVm.startClass(javaHome, InvocationTarget.class,
                 temp.resolve("gc-done").toString())) {
                 checkManualHold(target.port());
             }
@@ -1188,7 +1188,8 @@ class InterpreterHarnessLiveTest {
         };
     }
 
-    private static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
+    /** Plants a VM attached through the packet-counting transport into a connection service. */
+    static JDIConnectionService connectionFor(VirtualMachine vm, EvaluationGuard guard) {
         final JDIConnectionService connection = new JDIConnectionService(mock(JdiEventListener.class),
             new BreakpointTracker(), new EventHistory(), new WatcherManager(), guard,
             new MarkedInstanceRegistry(), new JdiHealthMonitor(), mock(JvmDiscoveryService.class)) {

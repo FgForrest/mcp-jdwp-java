@@ -6,16 +6,16 @@ The harness compares the compiled and interpreted evaluator on a synthetic Java 
 
 ```sh
 mvn -o -pl jdwp-mcp-server test \
-  -Dtest=InterpreterHarnessLiveTest,InterpreterExceptionLogpointLiveTest \
+  -Dtest=InterpreterHarnessLiveTest,InterpreterExceptionLogpointLiveTest,ClasspathDiscoveryLiveTest \
   -Djdwp.live=true \
   -Djdwp.live.target.java.home=/usr/lib/jvm/java-17-openjdk-amd64,/usr/lib/jvm/java-21-openjdk-amd64
 ```
 
 `jdwp.live.target.java.home` accepts a single JDK home or a comma-separated matrix. It defaults to the JVM running the tests. The fixture listens on an ephemeral loopback port and starts suspended. The corpus loader and ECJ parser shape checks also run in the regular unit suite.
 
-The live tests write `target/interp-baseline.md` at the repository root and one `target/interp-oracle-jdk<major>.jsonl` per target major. The baseline first runs an untimed warm-up on one connection per selected target to warm host ECJ against the selected JDKs. It then takes five fresh connections per target, interleaved by trial. Each connection contributes its first evaluation and five immediate repeats per engine. The compiled and navigation probes use `n + 1`. The invocation probe uses `store.map.size()` and checks for one instance invocation. The compiled repeats are cache hits. The report names the host JVM and shows median and min–max wall time, sample counts, and JDWP packet counts. It measures the unconfigured evaluator before listener prewarm and uses the fixture classpath.
+The live tests write `target/interp-baseline.md` at the repository root and one `target/interp-oracle-jdk<major>.jsonl` per target major. The baseline first runs an untimed warm-up on one connection per selected target to warm host ECJ against the selected JDKs. It then takes five fresh connections per target, interleaved by trial. Each connection contributes its first evaluation and five immediate repeats per engine. The compiled and navigation probes use `n + 1`. The invocation probe uses `store.map.size()` and checks for one instance invocation. The cold compiled probe reads the fixture's launch classpath and loader fields without invoking target code during discovery. The test checks that the cold compile takes fewer than the phase-0 baseline of 229 round trips. The compiled repeats are cache hits. The report names the host JVM and shows median and min–max wall time, sample counts, and JDWP packet counts.
 
-The packet counter uses JDI's public `Connection` SPI and counts matched command replies, including error replies. The timed window includes production value formatting. Attach, stop setup and the extra semantic reads used by differential replay happen outside that window. The exception-logpoint smoke test uses the regular server listener and tool to verify how it binds the actual thrown object.
+The packet counter uses JDI's public `Connection` SPI and counts matched command replies, including error replies. The timed window includes production value formatting. Attach, stop setup and the extra semantic reads used by differential replay happen outside that window. The exception-logpoint smoke test uses the regular server listener and tool to verify how it binds the actual thrown object. `ClasspathDiscoveryLiveTest` uses the real dispatcher and adds a child URL loader and a container-style parent with a custom `getURLs()`. Its stop window runs from resuming class preparation to presenting the first breakpoint. The test checks that the stop invokes nothing, the first compilation invokes the custom accessor once, and the entries match the captured legacy order. Additional live cases check that a stop-all condition publishes its stop without entering a private loader helper, that isolated defining loaders are added on first and later compiles, and that an overridden context-loader getter supplies its repository.
 
 ## Corpus and comparison
 

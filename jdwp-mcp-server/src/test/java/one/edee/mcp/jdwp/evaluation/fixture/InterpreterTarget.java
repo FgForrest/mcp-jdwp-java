@@ -3,6 +3,9 @@ package one.edee.mcp.jdwp.evaluation.fixture;
 import one.edee.mcp.jdwp.evaluation.fixture.shadow.ProcessBuilder;
 import org.jspecify.annotations.Nullable;
 
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.IntSupplier;
@@ -35,8 +38,15 @@ public class InterpreterTarget extends InterpreterTargetBase {
     private final Holder<InterpreterTargetBase> holder = new Holder<>(new InterpreterTargetBase());
     private final int secret = 21;
 
-    /** Runs the corpus stops followed by the type-binding regression stops. */
+    /** Runs the corpus and type-binding stops, optionally with a child context classloader chain. */
     public static void main(String[] args) throws Exception {
+        if (args.length != 0) {
+            final URL child = Path.of(args[0]).toUri().toURL();
+            final URL parent = Path.of(args[1]).toUri().toURL();
+            final ClassLoader application = InterpreterTarget.class.getClassLoader();
+            final URLClassLoader bridge = new ExtraRepositoryLoader(parent, application);
+            Thread.currentThread().setContextClassLoader(new URLClassLoader(new URL[]{child}, bridge));
+        }
         final InterpreterTarget target = new InterpreterTarget();
         final PackageStop packageStop = new PackageStop();
         final Inner inner = target.new Inner();
@@ -66,6 +76,24 @@ public class InterpreterTarget extends InterpreterTargetBase {
         TypeBindingFixture.run();
         // Keep the connection available until the debugger has read the last event.
         System.in.read();
+    }
+
+    /** Models a web application loader whose repositories live outside its URLClassPath. */
+    private static final class ExtraRepositoryLoader extends URLClassLoader {
+        /** The repository published by the override. */
+        private final URL repository;
+
+        /** Supplies a repository exposed only through the virtual accessor. */
+        private ExtraRepositoryLoader(URL repository, ClassLoader parent) {
+            super(new URL[0], parent);
+            this.repository = repository;
+        }
+
+        /** Exposes the web application repository, as a container loader would. */
+        @Override
+        public URL[] getURLs() {
+            return new URL[]{repository};
+        }
     }
 
     void inspect(int n, int max, Integer boxed, Integer otherBoxed, @Nullable Integer boxedNull, String text,

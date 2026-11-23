@@ -2387,7 +2387,7 @@ public class JDWPTools {
     /**
      * Composes the three-block diagnose report: MCP-server status, JDWP-connection status
      * (with the existing breakpoint report inline when connected), and a local-JVM inventory.
-     * Falls back gracefully if discovery throws — the connection block is always rendered.
+     * Includes the published remote classpath problem and local discovery status.
      */
     private String buildFullDiagnosticReport(boolean inspectAll) {
         final StringBuilder out = new StringBuilder();
@@ -2452,6 +2452,10 @@ public class JDWPTools {
 
         // Show the project directory even before attach. The report remains available while
         // Maven runs because this block reads the background discovery's current status.
+        final String remoteProblem = jdiService.getClasspathDiscoveryProblem();
+        if (status.connected() && remoteProblem != null) {
+            out.append("\n▸ Remote classpath\n  ").append(remoteProblem).append('\n');
+        }
         out.append(renderLocalClasspathBlock());
 
         out.append(renderLocalJvmsBlock(status, inspectAll));

@@ -558,6 +558,7 @@ public class FastLogpointService {
      * redefinition rule): the frame would turn obsolete and lose its locals. The arming hit's own
      * thread counts only when its set stops — otherwise it resumes and runs on in the old code.
      *
+     *
      * @param setStops whether the event's set already has a stop to show
      * @return what the dispatcher does with the event's set
      */
@@ -1628,7 +1629,8 @@ public class FastLogpointService {
         // In a constructor `this` may still be uninitialized at the line; passing it would not verify.
         final boolean includeThis = !method.isStatic() && !method.isConstructor();
 
-        expressionEvaluator.configureCompilerClasspathForEvent(thread);
+        // Include repositories visible to the class that will host the probe.
+        expressionEvaluator.configureCompilerClasspathForEvent(thread, refType.classLoader());
         if (flp.kind == Kind.LOGPOINT) {
             logArmingHit(flp, thread, location);
         } else {

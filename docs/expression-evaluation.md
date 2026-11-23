@@ -110,17 +110,19 @@ Three-phase injection: `defineClass` → `Class.forName` → `invokeMethod`. Ide
 
 ### `ClasspathDiscoverer`
 
-Walks the target VM's classloader hierarchy to collect all JARs. The initial `java.class.path` system property is often incomplete — for example, a Tomcat process only reports bootstrap JARs there. Discovery aggregates from three sources:
+Discovery starts with the launch classpath from JDWP `VirtualMachine.ClassPaths`, which reports the value captured at agent initialization. The first compile adds the thread's context loader chain. Compiles add the selected frame's defining loader chain as needed, in first-seen order. Each chain follows `ClassLoader.parent` from child to parent. Entries keep their first position when a later chain contains the same path.
 
-1. `System.getProperty("java.class.path")` via `invokeMethod`.
-2. `URLClassLoader.getURLs()` on each classloader in the chain.
-3. Tomcat `WebappClassLoaderBase.getURLs()` when present.
+Dispatcher compiles use the inherited `Thread.contextClassLoader` field and the frame's defining loader. Discovery leaves an overridden `getContextClassLoader()` pending for its originating thread. A compiled tool evaluation on that thread can invoke the getter under a lease in its 20-second `InvocationRunner` job, before taking the compiler configuration monitor. Failed or deferred getters keep the field result provisional until the getter succeeds, its thread dies, or the connection ends.
 
-Each URL is dereferenced to its path string and added to the deduplicated list. The result is cached in `JDIConnectionService.cachedClasspath`. See [memory-and-references.md](memory-and-references.md) § 9 for the allocation behaviour during the walk (transient mirrors, not cached).
+On JDK 17 and 21, standard URL loaders expose `ucp → URLClassPath.path`. The built-in loader's path supplies entries when JDWP provides no launch entries. Only `URLClassLoader` and its subclasses can use the public instance `getURLs()` fallback. This covers overrides that expose separate repositories, including Tomcat's `WebappClassLoaderBase`. Both URL paths use the same JDI field reads and UTF-8 decoding.
+
+Compilation can use partial entries. The next compile retries transient field and public URL accessor failures. An unsupported URL layout keeps its diagnostic for the connection and discovery caches that result by loader ID. Diagnose groups identical class and reason pairs with counts. A missing-type compilation error includes the remote discovery problem. [Mirror lifetimes](memory-and-references.md#9-classpath-loader-and-url-mirrors)
+
+`JdkDiscoveryService` uses the JDWP-reported VM version to select a matching local JDK. Where available, it reads the target's startup Java home through JDI and checks that path locally before searching `JAVA_HOME` and standard installation directories.
 
 ### `LocalProjectClasspathProvider` — local-project classpath fallback
 
-The remote classloader walk above is the source of truth, but it does not see everything. Tomcat's `WebappClassLoaderBase`, Spring Boot's `LaunchedClassLoader` / dev-tools `RestartClassLoader`, and arbitrary user-written `URLClassLoader`s hide their JARs from `getURLs()` or expose them only behind reflection — so JDT can fail to resolve types that are clearly visible to the running application. To plug those gaps, `LocalProjectClasspathProvider` (Spring singleton in the `evaluation/` package) computes a second, additive classpath from the **project directory** and `JdiExpressionEvaluator.configureCompilerClasspath` unions it with the remote-discovered one before handing the result to `InMemoryJavaCompiler.configure`.
+Container and custom classloaders can resolve types from nested archives or repositories that their exposed classpath entries do not describe. JDT can then fail to resolve types that the target can load. To plug those gaps, `LocalProjectClasspathProvider` (Spring singleton in the `evaluation/` package) computes a second, additive classpath from the **project directory** and `JdiExpressionEvaluator.configureCompilerClasspath` unions it with the remote-discovered one before handing the result to `InMemoryJavaCompiler.configure`.
 
 The project directory is the directory the agent session runs in. Claude Code starts the MCP server there, so it is `user.dir`. Codex starts plugin servers in the plugin's install directory and reports the session directory with each tool call (`_meta["codex/sandbox-state"].sandboxCwd`, see [diagnostics.md](diagnostics.md) § 8). `ClientWorkspace` records it, and when one was reported the provider scans it instead of `user.dir`. Each attach captures the current directory. If a subsequent evaluation sees a different reported directory, it starts a fresh scan for that directory.
 
@@ -134,7 +136,7 @@ The project directory is the directory the agent session runs in. Claude Code st
 
 Each connection starts local discovery on its own `jdi-local-classpath` daemon thread. Disconnect, target exit, and reconnect teardown cancel the departing connection's discovery. A fresh attach or directory change can start a new scan while the old one is still unwinding. Where `setsid` is available, an owned supervisor runs Maven in a private process group and signals its own group at the end of every run, including on timeout or cancellation. On hosts without `setsid`, the runner polls for descendants. A helper reparented between polls may outlive a cancelled or timed-out run, and `jdwp_diagnose` reports that limitation.
 
-The first suspending stop still prewarms remote classpath discovery and JDK detection. Compiled dispatcher evaluations can use the remote classpath while the scan runs. If local discovery finishes during the remote classloader walk, publication retries with the ready result using the same remote classpath. The compiler checks the connection, directory, and local result before publishing options and their wrapper cache. If remote-only compilation reports a possibly missing type, the evaluator checks the current workspace for that connection. It retries once with ready entries and discards the retry result if the workspace changes during compilation. A fast probe stays pending for a later hit if discovery is still running or its retry result was superseded. Compiled tool evaluations can wait for discovery for up to 180 seconds. If the tool deadline expires during that wait, `[STILL_RUNNING]` names local discovery and points to `jdwp_diagnose`.
+The first compiled evaluation or fast-probe arming compile discovers the remote classpath and matching JDK on demand. Compiled dispatcher evaluations can use the remote classpath while the scan runs. If local discovery finishes during the remote classloader walk, publication retries with the ready result using the same remote classpath. The compiler checks the connection, directory, and local result before publishing options and their wrapper cache. If remote-only compilation reports a possibly missing type, the evaluator checks the current workspace for that connection. It retries once with ready entries and discards the retry result if the workspace changes during compilation. A fast probe stays pending for a later hit if discovery is still running or its retry result was superseded. Compiled tool evaluations can wait for discovery for up to 180 seconds. If the tool deadline expires during that wait, `[STILL_RUNNING]` names local discovery and points to `jdwp_diagnose`.
 
 **Limitations.**
 
@@ -264,7 +266,7 @@ Dynamically derived from the target JVM's major version: `1.8` for Java 8, the b
 
 ### Classpath configuration precedes compiled evaluation
 
-`configureCompilerClasspath(thread)` issues its own `invokeMethod` calls (to discover JARs via the classloader hierarchy). Calling it from inside `evaluate()` would nest JDI invocations, risking deadlocks or `IncompatibleThreadStateException`. The router configures the classpath before fetching the compiled evaluation frame. Fast probes configure it through the compiled evaluator. The guard lets the same invocation chain lease the thread again (the nested lease ends nothing), but `ClasspathDiscoverer` needs a thread that is genuinely at an invocation event.
+The router reads the selected frame's defining loader before compiler setup and reads the frame again before evaluation because an accessor can resume its thread. Fast probes pass their method's defining loader. Optional context or URL accessor invocations take an invocation lease.
 
 ### Injected classes persist in the target JVM
 
@@ -333,6 +335,6 @@ Covered invocation sites:
 - Compiled evaluations from `jdwp_evaluate_expression`, `jdwp_assert_expression` and `jdwp_evaluate_watchers`.
 - Compiled conditions and logpoint expressions for line, exception and field events.
 - `jdwp_to_string`.
-- Classpath discovery (`ClasspathDiscoverer` calls via the evaluator's `configureCompilerClasspath`).
+- An overridden `Thread.getContextClassLoader()` or public `URLClassLoader.getURLs()` during compiler classpath discovery.
 - Deferred class loading via `Class.forName`.
 - Fast-logpoint arming: reading the class file, defining the probe.

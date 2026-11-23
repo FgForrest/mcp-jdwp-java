@@ -30,25 +30,25 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
             .toList();
     }
 
-    /** Starts the default interpreter fixture. */
-    static InterpreterTargetVm start(Path javaHome) throws Exception {
-        return start(javaHome, CLASS);
+    /** Starts the target with optional directories for its context classloader fixture. */
+    static InterpreterTargetVm start(Path javaHome, String... loaderDirectories) throws Exception {
+        return startClass(javaHome, InterpreterTarget.class, loaderDirectories);
     }
 
-    /** Starts a named fixture and passes its arguments through to main. */
-    static InterpreterTargetVm start(Path javaHome, String targetClass, String... arguments) throws Exception {
-        final String classpath = Path.of(InterpreterTarget.class.getProtectionDomain().getCodeSource()
+    /** Starts a fixture with the same classpath and JDWP transport as the interpreter target. */
+    static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... arguments) throws Exception {
+        final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
         final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, targetClass));
+            "-cp", classpath, mainClass.getName()));
         command.addAll(List.of(arguments));
         final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<>();
         final Thread drain = new Thread(() -> {
-            try (BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
+            try (final BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {
                 final String prefix = "Listening for transport dt_socket at address: ";
                 final StringBuilder startup = new StringBuilder();

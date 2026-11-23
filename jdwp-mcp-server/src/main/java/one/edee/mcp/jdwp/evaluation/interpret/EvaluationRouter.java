@@ -184,15 +184,12 @@ public final class EvaluationRouter {
         return new ToolJob(thread, requireOriginalStop);
     }
 
-    /** Re-plans on the invocation worker and configures classpath on its first compiled expression. */
+    /** Re-plans on the invocation worker and checks the classpath of each compiled frame. */
     public final class ToolJob {
         /** Thread the tool call evaluates on. */
         private final ThreadReference thread;
         /** Check that the thread is still at the stop the call started from. */
         private final Runnable requireOriginalStop;
-        /** Whether the compiler classpath was already configured for this job. */
-        private boolean configured;
-
         /** Created by {@link #toolJob}. */
         private ToolJob(ThreadReference thread, Runnable requireOriginalStop) {
             this.thread = thread;
@@ -209,11 +206,13 @@ public final class EvaluationRouter {
             return run(input, thread, frames, bindings, plan, this::configure, result);
         }
 
-        /** Configures the compiler classpath once per job. */
-        private void configure() throws JdiEvaluationException {
-            if (!configured) {
+        /** Verifies the original stop and configures the classpath for the selected loader. */
+        private void configure(@Nullable ClassLoaderReference loader) throws JdiEvaluationException {
+            requireOriginalStop.run();
+            if (loader == null) {
                 compiler.configureCompilerClasspath(thread);
-                configured = true;
+            } else {
+                compiler.configureCompilerClasspath(thread, loader);
             }
         }
     }
@@ -224,15 +223,20 @@ public final class EvaluationRouter {
         final Input input = parse(expression);
         final FrameSource frames = () -> thread.frame(0);
         final Planner.Plan plan = prepare(input, thread, frames, bindings, true);
-        return run(input, thread, frames, bindings, plan,
-            () -> compiler.configureCompilerClasspathForEvent(thread), result);
+        return run(input, thread, frames, bindings, plan, loader -> {
+            if (loader == null) {
+                compiler.configureCompilerClasspathForEvent(thread);
+            } else {
+                compiler.configureCompilerClasspathForEvent(thread, loader);
+            }
+        }, result);
     }
 
     /** Compiler classpath setup step that differs between tool calls and dispatcher events. */
     @FunctionalInterface
     private interface ConfigureClasspath {
-        /** Configures the compiler classpath. */
-        void run() throws JdiEvaluationException;
+        /** Configures the classpath with the selected frame's defining loader. */
+        void run(@Nullable ClassLoaderReference loader) throws JdiEvaluationException;
     }
 
     /**
@@ -254,12 +258,12 @@ public final class EvaluationRouter {
             compiled.increment();
             final @Nullable Value value;
             try {
-                configure.run();
-                final StackFrame frame = frames.read();
-                if (frame == null) {
-                    throw new JdiEvaluationException("No stack frame is available for compilation");
-                }
-                value = compiler.evaluate(frame, input.source(), bindings);
+                final StackFrame frame = requireCompilationFrame(frames);
+                final Location location = frame.location();
+                final ReferenceType type = location == null ? null : location.declaringType();
+                configure.run(type == null ? null : type.classLoader());
+                // The optional classpath accessors can resume the thread and invalidate the frame.
+                value = compiler.evaluate(requireCompilationFrame(frames), input.source(), bindings);
             } catch (Exception failure) {
                 if (mode == Mode.COMPILER || failure instanceof InterruptedException) {
                     throw failure;
@@ -270,6 +274,15 @@ public final class EvaluationRouter {
             }
             return result.accept(value);
         }
+    }
+
+    /** Requires an available frame before selecting a loader or compiling the expression. */
+    private static StackFrame requireCompilationFrame(FrameSource frames) throws Exception {
+        final StackFrame frame = frames.read();
+        if (frame == null) {
+            throw new JdiEvaluationException("No stack frame is available for compilation");
+        }
+        return frame;
     }
 
     /** Attach the reason when the tool's invocation guard refused a fallback before it ran. */
