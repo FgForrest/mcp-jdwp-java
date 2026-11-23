@@ -69,7 +69,7 @@ Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and pr
 
 ## Expression evaluation fails with "cannot be resolved" or "not visible"
 
-Ordinary expressions and supported read-only blocks can read private fields on manual holds and blocked threads. Supported calls can reach private and package-private methods on a thread stopped at its own event. Same-arity overloads, varargs, generic methods, lambdas and unsupported block constructs use compilation. A `not interpreted` reply explains the fallback. Check `jdwp_diagnose` for engine counts and classpath discovery status.
+Ordinary expressions and supported read-only blocks can read private fields on manual holds and blocked threads. Follow the field path directly from a local or `this` to reach a private member of a package-private class in another package. Supported calls can reach private and package-private methods on a thread stopped at its own event. Same-arity overloads, varargs, generic methods, lambdas and unsupported block constructs use compilation. A `not interpreted` reply explains the fallback. Check `jdwp_diagnose` for engine counts and classpath discovery status.
 
 On JDK 17 and 21, ordinary compilation can retry access errors on application field reads, method calls and constructors. A closed JDK package adds a module note to the original diagnostic. Assignment targets, inaccessible types and expression-qualified constants keep the original access checks. Type-qualified constants are inlined without class initialization. If a fast probe or its arming evaluation reports "not visible", use an ordinary breakpoint condition or logpoint for private members.
 

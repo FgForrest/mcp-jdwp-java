@@ -278,7 +278,7 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The interpreter reads private fields and handles supported private calls in expressions and blocks. The compiled wrapper starts with Java access rules for its package. When ECJ finds eligible visibility errors on JDK 17 or 21, ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints can retry private field reads, method calls and constructors through reflection. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
+The interpreter reads private fields and handles supported private calls in expressions and blocks. The navigation interpreter can follow one field path through private fields and package-private classes across package boundaries. The compiled wrapper starts with Java access rules for its package. When ECJ finds eligible visibility errors on JDK 17 or 21, ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints can retry private field reads, method calls and constructors through reflection. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
 
 The retry uses ECJ bindings and caches reflected members with the wrapper's defining loader. Values retain their exact types. Statements and void-compatible lambdas can discard the result. Assignment targets, inaccessible types, method references, constructors requiring an enclosing instance, and lambdas whose overload selection could change keep their original access checks.
 

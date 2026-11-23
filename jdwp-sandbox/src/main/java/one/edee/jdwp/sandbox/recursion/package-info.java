@@ -1,6 +1,6 @@
 /**
  * The Echo Chamber — recursive breakpoint hit during expression evaluation. A server check, not
- * one of the ten scored test flights.
+ * one of the eleven scored test flights.
  *
  * <p>Unlike the other sandbox scenarios, the production code in this package is correct.
  * The "break" is in the debugger interaction: without the reentrancy guard, evaluating an

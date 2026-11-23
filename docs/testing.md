@@ -104,7 +104,7 @@ The 30 ms sleep is the only timing dependency in the test suite. It is a known f
 - `deadlock/Account.java` — two transfers acquire locks in opposite orders and deadlock. Test fails when its join times out; diagnosed purely by thread inspection, no breakpoints.
 - `recursion/RecursiveCalculator.java` — actually correct! Used to verify the recursive-breakpoint protection works end-to-end with a real JVM.
 
-The full set is documented in the top-level [`README.md`](../README.md) as the "test flights".
+The eleven scored test flights are documented in the top-level [`README.md`](../README.md).
 
 ### Skip-by-default
 

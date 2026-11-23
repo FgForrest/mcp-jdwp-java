@@ -44,7 +44,7 @@ After each flight, tell the user:
 - **What you would change to fix it** — but do NOT make the change. The sandbox is intentionally broken.
 - **Your tool-call count** for the flight, against its **par** (listed per flight in `README.md`). Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. Par = ⭐⭐⭐, within 2× = ⭐⭐, solved = ⭐.
 
-After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 10/10".
+After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 11/11".
 
 ## What you may freely do
 

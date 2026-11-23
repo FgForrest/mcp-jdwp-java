@@ -45,7 +45,7 @@ echo "  output:  $OUTPUT_ZIP"
 rm -rf "$SCRIPT_DIR/dist"
 mkdir -p "$STAGING_DIR"
 
-# Copy the sandbox source tree as-is.
+# Copy the complete sandbox source tree, including packaged flight resources.
 cp -R "$SOURCE_DIR" "$STAGING_DIR/src"
 
 # Copy the standalone project files.

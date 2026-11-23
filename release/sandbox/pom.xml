@@ -11,9 +11,9 @@
 
     <name>JDWP Debugging Sandbox</name>
     <description>
-        Deliberately buggy Java classes used as debugging targets for the jdwp-debugging
-        Claude Code plugin. Standalone variant — no parent POM, no Spring Boot, no extra
-        modules. Compiles to plain Java 17 bytecode and is driven by Surefire.
+        Eleven deliberately broken Java scenarios for the jdwp-debugging plugin in Claude
+        Code and Codex. The standalone project compiles to Java 17 bytecode and runs the
+        selected flight with Surefire.
     </description>
 
     <properties>

@@ -1,8 +1,8 @@
 # JDWP Test Flights — Sandbox Edition
 
-Ten deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach your agent — Claude Code or Codex — via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
+Eleven deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach your agent — Claude Code or Codex — via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
 
-Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the ten, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
+Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. The suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
 
 This is the companion sandbox for the [jdwp-debugging plugin](https://github.com/FgForrest/mcp-jdwp-java) for Claude Code and Codex. Install the plugin first, then come back here.
 
@@ -143,6 +143,14 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 **Solved when:** you name one specific double sale: the seat, the window that sold it first and the window that sold it again. Knowing that the house is oversold, or by how much, is not enough.
 
+### #11 The Missing Pickup
+
+**Difficulty:** Moderate | **Test:** `PickupDeskTest` | **Package:** `pickup` | **Par:** 3
+
+**Symptom:** `Pickup unavailable for the selected location ==> expected: <true> but was: <false>` — a listed pickup point is reported as unavailable.
+
+**Solved when** you identify the exact value that makes the desk reject the selected pickup point and explain why.
+
 ## Scorecard
 
 **Flights solved** — did you find the root cause?
@@ -151,10 +159,10 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 |--------|----------------------------------------------------------------------|
 | 0-2    | The JVM is winning. Check your setup.                                |
 | 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 6-9    | Impressive. You found bugs that would take hours with println.       |
-| 10     | Bug terminator. Nothing survives your debugger.                      |
+| 6-10   | Impressive. You found bugs that would take hours with println.       |
+| 11     | Bug terminator. Nothing survives your debugger.                      |
 
-**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 30 stars across the ten flights.
+**Style** — how close to par? Every `jdwp_*` call counts, from the first call after attaching until the root cause is evident; the attach and the clean-up afterwards are free. ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 33 stars across the eleven flights.
 
 ## Where the spoilers live
 
@@ -172,4 +180,4 @@ The reveals are deliberately not in this zip so the agent that you ask to play c
 
 ## Have fun
 
-The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all ten and want more, the same techniques apply to real bugs in your own code.
+The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all eleven and want more, the same techniques apply to real bugs in your own code.
