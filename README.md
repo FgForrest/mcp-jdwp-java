@@ -706,7 +706,7 @@ jdwp_resume_until_event(timeoutMs=30000)
 → blocks until next breakpoint/step/exception, returns context immediately
 ```
 
-An unfiltered `jdwp_resume_until_event()` presents the oldest unseen stop immediately. With no unseen stop, it releases presented stops and manual holds before waiting, unless any step is pending. Pass `threadId=T` to present the oldest unseen stop on T and, if a release is needed, release only T. A pending step suppresses the targeted release pass only when the step is on T. If T is already running, the call can wait for its next stop without releasing anything. Other threads' unseen stops stay suspended and the reply counts them when there are any. A targeted wait lets queued and processing sets that suspend T settle before releasing any of T's holds. If another thread's stop-all then publishes unseen, the wait identifies that blocker.
+An unfiltered `jdwp_resume_until_event()` presents the oldest unseen stop immediately. With no unseen stop, it releases presented stops and manual holds before waiting, unless any step is pending. Pass `threadId=T` to present T's oldest unseen stop immediately. When T has no unseen stop, the call can release only T. A pending step suppresses the targeted release pass only when the step is on T. If T is already running, the call can wait for its next stop without releasing anything. Other threads' unseen stops stay suspended and the reply counts them when there are any. Before starting any release, a targeted wait lets queued and processing sets that suspend T settle and checks the deadline. If another thread's stop-all then publishes unseen, the wait identifies that blocker.
 
 The reply describes how the wait ended.
 

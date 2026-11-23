@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -895,8 +896,8 @@ public final class SuspensionSession {
     /**
      * The wait behind {@link #nextStop} and {@link #awaitStepStop}, under the session monitor.
      * A reset invalidates a step's retained outcome, even when already presented.
-     * Recovery holds end a targeted wait only when they cover its thread. A targeted next-stop
-     * wait lets all covering queued or processing contexts settle before its release pass.
+     * A targeted next-stop wait presents an unseen stop first. Before releasing any holds it
+     * checks for recovery, lets covering queued or processing contexts settle, and checks its deadline.
      *
      * @param thread          the thread whose stop is awaited, or {@code null} for any thread
      * @param startGeneration the generation the wait belongs to; a later one ends it with {@link Outcome#RESET}
@@ -919,12 +920,10 @@ public final class SuspensionSession {
                 outcome = Outcome.RESET;
                 break;
             }
-            final Context pending = thread != null && step == null && !closed && generation == startGeneration
-                ? coveringPendingContext(thread) : null;
             Context selected = null;
             if (step != null) {
                 selected = step.endingStop;
-            } else if (pending == null && (threadId == null || generation == startGeneration)) {
+            } else if (threadId == null || generation == startGeneration) {
                 selected = oldestUnseen(threadId);
             }
             if (selected != null && step != null && selected.reported) {
@@ -950,6 +949,7 @@ public final class SuspensionSession {
                 outcome = Outcome.STEP_ENDED;
                 break;
             }
+            final Context pending = thread != null && step == null ? coveringPendingContext(thread) : null;
             if (thread != null) {
                 recoveryFailures = waitingRecoveryFailures(thread);
                 if (!recoveryFailures.isEmpty()) {
@@ -971,7 +971,11 @@ public final class SuspensionSession {
                         released = releaseAllLocked();
                     }
                 } else if (!pendingSteps.containsKey(thread)) {
-                    threadRelease = releaseHolders(thread, new ArrayList<>(), new ArrayList<>());
+                    if (releaseDeadlinePassed(deadline)) {
+                        outcome = Outcome.TIMEOUT;
+                        break;
+                    }
+                    threadRelease = releaseHolders(thread, new ArrayList<>(), new ArrayList<>(), deadline);
                 }
             }
             if (closed) {
@@ -990,33 +994,41 @@ public final class SuspensionSession {
                     break;
                 }
             }
-            final long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
-            if (remainingMs <= 0) {
+            final long remainingNanos = deadline - System.nanoTime();
+            if (remainingNanos <= 0) {
                 if (pending != null) {
                     pendingContext = describePendingContext(pending);
                 }
                 outcome = Outcome.TIMEOUT;
                 break;
             }
-            waitForChange(remainingMs, thread);
+            waitForChange(remainingNanos, thread);
         }
         return endWait(outcome, report, released, threadRelease, refusal, threadId, recoveryFailures, pendingContext);
     }
 
     /**
-     * Parks on the session monitor until routing, publication, release, reset, close or timeout. A targeted wait is
-     * counted in {@link #targetedWaiters} while it is parked.
+     * Parks on the session monitor until the state changes or the timeout expires. A targeted
+     * wait is counted in {@link #targetedWaiters} while it is parked. Keep the sub-millisecond
+     * remainder so the monitor wait and release admission use the same deadline.
      */
-    private void waitForChange(long remainingMs, @Nullable ThreadReference thread) throws InterruptedException {
+    private void waitForChange(long remainingNanos, @Nullable ThreadReference thread) throws InterruptedException {
         if (thread == null) {
-            wait(remainingMs);
+            TimeUnit.NANOSECONDS.timedWait(this, remainingNanos);
             return;
         }
         targetedWaiters.merge(thread, 1, Integer::sum);
         try {
-            wait(remainingMs);
+            TimeUnit.NANOSECONDS.timedWait(this, remainingNanos);
         } finally {
             targetedWaiters.computeIfPresent(thread, (key, waiters) -> waiters == 1 ? null : waiters - 1);
+        }
+    }
+
+    /** Signals a change that can affect a parked waiter on this specific thread. */
+    private void notifyTargetedWaiters(ThreadReference thread) {
+        if (targetedWaiters.containsKey(thread)) {
+            notifyAll();
         }
     }
 
@@ -1548,7 +1560,7 @@ public final class SuspensionSession {
      * queued, processed or unseen. A tool's job must also still find one of the holds it was started
      * under ({@link #admittedUnder}). While a frame tool reads the thread ({@link #reserve}), the
      * lease waits for it: the invocation would run the thread under the tool, and the frames the tool
-     * reads next would be the invoked code's (#47 § 4).
+     * reads next would be the invoked code's (#47 § 4). Registering the lease wakes targeted waiters.
      *
      * @throws EvaluationRefusedException when the invocation is not admitted, including unpaid lease debt, or a frame tool still
      *                                    reads the thread after {@link #RESERVATION_WAIT_MS}
@@ -1595,6 +1607,7 @@ public final class SuspensionSession {
             lease.manualExempt = true;
         }
         leases.put(thread, lease);
+        notifyTargetedWaiters(thread);
     }
 
     /** Refuses a worker whose original stop has ended, including its read-only evaluations. */
@@ -1633,7 +1646,7 @@ public final class SuspensionSession {
      * Ends the invocation chain on {@code thread}: it goes back into each context it was taken out
      * of that still holds. A context released meanwhile has re-suspended it already. If restoring
      * an exemption fails, an available debt count can fund the hold. The session repays only the
-     * remaining debt.
+     * remaining debt. A restored share can become a blocker for a targeted waiter again.
      */
     public synchronized void unlease(ThreadReference thread) {
         final Lease lease = leases.remove(thread);
@@ -1647,6 +1660,7 @@ public final class SuspensionSession {
             if (context.state != State.RELEASED && context.exempt.contains(thread)
                 && (context.compensated.remove(thread) || restoreLeaseCount(thread, lease))) {
                 context.exempt.remove(thread);
+                notifyTargetedWaiters(thread);
             }
         }
         if (!closed && lease.manualExempt && manual.contains(thread)) {
@@ -1811,9 +1825,7 @@ public final class SuspensionSession {
                 released = set + " (its other threads stay parked)";
             }
             context.watchdogFailures.remove(owner);
-            if (targetedWaiters.containsKey(owner)) {
-                notifyAll();
-            }
+            notifyTargetedWaiters(owner);
             return released;
         } catch (RuntimeException e) {
             context.watchdogFailures.put(owner, new WatchdogReleaseFailure(lease, monitor, e));
@@ -2161,9 +2173,19 @@ public final class SuspensionSession {
 
     /** Releases ordinary thread holds and appends their outcomes with a thread-specific retry ID. */
     private ThreadRelease releaseHolders(ThreadReference thread, List<String> holders, List<ReleaseFailure> failures) {
+        return releaseHolders(thread, holders, failures, null);
+    }
+
+    /**
+     * Releases ordinary thread holds until the deadline, if set. Each JDI release that starts
+     * runs to completion so the session can record its outcome and preserve suspension ownership.
+     */
+    private ThreadRelease releaseHolders(ThreadReference thread, List<String> holders, List<ReleaseFailure> failures,
+                                         @Nullable Long deadline) {
         final String manualHold = "its jdwp_suspend_thread hold";
         final @Nullable Long retryId = retryThreadId(thread);
-        if (manual.contains(thread) && attemptRelease(() -> releaseManual(thread), () -> manualHold, failures, retryId)) {
+        if (manual.contains(thread) && !releaseDeadlinePassed(deadline)
+            && attemptRelease(() -> releaseManual(thread), () -> manualHold, failures, retryId)) {
             holders.add(manualHold);
         }
         for (Context context : new ArrayList<>(contexts)) {
@@ -2175,6 +2197,9 @@ public final class SuspensionSession {
             }
             if (context.compensated.contains(thread)) {
                 final String label = "temporary suspension from releasing " + describe(context);
+                if (releaseDeadlinePassed(deadline)) {
+                    break;
+                }
                 if (attemptRelease(() -> undoCompensation(context, thread), () -> label, failures, retryId)) {
                     holders.add(label);
                 }
@@ -2183,6 +2208,9 @@ public final class SuspensionSession {
                 continue;
             }
             final String label = describe(context);
+            if (releaseDeadlinePassed(deadline)) {
+                break;
+            }
             if (context.policy == EventRequest.SUSPEND_ALL) {
                 if (attemptRelease(() -> thread.resume(), () -> "its share of " + label, failures, retryId)) {
                     context.released.add(thread);
@@ -2196,6 +2224,11 @@ public final class SuspensionSession {
             }
         }
         return new ThreadRelease(null, holders, failures, closed);
+    }
+
+    /** Returns whether a targeted wait has exhausted the time available to start a release. */
+    private static boolean releaseDeadlinePassed(@Nullable Long deadline) {
+        return deadline != null && deadline - System.nanoTime() <= 0;
     }
 
     /** Resumes the set and wakes targeted waiters if it was pending, or leaves it owned on failure. */

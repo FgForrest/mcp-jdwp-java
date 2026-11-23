@@ -1718,9 +1718,10 @@ public class JDWPTools {
 
     /**
      * Waits on the tool caller's thread for a global or targeted stop on the fetched connection.
-     * Returns the selected stop with its captures even after transport loss, or the wait outcome.
+     * Presents a matching unseen stop before considering releases and retains its captures
+     * after transport loss.
      */
-    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). Presents an eligible unseen stop without resuming; while a step is in flight, it only waits for the step to land. With threadId, it waits for covering event sets to settle and resumes only that thread; other threads' unseen stops stay held. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
+    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). Presents the oldest matching unseen stop at once; while a step is in flight, it only waits for the step to land. With threadId, if no matching stop is unseen, it lets covering event sets settle before resuming only that thread. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs,
         @McpToolParam(required = false, description = "Resume and wait for this thread only") @Nullable Long threadId) {
@@ -5952,7 +5953,7 @@ public class JDWPTools {
         return jdwp_get_breakpoint_context(maxFrames, includeThisFields, null);
     }
 
-    /** Presents the selected stop and captures, or inspects a suspended thread without a stop report. */
+    /** Reports the selected thread's frames and captures, retaining its stop on connection loss. */
     @McpTool(description = "One-shot debugging context for a selected thread or the current breakpoint: thread, top frames, locals at frame 0, and 'this' field dump.")
     public String jdwp_get_breakpoint_context(
         @McpToolParam(required = false, description = "Max stack frames to render (default: 5). Junit/maven/reflection frames are always collapsed.") @Nullable Integer maxFrames,
@@ -5968,26 +5969,61 @@ public class JDWPTools {
             if (threadId == null) {
                 return renderPresentedOrLastStop(tool, getter);
             }
+            return renderTargetedContext(tool, threadId, frameLimit, includeThis, getter);
+        } catch (Exception e) {
+            return errorReply(e);
+        }
+    }
+
+    /** Resolves and inspects the selected thread, preserving its published stop if the connection ends. */
+    private String renderTargetedContext(String tool, long threadId, int frameLimit, boolean includeThis,
+                                         StopGetter getter) throws Exception {
+        @Nullable SuspensionSession session = null;
+        try {
             final VirtualMachine vm = jdiService.getVM();
-            final SuspensionSession session = breakpointTracker.suspensionSession();
+            session = breakpointTracker.suspensionSession();
             if (session != null && !session.matchesVm(vm)) {
                 return THREAD_CONNECTION_CHANGED;
             }
             final ThreadReference thread = session == null
                 ? findThread(vm, threadId) : findSessionThread(session, vm, threadId);
-            if (thread == null) {
-                return "Error: Thread not found with ID " + threadId;
-            }
             if (session != null) {
                 final SuspensionSession.StopReport report = session.presentPublishedStop(threadId, true);
                 if (report != null) {
                     return renderPresentedStop(session, report, tool, getter);
                 }
             }
-            return renderBreakpointContext(thread, null, null, frameLimit, includeThis);
+            final String closed = closedContextReply(session, threadId);
+            if (closed != null) {
+                return closed;
+            }
+            if (thread == null) {
+                return "Error: Thread not found with ID " + threadId;
+            }
+            final String live = renderBreakpointContext(thread, null, null, frameLimit, includeThis);
+            final String closedAfterRead = closedContextReply(session, threadId);
+            return closedAfterRead == null ? live : closedAfterRead;
         } catch (Exception e) {
-            return errorReply(e);
+            final SuspensionSession failed = session == null ? breakpointTracker.suspensionSession() : session;
+            final String closed = closedContextReply(failed, threadId);
+            if (closed != null) {
+                return closed;
+            }
+            if (e instanceof IllegalStateException || isVmGone(e)) {
+                final SuspensionSession.StopReport report = session == null ? null : session.presentPublishedStop(threadId);
+                return vmGoneEnvelope(tool, e) + (report == null ? "" : selectedStopNote(report));
+            }
+            throw e;
         }
+    }
+
+    /** Renders the closed connection's reply and any stop it published for the requested thread. */
+    @Nullable
+    private String closedContextReply(@Nullable SuspensionSession session, long threadId) {
+        if (session == null || !session.isClosed()) {
+            return null;
+        }
+        return renderWaitVmDeath(session, session.presentPublishedStop(threadId));
     }
 
     /** Reads suspended frames under the frame guards and includes the stop's capture when available. */

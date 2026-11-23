@@ -41,7 +41,7 @@ A reply ending in `⚠ Ignored unknown parameter(s)` lists the supplied names th
 
 - If an unseen stop-all holds the selected thread, use `jdwp_resume_until_event()` to inspect unseen stops in order until you reach the named blocker. Then retry with `threadId`.
 - If a targeted context, resume, or wait call returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying.
-- A targeted wait lets covering event sets settle within its deadline. If one is still queued or processing at the deadline, `[TIMEOUT]` identifies the set and its event thread. A direct `jdwp_resume_thread` can still refuse while that set is pending.
+- A targeted wait presents the oldest unseen stop for that thread immediately. When none is available, it lets covering event sets settle before releasing eligible holds within the deadline. If one is still queued or processing at the deadline, `[TIMEOUT]` identifies the set and its event thread. A direct `jdwp_resume_thread` can still refuse while that set is pending.
 - If a step with `wait=true` times out, continue with `jdwp_resume_until_event(threadId=T)`. If either wait reports another thread's unseen stop-all, present that stop first, then use `jdwp_resume_thread(threadId=T)` to free T before continuing the wait.
 
 ## JDWP port is already in use

@@ -6,6 +6,7 @@ import com.sun.jdi.Method;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.Value;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.EventRequest;
@@ -17,6 +18,8 @@ import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.ai.mcp.annotation.provider.tool.SyncMcpToolProvider;
 
 import java.util.List;
@@ -143,6 +146,49 @@ class JDWPToolsBreakpointContextTest {
 
 		assertThat(context(newThread.ref.uniqueID())).startsWith("[CONNECTION_CHANGED]");
 		assertThat(session.unseenCount()).isEqualTo(1);
+	}
+
+	/** Preserves the selected thread's stop and capture if its session closes before lookup. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void reportsClosedSessionWithSelectedThreadsPublishedStop(boolean vmAvailable) throws Exception {
+		final FakeSuspendModel.FakeThread other = model.thread("other");
+		final FakeSuspendModel.FakeThread target = model.thread("target");
+		publish(other, 19, "other capture");
+		publish(target, 71, "target capture");
+		when(jdi.getVM()).thenAnswer(invocation -> {
+			session.close();
+			if (!vmAvailable) {
+				throw new IllegalStateException("connection closed");
+			}
+			return model.vm;
+		});
+
+		assertThat(context(target.ref.uniqueID())).startsWith("[VM_DEATH]")
+			.contains("target", "breakpoint=71", "target capture").doesNotContain("other capture");
+		assertThat(session.unseenCount()).isOne();
+	}
+
+	/** Reports closure during enumeration for both a lookup miss and a stale lookup result. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void reportsSessionClosedDuringThreadLookup(boolean found) {
+		final FakeSuspendModel.FakeThread target = model.thread("target");
+		when(model.vm.allThreads()).thenAnswer(invocation -> {
+			session.close();
+			return found ? List.of(target.ref) : List.of();
+		});
+
+		assertThat(context(target.ref.uniqueID())).startsWith("[VM_DEATH]");
+	}
+
+	/** Uses the transport-loss reply when enumeration detects a disconnect before the listener. */
+	@Test
+	void reportsTransportLossDuringThreadLookup() {
+		final FakeSuspendModel.FakeThread target = model.thread("target");
+		when(model.vm.allThreads()).thenThrow(new VMDisconnectedException("transport closed"));
+
+		assertThat(context(target.ref.uniqueID())).startsWith("[VM_GONE]");
 	}
 
 	/** Publishes a thread-policy breakpoint with a distinct capture. */
