@@ -11,7 +11,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code and Codex as **50 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
 
 - **See runtime state, not stack traces** — read locals, fields, threads, the entire object graph
-- **Evaluate Java in the suspended frame** — read private fields through JDI and compile expressions that require target code
+- **Evaluate Java in the suspended frame** — read private fields and invoke supported private methods through JDI
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
 - **Trace without stopping** — line/exception/field logpoints write to an event log; the hitting thread pauses only while the server evaluates the expression, then runs on
@@ -591,7 +591,7 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. An ordinary call with one applicable signature can reach a private or package-private method. Same-arity overloads, varargs, generic methods, lambdas and blocks use compilation. Code still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 
@@ -794,7 +794,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                       | Parameters                                          | Description                                                       |
 |----------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
-| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java expression at suspended frame (supports `{ block }`; `threadId` defaults to the current stop's thread) |
+| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java in a suspended frame, including supported calls to private members and `{ block }` syntax. `threadId` defaults to the current stop's thread. |
 | `jdwp_assert_expression`   | `expression`, `expected`, `threadId?`, `frameIndex?` | Evaluate and compare against expected value                       |
 | `jdwp_set_local`           | `threadId`, `frameIndex`, `varName`, `value`        | Set a local variable's value                                      |
 | `jdwp_set_field`           | `objectId`, `fieldName`, `value`                    | Set a field's value on a cached object                            |
@@ -1067,7 +1067,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 - [memory-and-references.md](docs/memory-and-references.md) — JDI mirrors, the object cache, marks, the compilation cache, byte-array mirroring
 - [event-pipeline.md](docs/event-pipeline.md) — the JDI event listener loop and the suspension decision matrix
 - [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains, fast logpoints and fast breakpoints
-- [expression-evaluation.md](docs/expression-evaluation.md) — JDI navigation and the compiled evaluation pipeline
+- [expression-evaluation.md](docs/expression-evaluation.md) — JDI reads, interpreted calls and the compiled evaluation pipeline
 - [diagnostics.md](docs/diagnostics.md) — `jdwp_diagnose`, JVM discovery, the handshake probe, transport-loss envelopes, logging
 - [testing.md](docs/testing.md) — test architecture for contributors
 

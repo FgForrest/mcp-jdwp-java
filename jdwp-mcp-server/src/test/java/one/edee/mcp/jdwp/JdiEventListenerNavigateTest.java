@@ -114,6 +114,82 @@ class JdiEventListenerNavigateTest {
         }
     }
 
+    /** An interpreted condition holds a single dispatcher lease for both calls and releases it on return. */
+    @Test
+    void invokesConditionUnderOneDispatcherLease() throws Exception {
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread thread = target.thread("event");
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = spy(new EvaluationGuard());
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        final JdiEventListener listener = new JdiEventListener(tracker, history, compiler, guard, null,
+            new MarkedInstanceRegistry(), new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO));
+        final BlockingQueue<EventSet> sets = new LinkedBlockingQueue<>();
+        final EventQueue queue = mock(EventQueue.class);
+        when(target.vm.eventQueue()).thenReturn(queue);
+        when(queue.remove()).thenAnswer(call -> sets.take());
+        final BreakpointRequest request = mock(BreakpointRequest.class);
+        final int id = tracker.registerBreakpoint(request);
+        tracker.setCondition(id, "enabled() && enabled()");
+
+        final EventSet set = target.breakpointEvent(thread, EventRequest.SUSPEND_EVENT_THREAD, request);
+        final BreakpointEvent event = (BreakpointEvent) set.iterator().next();
+        final Location location = mock(Location.class);
+        final ClassType owner = mock(ClassType.class);
+        final StackFrame frame = mock(StackFrame.class);
+        final Method method = mock(Method.class);
+        final BooleanType type = mock(BooleanType.class);
+        final BooleanValue yes = mock(BooleanValue.class);
+        final ObjectReference self = mock(ObjectReference.class);
+        final CountDownLatch called = new CountDownLatch(2);
+
+        when(event.location()).thenReturn(location);
+        when(thread.ref.frame(0)).thenReturn(frame);
+        when(frame.location()).thenReturn(location);
+        when(frame.thisObject()).thenReturn(self);
+        when(location.declaringType()).thenReturn(owner);
+        when(location.lineNumber()).thenReturn(10);
+        when(owner.name()).thenReturn("example.App");
+        when(owner.methods()).thenReturn(List.of(method));
+        when(method.name()).thenReturn("enabled");
+        when(method.signature()).thenReturn("()Z");
+        when(method.returnType()).thenReturn(type);
+        when(method.declaringType()).thenReturn(owner);
+        when(type.name()).thenReturn("boolean");
+        when(yes.value()).thenReturn(true);
+        when(target.vm.mirrorOf(true)).thenReturn(yes);
+        when(compiler.invocationLease(thread.ref)).thenAnswer(call -> guard.lease(thread.ref));
+        when(self.invokeMethod(thread.ref, method, List.of(), ObjectReference.INVOKE_SINGLE_THREADED))
+            .thenAnswer(call -> {
+                assertThat(Thread.currentThread().getName()).contains("dispatcher");
+                assertThat(guard.isEvaluating(thread.ref)).isTrue();
+                final SuspensionSession session = tracker.suspensionSession();
+                assertThat(session).isNotNull();
+                assertThat(session.dispatcherInvocations()).hasSize(1);
+                called.countDown();
+                return yes;
+            });
+
+        try {
+            listener.start(target.vm);
+            sets.add(set);
+            assertThat(called.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThat(listener.awaitIdle(3000)).isTrue();
+            verify(guard).lease(thread.ref);
+            verify(compiler).invocationLease(thread.ref);
+            verify(compiler, never()).configureCompilerClasspathForEvent(any());
+            assertThat(guard.isEvaluating(thread.ref)).isFalse();
+            final SuspensionSession session = tracker.suspensionSession();
+            assertThat(session).isNotNull();
+            assertThat(session.dispatcherInvocations()).isEmpty();
+            assertThat(history.getRecent(20)).extracting(EventHistory.DebugEvent::type)
+                .contains("BREAKPOINT").doesNotContain("CONDITION_ERROR");
+        } finally {
+            listener.stop();
+        }
+    }
+
     /** Publishes the fail-safe stop and releases its counts on reset after an oversized condition fails. */
     @Test
     void publishesTheFailSafeStopForAnOversizedCondition() throws Exception {

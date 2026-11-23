@@ -14,18 +14,21 @@ import java.util.function.ToLongFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/** Verifies and reports JDWP traffic and timing for the expression evaluation probes. */
 final class InterpreterBaseline {
     private static final Command CLASS_INVOKE = new Command(3, 3);
     private static final Command OBJECT_INVOKE = new Command(9, 6);
     private static final Command ARRAY_SET_VALUES = new Command(13, 3);
 
+    /** Explains how the packet and timing measurements are collected. */
     static final String HEADER = """
         # Expression evaluation baseline
 
         Host JVM: %s %s
 
-        For each target, five fresh connections each contribute one cold `n + 1` evaluation and
-        five immediately repeated evaluations per engine. One untimed connection per engine and
+        For each target, five fresh connections each contribute one cold evaluation and
+        five immediately repeated evaluations per engine. The compiled and navigation probes use
+        `n + 1`. The invocation probe uses `store.map.size()`. One untimed connection per engine and
         target warms the host before sampling. The cold sample starts at the first
         fixture breakpoint with the compiler unconfigured. Local Maven classpath discovery is disabled. Measurement includes
         a fresh frame read and production value formatting. Attach, stop setup, semantic
@@ -61,6 +64,17 @@ final class InterpreterBaseline {
         }
     }
 
+    /**
+     * One measured evaluation.
+     *
+     * @param before packet counts before this evaluation
+     * @param configured packet counts after classpath configuration
+     * @param after packet counts after result formatting
+     * @param classpathNanos time spent configuring the classpath
+     * @param compileNanos time spent in the compiler
+     * @param totalNanos elapsed time for the measured operation
+     * @param bytes bytecode emitted by the compiler
+     */
     record Sample(Map<Command, Long> before, Map<Command, Long> configured, Map<Command, Long> after,
                   long classpathNanos, long compileNanos, long totalNanos, int bytes) {
         void verify(boolean cold) {
@@ -75,6 +89,14 @@ final class InterpreterBaseline {
             assertThat(discoveryPackets()).isZero();
             assertThat(delta(CLASS_INVOKE)).isZero();
             assertThat(delta(OBJECT_INVOKE)).isZero();
+            assertThat(delta(ARRAY_SET_VALUES)).isZero();
+        }
+
+        /** Confirms the probe made one instance call without classpath discovery or bytecode upload. */
+        void verifySingleInvocation() {
+            assertThat(discoveryPackets()).isZero();
+            assertThat(delta(CLASS_INVOKE)).isZero();
+            assertThat(delta(OBJECT_INVOKE)).isEqualTo(1);
             assertThat(delta(ARRAY_SET_VALUES)).isZero();
         }
 

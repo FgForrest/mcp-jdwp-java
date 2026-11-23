@@ -14,9 +14,10 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
 
-/** Checks navigation plans using controlled target type metadata. */
+/** Checks expression plans using controlled target type metadata. */
 class InterpreterPlannerTest {
 
+    /** Covers the expression categories using a frame with one primitive local. */
     @ParameterizedTest
     @CsvSource(delimiter = '|', textBlock = """
         item + 1           | NAVIGATE
@@ -30,9 +31,9 @@ class InterpreterPlannerTest {
         { return item; }   | COMPILE
         item++             | COMPILE
         item = 7           | COMPILE
-        item.toString()    | INVOKE
-        new Object()       | INVOKE
-        item instanceof String s | INVOKE
+        item.toString()    | COMPILE
+        new Object()       | COMPILE
+        item instanceof String s | COMPILE
         """)
     void plansDisjointEnginePaths(String source, Planner.KindOfPlan expected) throws Exception {
         final VirtualMachine vm = mock(VirtualMachine.class);
@@ -58,12 +59,266 @@ class InterpreterPlannerTest {
         when(frame.thisObject()).thenReturn(self);
         when(frame.visibleVariables()).thenReturn(List.of(item));
         when(frame.getValues(List.of(item))).thenReturn(Map.of(item, number));
-        final var plan = Planner.plan(vm, frame, Map.of("$tag", number), ExpressionParser.parse(source));
+        final Planner.Plan plan = Planner.plan(vm, frame, Map.of("$tag", number), ExpressionParser.parse(source));
         assertThat(plan.kind()).as(source).isEqualTo(expected);
         if (plan instanceof Planner.Error error && source.equals("missing")) {
             assertThat(error.message()).contains("Visible names", "item", "$tag");
         }
         verifyNoInteractions(self);
+    }
+
+    /** Applies the single-candidate rule before executing any expression steps. */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+        this.call(1) | INVOKE | applicable
+        call(1) | INVOKE | applicable
+        absent() | COMPILE | unqualified method name
+        call(true) | COMPILE | inapplicable argument
+        overloaded(1) | COMPILE | multiple candidates
+        variable(1) | COMPILE | varargs method
+        infer(1) | COMPILE | generic method
+        Example.cold() | COMPILE | static method's class is not initialized
+        """)
+    void plansCallsByDeclaredSignature(String source, Planner.KindOfPlan expected, String reason) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final ObjectReference self = mock(ObjectReference.class);
+        when(frame.thisObject()).thenReturn(self);
+        final IntegerType integer = mock(IntegerType.class);
+        when(integer.name()).thenReturn("int");
+        final Method call = call(owner, "call", "(I)I", integer, List.of(integer));
+        final Method overload = call(owner, "overloaded", "(I)I", integer, List.of(integer));
+        final Method other = call(owner, "overloaded", "(J)I", integer, List.of(integer));
+        final Method variable = call(owner, "variable", "([I)I", integer, List.of(integer));
+        when(variable.isVarArgs()).thenReturn(true);
+        final Method infer = call(owner, "infer", "(I)I", integer, List.of(integer));
+        when(infer.genericSignature()).thenReturn("<T:Ljava/lang/Object;>(I)I");
+        final Method cold = call(owner, "cold", "()I", integer, List.of());
+        when(cold.isStatic()).thenReturn(true);
+        when(owner.methods()).thenReturn(List.of(call, overload, other, variable, infer, cold));
+
+        final Planner.Plan plan = Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(source));
+        assertThat(plan.kind()).as(source).isEqualTo(expected);
+        if (plan instanceof Planner.Compile fallback) {
+            assertThat(fallback.reason()).contains(reason);
+        }
+        verifyNoInteractions(self);
+    }
+
+    /** Reads the declaring type in a static context and checks the dedicated instance-call error. */
+    @Test
+    void rejectsAnUnqualifiedInstanceMethodInAStaticFrame() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final Method current = mock(Method.class);
+        final StackFrame frame = typeFrame(owner, current);
+        final IntegerType integer = mock(IntegerType.class);
+        when(integer.name()).thenReturn("int");
+        when(current.isStatic()).thenReturn(true);
+        final Method method = call(owner, "attempt", "(I)I", integer, List.of(integer));
+        when(owner.methods()).thenReturn(List.of(method));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("attempt(1)")))
+            .isEqualTo(new Planner.Error("Cannot make a static reference to the non-static method attempt"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("attempt(true)")))
+            .isEqualTo(new Planner.Compile("inapplicable argument: attempt"));
+    }
+
+    /** Validates the class and constructor before deciding to execute an allocation. */
+    @Test
+    void plansConstructionOnlyForAnInitializedConcreteClass() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType inner = type(vm, "app.Example$Inner", null);
+        final ClassType nested = type(vm, "app.Example$Nested", null);
+        final ClassType abstractClass = type(vm, "app.Example$Abstract", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        when(abstractClass.isAbstract()).thenReturn(true);
+        when(nested.isStatic()).thenReturn(true);
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("new Inner()")))
+            .isEqualTo(new Planner.Compile("inner, local or anonymous class constructor: app.Example$Inner"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("new Abstract()")))
+            .isEqualTo(new Planner.Compile("constructor requires a concrete class: app.Example$Abstract"));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("new Nested()")))
+            .isEqualTo(new Planner.Compile("constructor's class is not initialized: app.Example$Nested"));
+        when(nested.isInitialized()).thenReturn(true);
+        final VoidType voidType = mock(VoidType.class);
+        final Method init = call(nested, "<init>", "()V", voidType, List.of());
+        when(nested.methods()).thenReturn(List.of(init));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("new Nested()")).kind())
+            .isEqualTo(Planner.KindOfPlan.INVOKE);
+    }
+
+    /** Checks that a runtime class cannot make an argument applicable to a narrow parameter. */
+    @Test
+    void argumentApplicabilityUsesTheLocalDeclaration() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final ClassType string = type(vm, "java.lang.String", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final LocalVariable argument = mock(LocalVariable.class);
+        final ObjectReference value = mock(ObjectReference.class);
+        final ObjectReference self = mock(ObjectReference.class);
+        when(frame.thisObject()).thenReturn(self);
+        when(frame.visibleVariables()).thenReturn(List.of(argument));
+        when(frame.getValues(List.of(argument))).thenReturn(Map.of(argument, value));
+        when(argument.name()).thenReturn("argument");
+        when(argument.type()).thenReturn(object);
+        when(value.referenceType()).thenReturn(string);
+        final Method method = call(owner, "take", "(Ljava/lang/String;)Ljava/lang/String;", string, List.of(string));
+        when(owner.methods()).thenReturn(List.of(method));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("take(argument)")))
+            .isEqualTo(new Planner.Compile("inapplicable argument: take"));
+        verifyNoInteractions(value, self);
+    }
+
+    /** Access relaxation only contributes a name when Java membership finds none. */
+    @Test
+    void separatesPackageMembershipFromRelaxedAccess() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType base = type(vm, "foreign.Base", null);
+        final ClassType samePackage = type(vm, "foreign.Peer", null);
+        final ClassType owner = type(vm, "app.Example", null);
+        final IntegerType integer = mock(IntegerType.class);
+        final Method hidden = call(base, "select", "(I)I", integer, List.of(integer));
+        final Method ordinary = call(owner, "select", "()I", integer, List.of());
+        final Method privateOnly = call(base, "privateOnly", "()I", integer, List.of());
+        when(hidden.isPackagePrivate()).thenReturn(true);
+        when(privateOnly.isPrivate()).thenReturn(true);
+        when(owner.superclass()).thenReturn(base);
+        when(samePackage.superclass()).thenReturn(base);
+        when(owner.methods()).thenReturn(List.of(ordinary));
+        when(base.methods()).thenReturn(List.of(hidden, privateOnly));
+
+        final JdiTypes types = new JdiTypes(vm, owner, null);
+        assertThat(CallCandidates.named(types, owner, JdiTypes.of(owner, null), "select"))
+            .containsExactly(ordinary);
+        assertThat(CallCandidates.named(types, samePackage, JdiTypes.of(samePackage, null), "select"))
+            .containsExactly(hidden);
+        assertThat(CallCandidates.named(types, owner, JdiTypes.of(owner, null), "privateOnly"))
+            .containsExactly(privateOnly);
+    }
+
+    /** An enum can overload final methods whose JDK implementations ordinarily have read-only shortcuts. */
+    @Test
+    void appliesMembershipBeforeEnumIntrinsics() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType enumType = type(vm, "java.lang.Enum", null);
+        final ClassType owner = type(vm, "app.Option", null);
+        final ClassType string = type(vm, "java.lang.String", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final BooleanType bool = mock(BooleanType.class);
+        final Method equality = call(enumType, "equals", "(Ljava/lang/Object;)Z", bool, List.of(object));
+        final Method overload = call(owner, "equals", "(Ljava/lang/String;)Z", bool, List.of(string));
+        when(enumType.methods()).thenReturn(List.of(equality));
+        when(owner.methods()).thenReturn(List.of(overload));
+        when(owner.superclass()).thenReturn(enumType);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        when(frame.thisObject()).thenReturn(mock(ObjectReference.class));
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("this.equals(null)")))
+            .isEqualTo(new Planner.Compile("multiple candidates of the same arity: equals"));
+    }
+
+    /** A substituted generic override is one source signature even when the JVM also needs a bridge. */
+    @Test
+    void collapsesAGenericOverrideAndItsBridge() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType base = type(vm, "app.Base", null);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final ClassType string = type(vm, "java.lang.String", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        when(frame.thisObject()).thenReturn(mock(ObjectReference.class));
+        when(owner.superclass()).thenReturn(base);
+        when(owner.genericSignature()).thenReturn("Lapp/Base<Ljava/lang/String;>;");
+        when(base.genericSignature()).thenReturn("<T:Ljava/lang/Object;>Ljava/lang/Object;");
+        when(string.signature()).thenReturn("Ljava/lang/String;");
+        when(string.isInitialized()).thenReturn(true);
+        final Method intern = call(string, "intern", "()Ljava/lang/String;", string, List.of());
+        when(string.methodsByName("intern", "()Ljava/lang/String;")).thenReturn(List.of(intern));
+        final String erased = "(Ljava/lang/Object;)Ljava/lang/Object;";
+        final Method inherited = call(base, "take", erased, object, List.of(object));
+        when(inherited.genericSignature()).thenReturn("(TT;)TT;");
+        final Method bridge = call(owner, "take", erased, object, List.of(object));
+        when(bridge.isBridge()).thenReturn(true);
+        when(bridge.isSynthetic()).thenReturn(true);
+        final Method override = call(owner, "take", "(Ljava/lang/String;)Ljava/lang/String;", string, List.of(string));
+        when(owner.methods()).thenReturn(List.of(bridge, override));
+        when(base.methods()).thenReturn(List.of(inherited));
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("take(\"example\")")).kind())
+            .isEqualTo(Planner.KindOfPlan.INVOKE);
+    }
+
+    /** A generic return from an inherited declaration retains its substituted static type. */
+    @Test
+    void substitutesInheritedReceiverTypes() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType parent = type(vm, "app.Parent", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final ClassType item = type(vm, "app.Item", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final ObjectReference self = mock(ObjectReference.class);
+        when(frame.thisObject()).thenReturn(self);
+        when(owner.superclass()).thenReturn(parent);
+        when(owner.genericSignature()).thenReturn("Lapp/Parent<Lapp/Item;>;");
+        when(parent.genericSignature()).thenReturn("<E:Ljava/lang/Object;>Ljava/lang/Object;");
+        final Method method = call(parent, "head", "()Ljava/lang/Object;", object, List.of());
+        when(method.genericSignature()).thenReturn("()TE;");
+        when(parent.methods()).thenReturn(List.of(method));
+
+        final Field field = field(item, "number");
+        when(field.type()).thenReturn(item);
+        when(item.fields()).thenReturn(List.of(field));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("head().number")).kind())
+            .isEqualTo(Planner.KindOfPlan.INVOKE);
+        verifyNoInteractions(self);
+    }
+
+    /** An erased local refuses field hiding and method overloading even at different arities. */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+        entry.value | field hiding on an erased type
+        entry.take() | multiple method signatures on an erased receiver
+        """)
+    void refusesAmbiguousMembersOnAnErasedLocal(String source, String reason) throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType owner = type(vm, "app.Example", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final ClassType actual = type(vm, "app.Actual", null);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        final LocalVariable local = mock(LocalVariable.class);
+        final ObjectReference value = mock(ObjectReference.class);
+        when(frame.visibleVariables()).thenReturn(List.of(local));
+        when(frame.getValues(List.of(local))).thenReturn(Map.of(local, value));
+        when(local.name()).thenReturn("entry");
+        when(local.type()).thenReturn(object);
+        when(local.genericSignature()).thenReturn("TE;");
+        when(value.referenceType()).thenReturn(actual);
+        final Field inherited = field(object, "value");
+        final Field hidden = field(actual, "value");
+        final Method first = call(actual, "take", "()Ljava/lang/Object;", object, List.of());
+        final Method second = call(actual, "take", "(Ljava/lang/Object;)Ljava/lang/Object;", object, List.of(object));
+        when(actual.allFields()).thenReturn(List.of(inherited, hidden));
+        when(actual.methods()).thenReturn(List.of(first, second));
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse(source)))
+            .isInstanceOfSatisfying(Planner.Compile.class, fallback -> assertThat(fallback.reason()).startsWith(reason));
+    }
+
+    /** Model a declared method with resolved JDI types. */
+    private static Method call(ReferenceType owner, String name, String signature, Type result,
+                               List<Type> parameters) throws Exception {
+        final Method method = mock(Method.class);
+        when(method.name()).thenReturn(name);
+        when(method.signature()).thenReturn(signature);
+        when(method.declaringType()).thenReturn(owner);
+        when(method.argumentTypes()).thenReturn(parameters);
+        when(method.returnType()).thenReturn(result);
+        return method;
     }
 
     /** Constant-pool names can trigger fallback while qualified lookup keeps the loader visibility check. */

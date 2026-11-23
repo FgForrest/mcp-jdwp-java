@@ -14,7 +14,7 @@ JDI delivers every interesting target-VM event — breakpoint hits, steps, excep
 
 One thread, named `jdi-event-listener`, daemon, spawned by `JdiEventListener.start(vm)`. Exactly one runs at a time — `start()` calls `stop()` first so reconnects never overlap two listeners. `start()` also opens the connection's `SuspensionSession` (`BreakpointTracker.openSuspensionSession`, which closes the previous one), binds it to the `EvaluationGuard`, and starts its `SuspensionWatchdog` (§ 14).
 
-The listener only drains and routes. Processing an event set can invoke target code through compiled conditions and logpoint expressions, fast-probe arming (including a fast breakpoint’s capture), or classpath prewarm. A target method called this way can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. So the sets are processed on a second thread, `jdi-event-dispatcher` (a single-thread executor per connection, so they stay in arrival order and their evaluations stay serialized), while the listener keeps draining:
+The listener only drains and routes. Processing an event set can invoke target code through interpreted calls or compiled conditions and logpoint expressions, fast-probe arming (including a fast breakpoint’s capture), or classpath prewarm. A target method called this way can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. So the sets are processed on a second thread, `jdi-event-dispatcher` (a single-thread executor per connection, so they stay in arrival order and their evaluations stay serialized), while the listener keeps draining:
 
 - a `VMDeath` / `VMDisconnect` set is processed on the listener thread after the dispatcher has finished the sets before it (bounded at 2 s). First the in-target probes are read (`FastLogpointService.readBeforeExit`, field reads only) and the set is resumed — a `VMDeathRequest` with `SUSPEND_ALL`, kept while fast probes exist, holds the target at its exit until then — and the exiting hook snapshots what the exit takes with it (`JDIConnectionService.captureExit`, for the `[VM_DEATH]`, `jdwp_reset` and `jdwp_disconnect` replies). Then the session is closed, and the set gets no context. Sets still queued after that are dropped unprocessed, so `VM_DEATH` stays the last entry; a set already being processed — a long compile, say — finishes on the closed session, which drops its buffered history and publishes nothing (§ 3);
 - a set whose thread is inside an MCP-driven evaluation (it holds a lease, § 14) is **suppressed** on the listener thread at once (`suppress`): it is routed as a context and finished immediately. In between, each event is recorded as `*_SUPPRESSED` (a step's request is deleted too); a fast-logpoint arming hit is re-armed and a fast breakpoint's stop skipped instead; a class prepare still promotes its deferred breakpoints. With no stop candidate, `finish` releases the set, which lets the waiting invocation finish. This path never evaluates, arms or pre-warms — not even if the evaluation has ended by the time the set is handled — so the listener thread never calls into the target;
@@ -181,7 +181,7 @@ For each event type, the handler returns `true` (it wants a stop: its candidate 
 | | Logpoint | false | Evaluate, log, chain effect |
 | | Suspending | **true** | Candidate, history, chain effect |
 | `ClassPrepareEvent` | always | (never stops) | Promotion side effect only; the CPR's own `SUSPEND_EVENT_THREAD` policy parks the loading thread until `finish` releases the set |
-| `VMStartEvent` | always | **true** | `VM_START` candidate: the VM stays suspended so the agent can set up. Compiled evaluation needs a later stop (§ 14) |
+| `VMStartEvent` | always | **true** | `VM_START` candidate: the VM stays suspended so the agent can set up. Invoking evaluations need a later stop (§ 14) |
 | `VMDisconnect` / `VMDeath` | always | exits loop | Death set only, processed on the listener without a context; sets `running=false`, runs the death hook |
 
 Fast logpoints and fast breakpoints are decided by `FastLogpointService` (`handleArmingHit` → `STOPPED` / `RESUME`, `handleStopHit`) under the same candidate rules; see [breakpoints.md](breakpoints.md) § 5a and § 5c. Arming and removal never redefine a method a held thread is in (§ 5d).
@@ -194,7 +194,7 @@ A few things stand out from the matrix:
 
 ## 6. Conditional-breakpoint evaluation
 
-`evaluateConditionWithBindings` routes line, exception and field breakpoint conditions on the dispatcher. Navigation uses the frame held by the event set and takes no invocation lease. The watchdog samples dispatcher leases, so navigation leaves queued suspensions alone. Compiled conditions configure the compiler classpath and use the event's existing invocation admission.
+`evaluateConditionWithBindings` routes line, exception and field breakpoint conditions on the dispatcher. Navigation uses the frame held by the event set and takes no invocation lease. The watchdog samples dispatcher leases, so navigation leaves queued suspensions alone. An INVOKE condition snapshots the frame and acquires one lease anchored on the event set being processed. COMPILE conditions also use event invocation admission and configure the compiler classpath.
 
 - **Fail-safe.** A parser, planner, compilation, execution or result-type error records `CONDITION_ERROR` and treats the condition as true. A suspending breakpoint stops and a logpoint processes its log expression.
 - **Boolean results.** Both primitive `BooleanValue` and boxed `java.lang.Boolean` are accepted.
@@ -209,7 +209,7 @@ When a logpoint fires:
 
 1. Run the same reentrancy and tracking checks as a normal BP.
 2. If a condition is set, evaluate it. False → return false, no log, no chain.
-3. Route the log expression through `evaluateAndFormat`. Navigation reads the held frame and object values. Compilation configures the classpath and invokes on the event thread.
+3. Route the log expression through `evaluateAndFormat`. Navigation reads the held frame and object values. An INVOKE plan runs its calls under one dispatcher lease. A COMPILE plan configures the classpath and invokes on the event thread.
 4. Record `LOGPOINT` to event history with the formatted result.
 5. Apply chain effects.
 6. Return `false` → no candidate; unless another event of the set stops, `finish` releases the set.

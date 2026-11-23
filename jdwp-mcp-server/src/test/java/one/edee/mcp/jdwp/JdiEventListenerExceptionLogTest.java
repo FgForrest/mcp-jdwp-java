@@ -9,6 +9,7 @@ import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ExceptionRequest;
 import one.edee.mcp.jdwp.BreakpointTracker.ExceptionBreakpointSpec;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.AfterEach;
@@ -45,9 +46,9 @@ import static org.mockito.Mockito.when;
  * {@link JdiEventListenerEvaluationSuppressionTest} which covers the reentrancy-suppression path
  * and the default suspending path.
  *
- * <p>The {@link JdiExpressionEvaluator} is mocked so we can assert that the {@code $exception}
- * binding is forwarded with the thrown {@link ObjectReference}, and so we can simulate evaluation
- * failures without spinning up a target VM.
+ * <p>These tests use the compiler route with a mocked {@link JdiExpressionEvaluator}. They check
+ * that the {@code $exception} binding holds the thrown {@link ObjectReference} and exercise
+ * simulated evaluation failures without a target VM.
  */
 class JdiEventListenerExceptionLogTest {
 
@@ -57,13 +58,16 @@ class JdiEventListenerExceptionLogTest {
 	private JdiExpressionEvaluator evaluator;
 	private JdiEventListener listener;
 
+	/** Uses a compiler mock to exercise log and condition outcomes without live JDI metadata. */
 	@BeforeEach
 	void setUp() {
 		tracker = new BreakpointTracker();
 		eventHistory = new EventHistory();
 		evaluationGuard = new EvaluationGuard();
 		evaluator = mock(JdiExpressionEvaluator.class);
-		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null, new MarkedInstanceRegistry());
+		final EvaluationRouter router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+		listener = new JdiEventListener(tracker, eventHistory, evaluator, evaluationGuard, null,
+			new MarkedInstanceRegistry(), router);
 	}
 
 	@AfterEach
