@@ -101,11 +101,11 @@ Marks are cleared on VM death (`JDIConnectionService.java:411`), explicit discon
 
 `MarkedInstanceRegistry.buildBindings()` (`MarkedInstanceRegistry.java:191`) returns a `Map<String, Value>` keyed `"$" + label`. The "$" sigil is a constant at `marks/MarkedInstanceRegistry.java:43`. Entries whose underlying ObjectReference has been collected since the mark are silently skipped (line 190) but stay in the registry so `jdwp_overview` can still surface them with a "(collected)" hint.
 
-The evaluation, assertion and watcher tools pass these marks to the router. Ordinary conditions and logpoints merge in event bindings before routing. Navigation resolves a mark alongside frame locals, and the compiled wrapper receives marks as method parameters. Reserved names keep marks distinct from bindings such as `$exception` and `$oldValue`.
+The evaluation, assertion and watcher tools pass these marks to the router. Ordinary conditions and logpoints merge in event bindings before routing. The interpreter resolves a mark alongside frame locals, and the compiled wrapper receives marks as method parameters. Reserved names keep marks distinct from bindings such as `$exception` and `$oldValue`.
 
 ## 5. Wrapper bytecode in the target — the permanent allocation
 
-Navigation avoids creating a wrapper class. String literals and concatenation can create target String mirrors, which are pinned during evaluation and formatting and released afterwards.
+Interpreted reads and method calls use existing target classes. String literals and concatenation can create target String mirrors. The interpreter pins those strings, boxed arguments and returned objects through result formatting and releases its pins afterwards.
 
 > **Background — when is a Java class actually unloaded?**
 >
@@ -200,13 +200,11 @@ ArrayList, LinkedList, HashMap, LinkedHashMap, TreeMap, HashSet, LinkedHashSet, 
 
 There is **no recursive descent into entry values**. Each key and value goes through `formatFieldValue` (`JDIConnectionService.java:856-885`), which renders nested objects as `Object#N (typename)` and caches them. Drilling in is the agent's responsibility — call `jdwp_get_fields(N)` on the next turn. The depth control is "one level at a time, agent-driven", not a depth-limited recursion. The smart view also appends the raw internal fields of the collection (e.g. `size`, `modCount`, `loadFactor`) at lines 589-595 for completeness.
 
-## 9. Classpath discovery is transient
+## 9. Classpath loader and URL mirrors
 
-`ClasspathDiscoverer` walks the target's classloader hierarchy to find every JAR for ECJ to compile against. The walk uses `invokeMethod` (`URLClassLoader.getURLs()`, `ClassLoader.getParent()`, etc.) and returns ObjectReferences for each URL — but **none of them are routed through `cacheObject(...)`**. They never touch `formatFieldValue`, so they never land in the `objectCache`.
+`ClasspathDiscoverer` reads loader chains for the compiler. URL and collection mirrors are transient and bypass the object cache. The JDI implementation releases their corresponding JDWP IDs lazily.
 
-The references are held only for the duration of the discovery call and become eligible for GC on both sides once the local references go out of scope. The JDI implementation releases the corresponding JDWP IDs lazily.
-
-The result of discovery — the list of JAR paths as strings — **is** cached, in `JDIConnectionService.cachedClasspath` (`volatile List<String>`). That cache is invalidated on disconnect and on `notifyVmDied`, and is rebuilt the next time an expression evaluator needs to configure the compiler. See [expression-evaluation.md](expression-evaluation.md) § "Compilation classpath" for the discovery details.
+The connection retains the ordered classpath and successful loader reads. That state allows later compiles to add defining loaders and retry incomplete reads. Disconnect and VM death drop the loader mirrors and classpath. [Expression evaluation](expression-evaluation.md#classpathdiscoverer)
 
 ## 10. Memory summary
 

@@ -95,6 +95,7 @@ class SuspensionRaceBarrierTest {
 	@DisplayName("reservation, then the evaluation check, then lease entry")
 	class ReservationAndLeaseEntry {
 
+		/** Verifies that competing frame tools perform no reads while classpath setup is paused. */
 		@Test
 		@DisplayName("a tool's job still compiling holds no lease yet, but a frame tool refuses its thread before reading anything")
 		void compilingJobRefusesFrameTools() throws Exception {
@@ -121,7 +122,9 @@ class SuspensionRaceBarrierTest {
 				tools.jdwp_get_stack(id(t), null, null));
 
 			assertThat(replies).allSatisfy(reply -> assertThat(reply).startsWith("Error: an evaluation is running on thread t"));
-			verify(t.ref, never()).frame(anyInt());
+			// Only the compiling job has read a frame, to select its defining loader.
+			verify(t.ref).frame(anyInt());
+			verify(t.ref).frame(0);
 			verify(t.ref, never()).frames();
 
 			compiled.countDown();

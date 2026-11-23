@@ -398,7 +398,7 @@ public class LocalProjectClasspathProvider {
 
     /**
      * The event dispatcher reads a snapshot without waiting. When the client reports a different
-     * directory, an evaluation starts the replacement scan. Remote-only prewarming just reads.
+     * directory, an evaluation can start the replacement scan.
      */
     synchronized @Nullable Snapshot snapshotFor(@Nullable VirtualMachine vm, boolean start) {
         if (connectionScoped && (owner == null || owner != vm)) {
@@ -425,13 +425,12 @@ public class LocalProjectClasspathProvider {
      * Publishes compiler options on the dispatcher or an evaluation worker only while the
      * connection, directory, and any observed local result are current. Returns false to retry.
      */
-    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, boolean includeLocal,
-                                          Runnable publish) {
+    synchronized boolean publishIfCurrent(@Nullable VirtualMachine vm, Snapshot snapshot, Runnable publish) {
         if ((connectionScoped && (owner == null || owner != vm)) || discovery != snapshot.scan()) {
             return false;
         }
         final ProjectDirectory project = snapshot.project();
-        if (includeLocal && statusFor(project, discovery).breakdown() != snapshot.status().breakdown()) {
+        if (statusFor(project, discovery).breakdown() != snapshot.status().breakdown()) {
             return false;
         }
         final ClientWorkspace workspace = clientWorkspace;

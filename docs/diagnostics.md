@@ -27,6 +27,10 @@ This block answers "what process is the agent talking to?". Useful when a sessio
 
 When connected, an inline breakpoint-and-events sub-report is appended (`JDWPTools.java:1239-1241`, via `buildDiagnosticReport(false, null)` at line 1307+). That gives the agent the breakpoint registry state and the recent event timeline without having to fan out across multiple tool calls.
 
+### Remote classpath
+
+This block reports transient classpath discovery failures, unsupported URL layouts, and context getters pending for live threads. It groups matching class names and reasons with counts. A compiled tool evaluation can retry a pending getter only on its originating thread. Pending getters disappear after success, thread retirement, or teardown. Unsupported layout diagnostics stay for the connection. Diagnose reads the published discovery state and checks pending threads for retirement.
+
 ### Local project classpath
 
 This section shows the current project directory, whether the client reported it, the presence of a root `pom.xml`, and the state of `JDWP_EXTRA_CLASSPATH`. It reports progress while discovery runs and shows the per-source counts, total entries, and any Maven failure when it finishes. Output-read failures identify the affected per-run file and preserve entries from readable modules. If Maven exits successfully without creating any private output, the failure points to the dependency plugin's `outputFile` setting in the POM. When the project contains a literal `${env.JDWP_MCP_CLASSPATH_DIR}` directory, the failure instead identifies a launcher that dropped the environment and names the generated directory. On hosts where Maven cleanup uses descendant polling, the section warns that helper processes may outlive a cancelled or timed-out run, even if there is no current root POM. A torn-down connection no longer reports a scan in progress. Diagnose reads the available snapshot immediately.
@@ -38,7 +42,7 @@ This section shows the current project directory, whether the client reported it
 The discovery sources are covered in § 2; the port-reachability classification is in § 3.
 
 
-The expression evaluation line shows counts of ordinary interpreted and compiled evaluations since the server started, the selected `JDWP_EVAL_ENGINE` mode, and up to five reasons expressions needed compilation.
+The expression evaluation line shows counts of compiled evaluations and interpreted evaluations with or without target calls since the server started, the selected `JDWP_EVAL_ENGINE` mode, and up to five reasons expressions needed compilation.
 
 ## 2. JVM discovery — Attach API + `/proc`
 

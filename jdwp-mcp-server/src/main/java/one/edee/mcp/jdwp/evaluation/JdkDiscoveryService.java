@@ -1,6 +1,9 @@
 package one.edee.mcp.jdwp.evaluation;
 
-import com.sun.jdi.*;
+import com.sun.jdi.Field;
+import com.sun.jdi.ReferenceType;
+import com.sun.jdi.StringReference;
+import com.sun.jdi.VirtualMachine;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,12 +22,12 @@ import java.util.stream.Stream;
  * {@code java.*} system classes when compiling expression-evaluator wrapper classes; without this
  * discovery the compiler can't produce bytecode for the target.
  * <p>
- * One-shot, stateful helper: holds {@link #targetMajorVersion} after a successful
- * {@link #discoverMatchingJdk} so callers can read it without re-running discovery. NOT a Spring
- * bean — instantiated manually by {@link ClasspathDiscoverer} per discovery call.
+ * {@link ClasspathDiscoverer} uses this helper when starting a classpath walk without a prior
+ * snapshot. On success it captures {@link #targetMajorVersion} alongside the local JDK path for
+ * use by subsequent walks.
  * <p>
  * Search strategy (in order):
- * 1. The target JVM's own {@code java.home} if accessible from the MCP server's filesystem.
+ * 1. The target JVM's startup {@code java.home} if readable through JDI and accessible locally.
  * 2. The {@code JAVA_HOME} environment variable, but only when its {@code <jdkHome>/release} file
  * confirms a matching major version (a mismatched JAVA_HOME would later trigger cryptic JDT class-file
  * errors).
@@ -42,13 +45,14 @@ public class JdkDiscoveryService {
      */
     private int targetMajorVersion;
 
+    /** Binds version and startup-home discovery to the target VM. */
     public JdkDiscoveryService(VirtualMachine vm) {
         this.vm = vm;
     }
 
     /**
-     * Parses both the legacy `1.8.x` scheme (returns 8) and the modern `<major>.x.x` scheme
-     * (returns the first dot-separated integer). Returns 0 on parse failure.
+     * Parses legacy 1.8 versions and modern version strings, including early-access builds.
+     * Returns 0 on parse failure.
      */
     private static int extractMajorVersion(String version) {
         // Handle both "1.8.0_xxx" (Java 8) and "11.0.21" (Java 9+) formats
@@ -56,8 +60,7 @@ public class JdkDiscoveryService {
             return 8;
         }
 
-        // For Java 9+, major version is the first number
-        final String[] parts = version.split("\\.", -1);
+        final String[] parts = version.split("[.\\-+]", 2);
         try {
             return Integer.parseInt(parts[0]);
         } catch (NumberFormatException e) {
@@ -71,9 +74,9 @@ public class JdkDiscoveryService {
      * found, or `null` if every strategy fails (the caller throws {@link JdkNotFoundException}).
      */
     @Nullable
-    private static String findLocalJdk(int majorVersion, String targetHome) {
+    private static String findLocalJdk(int majorVersion, @Nullable String targetHome) {
         // Strategy 1: Check if target JVM's java.home is accessible locally
-        if (isValidJdkHome(targetHome)) {
+        if (targetHome != null && isValidJdkHome(targetHome)) {
             log.debug("[JDK Discovery] Target JVM home is accessible locally: {}", targetHome);
             return targetHome;
         }
@@ -288,18 +291,15 @@ public class JdkDiscoveryService {
      * Runs the search strategy and returns the absolute path of a JDK home directory matching the
      * target JVM. Side effect: populates {@link #targetMajorVersion}. The thrown
      * {@link JdkNotFoundException} carries a user-actionable error message listing the common
-     * installation paths the search probed.
+     * installation paths the search probed. Version and home detection use debugger reads.
      *
-     * @param suspendedThread thread suspended at a breakpoint or step (used to invoke
-     *                        `System.getProperty` in the target VM)
      * @return path to the local JDK home directory
      * @throws JdkNotFoundException if no matching JDK is found anywhere on the search path
      */
-    public String discoverMatchingJdk(ThreadReference suspendedThread) throws JdkNotFoundException {
+    public String discoverMatchingJdk() throws JdkNotFoundException {
         try {
-            // 1. Get target JVM version
-            final String targetVersion = getTargetJavaVersion(suspendedThread);
-            final String targetHome = getTargetJavaHome(suspendedThread);
+            final String targetVersion = vm.version();
+            final String targetHome = readTargetJavaHome();
 
             log.info("[JDK Discovery] Target JVM: Java {} at {}", targetVersion, targetHome);
 
@@ -353,41 +353,23 @@ public class JdkDiscoveryService {
     }
 
     /**
-     * Invokes `System.getProperty("java.version")` in the target VM.
+     * Reads the JDK's saved startup home when present. Older or non-HotSpot targets can
+     * still use the local search based on the JDWP version.
      */
-    private String getTargetJavaVersion(ThreadReference suspendedThread) throws Exception {
-        return getSystemProperty(suspendedThread, "java.version");
-    }
-
-    /**
-     * Invokes `System.getProperty("java.home")` in the target VM.
-     */
-    private String getTargetJavaHome(ThreadReference suspendedThread) throws Exception {
-        return getSystemProperty(suspendedThread, "java.home");
-    }
-
-    /**
-     * Invokes {@code System.getProperty(name)} in the target VM via JDI and returns the string value.
-     */
-    private String getSystemProperty(ThreadReference suspendedThread, String propertyName) throws Exception {
-        final ClassType systemClass = (ClassType) vm.classesByName("java.lang.System").get(0);
-        final Method getPropertyMethod = systemClass.methodsByName("getProperty", "(Ljava/lang/String;)Ljava/lang/String;").get(0);
-        final Value result;
-        try (PinnedMirrors pins = new PinnedMirrors()) {
-            final StringReference nameArg = pins.string(vm, propertyName);
-            result = systemClass.invokeMethod(
-                suspendedThread,
-                getPropertyMethod,
-                Collections.singletonList(nameArg),
-                ClassType.INVOKE_SINGLE_THREADED
-            );
+    private @Nullable String readTargetJavaHome() {
+        try {
+            final List<ReferenceType> types = vm.classesByName("jdk.internal.util.StaticProperty");
+            if (!types.isEmpty()) {
+                final ReferenceType properties = types.get(0);
+                final Field javaHome = properties.fieldByName("JAVA_HOME");
+                if (javaHome != null && properties.getValue(javaHome) instanceof StringReference home) {
+                    return home.value();
+                }
+            }
+        } catch (RuntimeException e) {
+            log.debug("[JDK Discovery] Could not read target java.home: {}", e.getMessage());
         }
-
-        if (!(result instanceof StringReference sr)) {
-            throw new IllegalStateException(
-                "System.getProperty(\"" + propertyName + "\") returned null — property not set in the target VM");
-        }
-        return sr.value();
+        return null;
     }
 
     /**

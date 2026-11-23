@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.LongAdder;
 /** Front door for ordinary evaluation. Fast probes depend on the compiled evaluator directly. */
 @Service
 public final class EvaluationRouter {
-    /** Engine selection: interpret what can be navigated and compile the rest, always compile, or never compile. */
+    /** Engine selection: interpret supported expressions and compile the rest, always compile, or never compile. */
     public enum Mode { AUTO, COMPILER, INTERPRETER }
 
     /**
@@ -34,17 +34,17 @@ public final class EvaluationRouter {
         @Nullable StackFrame read() throws Exception;
     }
 
-    /** Signals that the read-only interpreter cannot evaluate the expression and the compiler must. */
-    public static final class NeedsCompiler extends Exception {
+    /** Signals that the tool must leave the frame reservation and take the invocation path. */
+    public static final class NeedsInvocation extends Exception {
         /** Serialization version of this exception. */
         @Serial
         private static final long serialVersionUID = 1L;
 
-        /** Why the interpreter declined the expression. */
-        private final String reason;
+        /** Compiler fallback reason, or null for an interpreted invocation. */
+        private final @Nullable String reason;
 
         /** Creates the signal without a stack trace; it is control flow, not a failure. */
-        NeedsCompiler(String reason) {
+        NeedsInvocation(@Nullable String reason) {
             super(reason, null, false, false);
             this.reason = reason;
         }
@@ -52,12 +52,14 @@ public final class EvaluationRouter {
 
     /** How many times planning re-reads a frame that was invalidated while it was being planned. */
     private static final int FRAME_READ_ATTEMPTS = 3;
-    /** Compiling evaluator used for everything the interpreter cannot navigate. */
+    /** Evaluator for expressions routed to compilation. */
     private final JdiExpressionEvaluator compiler;
     /** Selected engine mode. */
     private final Mode mode;
-    /** Number of expressions that were interpreted. */
+    /** Number of interpreted evaluations that executed no target call. */
     private final LongAdder navigated = new LongAdder();
+    /** Number of interpreted evaluations that executed at least one target call. */
+    private final LongAdder invoked = new LongAdder();
     /** Number of expressions that fell through to the compiler. */
     private final LongAdder compiled = new LongAdder();
     /** Counts of fallback reasons, grouped by category. */
@@ -100,7 +102,7 @@ public final class EvaluationRouter {
     }
 
     /**
-     * Plans the evaluation; with {@code retry} a frame invalidated during planning is re-read from the anchored location.
+     * Plans an expression or block; with {@code retry} an invalidated frame is re-read from the anchored location.
      */
     private Planner.Plan prepare(Input input, ThreadReference thread, FrameSource frames,
                                  Map<String, Value> bindings, boolean retry) throws Exception {
@@ -110,7 +112,7 @@ public final class EvaluationRouter {
         }
         final Planner.Plan syntax = SyntaxShape.routing(parsed);
         if (syntax != null) {
-            return effective(syntax);
+            return syntax;
         }
         final VirtualMachine vm = thread.virtualMachine();
         @Nullable Location anchor = null;
@@ -126,8 +128,7 @@ public final class EvaluationRouter {
                 if (retry) {
                     anchor = location;
                 }
-                return effective(Planner.navigation(vm, frame, location, bindings,
-                    Objects.requireNonNull(parsed.expression())));
+                return Planner.bind(vm, frame, location, bindings, parsed);
             } catch (InvalidStackFrameException invalidated) {
                 if (!retry || attempt == FRAME_READ_ATTEMPTS) {
                     throw invalidated;
@@ -137,22 +138,20 @@ public final class EvaluationRouter {
         }
     }
 
-    /** INVOKE plans use the compiler in phase 1. */
-    public static Planner.Plan effective(Planner.Plan plan) {
-        return plan instanceof Planner.Invoke invoke ? new Planner.Compile(invoke.reason()) : plan;
-    }
-
-    /** Fails with {@link NeedsCompiler} when the compiler is forced, so a read-only tool refuses early. */
-    public void requireReadOnlyMode() throws NeedsCompiler {
+    /** Fails with {@link NeedsInvocation} when the compiler is forced, so a read-only tool refuses early. */
+    public void requireReadOnlyMode() throws NeedsInvocation {
         if (mode == Mode.COMPILER) {
-            throw new NeedsCompiler("compiler selected");
+            throw new NeedsInvocation("compiler selected");
         }
     }
 
-    /** Fails with {@link NeedsCompiler} when the plan needs the compiler and the interpreter is not forced. */
-    public void requireReadOnly(Planner.Plan plan) throws NeedsCompiler {
+    /** Signals that an interpreted call or a compiler fallback needs the invocation runner. */
+    public void requireReadOnly(Planner.Plan plan) throws NeedsInvocation {
+        if (plan instanceof Planner.Invoke) {
+            throw new NeedsInvocation(null);
+        }
         if (mode != Mode.INTERPRETER && plan instanceof Planner.Compile fallback) {
-            throw new NeedsCompiler(fallback.reason());
+            throw new NeedsInvocation(fallback.reason());
         }
     }
 
@@ -167,7 +166,7 @@ public final class EvaluationRouter {
             try {
                 return Interpreter.execute(navigation, result);
             } catch (Planner.Refusal e) {
-                return readOnly(effective(e.plan), result);
+                return readOnly(e.plan, result);
             } catch (ClassNotPreparedException | ObjectCollectedException e) {
                 return readOnly(new Planner.Compile(e instanceof ObjectCollectedException
                     ? "object was collected" : "type is not prepared"), result);
@@ -185,100 +184,129 @@ public final class EvaluationRouter {
         return new ToolJob(thread, requireOriginalStop);
     }
 
-    /** Re-plans on the invocation worker and configures classpath on its first compiled expression. */
+    /** Re-plans on the invocation worker and checks the classpath of each compiled frame. */
     public final class ToolJob {
         /** Thread the tool call evaluates on. */
         private final ThreadReference thread;
         /** Check that the thread is still at the stop the call started from. */
         private final Runnable requireOriginalStop;
-        /** Whether the compiler classpath was already configured for this job. */
-        private boolean configured;
-
         /** Created by {@link #toolJob}. */
         private ToolJob(ThreadReference thread, Runnable requireOriginalStop) {
             this.thread = thread;
             this.requireOriginalStop = requireOriginalStop;
         }
 
-        /** Plans and runs the input, falling back to the compiler when the interpreter cannot handle it. */
+        /** Replans the input on the invocation worker and evaluates it through the selected engine. */
         public <T> T evaluate(Input input, FrameSource frames, Map<String, Value> bindings,
                               Interpreter.Result<T> result) throws Exception {
             final Planner.Plan plan = prepare(input, thread, frames, bindings, true);
             if (plan instanceof Planner.Navigate) {
                 requireOriginalStop.run();
             }
-            return run(input, frames, bindings, plan, this::configure, result);
+            return run(input, thread, frames, bindings, plan, this::configure, result);
         }
 
-        /** Configures the compiler classpath once per job. */
-        private void configure() throws JdiEvaluationException {
-            if (!configured) {
+        /** Verifies the original stop and configures the classpath for the selected loader. */
+        private void configure(@Nullable ClassLoaderReference loader) throws JdiEvaluationException {
+            requireOriginalStop.run();
+            if (loader == null) {
                 compiler.configureCompilerClasspath(thread);
-                configured = true;
+            } else {
+                compiler.configureCompilerClasspath(thread, loader);
             }
         }
     }
 
-    /** Evaluate while the dispatcher owns the event set. Only the compiled path can take a lease. */
+    /** Evaluates while the dispatcher owns the event set that anchors any invocation lease. */
     public <T> T evaluateEvent(String expression, ThreadReference thread, Map<String, Value> bindings,
                                Interpreter.Result<T> result) throws Exception {
         final Input input = parse(expression);
         final FrameSource frames = () -> thread.frame(0);
         final Planner.Plan plan = prepare(input, thread, frames, bindings, true);
-        return run(input, frames, bindings, plan, () -> compiler.configureCompilerClasspathForEvent(thread), result);
+        return run(input, thread, frames, bindings, plan, loader -> {
+            if (loader == null) {
+                compiler.configureCompilerClasspathForEvent(thread);
+            } else {
+                compiler.configureCompilerClasspathForEvent(thread, loader);
+            }
+        }, result);
     }
 
     /** Compiler classpath setup step that differs between tool calls and dispatcher events. */
     @FunctionalInterface
     private interface ConfigureClasspath {
-        /** Configures the compiler classpath. */
-        void run() throws JdiEvaluationException;
+        /** Configures the classpath with the selected frame's defining loader. */
+        void run(@Nullable ClassLoaderReference loader) throws JdiEvaluationException;
     }
 
     /**
-     * Runs the plan with the interpreter and falls back to the compiler, attaching the fallback reason to compiler failures.
+     * Runs the selected engine and includes the interpreter's refusal reason when fallback compilation fails.
      */
-    private <T> T run(Input input, FrameSource frames, Map<String, Value> bindings, Planner.Plan plan,
+    private <T> T run(Input input, ThreadReference thread, FrameSource frames, Map<String, Value> bindings, Planner.Plan plan,
                       ConfigureClasspath configure, Interpreter.Result<T> result) throws Exception {
+        if (plan instanceof Planner.Invoke invocation) {
+            // Keep invocation failures outside the compiler fallback path to avoid replaying target calls.
+            return Interpreter.execute(invocation, thread, compiler, this::recordInvocation, result);
+        }
         try {
             return readOnly(plan, result);
-        } catch (NeedsCompiler needs) {
+        } catch (NeedsInvocation needs) {
+            final String reason = Objects.requireNonNull(needs.reason);
             if (mode != Mode.COMPILER) {
-                recordReason(needs.reason);
+                recordReason(reason);
             }
             compiled.increment();
             final @Nullable Value value;
             try {
-                configure.run();
-                final StackFrame frame = frames.read();
-                if (frame == null) {
-                    throw new JdiEvaluationException("No stack frame is available for compilation");
-                }
-                value = compiler.evaluate(frame, input.source(), bindings);
+                final StackFrame frame = requireCompilationFrame(frames);
+                final Location location = frame.location();
+                final ReferenceType type = location == null ? null : location.declaringType();
+                configure.run(type == null ? null : type.classLoader());
+                // The optional classpath accessors can resume the thread and invalidate the frame.
+                value = compiler.evaluate(requireCompilationFrame(frames), input.source(), bindings);
             } catch (Exception failure) {
                 if (mode == Mode.COMPILER || failure instanceof InterruptedException) {
                     throw failure;
                 }
                 final String message = failure.getMessage();
                 throw new JdiEvaluationException(withReason(
-                    message == null ? failure.getClass().getSimpleName() : message, needs), failure);
+                    message == null ? failure.getClass().getSimpleName() : message, reason), failure);
             }
             return result.accept(value);
         }
     }
 
+    /** Requires an available frame before selecting a loader or compiling the expression. */
+    private static StackFrame requireCompilationFrame(FrameSource frames) throws Exception {
+        final StackFrame frame = frames.read();
+        if (frame == null) {
+            throw new JdiEvaluationException("No stack frame is available for compilation");
+        }
+        return frame;
+    }
+
     /** Attach the reason when the tool's invocation guard refused a fallback before it ran. */
-    public String refused(String message, NeedsCompiler need) {
-        if (mode == Mode.COMPILER) {
+    public String refused(String message, NeedsInvocation need) {
+        final String reason = need.reason;
+        if (mode == Mode.COMPILER || reason == null) {
             return message;
         }
-        recordReason(need.reason);
-        return withReason(message, need);
+        recordReason(reason);
+        return withReason(message, reason);
     }
 
     /** Appends the reason the interpreter declined to a message. */
-    private static String withReason(String message, NeedsCompiler need) {
-        return message + "\nnot interpreted: " + need.reason;
+    private static String withReason(String message, String reason) {
+        return message + "\nnot interpreted: " + reason;
+    }
+
+    /** Records whether execution reached a call, even when the plan was conditional. */
+    private void recordInvocation(int calls) {
+        if (calls == 0) {
+            navigated.increment();
+        } else {
+            invoked.increment();
+        }
     }
 
     /** Counts a fallback under its category. */
@@ -291,8 +319,10 @@ public final class EvaluationRouter {
 
     /** Summarizes how many expressions were interpreted or compiled and the five most common fallback reasons. */
     public String diagnostics() {
-        final StringBuilder out = new StringBuilder("Expression evaluation: interpreted %d, compiled %d (mode %s)%n"
-            .formatted(navigated.sum(), compiled.sum(), mode.name().toLowerCase(Locale.ROOT)));
+        final StringBuilder out = new StringBuilder(
+            "Expression evaluation: interpreted %d, compiled %d (mode %s), with invocations %d, without invocations %d%n"
+                .formatted(navigated.sum() + invoked.sum(), compiled.sum(), mode.name().toLowerCase(Locale.ROOT),
+                    invoked.sum(), navigated.sum()));
         reasons.entrySet().stream()
             .sorted(Comparator.<Map.Entry<String, LongAdder>>comparingLong(e -> e.getValue().sum()).reversed()
                 .thenComparing(Map.Entry::getKey))

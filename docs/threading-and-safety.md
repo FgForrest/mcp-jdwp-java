@@ -11,7 +11,7 @@ Every concurrency decision in the code orbits these actors.
 | **Spring `main`** | `JDWPMcpServerApplication.main` | Boots the context, then idles. No HTTP listener (`spring.main.web-application-type=none`). |
 | **MCP STDIO worker** | `MultiVersionStdioServerTransportProvider` (Spring AI MCP) | Reads JSON-RPC frames from `System.in`, dispatches to `@McpTool` methods one at a time, writes responses to `System.out`. |
 | **`jdi-event-listener`** | Spawned by `JdiEventListener.start(vm)` on every `connect()` | Daemon. Drains `vm.eventQueue().remove()` and routes event sets. Exactly one at a time — `start()` calls `stop()` first. Never calls into the target itself. |
-| **`jdi-event-dispatcher`** | Single-thread executor created by `JdiEventListener.start(vm)`, shut down by `stop()` | Daemon. Processes the routed event sets in arrival order — handlers, logpoint and condition evaluation, fast-logpoint arming, remote classpath pre-warm — and ends each with `SuspensionSession.finish`: publish a stop, or release the set. |
+| **`jdi-event-dispatcher`** | Single-thread executor created by `JdiEventListener.start(vm)`, shut down by `stop()` | Daemon. Processes the routed event sets in arrival order — handlers, logpoint and condition evaluation, and fast-probe arming — and ends each with `SuspensionSession.finish`: publish a stop, or release the set. |
 | **`jdi-local-classpath`** | One daemon thread per discovery | Resolves the environment override, scans the project, and runs Maven when the root has a `pom.xml`. Teardown interrupts the old scan. A replacement has its own worker and private Maven output directory. The dispatcher checks for a ready result at publication and after a remote-only missing-type error. After an ECJ retry it checks that the result still belongs to the current workspace. Tool evaluations can wait outside the compiler and suspension-session monitors. |
 | **`jdi-suspension-watchdog`** | `SuspensionWatchdog.start(session)`, called by `JdiEventListener.start(vm)` | Daemon, one per session. Every 500 ms samples the dispatcher's invocations and frees the owner of a monitor a stuck one waits for ([event-pipeline.md](event-pipeline.md) § 14). Stops once its session is closed. |
 | **`jdi-invoker-N`** | `InvocationRunner.newPool()`, a cached pool `JDWPTools` creates | Daemon, created on demand. Runs a tool's invoking work — an evaluation, `toString()`, force-loading a class — while the MCP worker waits at most 20 s (§ 5). A hung job pins its thread until the connection ends. |
@@ -44,7 +44,7 @@ Beyond those, the codebase uses targeted lock-free primitives where the hot path
 - **`ConcurrentHashMap`** — `JDIConnectionService.objectCache`, every map on `BreakpointTracker`, `EvaluationGuard.holds` and `depthByThreadId`, `InvocationRunner.running` (the job per target thread).
 - **`ConcurrentLinkedDeque`** — `EventHistory.events`. Producers are the listener, the session (on the dispatcher and the watchdog), invoker threads and tool methods; consumers are MCP tool methods (`getRecent`). Non-blocking on both sides. `getRecent` returns a detached copy so iteration is safe.
 - **`synchronized` mutators on `BreakpointTracker`** — operations that mutate several maps at once must be atomic so the dispatcher cannot read a half-written state: `registerPendingBreakpoint`, promotion, `clearAll`, `reset`; `tryPromotePending` re-acquires the monitor for its recheck-and-mutate section. The next-event latch pair (`armNextEventLatch` / `fireNextEvent`) is still there, but no production tool waits on it any more — `jdwp_resume_until_event` waits on the session (§ 7).
-- **`volatile`** — `JDIConnectionService.cachedClasspath`, `discoveredJdkPath`, `targetMajorVersion`, `lastConnectAttempt`, `lastConnectError`; `BreakpointTracker.lastBreakpoint`, `suspensionSession`; `JdiEventListener.listenerThread`, `running`, `dispatcher`, `session`, `watchdog`, `vmDeathHook`; `EvaluationGuard.session`. Each marks a single reference that one thread writes and others read without locking.
+- **`volatile`** — `JDIConnectionService.classpathDiscovery`, `discoveredJdkPath`, `targetMajorVersion`, `lastConnectAttempt`, `lastConnectError`; `BreakpointTracker.lastBreakpoint`, `suspensionSession`; `JdiEventListener.listenerThread`, `running`, `dispatcher`, `session`, `watchdog`, `vmDeathHook`; `EvaluationGuard.session`. Each marks a single reference that one thread writes and others read without locking.
 - **Thread-local** — `SuspensionSession`'s processing marker: on the thread that processes a set, the tracker's snapshot becomes the set's stop candidate and `EventHistory.record` buffers into the set ([event-pipeline.md](event-pipeline.md) § 3).
 - **`AtomicInteger`** for synthetic breakpoint IDs (`BreakpointTracker.idCounter`) and for an invoker job's state, whose compare-and-set settles the job's completion against its caller's timeout. **`AtomicBoolean`** for the one-shot VM-death-hook gate (`JdiEventListener.vmDeathHookInvoked`).
 
@@ -71,15 +71,16 @@ Without `INVOKE_SINGLE_THREADED`, JDI would resume **all** threads in the target
 
 A single-threaded invocation borrows exactly one of the thread's suspensions: the JDWP agent resumes the thread once to run it and suspends it once when it completes. The thread runs only if that count was its last one.
 
-Navigation evaluation uses JDI reads on a suspended thread and leaves its suspend count alone. It can read a manual hold, another thread's stop-all bystander, and a suspended thread in MONITOR or WAIT. The three ordinary evaluation tools use the same reservation and frame retry as the other frame tools. A plan that needs compilation leaves the reservation before entering invocation admission.
+Navigation evaluation uses JDI reads on a suspended thread and leaves its suspend count alone. It can read a manual hold, another thread's stop-all bystander, and a suspended thread in MONITOR or WAIT. The three ordinary evaluation tools use the same reservation and frame retry as the other frame tools. An INVOKE or COMPILE plan leaves the reservation before entering invocation admission. The invocation job reads a fresh frame and checks the plan again.
 
 Before an invocation, cheap checks reject an obviously unusable thread: the evaluation tools refuse a thread that is not suspended or is blocked on a monitor or in `Object.wait()` (`checkSafeToInvoke`), and `JDIConnectionService.isUsableForInvoke` (suspended, with frames) picks a thread for force-loading. The deciding check is the session's admission when the lease is taken (§ 5): the thread must be stopped at an event of its own that a tool has presented. A bystander of another thread's stop-all, a `jdwp_suspend_thread` hold or a VM-start stop is refused with a reason instead of an `IncompatibleThreadStateException`.
 
 Use sites:
 
+- `Interpreter` — method and constructor calls in an INVOKE plan.
 - `JdiExpressionEvaluator.systemClassLoader` — the `getSystemClassLoader()` fallback.
 - `RemoteCodeExecutor` — the wrapper method invoke, `ClassLoader.defineClass`, `Class.forName`.
-- `ClasspathDiscoverer` and `JdkDiscoveryService` — `System.getProperty`, the classloader walk.
+- `ClasspathDiscoverer` — an overridden context-loader getter or public `URLClassLoader.getURLs()` during compiler setup.
 - `JDIConnectionService.findOrForceLoadClass` — `Class.forName`.
 - `JDWPTools.jdwp_to_string` — `Object.toString`.
 - `FastLogpointService` — reading the class file (`getResourceAsStream`, `read`, `close`).
@@ -105,7 +106,7 @@ This is the most subtle correctness mechanism in the codebase. Read `EvaluationG
 
 ### The problem
 
-The compiled evaluator calls `invokeMethod` on a suspended target-VM thread T. While the expression runs, T executes user bytecode that may re-enter the line that the agent originally breakpointed. JDWP delivers the resulting `BreakpointEvent` to the server's event queue. If the pipeline followed its normal path, it would publish a stop and keep T suspended — but T is **exactly the thread** the outer `invokeMethod` is waiting on. Cross-thread deadlock.
+An invoking evaluation calls `invokeMethod` on a suspended target-VM thread T. While the expression runs, T executes user bytecode that may re-enter the line that the agent originally breakpointed. JDWP delivers the resulting `BreakpointEvent` to the server's event queue. If the pipeline followed its normal path, it would publish a stop and keep T suspended — but T is **exactly the thread** the outer `invokeMethod` is waiting on. Cross-thread deadlock.
 
 The borrowed count (§ 4) adds two more problems. If another thread's stop-all also holds T, the borrowed count is not T's last one and the invocation never runs. And if a tool releases the stop the invocation borrows from while it runs, that release must not be lost or spend the wrong count.
 
@@ -121,7 +122,7 @@ try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
 
 `EvaluationGuard` keeps one **hold** per target thread, keyed by `uniqueID()`: the Java thread running the invocation chain, and the session that admitted it.
 
-- **Same chain re-enters.** `lease(T)` from the Java thread that already holds T returns a nested lease that ends nothing — classpath discovery inside an evaluation, say.
+- **Same chain re-enters.** `lease(T)` from the Java thread that already holds T returns a nested lease that ends nothing when compiler setup runs inside an invocation chain.
 - **Other chains are refused.** `lease(T)` from any other Java thread throws `EvaluationRefusedException` ("an evaluation on thread T is already running"). The JDWP agent runs one invocation per thread, and a second chain would spend the suspension the first one borrows. The hold is taken with `putIfAbsent`, so two racing chains cannot both win.
 - **Admission.** The outermost lease is also taken in the bound session: `SuspensionSession.lease(T)` admits the invocation or refuses it with a reason, checks T's suspend count against the holds it knows, and takes T out of every other stop that suspends it ([event-pipeline.md](event-pipeline.md) § 14, "Leases and admission"). A refusal removes the hold again.
 - **End.** Closing the outermost lease calls `SuspensionSession.unlease(T)` first — T's own events stay suppressed meanwhile — and then removes the hold by identity, so a hold of an earlier connection never removes one of the current connection. A failed suspend can use a remaining lease debt count to restore the hold. A failed debt repayment leaves the count available for retry and wakes next-stop waiters.
@@ -132,7 +133,8 @@ The listener checks `isEvaluating` before it routes a set (`fromEvaluatingThread
 
 Lease sites:
 
-- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and around classpath discovery in `configureCompilerClasspath`.
+- `Interpreter` — one lease for the expression or block after the frame snapshot.
+- `JdiExpressionEvaluator` — around the remote execution (with the `getSystemClassLoader` fallback), and in `ClasspathDiscoverer` around optional context and URL accessor calls.
 - `FastLogpointService` — the arming, once around reading the class file and once around defining the probe.
 - `JDIConnectionService.findOrForceLoadClass` — around `Class.forName`.
 - `JDWPTools.jdwp_to_string` — around `toString()`.
@@ -151,10 +153,12 @@ So the lease captures the `long` once, when it is taken and the thread is provab
 
 ```
 1. Agent: jdwp_evaluate_expression(threadId=T, expression="this.compute(3)")
-   The MCP worker hands the job to InvocationRunner and waits ≤ 20 s.
+   With the compiler selected, the MCP worker hands the job to
+   InvocationRunner and waits ≤ 20 s.
 
-2. On jdi-invoker-N: configureCompilerClasspath (its own lease), the
-   frame read (locals, this, class loader), the wrapper compile.
+2. On jdi-invoker-N: read the selected frame's defining loader, then run
+   configureCompilerClasspath. An optional accessor takes its own lease.
+   Read the frame again for locals and this, then compile the wrapper.
 
 3. evaluationGuard.lease(T): hold {chain = jdi-invoker-N, session}.
    SuspensionSession.lease(T) admits — T is stopped at its own presented
@@ -182,11 +186,11 @@ So the lease captures the `long` once, when it is taken and the thread is provab
 
 No lock is held across `invokeMethod`: the guard's maps are lock-free, and the session monitor is held only inside `lease` and `unlease`, not across the call. T is never re-suspended by the pipeline while the server is waiting on it. The same mechanism covers nested `Class.forName`, `toString`, `getSystemClassLoader`, and step events fired during evaluation.
 
-Ordinary conditions and logpoint expressions, fast-probe arming and classpath prewarm run on the `jdi-event-dispatcher` thread. A navigation plan uses the frame held by the event set and takes no lease. A compiled plan can block the dispatcher at step 4 while the listener keeps draining. Step 6 still needs a free listener: it takes T's new event set off the queue, sees that T is evaluating, and handles that set itself instead of queueing it behind the dispatcher, which is the thread waiting for T. A dispatcher invocation borrows the count of the set being processed; it does not go through `InvocationRunner`, and the `SuspensionWatchdog` watches it instead ([event-pipeline.md](event-pipeline.md) § 14).
+Ordinary conditions, logpoint expressions and fast-probe arming run on the `jdi-event-dispatcher` thread. A navigation plan uses the frame held by the event set and takes no lease, including for read-only statement blocks. An INVOKE plan snapshots the frame and takes one lease for the expression or block. When an evaluation needs compilation, the dispatcher configures the classpath using the selected frame's defining loader and reads the frame again before evaluating. An interpreted or compiled invocation can block the dispatcher at step 4. The listener keeps draining, recognizes that T is evaluating, and handles T's new event set itself. A dispatcher invocation borrows the suspension count of the set being processed, with the `SuspensionWatchdog` monitoring the invocation. See [event-pipeline.md](event-pipeline.md) § 14.
 
 ### Bounded waits — `InvocationRunner`
 
-Invoked code can block — on a lock a parked thread holds, on a `join`. MCP tool calls are serialized, so a tool blocked in `invokeMethod` would leave the user no tool to release that thread with. So the compiled branches of `jdwp_evaluate_expression`, `jdwp_assert_expression` and `jdwp_evaluate_watchers`, plus `jdwp_to_string` and force-loading, hand their invoking work to `InvocationRunner.run(thread, what, work)`:
+Invoked code can block on a lock a parked thread holds or on a `join`. MCP tool calls are serialized, so a tool blocked in `invokeMethod` would leave the user without a tool to release that thread. The evaluation tools (`jdwp_evaluate_expression`, `jdwp_assert_expression`, and `jdwp_evaluate_watchers`) run navigation inside `withFreshFrames` and send INVOKE and COMPILE plans to `InvocationRunner.run(thread, what, work)`. A worker sets up the classpath only for compilation and can invoke an overridden context-loader getter there. `jdwp_to_string` and force-loading also use the runner.
 
 - The job runs on the `jdi-invoker-N` pool; the MCP worker waits at most `InvocationRunner.TIMEOUT_MS` (20 s, well under the 120 s MCP tool timeout).
 - A target thread with a job still running refuses another one at once, before anything is read from it (`[STILL_RUNNING] … wait for EVALUATION_COMPLETED_LATE`). A job of an ended connection refuses nothing: its thread ID may name a thread of the next VM.
