@@ -16,7 +16,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -34,28 +34,30 @@ class MemberAccessRewriteTest {
     /** Checks the exact span replaced and leaves nearby source, including comments, intact. */
     @ParameterizedTest
     @CsvSource(delimiter = '|', textBlock = """
-        receiver /* before */ . amount | ((int) __mcpGet(receiver, "OWNER", "amount", "Cannot read field \\"amount\\" because \\"receiver\\" is null"))
-        (receiver.amount) | (((int) __mcpGet(receiver, "OWNER", "amount", "Cannot read field \\"amount\\" because \\"receiver\\" is null")))
+        receiver /* before */ . amount | ((int) __mcpGet(receiver, "OWNER", "amount", "Cannot read field \\"amount\\" because \\"receiver\\" is null", 0))
+        (receiver.amount) | (((int) __mcpGet(receiver, "OWNER", "amount", "Cannot read field \\"amount\\" because \\"receiver\\" is null", 0)))
         OWNER.TOTAL | ((int) 12)
-        receiver.select("abc") | ((int) __mcpInvoke(receiver, "OWNER", "select", new java.lang.String[]{"java.lang.String"}, new java.lang.Object[]{(java.lang.String) ("abc")}, "Cannot invoke \\"OWNER.select(String)\\" because \\"receiver\\" is null"))
-        receiver.select(3) | ((int) __mcpInvoke(receiver, "OWNER", "select", new java.lang.String[]{"long"}, new java.lang.Object[]{(long) (3)}, "Cannot invoke \\"OWNER.select(long)\\" because \\"receiver\\" is null"))
+        receiver.select("abc") | ((int) __mcpInvoke(receiver, "OWNER", "select", new java.lang.String[]{"java.lang.String"}, new java.lang.Object[]{(java.lang.String) ("abc")}, "Cannot invoke \\"OWNER.select(String)\\" because \\"receiver\\" is null", 0))
+        receiver.select(3) | ((int) __mcpInvoke(receiver, "OWNER", "select", new java.lang.String[]{"long"}, new java.lang.Object[]{(long) (3)}, "Cannot invoke \\"OWNER.select(long)\\" because \\"receiver\\" is null", 0))
         new OWNER(5) | ((OWNER) __mcpConstruct(__mcpInitialize("OWNER"), new java.lang.String[]{"int"}, new java.lang.Object[]{(int) (5)}))
-        receiver.next.amount | ((OWNER) __mcpGet(receiver, "OWNER", "next", "Cannot read field \\"next\\" because \\"receiver\\" is null")).amount
+        receiver.next.amount | ((OWNER) __mcpGet(receiver, "OWNER", "next", "Cannot read field \\"next\\" because \\"receiver\\" is null", 0)).amount
         """)
     void rewritesOnlyTheFailingAccess(String expression, String expected, @TempDir Path directory) throws Exception {
         final String original = source("return /* keep */ " + owners(expression) + ";");
         final Path file = Files.writeString(directory.resolve("Probe.java"), original);
-        final String rewritten = MemberAccessRewrite.rewrite(NAME, file, original, CONFIG, true, new HashMap<>());
+        final String rewritten = MemberAccessRewrite.rewrite(NAME, file, original, CONFIG, true, new ArrayList<>());
         assertThat(rewritten).contains("    return /* keep */ " + owners(expected) + ";\n");
     }
 
-    /** Discarded call results still have the original type and remain valid Java statement expressions. */
+    /** A discarded result is a helper invocation statement without a cast or typed bridge. */
     @Test
-    void preservesTheTypeOfDiscardedInvocations(@TempDir Path directory) throws Exception {
+    void discardsInvocationResultsWithoutACast(@TempDir Path directory) throws Exception {
         final String original = source(owners("receiver.select(3); new OWNER(5); return null;"));
         final Path file = Files.writeString(directory.resolve("Probe.java"), original);
-        final String rewritten = MemberAccessRewrite.rewrite(NAME, file, original, CONFIG, true, new HashMap<>());
-        assertThat(rewritten).contains("private static int __mcpBridge0(", "private static " + OWNER + " __mcpBridge1(");
+        final String rewritten = MemberAccessRewrite.rewrite(NAME, file, original, CONFIG, true, new ArrayList<>());
+        assertThat(rewritten)
+            .contains("    __mcpInvoke(receiver,", "; __mcpConstruct(__mcpInitialize(")
+            .doesNotContain("__mcpBridge");
     }
 
     /** Compiles successive accesses and terminates with the first diagnostics if the budget is exhausted. */
@@ -178,6 +180,61 @@ class MemberAccessRewriteTest {
         assertions.assertAll();
     }
 
+    /** Compares assignment, generic-result, and receiver-site cases against javac or the original diagnostics. */
+    @Test
+    void preservesErasedDiscardsAndReceiverSites() {
+        final Class<?> fixture = PrivateMembers.AccessSites.class;
+        final Map<String, String> cases = new TreeMap<>();
+        cases.put("array-target", "x.array[0] = x.argument(); return x.array[0];");
+        cases.put("index-target", "int[] a = {7}; a[x.index] = x.argument(); return a[0];");
+        cases.put("nested-target", "((x.array[0]))++; return x.array[0];");
+        cases.put("generic", "return F.pick(x.generic());");
+        cases.put("array", "return F.pick(x.array);");
+        cases.put("primitive", "return F.pick(x.primitive);");
+        cases.put("boxed", "return F.pick(x.boxed);");
+        cases.put("cold-hidden", "return F.HiddenCold.CONSTANT;");
+        cases.put("constant-expression", "return F.pick(F.Cold.CONSTANT + 1);");
+        cases.put("string", "return F.constantIdentity(F.Cold.STRING + \"!\", \"string!\");");
+        cases.put("constructor", "new F.Outer(new F.Inner(x.argument())); return \"ok\";");
+        cases.put("chained-null", "return x.chain().absent().value;");
+        cases.put("array-null", "return x.elements()[0].value;");
+        cases.put("discard-statement", "x.genericChild.retrieve(); return \"ok\";");
+        cases.put("discard-lambda", "Runnable call = () -> x.genericChild.retrieve(); call.run(); return \"ok\";");
+        cases.put("discard-argument", "F.consume(() -> x.genericChild.retrieve()); return \"ok\";");
+        cases.put("discard-cast", "((Runnable) () -> x.genericChild.retrieve()).run(); return \"ok\";");
+        cases.put("ambiguous-lambda", "return F.choose(() -> x.genericChild.retrieve());");
+        cases.put("method-description", "try { if (F.takeFirst()) return F.A.noReceiver().value; "
+            + "return F.B.noReceiver().value; } catch (NullPointerException e) { F.mark(\"getMessage\"); return e.getMessage(); }");
+        cases.put("field-description", "try { if (F.takeFirst()) return F.A.empty.value; "
+            + "return F.B.empty.value; } catch (NullPointerException e) { F.mark(\"getMessage\"); return e.getMessage(); }");
+        final Set<String> refused = Set.of("array-target", "index-target", "nested-target", "cold-hidden",
+            "ambiguous-lambda");
+        final InMemoryJavaCompiler compiler = new InMemoryJavaCompiler();
+        final SoftAssertions assertions = new SoftAssertions();
+        for (final Map.Entry<String, String> row : cases.entrySet()) {
+            final String id = row.getKey();
+            final String body = row.getValue().replaceAll("\\bF\\b", fixture.getCanonicalName());
+            final String wrapper = "package wrapper; public class Probe { public static Object evaluate("
+                + fixture.getCanonicalName() + " x) throws Throwable {\n" + body + "\n}}";
+            final Observation actual = observe(fixture, type -> run(
+                InMemoryJavaCompiler.compileEvaluation(compiler, NAME, wrapper, CONFIG).classes(), type, id));
+            if (refused.contains(id)) {
+                final Observation direct = observe(fixture, type -> run(compiler.compile(NAME, wrapper, CONFIG), type, id));
+                assertions.assertThat(direct.outcome()).as(id).startsWith("Compilation failed:");
+                assertions.assertThat(actual).as(id).isEqualTo(direct);
+            } else if ("array-null".equals(id)) {
+                assertions.assertThat(actual).as(id).isEqualTo(new Observation(
+                    "java.lang.NullPointerException: Cannot read field \"value\" because the receiver is null", "elements"));
+            } else {
+                final Observation golden = observe(fixture, type -> MethodHandles.publicLookup().findStatic(type, "golden",
+                        MethodType.methodType(Object.class, String.class, type))
+                    .invokeWithArguments(id, type.getConstructor().newInstance()));
+                assertions.assertThat(actual).as(id).isEqualTo(golden);
+            }
+        }
+        assertions.assertAll();
+    }
+
     /** Loads the generated classes and calls them without wrapping application exceptions. */
     private static Object run(Map<String, byte[]> classes, Class<?> fixture, String id) throws Throwable {
         final ClassLoader loader = new ClassLoader(fixture.getClassLoader()) {
@@ -199,9 +256,14 @@ class MemberAccessRewriteTest {
 
     /** Captures Java exceptions and ECJ errors together with side effects in the same loader. */
     private static Observation observe(Evaluation evaluation) {
-        final URL fixtureLocation = PrivateMembers.class.getProtectionDomain().getCodeSource().getLocation();
+        return observe(PrivateMembers.Semantics.class, evaluation);
+    }
+
+    /** Isolates initialization effects of the selected javac fixture. */
+    private static Observation observe(Class<?> fixtureClass, Evaluation evaluation) {
+        final URL fixtureLocation = fixtureClass.getProtectionDomain().getCodeSource().getLocation();
         try (URLClassLoader loader = new URLClassLoader(new URL[]{fixtureLocation}, ClassLoader.getPlatformClassLoader())) {
-            final Class<?> fixture = loader.loadClass(PrivateMembers.Semantics.class.getName());
+            final Class<?> fixture = loader.loadClass(fixtureClass.getName());
             final java.lang.reflect.Method trace = fixture.getMethod("trace");
             try {
                 return new Observation(String.valueOf(evaluation.evaluate(fixture)), trace.invoke(null).toString().strip());

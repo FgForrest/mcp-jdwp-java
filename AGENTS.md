@@ -45,7 +45,7 @@ Ordinary expressions enter through **EvaluationRouter** in `evaluation/interpret
 
 1. **JdiExpressionEvaluator** — Orchestrator. Analyzes the stack frame, generates a wrapper class with a unique UUID name, delegates compilation, and caches results.
 2. **ClasspathDiscoverer** — Walks the target JVM's classloader hierarchy (including Tomcat/container classloaders) to discover all JARs. Also uses **JdkDiscoveryService** to find a local JDK matching the target JVM version.
-3. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory. Ordinary wrappers can retry member visibility errors through **MemberAccessRewrite**, which uses ECJ bindings to generate reflective field reads, method calls and constructor calls. The retry preserves exact types, leaves assignment targets alone, and inlines type-qualified constants. Fast probes and their arming evaluations use the direct compiler entry point.
+3. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory. Ordinary wrappers can retry member visibility errors through **MemberAccessRewrite**, which uses ECJ bindings to generate reflective field reads, method calls and constructor calls. The retry preserves exact types where values are used, leaves assignment targets alone, and inlines type-qualified constants. Fast probes and their arming evaluations use the direct compiler entry point.
 4. **RemoteCodeExecutor** — Injects compiled bytecode into the target JVM via `ClassLoader.defineClass()` and invokes it.
 
 ### Watcher System (`watchers/` package)

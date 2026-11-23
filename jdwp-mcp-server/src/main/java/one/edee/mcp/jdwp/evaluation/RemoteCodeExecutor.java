@@ -4,16 +4,11 @@ import com.sun.jdi.*;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.jspecify.annotations.Nullable;
-import org.objectweb.asm.ClassReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -84,7 +79,7 @@ public final class RemoteCodeExecutor {
                 className, methodName, methodArgs.size());
 
             // 1. Load the class into the target VM
-            final ClassType loadedClass = (ClassType) loadClass(vm, thread, classLoader, className, bytecode, false);
+            final ClassType loadedClass = loadClass(vm, thread, classLoader, className, bytecode);
             log.debug("[Executor] Class {} loaded successfully", className);
 
             // 2. Force class preparation/initialization via Class.forName()
@@ -147,46 +142,6 @@ public final class RemoteCodeExecutor {
         }
     }
 
-    /** Attempts companion definitions without triggering their initializers or requiring them to succeed. */
-    static void defineAuxiliaryClasses(VirtualMachine vm, ThreadReference thread, ClassLoaderReference loader,
-                                       String wrapper, Map<String, byte[]> classes) {
-        for (ReferenceType existing : vm.classesByName(wrapper)) {
-            if (loader.equals(existing.classLoader())) {
-                return;
-            }
-        }
-        final Map<String, byte[]> byInternalName = new HashMap<>();
-        for (byte[] bytes : classes.values()) {
-            byInternalName.put(new ClassReader(bytes).getClassName(), bytes);
-        }
-        final Set<String> attempted = new HashSet<>();
-        for (final String name : byInternalName.keySet()) {
-            defineAuxiliaryClass(vm, thread, loader, byInternalName, attempted, name);
-        }
-    }
-
-    /** Tries generated supertypes first, leaving failed companions for the wrapper's usual JVM linkage. */
-    private static void defineAuxiliaryClass(VirtualMachine vm, ThreadReference thread, ClassLoaderReference loader,
-                                             Map<String, byte[]> classes, Set<String> attempted, @Nullable String name) {
-        if (name == null) {
-            return;
-        }
-        final byte @Nullable [] bytes = classes.get(name);
-        if (bytes == null || !attempted.add(name)) {
-            return;
-        }
-        final ClassReader type = new ClassReader(bytes);
-        defineAuxiliaryClass(vm, thread, loader, classes, attempted, type.getSuperName());
-        for (String face : type.getInterfaces()) {
-            defineAuxiliaryClass(vm, thread, loader, classes, attempted, face);
-        }
-        try {
-            loadClass(vm, thread, loader, name.replace('/', '.'), bytes, true);
-        } catch (JdiEvaluationException failure) {
-            log.debug("[Executor] Skipping companion {}: {}", name, failure.getMessage());
-        }
-    }
-
     /** Reads the generated module marker while leaving user-thrown exceptions of the same type intact. */
     static @Nullable String closedMemberAccessModule(JdiEvaluationException failure, String wrapper) {
         if (!(failure.getCause() instanceof InvocationException invocation)) {
@@ -227,7 +182,7 @@ public final class RemoteCodeExecutor {
     public static ClassType defineAndInitialize(VirtualMachine vm, ThreadReference thread,
                                                 ClassLoaderReference classLoader, String className,
                                                 byte[] bytecode) throws JdiEvaluationException {
-        final ClassType defined = (ClassType) loadClass(vm, thread, classLoader, className, bytecode, false);
+        final ClassType defined = loadClass(vm, thread, classLoader, className, bytecode);
         final Value resolved = forceClassInitialization(vm, thread, classLoader, className);
         if (!(resolved instanceof ClassObjectReference classObject) || !defined.equals(classObject.reflectedType())) {
             throw new JdiEvaluationException("Class loader " + classLoader.referenceType().name()
@@ -239,18 +194,16 @@ public final class RemoteCodeExecutor {
     /**
      * Defines `bytecode` as `className` in the target VM via the supplied classloader. Idempotent:
      * if the class is already loaded (cached compilation reuse), the existing definition is
-     * returned unchanged. A companion definition is best effort and its caller logs failures.
+     * returned unchanged. A duplicate definition would throw LinkageError.
      */
-    private static ReferenceType loadClass(VirtualMachine vm, ThreadReference thread, ClassLoaderReference classLoader,
-                                       String className, byte[] bytecode, boolean companion) throws JdiEvaluationException {
+    private static ClassType loadClass(VirtualMachine vm, ThreadReference thread, ClassLoaderReference classLoader,
+                                       String className, byte[] bytecode) throws JdiEvaluationException {
         // Cached compilations reuse the same class name across calls — if the class
         // is already loaded in the target VM, skip defineClass to avoid LinkageError.
         final List<ReferenceType> existing = vm.classesByName(className);
-        for (ReferenceType type : existing) {
-            if (classLoader.equals(type.classLoader())) {
-                log.debug("[Executor] Class {} already loaded — reusing", className);
-                return type;
-            }
+        if (!existing.isEmpty() && existing.get(0) instanceof ClassType existingClass) {
+            log.debug("[Executor] Class {} already loaded — reusing", className);
+            return existingClass;
         }
 
         try {
@@ -263,9 +216,7 @@ public final class RemoteCodeExecutor {
                 CLASSLOADER_DEFINE_CLASS_METHOD, CLASSLOADER_DEFINE_CLASS_SIGNATURE
             );
             if (defineClassMethods.isEmpty()) {
-                if (!companion) {
-                    log.error("[Executor] Could not find defineClass method on {}", classLoaderType.name());
-                }
+                log.error("[Executor] Could not find defineClass method on {}", classLoaderType.name());
                 throw new JdiEvaluationException("Could not find 'defineClass' method on the provided ClassLoader.");
             }
             final Method defineClassMethod = defineClassMethods.get(0);
@@ -292,28 +243,22 @@ public final class RemoteCodeExecutor {
                 );
             }
             if (!(loadedClassObject instanceof ClassObjectReference classObjectReference)) {
-                if (!companion) {
-                    log.error("[Executor] defineClass returned unexpected type: {}",
-                        loadedClassObject != null ? loadedClassObject.getClass().getName() : "null");
-                }
+                log.error("[Executor] defineClass returned unexpected type: {}",
+                    loadedClassObject != null ? loadedClassObject.getClass().getName() : "null");
                 throw new JdiEvaluationException("defineClass did not return a Class object.");
             }
 
-            final ReferenceType result = classObjectReference.reflectedType();
+            final ClassType result = (ClassType) classObjectReference.reflectedType();
             log.debug("[Executor] Class loaded and reflected successfully: {}", result.name());
             return result;
 
         } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException e) {
-            if (!companion) {
-                log.error("[Executor] Failed to load class {}: {}", className, e.getClass().getSimpleName(), e);
-            }
+            log.error("[Executor] Failed to load class {}: {}", className, e.getClass().getSimpleName(), e);
             throw new JdiClassDefinitionException("Failed to load class '" + className + "' into target VM: " + e.getMessage(), e);
         } catch (InvocationException e) {
             final ObjectReference exception = e.exception();
             final String exceptionType = exception != null ? exception.type().name() : "unknown";
-            if (!companion) {
-                log.error("[Executor] defineClass threw exception {}: {}", exceptionType, e.getMessage(), e);
-            }
+            log.error("[Executor] defineClass threw exception {}: {}", exceptionType, e.getMessage(), e);
             throw new JdiClassDefinitionException("Failed to load class '" + className + "': " + exceptionType, e);
         }
     }

@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -23,17 +24,19 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
             .toList();
     }
 
-    static InterpreterTargetVm start(Path javaHome) throws Exception {
+    /** Starts the suspended fixture with JVM options before the target classpath. */
+    static InterpreterTargetVm start(Path javaHome, String... options) throws Exception {
         final String classpath = Path.of(InterpreterTarget.class.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
-        final Process process = new ProcessBuilder(
-            javaHome.resolve("bin/java").toString(),
-            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, CLASS).redirectErrorStream(true).start();
+        final List<String> command = new ArrayList<>(List.of(javaHome.resolve("bin/java").toString(),
+            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0"));
+        command.addAll(List.of(options));
+        command.addAll(List.of("-cp", classpath, CLASS));
+        final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
-        final var port = new CompletableFuture<Integer>();
-        final var drain = new Thread(() -> {
-            try (var output = new BufferedReader(new InputStreamReader(process.getInputStream(),
+        final CompletableFuture<Integer> port = new CompletableFuture<Integer>();
+        final Thread drain = new Thread(() -> {
+            try (BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {
                 final String prefix = "Listening for transport dt_socket at address: ";
                 final StringBuilder startup = new StringBuilder();

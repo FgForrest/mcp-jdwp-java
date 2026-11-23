@@ -11,8 +11,10 @@ import org.eclipse.jdt.internal.compiler.ast.CastExpression;
 import org.eclipse.jdt.internal.compiler.ast.CompilationUnitDeclaration;
 import org.eclipse.jdt.internal.compiler.ast.CompoundAssignment;
 import org.eclipse.jdt.internal.compiler.ast.Expression;
+import org.eclipse.jdt.internal.compiler.ast.ExpressionContext;
 import org.eclipse.jdt.internal.compiler.ast.FieldReference;
 import org.eclipse.jdt.internal.compiler.ast.ForStatement;
+import org.eclipse.jdt.internal.compiler.ast.IntLiteral;
 import org.eclipse.jdt.internal.compiler.ast.Invocation;
 import org.eclipse.jdt.internal.compiler.ast.LambdaExpression;
 import org.eclipse.jdt.internal.compiler.ast.MessageSend;
@@ -51,7 +53,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
 
@@ -68,9 +69,15 @@ final class MemberAccessRewrite extends ASTVisitor {
     private final List<Edit> edits = new ArrayList<>();
     /** Statement expressions whose values the surrounding Java code discards. */
     private final Set<Expression> discarded = new HashSet<>();
-    /** Original receiver wording keyed by generated calls that later passes may use as receivers. */
-    private final Map<String, String> receiverDescriptions;
-    /** Generated signatures for discarded results and reflected calls that declare checked exceptions. */
+    /** Source-site indexes survive each pass as integer arguments on the generated calls. */
+    private final List<String> receiverDescriptions;
+    /** The binary name of the wrapper that owns the generated helpers. */
+    private final String wrapperName;
+    /** Lambdas whose enclosing invocation has only one declaration for the given arity. */
+    private final Set<LambdaExpression> fixedLambdaArguments = new HashSet<>();
+    /** Lambda invocation bodies whose original target can depend on their value or void compatibility. */
+    private final Set<Expression> overloadSensitiveBodies = new HashSet<>();
+    /** Generated signatures for reflected calls that declare checked exceptions. */
     private final StringBuilder bridges = new StringBuilder();
     /** Next candidate suffix for a generated call bridge. */
     private int nextBridge;
@@ -81,7 +88,9 @@ final class MemberAccessRewrite extends ASTVisitor {
     private record Edit(int start, int end, String replacement) {}
 
     /** Collects edits against the original source for this round. */
-    private MemberAccessRewrite(String source, List<IProblem> accessProblems, Map<String, String> receiverDescriptions) {
+    private MemberAccessRewrite(String wrapperName, String source, List<IProblem> accessProblems,
+                                List<String> receiverDescriptions) {
+        this.wrapperName = wrapperName;
         this.source = source;
         this.accessProblems = accessProblems;
         this.receiverDescriptions = receiverDescriptions;
@@ -116,7 +125,7 @@ final class MemberAccessRewrite extends ASTVisitor {
      */
     static @Nullable String rewrite(String className, Path file, String source,
                                     InMemoryJavaCompiler.Configuration config, boolean appendHelpers,
-                                    Map<String, String> receiverDescriptions) {
+                                    List<String> receiverDescriptions) {
         final List<String> options = InMemoryJavaCompiler.buildCompilerOptions(config);
         options.addAll(List.of("-proc:none", file.toString()));
         final PrintWriter output = new PrintWriter(Writer.nullWriter());
@@ -139,7 +148,7 @@ final class MemberAccessRewrite extends ASTVisitor {
                     return null;
                 }
             }
-            final MemberAccessRewrite rewrite = new MemberAccessRewrite(source, access, receiverDescriptions);
+            final MemberAccessRewrite rewrite = new MemberAccessRewrite(className, source, access, receiverDescriptions);
             unit.traverse(rewrite, unit.scope, false);
             return rewrite.apply(className, unit.types[0], appendHelpers);
         } finally {
@@ -182,14 +191,83 @@ final class MemberAccessRewrite extends ASTVisitor {
         return true;
     }
 
-    /** A non-void call in a void-compatible lambda still has to be a statement expression. */
+    /** A void-targeted body discards its result. An overload-sensitive body must keep its original diagnostic. */
     @Override
     public boolean visit(LambdaExpression node, BlockScope scope) {
-        if (node.body() instanceof Expression body && node.descriptor != null
-            && node.descriptor.returnType == TypeBinding.VOID) {
-            discarded.add(body);
+        if (node.body() instanceof Expression body && body instanceof Invocation) {
+            if (node.descriptor == null || (node.getExpressionContext() == ExpressionContext.INVOCATION_CONTEXT
+                && !fixedLambdaArguments.contains(node))) {
+                overloadSensitiveBodies.add(body);
+            }
+            if (node.descriptor != null && node.descriptor.returnType == TypeBinding.VOID) {
+                discarded.add(body);
+            }
         }
         return true;
+    }
+
+    /** Allows direct lambda arguments when the enclosing method has a single known declaration. */
+    @Override
+    public boolean visit(MessageSend node, BlockScope scope) {
+        recordFixedLambdaArguments(node.arguments, node.binding, node.actualReceiverType);
+        return true;
+    }
+
+    /** Allows direct lambda arguments when the enclosing constructor has a single declaration. */
+    @Override
+    public boolean visit(AllocationExpression node, BlockScope scope) {
+        recordFixedLambdaArguments(node.arguments, node.binding, node.resolvedType);
+        return true;
+    }
+
+    /** Detects direct lambdas whose target does not depend on overload selection. */
+    private void recordFixedLambdaArguments(Expression @Nullable [] args, @Nullable MethodBinding binding,
+                                            @Nullable TypeBinding receiver) {
+        if (args == null || binding == null || !binding.isValidBinding()
+            || !(receiver instanceof ReferenceBinding owner)) {
+            return;
+        }
+        for (final Expression argument : args) {
+            if (argument instanceof LambdaExpression) {
+                if (hasOtherDeclaration(owner, binding.original(), args.length, new HashSet<>())) {
+                    return;
+                }
+                for (final Expression candidate : args) {
+                    if (candidate instanceof LambdaExpression lambda) {
+                        fixedLambdaArguments.add(lambda);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /** Conservatively declines overloaded names, including declarations inherited by a method receiver. */
+    private static boolean hasOtherDeclaration(ReferenceBinding type, MethodBinding selected, int arity,
+                                               Set<ReferenceBinding> seen) {
+        if (!seen.add(type)) {
+            return false;
+        }
+        for (final MethodBinding candidate : type.getMethods(selected.selector)) {
+            final boolean arityMatches = candidate.isVarargs()
+                ? arity >= candidate.parameters.length - 1 : arity == candidate.parameters.length;
+            if (arityMatches && !candidate.isBridge() && candidate.original() != selected) {
+                return true;
+            }
+        }
+        if (selected.isConstructor()) {
+            return false;
+        }
+        final @Nullable ReferenceBinding superclass = type.superclass();
+        if (superclass != null && hasOtherDeclaration(superclass, selected, arity, seen)) {
+            return true;
+        }
+        for (final ReferenceBinding face : type.superInterfaces()) {
+            if (hasOtherDeclaration(face, selected, arity, seen)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** For-loop initializers and updates can discard the value of a call without a semicolon. */
@@ -331,9 +409,11 @@ final class MemberAccessRewrite extends ASTVisitor {
             return;
         }
         final boolean returnsVoid = binding.returnType == TypeBinding.VOID;
-        final boolean discardedResult = discardsValue(node) && !returnsVoid;
-        final @Nullable String helper = bridge(binding, returnsVoid ? "__mcpInvokeVoid" : "__mcpInvoke",
-            false, discardedResult ? binding.returnType : null, scope);
+        if (!returnsVoid && overloadSensitiveBodies.contains(node)) {
+            refused = true;
+            return;
+        }
+        final @Nullable String helper = bridge(binding, returnsVoid ? "__mcpInvokeVoid" : "__mcpInvoke", false, scope);
         if (helper == null) {
             return;
         }
@@ -342,13 +422,11 @@ final class MemberAccessRewrite extends ASTVisitor {
             "Cannot invoke " + member + " because " + describeReceiver(node.receiver) + " is null");
         final String qualifier = receiver(text(node.receiver), typeReceiver, binding.isStatic());
         final String invoke = helper + "(" + qualifier + ", " + quote(binaryName(binding.declaringClass))
-            + ", " + quote(new String(node.selector)) + ", " + arguments + ", " + nullMessage + ")";
-        if (returnsVoid || discardedResult) {
-            add(node.sourceStart, node.sourceEnd, invoke);
-        } else {
-            receiverDescriptions.put(invoke, "the return value of " + member);
-            add(node.sourceStart, node.sourceEnd, cast(binding.returnType, invoke));
-        }
+            + ", " + quote(new String(node.selector)) + ", " + arguments + ", " + nullMessage
+            + ", " + rememberReceiver("the return value of " + member) + ")";
+        // A statement or void-targeted lambda discards the erased result without a checkcast.
+        final String replacement = returnsVoid || discardsValue(node) ? invoke : cast(binding.returnType, invoke);
+        add(node.sourceStart, node.sourceEnd, replacement);
     }
 
     /** Rewrites ordinary class creation when the constructor alone is inaccessible. */
@@ -371,14 +449,16 @@ final class MemberAccessRewrite extends ASTVisitor {
             refused = true;
             return;
         }
-        final boolean discardedResult = discardsValue(node);
-        final @Nullable String helper = bridge(binding, "__mcpConstruct", true,
-            discardedResult ? node.resolvedType : null, scope);
+        if (overloadSensitiveBodies.contains(node)) {
+            refused = true;
+            return;
+        }
+        final @Nullable String helper = bridge(binding, "__mcpConstruct", true, scope);
         if (helper != null) {
             // Java initializes the class at new, before evaluating constructor arguments.
             final String owner = "__mcpInitialize(" + quote(binaryName(binding.declaringClass)) + ")";
             final String invoke = helper + "(" + owner + ", " + arguments + ")";
-            add(node.sourceStart, node.sourceEnd, discardedResult ? invoke : cast(node.resolvedType, invoke));
+            add(node.sourceStart, node.sourceEnd, discardsValue(node) ? invoke : cast(node.resolvedType, invoke));
         }
     }
 
@@ -428,9 +508,8 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
     }
 
-    /** Keeps checked-exception reachability and types discarded results without making them cast statements. */
-    private @Nullable String bridge(MethodBinding method, String helper, boolean constructor,
-                                    @Nullable TypeBinding discardedType, BlockScope scope) {
+    /** Preserves checked-exception reachability while forwarding the erased result. */
+    private @Nullable String bridge(MethodBinding method, String helper, boolean constructor, BlockScope scope) {
         final StringJoiner exceptions = new StringJoiner(", ");
         for (ReferenceBinding exception : method.thrownExceptions) {
             if (!exception.isUncheckedException(false)) {
@@ -440,7 +519,7 @@ final class MemberAccessRewrite extends ASTVisitor {
                 exceptions.add(new String(exception.readableName()));
             }
         }
-        if (exceptions.length() == 0 && discardedType == null) {
+        if (exceptions.length() == 0) {
             return helper;
         }
         String name;
@@ -448,12 +527,7 @@ final class MemberAccessRewrite extends ASTVisitor {
             name = "__mcpBridge" + nextBridge++;
         } while (source.contains(" " + name + "("));
         final boolean returnsVoid = method.returnType == TypeBinding.VOID && !constructor;
-        final String returnType;
-        if (discardedType != null) {
-            returnType = new String(discardedType.readableName());
-        } else {
-            returnType = returnsVoid ? "void" : "java.lang.Object";
-        }
+        final String returnType = returnsVoid ? "void" : "java.lang.Object";
         bridges.append("\nprivate static ").append(returnType).append(' ').append(name).append('(');
         if (!constructor) {
             bridges.append("java.lang.Object receiver, ");
@@ -464,13 +538,9 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
         bridges.append("java.lang.String[] signature, java.lang.Object[] args");
         if (!constructor) {
-            bridges.append(", java.lang.String nullMessage");
+            bridges.append(", java.lang.String nullMessage, int site");
         }
-        bridges.append(')');
-        if (exceptions.length() != 0) {
-            bridges.append(" throws ").append(exceptions);
-        }
-        bridges.append(" {\n    ");
+        bridges.append(") throws ").append(exceptions).append(" {\n    ");
         if (!returnsVoid) {
             bridges.append("return ");
         }
@@ -482,11 +552,10 @@ final class MemberAccessRewrite extends ASTVisitor {
         }
         call.append("signature, args");
         if (!constructor) {
-            call.append(", nullMessage");
+            call.append(", nullMessage, site");
         }
         call.append(')');
-        final String invocation = call.toString();
-        bridges.append(discardedType == null ? invocation : cast(discardedType, invocation)).append(";\n}\n");
+        bridges.append(call).append(";\n}\n");
         return name;
     }
 
@@ -612,9 +681,16 @@ final class MemberAccessRewrite extends ASTVisitor {
         final String nullMessage = field.isStatic() ? "null"
             : quote("Cannot read field " + displayQuoted(name) + " because " + receiverDescription + " is null");
         final String invoke = "__mcpGet(" + receiver(qualifier, typeQualifier, field.isStatic()) + ", "
-            + quote(binaryName(field.declaringClass)) + ", " + quote(name) + ", " + nullMessage + ")";
-        receiverDescriptions.put(invoke, describeFieldValue(field, qualifierType, receiverDescription));
+            + quote(binaryName(field.declaringClass)) + ", " + quote(name) + ", " + nullMessage
+            + ", " + rememberReceiver(describeFieldValue(field, qualifierType, receiverDescription)) + ")";
         add(start, end, cast(field.type, invoke));
+    }
+
+    /** Reserves a distinct site even when two sites lower to the same member and arguments. */
+    private int rememberReceiver(String description) {
+        final int site = receiverDescriptions.size();
+        receiverDescriptions.add(description);
+        return site;
     }
 
     /** Describes a field result if a later member access uses it as a receiver. */
@@ -664,9 +740,7 @@ final class MemberAccessRewrite extends ASTVisitor {
     /** Describes locals, fields and method results using the JVM's helpful-null wording. */
     private String describeReceiver(Expression expression) {
         if (expression instanceof CastExpression cast && cast.expression instanceof MessageSend call) {
-            // A previous edit preserved the receiver's static type in a cast around this helper call.
-            return receiverDescriptions.getOrDefault(source.substring(call.sourceStart, call.sourceEnd + 1),
-                "the receiver");
+            return describeRewrittenReceiver(call);
         }
         if (expression instanceof MessageSend call) {
             final @Nullable MethodBinding binding = method(call.binding);
@@ -695,6 +769,20 @@ final class MemberAccessRewrite extends ASTVisitor {
                 if (reference.receiver instanceof SingleNameReference name && name.binding instanceof LocalVariableBinding) {
                     return displayQuoted(displayLocal(name.token) + "." + new String(reference.token));
                 }
+            }
+        }
+        return "the receiver";
+    }
+
+    /** Recovers the original description from a helper's site argument after reparsing. */
+    private String describeRewrittenReceiver(MessageSend call) {
+        if (call.binding != null && call.binding.isValidBinding()
+            && wrapperName.equals(binaryName(call.binding.declaringClass))
+            && call.arguments != null && call.arguments.length > 0
+            && call.arguments[call.arguments.length - 1] instanceof IntLiteral index) {
+            final int site = index.constant.intValue();
+            if (site >= 0 && site < receiverDescriptions.size()) {
+                return receiverDescriptions.get(site);
             }
         }
         return "the receiver";
@@ -960,7 +1048,7 @@ final class MemberAccessRewrite extends ASTVisitor {
 
             /** Checks the receiver before looking up or reading the field. */
             private static java.lang.Object __mcpGet(java.lang.Object receiver, java.lang.String owner,
-                                                     java.lang.String name, java.lang.String nullMessage) {
+                                                     java.lang.String name, java.lang.String nullMessage, int site) {
                 __mcpCheckReceiver(receiver, nullMessage);
                 try {
                     return ((java.lang.reflect.Field) __mcpMember(owner, name, null)).get(receiver);
@@ -972,7 +1060,7 @@ final class MemberAccessRewrite extends ASTVisitor {
             /** Checks the receiver after the call site has evaluated the arguments. */
             private static java.lang.Object __mcpInvoke(java.lang.Object receiver, java.lang.String owner, java.lang.String name,
                                                         java.lang.String[] signature, java.lang.Object[] args,
-                                                        java.lang.String nullMessage) {
+                                                        java.lang.String nullMessage, int site) {
                 __mcpCheckReceiver(receiver, nullMessage);
                 try {
                     return ((java.lang.reflect.Method) __mcpMember(owner, name, signature)).invoke(receiver, args);
@@ -986,8 +1074,8 @@ final class MemberAccessRewrite extends ASTVisitor {
             /** Preserves the void type of calls that cannot appear in a value context. */
             private static void __mcpInvokeVoid(java.lang.Object receiver, java.lang.String owner, java.lang.String name,
                                                 java.lang.String[] signature, java.lang.Object[] args,
-                                                java.lang.String nullMessage) {
-                __mcpInvoke(receiver, owner, name, signature, args, nullMessage);
+                                                java.lang.String nullMessage, int site) {
+                __mcpInvoke(receiver, owner, name, signature, args, nullMessage, site);
             }
 
             /** A null message marks static access, where a null qualifier is valid. */

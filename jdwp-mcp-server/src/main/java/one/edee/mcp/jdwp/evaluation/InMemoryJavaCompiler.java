@@ -231,7 +231,7 @@ public class InMemoryJavaCompiler {
             final Path file = directory.resolve(className.substring(className.lastIndexOf('.') + 1) + ".java");
             try {
                 String current = source;
-                final Map<String, String> receiverDescriptions = new HashMap<>();
+                final List<String> receiverDescriptions = new ArrayList<>();
                 for (int round = 0; round < MEMBER_ACCESS_ROUNDS; round++) {
                     Files.writeString(file, current);
                     final @Nullable String rewritten =

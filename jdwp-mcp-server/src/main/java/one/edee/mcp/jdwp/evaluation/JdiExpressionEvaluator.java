@@ -1299,15 +1299,7 @@ public class JdiExpressionEvaluator {
             // Only ordinary evaluations may rewrite access. Both arming entries retain their result.
             final Compilation compilation = compileWithClasspathContext(className, sourceCode, state, !retainResult);
             final byte[] bytecode = findCompiledBytecode(compilation.classes(), className);
-            final Map<String, byte[]> auxiliary = new LinkedHashMap<>();
-            if (!retainResult) {
-                for (Map.Entry<String, byte[]> emitted : compilation.classes().entrySet()) {
-                    if (emitted.getValue() != bytecode) {
-                        auxiliary.put(emitted.getKey(), emitted.getValue());
-                    }
-                }
-            }
-            wrapper = new CachedCompilation(className, bytecode, Map.copyOf(auxiliary), compilation.accessDiagnostic());
+            wrapper = new CachedCompilation(className, bytecode, compilation.accessDiagnostic());
             if (compilation.cacheable()) {
                 cache.put(cacheKey, wrapper);
             }
@@ -1335,9 +1327,6 @@ public class JdiExpressionEvaluator {
             if (retainResult) {
                 return RemoteCodeExecutor.execute(vm, thread, classLoader, wrapper.className(), wrapper.bytecode(),
                     EVALUATION_METHOD_NAME, context.getValues(), true, readAndReport);
-            }
-            if (!wrapper.auxiliary().isEmpty()) {
-                RemoteCodeExecutor.defineAuxiliaryClasses(vm, thread, classLoader, wrapper.className(), wrapper.auxiliary());
             }
             try {
                 value = RemoteCodeExecutor.execute(vm, thread, classLoader, wrapper.className(), wrapper.bytecode(),
@@ -1995,10 +1984,9 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Holds the wrapper and any companion class files together with the original visibility diagnostic.
+     * Holds the primary wrapper bytecode and the original visibility diagnostic.
      */
-    private record CachedCompilation(String className, byte[] bytecode, Map<String, byte[]> auxiliary,
-                                     @Nullable String accessDiagnostic) {
+    private record CachedCompilation(String className, byte[] bytecode, @Nullable String accessDiagnostic) {
     }
 
     /**

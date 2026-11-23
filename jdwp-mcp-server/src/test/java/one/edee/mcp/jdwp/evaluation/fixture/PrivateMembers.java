@@ -1,6 +1,9 @@
 package one.edee.mcp.jdwp.evaluation.fixture;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.function.Supplier;
 
 /** Binary fixture for the compiler's private-member binding tests. */
 public class PrivateMembers {
@@ -386,6 +389,289 @@ public class PrivateMembers {
                     s
                     """);
                 default -> throw new AssertionError(id);
+            };
+        }
+    }
+
+    /** Exercises static types, discarded results, and receiver descriptions in the javac oracle. */
+    public static final class AccessSites {
+        /** Ordered application calls observed in one isolated loader. */
+        private static String trace = "";
+        private final int[] array = {11};
+        private final int index = 0;
+        private final Integer boxed = 4;
+        private int primitive = 3;
+        private int value = 17;
+        /** Supplies the inherited return type in the discarded-result cases. */
+        public final GenericChild genericChild = new GenericChild();
+
+        /** Records an application call in order. */
+        public static void mark(String name) {
+            trace += (trace.isEmpty() ? "" : " -> ") + name;
+        }
+
+        /** Returns the calls made by this isolated fixture. */
+        public static String trace() {
+            return trace;
+        }
+
+        /** Records the guard for the branch with the compile-only superclass. */
+        public static boolean companionGuard() {
+            CompanionTrackingLoader.record("guard");
+            return false;
+        }
+
+        /** Records lambda execution after the skipped branch. */
+        public static String companionLambda() {
+            CompanionTrackingLoader.record("lambda");
+            return "ok";
+        }
+
+        /** Supplies a fixed void target for a lambda argument. */
+        public static void consume(Runnable call) {
+            call.run();
+        }
+
+        /** An overload with a different arity cannot supply the target for a one-argument call. */
+        public static String consume(Supplier<String> call, String suffix) {
+            return call.get() + suffix;
+        }
+
+        /** Supplies the void-compatible overload. */
+        public static String choose(Runnable call) {
+            call.run();
+            return "void";
+        }
+
+        /** Supplies the value-compatible overload. */
+        public static String choose(Supplier<String> call) {
+            return call.get();
+        }
+
+        /** Selects the first source site when two sites resolve to an inherited member. */
+        public static boolean takeFirst() {
+            mark("takeFirst");
+            return true;
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(Collection<String> value) {
+            mark("pick(Collection)");
+            return "collection";
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(List<String> value) {
+            mark("pick(List)");
+            return value.get(0);
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(int[] value) {
+            mark("pick(int[])");
+            return "array:" + value[0];
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(Object value) {
+            mark("pick(Object)");
+            return "object";
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(int value) {
+            mark("pick(int)");
+            return "int:" + value;
+        }
+
+        /** Records the overload selected by javac or ECJ. */
+        public static String pick(Integer value) {
+            mark("pick(Integer)");
+            return "Integer:" + value;
+        }
+
+        /** Returns a parameterized type that the rewrite must preserve. */
+        private List<String> generic() {
+            mark("generic");
+            return List.of("list");
+        }
+
+        /** Provides a generic declaration with a deliberately polluted erased return. */
+        public static class GenericBase<T> {
+            /** Returns an Integer through the erased generic declaration. */
+            @SuppressWarnings("unchecked")
+            protected T retrieve() {
+                mark("retrieve");
+                return (T) Integer.valueOf(2);
+            }
+        }
+
+        /** Binds the inherited result type to String without introducing a bridge. */
+        public static final class GenericChild extends GenericBase<String> {}
+
+        /** Declares members inherited under two distinct source qualifiers. */
+        public static class Base {
+            protected static AccessSites empty;
+            /** Returns a null result for an inherited static method. */
+            protected static AccessSites noReceiver() {
+                mark("noReceiver");
+                return null;
+            }
+        }
+
+        /** Provides the first symbolic owner of the inherited static members. */
+        public static final class A extends Base {}
+        /** Provides the second symbolic owner of the inherited static members. */
+        public static final class B extends Base {}
+
+        /** Supplies folded constants and records any class initialization. */
+        public static class Cold {
+            private static final int CONSTANT = 7 * 6;
+            private static final String STRING = "str" + "ing";
+            static {
+                mark("Cold.<clinit>");
+            }
+        }
+
+        /** Supplies a constant whose enclosing type cannot be named. */
+        private static final class HiddenCold {
+            public static final int CONSTANT = 8 * 6;
+            static {
+                mark("HiddenCold.<clinit>");
+            }
+        }
+
+        /** Records superclass initialization and construction. */
+        public static class Parent {
+            static {
+                mark("Parent.<clinit>");
+            }
+
+            /** Records superclass initialization and construction. */
+            public Parent() {
+                mark("Parent.<init>");
+            }
+        }
+
+        /** Records initialization of the class used as a constructor argument. */
+        public static final class Inner {
+            static {
+                mark("Inner.<clinit>");
+            }
+
+            /** Records initialization of the class used as a constructor argument. */
+            private Inner(int n) {
+                mark("Inner.<init>");
+            }
+        }
+
+        /** Records initialization of the class being constructed first. */
+        public static final class Outer extends Parent {
+            static {
+                mark("Outer.<clinit>");
+            }
+
+            /** Records initialization of the class being constructed first. */
+            private Outer(Inner inner) {
+                mark("Outer.<init>");
+            }
+        }
+
+        /** Records argument evaluation and supplies a value. */
+        public int argument() {
+            mark("argument");
+            return 5;
+        }
+
+        /** Records a private call that returns the current receiver. */
+        private AccessSites chain() {
+            mark("chain");
+            return this;
+        }
+
+        /** Records a private call that returns null. */
+        private AccessSites absent() {
+            mark("absent");
+            return null;
+        }
+
+        /** Returns an array containing a null receiver. */
+        public AccessSites[] elements() {
+            mark("elements");
+            return new AccessSites[1];
+        }
+
+        /** Observes the identity of strings folded at compile time. */
+        public static boolean constantIdentity(String a, String b) {
+            mark("constantIdentity");
+            return a == b;
+        }
+
+        /** Executes each supported expression directly with javac. */
+        public static Object golden(String id, AccessSites x) {
+            return switch (id) {
+                case "array-target" -> {
+                    x.array[0] = x.argument();
+                    yield x.array[0];
+                }
+                case "index-target" -> {
+                    int[] a = {7};
+                    a[x.index] = x.argument();
+                    yield a[0];
+                }
+                case "nested-target" -> {
+                    ((x.array[0]))++;
+                    yield x.array[0];
+                }
+                case "generic" -> pick(x.generic());
+                case "array" -> pick(x.array);
+                case "primitive" -> pick(x.primitive);
+                case "boxed" -> pick(x.boxed);
+                case "cold-hidden" -> HiddenCold.CONSTANT;
+                case "constant-expression" -> x.pick(Cold.CONSTANT + 1);
+                case "string" -> constantIdentity(Cold.STRING + "!", "string!");
+                case "constructor" -> {
+                    new Outer(new Inner(x.argument()));
+                    yield "ok";
+                }
+                case "chained-null" -> x.chain().absent().value;
+                case "array-null" -> x.elements()[0].value;
+                case "discard-statement" -> {
+                    x.genericChild.retrieve();
+                    yield "ok";
+                }
+                case "discard-lambda" -> {
+                    Runnable call = () -> x.genericChild.retrieve();
+                    call.run();
+                    yield "ok";
+                }
+                case "discard-argument" -> {
+                    consume(() -> x.genericChild.retrieve());
+                    yield "ok";
+                }
+                case "discard-cast" -> {
+                    ((Runnable) () -> x.genericChild.retrieve()).run();
+                    yield "ok";
+                }
+                case "method-description" -> {
+                    try {
+                        if (takeFirst()) yield A.noReceiver().value;
+                        yield B.noReceiver().value;
+                    } catch (NullPointerException e) {
+                        mark("getMessage");
+                        yield e.getMessage();
+                    }
+                }
+                case "field-description" -> {
+                    try {
+                        if (takeFirst()) yield A.empty.value;
+                        yield B.empty.value;
+                    } catch (NullPointerException e) {
+                        mark("getMessage");
+                        yield e.getMessage();
+                    }
+                }
+                default -> throw new IllegalArgumentException(id);
             };
         }
     }
