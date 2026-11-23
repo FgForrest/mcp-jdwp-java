@@ -38,6 +38,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 
 /**
@@ -134,6 +135,7 @@ class JDWPToolsEvaluateExpressionTest {
 		assertThat(result).isEqualTo("Error: Thread is not suspended.");
 	}
 
+	/** Uses the default frame for loader selection and again for execution. */
 	@Test
 	@DisplayName("defaults frameIndex to 0 when null")
 	void shouldDefaultFrameIndexToZeroWhenNull() throws Exception {
@@ -149,11 +151,11 @@ class JDWPToolsEvaluateExpressionTest {
 
 		tools.jdwp_evaluate_expression(1L, "x", null);
 
-		// Frame 0 is the documented default; verify it via the JDI call rather than parsing the
-		// rendered output.
-		verify(thread).frame(0);
+		// Classpath discovery can resume the thread, so execution reads the same index again.
+		verify(thread, times(2)).frame(0);
 	}
 
+	/** Uses the explicit frame for loader selection and again for execution. */
 	@Test
 	@DisplayName("explicit frameIndex is respected")
 	void shouldUseExplicitFrameIndexWhenProvided() throws Exception {
@@ -169,7 +171,7 @@ class JDWPToolsEvaluateExpressionTest {
 
 		tools.jdwp_evaluate_expression(1L, "y", 2);
 
-		verify(thread).frame(2);
+		verify(thread, times(2)).frame(2);
 	}
 
 	/**

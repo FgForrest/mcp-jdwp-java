@@ -126,10 +126,9 @@ public final class RemoteCodeExecutor {
             throw new JdiEvaluationException("Failed to execute remote code: " + e.getMessage(), e);
         } catch (InvocationException e) {
             final long elapsed = System.currentTimeMillis() - startTime;
-            final ObjectReference exception = e.exception();
-            final String exceptionType = exception != null ? exception.type().name() : "unknown";
-            log.error("[Executor] Target VM threw exception after {}ms: {}", elapsed, exceptionType, e);
-            throw new JdiEvaluationException("Target VM threw exception: " + exceptionType, e);
+            final JdiEvaluationException failure = targetException(e);
+            log.error("[Executor] Remote execution failed after {}ms: {}", elapsed, failure.getMessage(), e);
+            throw failure;
         } catch (JdiEvaluationException e) {
             // Already classified by a lower phase (notably loadClass's JdiClassDefinitionException).
             // Propagate unchanged so the evaluator can act on the precise subtype — re-wrapping here
@@ -140,6 +139,34 @@ public final class RemoteCodeExecutor {
             log.error("[Executor] Unexpected exception after {}ms: {}", elapsed, e.getClass().getName(), e);
             throw new JdiEvaluationException("Unexpected exception during remote execution: " + e.getMessage(), e);
         }
+    }
+
+    /** Formats a target exception identically for compiled and interpreted Java. */
+    public static JdiEvaluationException targetException(InvocationException failure) {
+        final ObjectReference exception = failure.exception();
+        final String type = exception != null ? exception.type().name() : "unknown";
+        return new JdiEvaluationException("Target VM threw exception: " + type, failure);
+    }
+
+    /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */
+    static @Nullable String closedMemberAccessModule(JdiEvaluationException failure, String wrapper) {
+        if (!(failure.getCause() instanceof InvocationException invocation)) {
+            return null;
+        }
+        final @Nullable ObjectReference exception = invocation.exception();
+        if (exception == null || !exception.referenceType().name().equals("java.lang.reflect.InaccessibleObjectException")) {
+            return null;
+        }
+        // The wrapper marker distinguishes reflection failures from exceptions thrown by the application.
+        final String marker = wrapper + MemberAccessRewrite.MODULE_FAILURE;
+        for (Field field : exception.referenceType().allFields()) {
+            if (field.name().equals("detailMessage") && field.declaringType().name().equals("java.lang.Throwable")
+                && exception.getValue(field) instanceof StringReference message) {
+                final String detail = message.value();
+                return detail.startsWith(marker) ? detail.substring(marker.length()) : null;
+            }
+        }
+        return null;
     }
 
     /**
@@ -174,7 +201,7 @@ public final class RemoteCodeExecutor {
     /**
      * Defines `bytecode` as `className` in the target VM via the supplied classloader. Idempotent:
      * if the class is already loaded (cached compilation reuse), the existing definition is
-     * returned unchanged — calling `defineClass` twice would throw `LinkageError`.
+     * returned unchanged. A duplicate definition would throw LinkageError.
      */
     private static ClassType loadClass(VirtualMachine vm, ThreadReference thread, ClassLoaderReference classLoader,
                                        String className, byte[] bytecode) throws JdiEvaluationException {

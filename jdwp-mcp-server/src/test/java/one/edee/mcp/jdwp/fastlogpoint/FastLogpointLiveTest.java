@@ -82,6 +82,26 @@ class FastLogpointLiveTest {
 		session.close();
 	}
 
+	/** Keeps the visibility diagnostic and ordinary-tool hint for fast probes on each target JDK. */
+	@Test
+	@Order(19)
+	void privateFieldRemainsUnavailableToFastLogpoints() throws Exception {
+		final String javaHomes = System.getProperty("jdwp.live.target.java.home", System.getProperty("java.home"));
+		for (String home : javaHomes.split(",")) {
+			try (LiveSession target = LiveSession.start(Path.of(home.trim()))) {
+				final int id = idOf(target.tools.jdwp_set_fast_logpoint(TARGET, probeLine, "this.privateBase",
+					null, true, null, null));
+				await("private-field arm failure", () -> target.tools.jdwp_get_events(30).contains("[FAST_LOGPOINT_ARM_FAILED]"));
+				assertThat(target.fastLogpoints.list()).singleElement().satisfies(info -> {
+					assertThat(info.id()).isEqualTo(id);
+					assertThat(info.state()).isEqualTo(FastLogpointService.State.FAILED);
+				});
+				assertThat(target.tools.jdwp_get_events(30)).contains("[FAST_LOGPOINT_ERROR]", "[FAST_LOGPOINT_ARM_FAILED]",
+					"privateBase", "is not visible", "jdwp_set_logpoint can interpret");
+			}
+		}
+	}
+
 	@Test
 	@Order(1)
 	@DisplayName("without userApproved=true nothing is armed and the risk briefing names the target")

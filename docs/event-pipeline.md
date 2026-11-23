@@ -14,10 +14,10 @@ JDI delivers every interesting target-VM event — breakpoint hits, steps, excep
 
 One thread, named `jdi-event-listener`, daemon, spawned by `JdiEventListener.start(vm)`. Exactly one runs at a time — `start()` calls `stop()` first so reconnects never overlap two listeners. `start()` also opens the connection's `SuspensionSession` (`BreakpointTracker.openSuspensionSession`, which closes the previous one), binds it to the `EvaluationGuard`, and starts its `SuspensionWatchdog` (§ 14).
 
-The listener only drains and routes. Processing an event set can invoke target code through compiled conditions and logpoint expressions, fast-probe arming (including a fast breakpoint’s capture), or classpath prewarm. A target method called this way can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. So the sets are processed on a second thread, `jdi-event-dispatcher` (a single-thread executor per connection, so they stay in arrival order and their evaluations stay serialized), while the listener keeps draining:
+The listener only drains and routes. Ordinary conditions and logpoints accept expressions and statement blocks. Read-only plans use the held frame. Processing can invoke target code during interpreted calls, compiled evaluations, or fast-probe arming, including a fast breakpoint's capture. Compiler setup runs on demand and walks the selected frame's defining loader chain. On the dispatcher it reads the inherited context loader field, can invoke a public `URLClassLoader.getURLs()` accessor, and leaves overridden context getters pending for a tool evaluation. A target method called during processing can hit a breakpoint of its own. The invocation cannot return until that second event is drained and its thread resumed. Each connection uses a single `jdi-event-dispatcher` thread to process sets in arrival order while the listener keeps draining.
 
 - a `VMDeath` / `VMDisconnect` set is processed on the listener thread after the dispatcher has finished the sets before it (bounded at 2 s). First the in-target probes are read (`FastLogpointService.readBeforeExit`, field reads only) and the set is resumed — a `VMDeathRequest` with `SUSPEND_ALL`, kept while fast probes exist, holds the target at its exit until then — and the exiting hook snapshots what the exit takes with it (`JDIConnectionService.captureExit`, for the `[VM_DEATH]`, `jdwp_reset` and `jdwp_disconnect` replies). Then the session is closed, and the set gets no context. Sets still queued after that are dropped unprocessed, so `VM_DEATH` stays the last entry; a set already being processed — a long compile, say — finishes on the closed session, which drops its buffered history and publishes nothing (§ 3);
-- a set whose thread is inside an MCP-driven evaluation (it holds a lease, § 14) is **suppressed** on the listener thread at once (`suppress`): it is routed as a context and finished immediately. In between, each event is recorded as `*_SUPPRESSED` (a step's request is deleted too); a fast-logpoint arming hit is re-armed and a fast breakpoint's stop skipped instead; a class prepare still promotes its deferred breakpoints. With no stop candidate, `finish` releases the set, which lets the waiting invocation finish. This path never evaluates, arms or pre-warms — not even if the evaluation has ended by the time the set is handled — so the listener thread never calls into the target;
+- a set whose thread is inside an MCP-driven evaluation (it holds a lease, § 14) is **suppressed** on the listener thread at once (`suppress`): it is routed as a context and finished immediately. In between, each event is recorded as `*_SUPPRESSED` (a step's request is deleted too); a fast-logpoint arming hit is re-armed and a fast breakpoint's stop skipped instead; a class prepare still promotes its deferred breakpoints. With no stop candidate, `finish` releases the set, which lets the waiting invocation finish. The listener handles these events as suppressed even if the evaluation has ended by the time the set is handled;
 - every other set is routed as a QUEUED context (`SuspensionSession.route`) and handed to the dispatcher.
 
 Only a set's own context releases its suspension. The dispatcher's `finish` ends each set's processing. It publishes the set's first stop candidate as a **held stop**, or attempts to release the set. A tool releases a published stop after presentation. Tools can also recover a failed automatic release or retry an eligible watchdog release. Every retry still spends only the suspension its context owns. § 14 has the full model.
@@ -80,7 +80,7 @@ boolean process(EventSet eventSet, …) {                    // returns "release
         shouldSuspend |= stop;
         if (!stop) dropCandidatesAfter(context, mark);      // the handler's candidates are withdrawn
     }
-    // fast-logpoint arming hits run last; then, if shouldSuspend, the classpath pre-warm
+    // fast-probe arming hits run last
     return !shouldSuspend;
 }
 ```
@@ -90,7 +90,7 @@ Two details matter:
 1. **`shouldSuspend` is OR-accumulated across the entire `EventSet`.** JDWP can deliver multiple events together — for example, a `BreakpointEvent` and a `StepEvent` on the same thread at the same location. If **any** handler wants a stop, the set is published and the entire set stays parked. A handler that does not stop withdraws the candidates it added (a breakpoint handler records its snapshot before it evaluates the condition); of the candidates kept, the first is the stop's report. The JDI suspension policy on each request decides which threads are parked; the dispatcher's decision is purely "publish a stop, or release the set".
 2. **An exception thrown from a handler defaults to suspend.** Several handlers catch, record the error and return `true`; an exception escaping `process` sets `keep` in `dispatch`. A set kept without a candidate (an untracked breakpoint) is published as a plain breakpoint stop of its thread. The principle is fail-safe — if something is broken, the agent gets a chance to inspect; we never silently resume on an unexpected error. One exception: a set routed as one that never stops (`mayStop` false — only logpoints, exception and field logpoints, a fast logpoint's arming hit, class prepares) never publishes. The redefinition rule (`breakpoints.md` § 5d) did not count its thread, so the method it stopped in may have been redefined meanwhile; `SuspensionSession.finish` releases it, and the handler's error stays in the history.
 
-The remote classpath pre-warm runs before publishing the first suspending stop. Local project discovery starts at attach on its own daemon thread and is cancelled when that connection ends. Compiled dispatcher evaluations use the remote classpath while local discovery is pending. If local discovery finishes during the remote walk, the dispatcher merges the ready result at publication without another remote walk. A remote-only compile that misses a type retries on the same hit if the current local result is ready. A fast probe that needs a running scan or whose retry result is superseded defers to a later hit. The deferral adds no stop. The event set resumes only when no other event in it requests a stop.
+Compiled dispatcher evaluations and fast-probe arming configure the remote classpath on demand. Local project discovery starts at attach on its own daemon thread and is cancelled when that connection ends. Compiled dispatcher evaluations use the remote classpath while local discovery is pending. If local discovery finishes during the remote walk, the dispatcher merges the ready result at publication without another remote walk. A remote-only compile that misses a type retries on the same hit if the current local result is ready. A fast probe that needs a running scan or whose retry result is superseded defers to a later hit. The deferral adds no stop. The event set resumes only when no other event in it requests a stop.
 
 ### Dispatch by type
 
@@ -181,7 +181,7 @@ For each event type, the handler returns `true` (it wants a stop: its candidate 
 | | Logpoint | false | Evaluate, log, chain effect |
 | | Suspending | **true** | Candidate, history, chain effect |
 | `ClassPrepareEvent` | always | (never stops) | Promotion side effect only; the CPR's own `SUSPEND_EVENT_THREAD` policy parks the loading thread until `finish` releases the set |
-| `VMStartEvent` | always | **true** | `VM_START` candidate: the VM stays suspended so the agent can set up. Compiled evaluation needs a later stop (§ 14) |
+| `VMStartEvent` | always | **true** | `VM_START` candidate: the VM stays suspended so the agent can set up. Invoking evaluations need a later stop (§ 14) |
 | `VMDisconnect` / `VMDeath` | always | exits loop | Death set only, processed on the listener without a context; sets `running=false`, runs the death hook |
 
 Fast logpoints and fast breakpoints are decided by `FastLogpointService` (`handleArmingHit` → `STOPPED` / `RESUME`, `handleStopHit`) under the same candidate rules; see [breakpoints.md](breakpoints.md) § 5a and § 5c. Arming and removal never redefine a method a held thread is in (§ 5d).
@@ -194,7 +194,7 @@ A few things stand out from the matrix:
 
 ## 6. Conditional-breakpoint evaluation
 
-`evaluateConditionWithBindings` routes line, exception and field breakpoint conditions on the dispatcher. Navigation uses the frame held by the event set and takes no invocation lease. The watchdog samples dispatcher leases, so navigation leaves queued suspensions alone. Compiled conditions configure the compiler classpath and use the event's existing invocation admission.
+`evaluateConditionWithBindings` routes line, exception and field breakpoint conditions on the dispatcher. Navigation uses the frame held by the event set and takes no invocation lease. The watchdog samples dispatcher leases, so navigation leaves queued suspensions alone. An INVOKE condition snapshots the frame and acquires one lease anchored on the event set being processed. COMPILE conditions also use event invocation admission and configure the compiler classpath.
 
 - **Fail-safe.** A parser, planner, compilation, execution or result-type error records `CONDITION_ERROR` and treats the condition as true. A suspending breakpoint stops and a logpoint processes its log expression.
 - **Boolean results.** Both primitive `BooleanValue` and boxed `java.lang.Boolean` are accepted.
@@ -209,7 +209,7 @@ When a logpoint fires:
 
 1. Run the same reentrancy and tracking checks as a normal BP.
 2. If a condition is set, evaluate it. False → return false, no log, no chain.
-3. Route the log expression through `evaluateAndFormat`. Navigation reads the held frame and object values. Compilation configures the classpath and invokes on the event thread.
+3. Route the log expression through `evaluateAndFormat`. Navigation reads the held frame and object values. An INVOKE plan runs its calls under one dispatcher lease. A COMPILE plan configures the classpath and invokes on the event thread.
 4. Record `LOGPOINT` to event history with the formatted result.
 5. Apply chain effects.
 6. Return `false` → no candidate; unless another event of the set stops, `finish` releases the set.

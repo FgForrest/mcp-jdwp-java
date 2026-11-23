@@ -7,11 +7,18 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * A running fixture JVM with its loopback debugger endpoint.
+ *
+ * @param process target JVM process owned by this scope
+ * @param port JDWP port announced by the target
+ */
 record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
     static final String CLASS = InterpreterTarget.class.getName();
 
@@ -23,17 +30,37 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
             .toList();
     }
 
-    static InterpreterTargetVm start(Path javaHome) throws Exception {
-        final String classpath = Path.of(InterpreterTarget.class.getProtectionDomain().getCodeSource()
-            .getLocation().toURI()).toString();
-        final Process process = new ProcessBuilder(
-            javaHome.resolve("bin/java").toString(),
-            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, CLASS).redirectErrorStream(true).start();
+    /** Starts the target with optional directories for its context classloader fixture. */
+    static InterpreterTargetVm start(Path javaHome, String... loaderDirectories) throws Exception {
+        return startClass(javaHome, InterpreterTarget.class, loaderDirectories);
+    }
 
-        final var port = new CompletableFuture<Integer>();
-        final var drain = new Thread(() -> {
-            try (var output = new BufferedReader(new InputStreamReader(process.getInputStream(),
+    /** Starts a fixture with the same classpath and JDWP transport as the interpreter target. */
+    static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... arguments) throws Exception {
+        return launch(javaHome, mainClass, List.of(), List.of(arguments));
+    }
+
+    /** Starts the interpreter target with JVM options before its classpath. */
+    static InterpreterTargetVm startWithOptions(Path javaHome, String... options) throws Exception {
+        return launch(javaHome, InterpreterTarget.class, List.of(options), List.of());
+    }
+
+    private static InterpreterTargetVm launch(Path javaHome, Class<?> mainClass, List<String> options,
+                                               List<String> arguments) throws Exception {
+        final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
+            .getLocation().toURI()).toString();
+        final List<String> command = new ArrayList<>(List.of(
+            javaHome.resolve("bin/java").toString(),
+            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0"));
+        command.addAll(options);
+        command.addAll(List.of("-cp", classpath, mainClass.getName()));
+        command.addAll(arguments);
+        final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+
+        final CompletableFuture<Integer> port = new CompletableFuture<>();
+        // Keep draining output after startup so a full pipe cannot block the fixture.
+        final Thread drain = new Thread(() -> {
+            try (final BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {
                 final String prefix = "Listening for transport dt_socket at address: ";
                 final StringBuilder startup = new StringBuilder();

@@ -51,7 +51,7 @@ public final class InvocationRunner {
      */
     private static final long BLOCKER_TIMEOUT_MS = 2_000;
 
-    /** The worker can annotate the job while it is waiting on host-side classpath discovery. */
+    /** The active tool job for admission checks and local classpath wait reporting. */
     private static final ThreadLocal<Job<?>> CURRENT_JOB = new ThreadLocal<>();
 
     private static final int PENDING = 0;
@@ -157,6 +157,12 @@ public final class InvocationRunner {
         } catch (ExecutionException e) {
             throw rethrow(e);
         }
+    }
+
+    /** Whether the calling worker is running a bounded tool job for this target thread. */
+    public static boolean isWorkerFor(ThreadReference thread) {
+        final Job<?> job = CURRENT_JOB.get();
+        return job != null && thread.equals(job.thread);
     }
 
     /** Marks a bounded host-side wait so a tool deadline can explain what its job is doing. */

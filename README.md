@@ -11,7 +11,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 An MCP server that speaks **JDWP** — the same protocol IntelliJ / Eclipse / VS Code use to attach — and exposes the debugger to Claude Code and Codex as **50 tools + 2 MCP resources** over STDIO. Once the agent attaches to your JVM, it can:
 
 - **See runtime state, not stack traces** — read locals, fields, threads, the entire object graph
-- **Evaluate Java in the suspended frame** — read private fields through JDI and compile expressions that require target code
+- **Evaluate Java in the suspended frame** — read private fields and invoke supported private methods through JDI
 - **Mutate the running program** — set locals, write fields, test "what if?" without restart
 - **Stop on the bad case only** — conditional breakpoints, exception breakpoints at the throw site, deferred BPs that arm before the class loads, chains that gate one BP on another
 - **Trace without stopping** — line/exception/field logpoints write to an event log; the hitting thread pauses only while the server evaluates the expression, then runs on
@@ -620,14 +620,18 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. Navigation works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. Ordinary method calls, lambdas and blocks compile against the available classpath and run in the target. Compiled code that is still running after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+
+On JDK 17 and 21, ordinary compilation can retry visibility errors on private application field reads, method calls and constructors through reflection. The retry preserves exact value types and inlines type-qualified constants without class initialization. Assignment targets, inaccessible types, expression-qualified constants and closed JDK packages can still produce access errors. Fast probes and their arming evaluations use Java access rules.
+
+The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath, the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 
 Two input modes:
 
 - **Single expression** — `order.getTotal()`, `x + y`, `list.size() == 5`. The same expression form works for navigation and compilation.
-- **Block mode** — wrap the input in `{ ... }` to send a multi-statement body with try/catch, intermediate locals, or early `return`. The agent writes explicit `return X;` to yield a value. Available everywhere expressions are accepted: `jdwp_evaluate_expression`, `jdwp_assert_expression`, breakpoint conditions, logpoint expressions, watchers.
+- **Block mode** — wrap the input in `{ ... }` to send a multi-statement body with try/catch, intermediate locals, or early `return`. Use explicit `return X;` to yield a value. Read-only blocks with local variables, assignments to those locals, and branches can run without invoking the target. Constructs such as loops and try/catch use compilation. Available everywhere expressions are accepted: `jdwp_evaluate_expression`, `jdwp_assert_expression`, breakpoint conditions, logpoint expressions, watchers.
 
 Set `JDWP_EVAL_ENGINE=auto|compiler|interpreter` in the server environment. `jdwp_diagnose` reports engine counts and why expressions needed compilation. [Expression evaluation](docs/expression-evaluation.md)
 
@@ -687,7 +691,7 @@ When an expression evaluation at a breakpoint re-enters the breakpointed line (e
 2. A `BREAKPOINT_SUPPRESSED` / `EXCEPTION_SUPPRESSED` / `STEP_SUPPRESSED` entry is recorded in event history
 3. The outer breakpoint context is preserved
 
-**Covered invocation sites:** `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`, logpoint evaluation, conditional breakpoint evaluation, `jdwp_to_string`, classpath discovery, and deferred class loading via `Class.forName`.
+**Covered invocation sites:** `jdwp_evaluate_expression`, `jdwp_assert_expression`, `jdwp_evaluate_watchers`, logpoint evaluation, conditional breakpoint evaluation, `jdwp_to_string`, an overridden context-loader getter or public `URLClassLoader.getURLs()` during compiler setup, and deferred class loading via `Class.forName`.
 
 ### Smart filtering
 
@@ -823,7 +827,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                       | Parameters                                          | Description                                                       |
 |----------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
-| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java expression at suspended frame (supports `{ block }`; `threadId` defaults to the current stop's thread) |
+| `jdwp_evaluate_expression` | `expression`, `threadId?`, `frameIndex?`            | Evaluate Java in a suspended frame, including supported private member access and `{ block }` syntax. Read-only blocks work on manual holds. Compilation discovers the target classpath on demand. `threadId` defaults to the current stop's thread. |
 | `jdwp_assert_expression`   | `expression`, `expected`, `threadId?`, `frameIndex?` | Evaluate and compare against expected value                       |
 | `jdwp_set_local`           | `threadId`, `frameIndex`, `varName`, `value`        | Set a local variable's value                                      |
 | `jdwp_set_field`           | `objectId`, `fieldName`, `value`                    | Set a field's value on a cached object                            |
@@ -983,7 +987,7 @@ The server is `SYNC` mode, `web-application-type=none` — JSON over STDIO, no H
 ### Expression evaluation pipeline (`evaluation/`)
 
 1. **JdiExpressionEvaluator** — Analyzes the stack frame, generates a wrapper class with a UUID name, delegates compilation, caches results.
-2. **ClasspathDiscoverer** — Walks target JVM classloader hierarchy (including Tomcat/container) to find all JARs. Uses **JdkDiscoveryService** to locate a local JDK matching the target version.
+2. **ClasspathDiscoverer** — Reads the JDWP launch classpath and the context and defining loader chains. Later compiles add newly selected loader chains and retry failed reads. **JdkDiscoveryService** uses the debugger-reported version to locate a matching local JDK.
 3. **LocalProjectClasspathProvider** — Additive fallback for when the target's classloader hierarchy hides JARs (Tomcat, Spring Boot dev-tools, custom `URLClassLoader`s). Composes `JDWP_EXTRA_CLASSPATH` (override), a depth-5 scan of `target/classes` / `target/test-classes` under the project directory, and `mvn dependency:build-classpath` there. Discovery starts on attach and dispatcher evaluations use the remote classpath until the local entries are ready. The project directory is the server's working directory, or the session directory the client reports (Codex). Set `JDWP_EXTRA_CLASSPATH=/path/extra.jar:/path/more.jar` (colon/semicolon-separated) to plug specific gaps; `jdwp_diagnose` shows a per-source breakdown. Details in [docs/expression-evaluation.md](docs/expression-evaluation.md#localprojectclasspathprovider--local-project-classpath-fallback).
 4. **InMemoryJavaCompiler** — Compiles Java source to bytecode using Eclipse JDT (ECJ), entirely in memory.
 5. **RemoteCodeExecutor** — Injects bytecode via `ClassLoader.defineClass()` and invokes it.
@@ -1096,7 +1100,7 @@ Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. 
 - [memory-and-references.md](docs/memory-and-references.md) — JDI mirrors, the object cache, marks, the compilation cache, byte-array mirroring
 - [event-pipeline.md](docs/event-pipeline.md) — the JDI event listener loop and the suspension decision matrix
 - [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains, fast logpoints and fast breakpoints
-- [expression-evaluation.md](docs/expression-evaluation.md) — JDI navigation and the compiled evaluation pipeline
+- [expression-evaluation.md](docs/expression-evaluation.md) — JDI reads, interpreted calls and the compiled evaluation pipeline
 - [diagnostics.md](docs/diagnostics.md) — `jdwp_diagnose`, JVM discovery, the handshake probe, transport-loss envelopes, logging
 - [testing.md](docs/testing.md) — test architecture for contributors
 

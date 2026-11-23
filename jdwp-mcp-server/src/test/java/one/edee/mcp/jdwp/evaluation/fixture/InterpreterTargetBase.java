@@ -5,7 +5,9 @@ public class InterpreterTargetBase {
     public int hidden = 10;
     public int inherited = 11;
 
+    /** Records explicit dispatch to the superclass implementation. */
     public String dispatch() {
+        InterpreterTarget.step("D", 0);
         return "base";
     }
     /** A member type that shadows the bootstrap type in the subclass. */
