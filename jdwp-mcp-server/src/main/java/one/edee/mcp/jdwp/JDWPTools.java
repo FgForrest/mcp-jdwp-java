@@ -1723,9 +1723,10 @@ public class JDWPTools {
 
     /**
      * Waits on the tool caller's thread for a global or targeted stop on the fetched connection.
-     * Returns the selected stop with its captures even after transport loss, or the wait outcome.
+     * Presents a matching unseen stop before considering releases and retains its captures
+     * after transport loss.
      */
-    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). If a stop happened that you have not seen yet, it is returned at once and nothing is resumed; while a step is in flight, it only waits for the step to land. With threadId, it resumes only what holds that thread and waits for that thread's stop; other threads' stops stay held and unseen. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
+    @McpTool(description = "Resume the stops you have seen and BLOCK until the next breakpoint, step, or exception stop (or timeout). Presents the oldest matching unseen stop at once; while a step is in flight, it only waits for the step to land. With threadId, if no matching stop is unseen, it lets covering event sets settle before resuming only that thread. Returns the same info as jdwp_get_current_thread on success. Returns 'Event fired ...' on a stop, '[RESUME_FAILED] ...' if a hold could not be released, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected, '[NO_EVENT] ...' when jdwp_reset ran meanwhile, or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs,
         @McpToolParam(required = false, description = "Resume and wait for this thread only") @Nullable Long threadId) {
@@ -1833,7 +1834,7 @@ public class JDWPTools {
                 final String envelope = stepTool == null ? renderSoftWaitEnvelope("jdwp_resume_until_event", deadlineMs)
                     : renderSoftWaitEnvelope(stepTool, deadlineMs, "call jdwp_resume_until_event(threadId=" + threadId
                         + ") to continue waiting for the pending step");
-                yield envelope + "\n\n" + timeoutDiagnostics(deadlineMs, threadId) + suffix;
+                yield envelope + "\n\n" + timeoutDiagnostics(deadlineMs, threadId, next.pendingContext()) + suffix;
             }
             case CLOSED -> renderWaitVmDeath(session, report) + releasedBeforeWait(next, threadId, true);
             case RESUME_FAILED -> {
@@ -1897,13 +1898,16 @@ public class JDWPTools {
         }
     }
 
-    /** Supplies the targeted timeout even if the optional diagnostic snapshot fails. */
-    private String timeoutDiagnostics(int deadlineMs, @Nullable Long threadId) {
+    /** Supplies the timeout and any unsettled context even if the optional diagnostic snapshot fails. */
+    private String timeoutDiagnostics(int deadlineMs, @Nullable Long threadId, @Nullable String pendingContext) {
+        final String header = pendingContext == null ? timeoutHeader(deadlineMs, threadId)
+            : "[TIMEOUT] No stop was presented for thread " + threadId + " within " + deadlineMs
+                + "ms. At the deadline, " + pendingContext + ".";
         try {
-            return buildDiagnosticReport(true, deadlineMs, threadId);
+            return buildDiagnosticReport(header);
         } catch (RuntimeException e) {
             log.debug("Could not render diagnostics for timed-out stop wait", e);
-            return timeoutHeader(deadlineMs, threadId) + "\n\nDiagnostic snapshot unavailable.";
+            return header + "\n\nDiagnostic snapshot unavailable.";
         }
     }
 
@@ -2452,7 +2456,7 @@ public class JDWPTools {
         // nothing was set up — confusing in a session that previously had a full BP rig, since
         // disconnect wipes the registry. Skipping it removes the contradiction and saves tokens.
         if (status.connected()) {
-            out.append('\n').append(buildDiagnosticReport(false, null, null));
+            out.append('\n').append(buildDiagnosticReport("[DIAGNOSTIC] Current debugger state:"));
         }
 
         // Show the project directory even before attach. The report remains available while
@@ -2589,7 +2593,7 @@ public class JDWPTools {
      * whether retrying is pointless (pending BPs, failed bindings) or whether the BP is firing but
      * auto-resuming (logpoints, false conditions).
      */
-    private String buildDiagnosticReport(boolean afterTimeout, @Nullable Integer waitedMs, @Nullable Long threadId) {
+    private String buildDiagnosticReport(String header) {
         final Map<Integer, BreakpointRequest> activeLineBps = breakpointTracker.getAllBreakpoints();
         final Map<Integer, BreakpointTracker.PendingBreakpoint> pendingLineBps =
             breakpointTracker.getAllPendingBreakpoints();
@@ -2604,12 +2608,7 @@ public class JDWPTools {
         final List<EventHistory.DebugEvent> recent = eventHistory.getRecent(10);
         final BreakpointTracker.LastBreakpoint last = breakpointTracker.getLastBreakpoint();
 
-        final StringBuilder out = new StringBuilder();
-        if (afterTimeout) {
-            out.append(timeoutHeader(java.util.Objects.requireNonNull(waitedMs), threadId)).append("\n\n");
-        } else {
-            out.append("[DIAGNOSTIC] Current debugger state:\n\n");
-        }
+        final StringBuilder out = new StringBuilder(header).append("\n\n");
 
         out.append(String.format("Active line breakpoints: %d%n", activeLineBps.size()));
         for (Map.Entry<Integer, BreakpointRequest> e : activeLineBps.entrySet()) {
@@ -5961,42 +5960,49 @@ public class JDWPTools {
     }
 
     /**
-     * Selects the stop for a getter. Once it is presented, even refused or failed enrichment
-     * must leave enough of the captured report in the reply to identify that stop, including
-     * when the selected session closes during an unsuccessful frame read.
+     * Selects the current stop for a getter, falling back to the last published snapshot.
      */
     private String renderPresentedOrLastStop(String tool, StopGetter getter) throws Exception {
         final SuspensionSession session = breakpointTracker.suspensionSession();
         if (session != null) {
             final SuspensionSession.StopReport report = session.presentCurrentReport();
             if (report != null) {
-                final String fallback = selectedStopNote(report, report.unblockedNote() + unseenNote()).stripLeading();
-                try {
-                    final String live = enrichHeldStop(session, report, () -> getter.render(report.stop(), report));
-                    if (session.isClosed()) {
-                        return renderWaitVmDeath(session, report);
-                    }
-                    if (live == null) {
-                        return fallback;
-                    }
-                    if (live.startsWith("Error:")) {
-                        return fallback + "\n" + live;
-                    }
-                    return live;
-                } catch (Exception e) {
-                    if (session.isClosed()) {
-                        return renderWaitVmDeath(session, report);
-                    }
-                    if (isVmGone(e)) {
-                        return vmGoneEnvelope(tool, e) + selectedStopNote(report);
-                    }
-                    return fallback;
-                }
+                return renderPresentedStop(session, report, tool, getter);
             }
         }
         final BreakpointTracker.LastBreakpoint last = breakpointTracker.getLastBreakpoint();
         return last == null ? "No current breakpoint detected. Set a breakpoint and trigger it first."
             : getter.render(last, null);
+    }
+
+    /**
+     * Renders a presented stop. If live enrichment is refused or fails, retains enough of the
+     * captured report to identify it, including when the session closes during a frame read.
+     */
+    private String renderPresentedStop(SuspensionSession session, SuspensionSession.StopReport report,
+                                       String tool, StopGetter getter) {
+        final String fallback = selectedStopNote(report, report.unblockedNote() + unseenNote()).stripLeading();
+        try {
+            final String live = enrichHeldStop(session, report, () -> getter.render(report.stop(), report));
+            if (session.isClosed()) {
+                return renderWaitVmDeath(session, report);
+            }
+            if (live == null) {
+                return fallback;
+            }
+            if (live.startsWith("Error:")) {
+                return fallback + "\n" + live;
+            }
+            return live;
+        } catch (Exception e) {
+            if (session.isClosed()) {
+                return renderWaitVmDeath(session, report);
+            }
+            if (isVmGone(e)) {
+                return vmGoneEnvelope(tool, e) + selectedStopNote(report);
+            }
+            return fallback;
+        }
     }
 
     /**
@@ -6009,29 +6015,96 @@ public class JDWPTools {
             + "the next one)", unseen);
     }
 
-    /** Presents the selected stop and its captures, with frames and locals when available. */
-    @McpTool(description = "One-shot debugging context at the current breakpoint: thread, top frames, locals at frame 0, and 'this' field dump. Use this instead of the four-call sequence (get_current_thread → get_stack → get_locals → get_fields(this)) at every BP hit.")
+    /** {@link #jdwp_get_breakpoint_context(Integer, Boolean, Long)} for the current stop. */
+    public String jdwp_get_breakpoint_context(
+        @Nullable Integer maxFrames, @Nullable Boolean includeThisFields) {
+        return jdwp_get_breakpoint_context(maxFrames, includeThisFields, null);
+    }
+
+    /** Reports the selected thread's frames and captures, retaining its stop on connection loss. */
+    @McpTool(description = "One-shot debugging context for a selected thread or the current breakpoint: thread, top frames, locals at frame 0, and 'this' field dump.")
     public String jdwp_get_breakpoint_context(
         @McpToolParam(required = false, description = "Max stack frames to render (default: 5). Junit/maven/reflection frames are always collapsed.") @Nullable Integer maxFrames,
-        @McpToolParam(required = false, description = "Include the 'this' field dump (default: true)") @Nullable Boolean includeThisFields) {
+        @McpToolParam(required = false, description = "Include the 'this' field dump (default: true)") @Nullable Boolean includeThisFields,
+        @McpToolParam(required = false, description = "Show context for this suspended thread only.") @Nullable Long threadId) {
         final int frameLimit = (maxFrames != null && maxFrames > 0) ? maxFrames : 5;
         final boolean includeThis = includeThisFields == null || includeThisFields;
+        final String tool = "jdwp_get_breakpoint_context";
+        final StopGetter getter = (snapshot, report) ->
+            renderBreakpointContext(snapshot.thread(), snapshot, report, frameLimit, includeThis);
 
         try {
-            return renderPresentedOrLastStop("jdwp_get_breakpoint_context",
-                (snapshot, report) -> renderBreakpointContext(snapshot, report, frameLimit, includeThis));
+            if (threadId == null) {
+                return renderPresentedOrLastStop(tool, getter);
+            }
+            return renderTargetedContext(tool, threadId, frameLimit, includeThis, getter);
         } catch (Exception e) {
             return errorReply(e);
         }
     }
 
-    /** Renders captures from the snapshot and reads breakpoint context under the frame guards. */
-    private String renderBreakpointContext(BreakpointTracker.LastBreakpoint snapshot,
+    /** Resolves and inspects the selected thread, recovering a stop only from the matched session. */
+    private String renderTargetedContext(String tool, long threadId, int frameLimit, boolean includeThis,
+                                         StopGetter getter) throws Exception {
+        @Nullable SuspensionSession session = null;
+        try {
+            final VirtualMachine vm = jdiService.getVM();
+            session = breakpointTracker.suspensionSession();
+            if (session != null && !session.matchesVm(vm)) {
+                return THREAD_CONNECTION_CHANGED;
+            }
+            final ThreadReference thread = session == null
+                ? findThread(vm, threadId) : findSessionThread(session, vm, threadId);
+            if (session != null) {
+                final SuspensionSession.StopReport report = session.presentPublishedStop(threadId, true);
+                if (report != null) {
+                    return renderPresentedStop(session, report, tool, getter);
+                }
+            }
+            final String closed = closedContextReply(session, threadId);
+            if (closed != null) {
+                return closed;
+            }
+            if (thread == null) {
+                return "Error: Thread not found with ID " + threadId;
+            }
+            final String live = renderBreakpointContext(thread, null, null, frameLimit, includeThis);
+            final String closedAfterRead = closedContextReply(session, threadId);
+            return closedAfterRead == null ? live : closedAfterRead;
+        } catch (Exception e) {
+            if (session == null) {
+                throw e;
+            }
+            final String closed = closedContextReply(session, threadId);
+            if (closed != null) {
+                return closed;
+            }
+            if (e instanceof IllegalStateException || isVmGone(e)) {
+                final SuspensionSession.StopReport report = session.presentPublishedStop(threadId);
+                return vmGoneEnvelope(tool, e) + (report == null ? "" : selectedStopNote(report));
+            }
+            throw e;
+        }
+    }
+
+    /** Renders the closed connection's reply and any stop it published for the requested thread. */
+    @Nullable
+    private String closedContextReply(@Nullable SuspensionSession session, long threadId) {
+        if (session == null || !session.isClosed()) {
+            return null;
+        }
+        return renderWaitVmDeath(session, session.presentPublishedStop(threadId));
+    }
+
+    /** Reads suspended frames under the frame guards and includes the stop's capture when available. */
+    private String renderBreakpointContext(ThreadReference thread, BreakpointTracker.@Nullable LastBreakpoint snapshot,
                                             SuspensionSession.@Nullable StopReport report,
                                             int frameLimit, boolean includeThis) throws Exception {
-        final ThreadReference thread = snapshot.thread();
         return withFreshFrames(thread, "call again.", () -> {
             if (!thread.isSuspended()) {
+                if (snapshot == null) {
+                    return notSuspendedForInspection(thread);
+                }
                 if (report != null) {
                     return selectedStopNote(report, " The thread is no longer suspended.").stripLeading();
                 }
@@ -6041,9 +6114,15 @@ public class JDWPTools {
 
             final StringBuilder sb = new StringBuilder();
             sb.append("=== Breakpoint Context ===\n");
-            sb.append(String.format("Thread: %s (ID=%d, %s)%s",
-                report == null ? thread.name() : report.threadName(), thread.uniqueID(), formatEventTag(snapshot),
-                report == null ? "" : report.unblockedNote())).append(captureLines(snapshot)).append("\n\n");
+            if (snapshot == null) {
+                sb.append(String.format("Thread: %s (ID=%d). No stop of its own is recorded.",
+                    thread.name(), thread.uniqueID()));
+            } else {
+                sb.append(String.format("Thread: %s (ID=%d, %s)%s",
+                    report == null ? thread.name() : report.threadName(), thread.uniqueID(), formatEventTag(snapshot),
+                    report == null ? "" : report.unblockedNote())).append(captureLines(snapshot));
+            }
+            sb.append("\n\n");
 
             // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
             final FrameView view = FrameView.of(thread);

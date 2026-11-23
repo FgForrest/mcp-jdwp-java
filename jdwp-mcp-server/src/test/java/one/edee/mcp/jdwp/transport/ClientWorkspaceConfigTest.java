@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp.transport;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.spec.McpSchema;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -12,6 +13,7 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -104,6 +106,74 @@ class ClientWorkspaceConfigTest {
 		assertThat(processor.postProcessAfterInitialization(empty, "empty")).isSameAs(empty);
 		assertThat(processor.postProcessAfterInitialization(mixed, "mixed")).isSameAs(mixed);
 		assertThat(processor.postProcessAfterInitialization(plain, "plain")).isSameAs(plain);
+	}
+
+	/** Appends one warning to the existing text and preserves the result and content metadata. */
+	@Test
+	void shouldWarnAboutOneUnknownParameterWithoutChangingResultShape() {
+		final Map<String, Object> textMeta = Map.of("text-source", "tool");
+		final Map<String, Object> resultMeta = Map.of("result-source", "tool");
+		final Map<String, Object> structured = Map.of("status", "example");
+		final McpSchema.ImageContent image = new McpSchema.ImageContent(null, "AAAA", "image/png");
+		final McpSchema.TextContent first = new McpSchema.TextContent("first");
+		final McpSchema.TextContent last = new McpSchema.TextContent(null, "last", textMeta);
+		final McpSchema.CallToolResult original =
+			new McpSchema.CallToolResult(List.of(first, last, image), true, structured, resultMeta);
+
+		final McpSchema.CallToolResult reply = callWithArguments(Map.of("frame", 2, "typo", 3), original);
+
+		assertThat(reply.content()).containsExactly(first, new McpSchema.TextContent(null,
+			"last\n⚠ Ignored unknown parameter(s): typo. jdwp_probe accepts: frame, threadId.", textMeta), image);
+		assertThat(reply.isError()).isTrue();
+		assertThat(reply.structuredContent()).isEqualTo(structured);
+		assertThat(reply.meta()).isEqualTo(resultMeta);
+	}
+
+	/** Reports several unknown names in one line and excludes the reserved metadata key. */
+	@Test
+	void shouldWarnAboutSeveralUnknownParameters() {
+		final McpSchema.CallToolResult reply = callWithArguments(
+			Map.of("zzz\nextra", 1, "_meta", Map.of(), "aaa", 2), result("ok"));
+
+		assertThat(reply.content()).containsExactly(new McpSchema.TextContent(
+			"ok\n⚠ Ignored unknown parameter(s): aaa, zzz\\nextra. jdwp_probe accepts: frame, threadId."));
+	}
+
+	/** Leaves calls with only declared or reserved names untouched. */
+	@Test
+	void shouldLeaveKnownReservedAndEmptyArgumentsAlone() {
+		final McpSchema.CallToolResult original = result("ok");
+		assertThat(callWithArguments(Map.of("threadId", 1L, "_meta", Map.of(), "progressToken", "call-1"), original)).isSameAs(original);
+		assertThat(callWithArguments(Map.of(), original)).isSameAs(original);
+	}
+
+	/** Leaves a call with omitted arguments untouched. */
+	@Test
+	void shouldLeaveNullArgumentsAlone() {
+		final McpSchema.CallToolResult original = result("ok");
+		assertThat(callWithArguments(null, original)).isSameAs(original);
+	}
+
+	/** Calls a wrapped tool with a fixed schema and verifies that the handler still runs. */
+	private static McpSchema.CallToolResult callWithArguments(
+		@Nullable Map<String, Object> arguments, McpSchema.CallToolResult original
+	) {
+		final Map<String, Object> properties = new LinkedHashMap<>();
+		properties.put("frame", Map.of("type", "integer"));
+		properties.put("threadId", Map.of("type", "integer"));
+		final McpSchema.Tool tool = McpSchema.Tool.builder().name("jdwp_probe")
+			.inputSchema(new McpSchema.JsonSchema("object", properties, List.of(), false, null, null))
+			.build();
+		final AtomicReference<McpSchema.CallToolRequest> seen = new AtomicReference<>();
+		final SyncToolSpecification wrapped = ClientWorkspaceConfig.observingWorkspace(
+			new SyncToolSpecification(tool, (exchange, request) -> {
+				seen.set(request);
+				return original;
+			}), provider(new ClientWorkspace()));
+		final McpSchema.CallToolRequest request = new McpSchema.CallToolRequest("jdwp_probe", arguments);
+		final McpSchema.CallToolResult reply = wrapped.callHandler().apply(null, request);
+		assertThat(seen.get()).isSameAs(request);
+		return reply;
 	}
 
 	private static List<?> postProcess(List<?> toolSpecs, ClientWorkspace workspace) {
