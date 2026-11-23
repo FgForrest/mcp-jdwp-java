@@ -13,6 +13,12 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * A running fixture JVM with its loopback debugger endpoint.
+ *
+ * @param process target JVM process owned by this scope
+ * @param port JDWP port announced by the target
+ */
 record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
     static final String CLASS = InterpreterTarget.class.getName();
 
@@ -30,14 +36,14 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
     }
 
     /** Starts a fixture with the same classpath and JDWP transport as the interpreter target. */
-    static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... args) throws Exception {
+    static InterpreterTargetVm startClass(Path javaHome, Class<?> mainClass, String... arguments) throws Exception {
         final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
         final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
             "-cp", classpath, mainClass.getName()));
-        command.addAll(List.of(args));
+        command.addAll(List.of(arguments));
         final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<>();

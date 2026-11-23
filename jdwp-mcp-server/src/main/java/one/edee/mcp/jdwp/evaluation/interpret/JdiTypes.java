@@ -15,10 +15,29 @@ import static one.edee.mcp.jdwp.evaluation.interpret.PrimitiveOps.Kind;
  */
 final class JdiTypes {
     /**
-     * Compile-time type of a plan node: a primitive kind, a reference type, the null type, or a deferred type whose erasure is imprecise. {@code bounds} lists the intersection bounds when there are several.
+     * A node's source type and the metadata needed to prove Java type conversions.
+     *
+     * @param kind primitive kind, or null for references and null values
+     * @param reference reference type available for member lookup, or null if unavailable or inapplicable
+     * @param imprecise whether erasure prevents an exact source type from being known
+     * @param bounds conjunctive bounds of an intersection type
+     * @param genericSignature source type signature, or null when absent
+     * @param captured whether the lookup type represents a wildcard's upper bound
      */
     record StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
-                      List<ReferenceType> bounds) {
+                      List<ReferenceType> bounds, @Nullable String genericSignature, boolean captured) {
+        /** Creates a type whose source type was not reduced to a capture bound. */
+        StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
+                   List<ReferenceType> bounds, @Nullable String genericSignature) {
+            this(kind, reference, imprecise, bounds, genericSignature, false);
+        }
+
+        /** Creates a type without generic arguments. */
+        StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
+                   List<ReferenceType> bounds) {
+            this(kind, reference, imprecise, bounds, null);
+        }
+
         /** Creates a type without intersection bounds. */
         StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise) {
             this(kind, reference, imprecise, List.of());
@@ -83,10 +102,62 @@ final class JdiTypes {
      * Returns the static type of a JDI type; a generic signature starting with {@code T} marks an erased type variable.
      */
     static StaticType of(Type type, @Nullable String genericSignature) {
+        return of(type, genericSignature, false);
+    }
+
+    /** Preserves capture provenance when a generic result uses its upper bound for lookup. */
+    static StaticType of(Type type, @Nullable String genericSignature, boolean captured) {
         if (type instanceof ReferenceType reference) {
-            return new StaticType(null, reference, genericSignature != null && genericSignature.startsWith("T"));
+            return new StaticType(null, reference, genericSignature != null && genericSignature.startsWith("T"),
+                List.of(), genericSignature, captured);
         }
         return primitive(Kind.valueOf(type.name().toUpperCase(Locale.ROOT)));
+    }
+
+    /** Whether the target language version permits an unconditional binding pattern in instanceof. */
+    boolean supportsUnconditionalPatterns() {
+        final @Nullable String version = vm.version();
+        if (version == null) {
+            return false;
+        }
+        try {
+            return Runtime.Version.parse(version).feature() >= 21;
+        } catch (IllegalArgumentException ignored) {
+            return false;
+        }
+    }
+
+    /** Whether the source type of a pattern operand is known without capture, erasure or inference. */
+    boolean plainPatternType(StaticType type) throws ClassNotLoadedException {
+        if (type.imprecise() || type.captured() || !type.bounds().isEmpty()) {
+            return false;
+        }
+        final ReferenceType reference = type.reference();
+        if (reference == null) {
+            return type.isNull();
+        }
+        final String signature = type.genericSignature();
+        return (signature == null || signature.equals(reference.signature())) && plainPatternReference(reference);
+    }
+
+    /** Checks for generic declarations, including array components and non-static member class owners. */
+    boolean plainPatternReference(ReferenceType reference) throws ClassNotLoadedException {
+        if (reference instanceof ArrayType array) {
+            final Type component = array.componentType();
+            return !(component instanceof ReferenceType ref) || plainPatternReference(ref);
+        }
+        final String declaration = reference.genericSignature();
+        if (declaration != null && declaration.startsWith("<")) {
+            return false;
+        }
+        final String name = reference.name();
+        final int nested = name.lastIndexOf('$');
+        if (nested < 0 || reference.isStatic()) {
+            return true;
+        }
+        // A non-static member type may carry arguments from its enclosing declaration.
+        final ReferenceType owner = signatureType(name.substring(0, nested), reference);
+        return owner != null && plainPatternReference(owner);
     }
 
     /** Returns the primitive kind of a primitive or box type, or null for any other type. */
@@ -108,6 +179,15 @@ final class JdiTypes {
     /** Whether the type is the named class loaded by the bootstrap loader. */
     static boolean isBootstrap(@Nullable ReferenceType type, String name) {
         return type != null && name.equals(type.name()) && type.classLoader() == null;
+    }
+
+    /** Finds a type by its JVM name in the context of a member's declaration. */
+    @Nullable ReferenceType signatureType(String name, ReferenceType owner) {
+        final ReferenceType local = findExact(name);
+        if (local != null || (declaring != null && Objects.equals(owner.classLoader(), declaring.classLoader()))) {
+            return local;
+        }
+        return new JdiTypes(vm, owner).findExact(name);
     }
 
     /** Finds a loaded bootstrap class, or refuses the plan when it is not loaded. */

@@ -135,6 +135,11 @@ public class JdiExpressionEvaluator {
         this.localClasspathProvider = localClasspathProvider;
     }
 
+    /** Admits ordinary interpreted calls through the same guard as compiled evaluations. */
+    public EvaluationGuard.Lease invocationLease(ThreadReference thread) {
+        return evaluationGuard.lease(thread);
+    }
+
     /**
      * Rewrites bare references to fields of {@code this} as {@code _this.field} so the wrapper class
      * can resolve them. Only safe to call when {@code this}'s declared type is public AND each

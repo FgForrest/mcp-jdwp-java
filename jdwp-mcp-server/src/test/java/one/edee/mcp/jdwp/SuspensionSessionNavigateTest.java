@@ -30,28 +30,29 @@ class SuspensionSessionNavigateTest {
         SuspensionSession.endProcessing();
     }
 
-    /** Checks that navigation on each supported hold preserves its suspend count. */
+    /** Checks reads and invocation admission without changing any held suspend count. */
     @Test
     void toolsNavigateManualBystanderMonitorAndWaitHoldsWithoutBorrowingCounts() throws Exception {
-        final var target = new FakeSuspendModel();
-        final var event = target.thread("event");
-        final var manual = target.thread("manual");
-        final var bystander = target.thread("bystander");
-        final var monitor = target.thread("monitor");
-        final var wait = target.thread("wait");
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread event = target.thread("event");
+        final FakeSuspendModel.FakeThread manual = target.thread("manual");
+        final FakeSuspendModel.FakeThread bystander = target.thread("bystander");
+        final FakeSuspendModel.FakeThread monitor = target.thread("monitor");
+        final FakeSuspendModel.FakeThread wait = target.thread("wait");
         monitor.status = ThreadReference.THREAD_STATUS_MONITOR;
         wait.status = ThreadReference.THREAD_STATUS_WAIT;
 
-        final var tracker = new BreakpointTracker();
-        final var history = new EventHistory();
-        final var guard = new EvaluationGuard();
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
         final SuspensionSession session = tracker.openSuspensionSession(target.vm, history);
         guard.bind(session);
-        final var connection = mock(JDIConnectionService.class);
-        final var compiler = mock(JdiExpressionEvaluator.class);
-        final var router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
-        final var watchers = new WatcherManager();
-        final var tools = new JDWPTools(connection, tracker, watchers, router, history, guard,
+        final JDIConnectionService connection = mock(JDIConnectionService.class);
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        when(compiler.invocationLease(any())).thenAnswer(call -> guard.lease(call.getArgument(0)));
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final WatcherManager watchers = new WatcherManager();
+        final JDWPTools tools = new JDWPTools(connection, tracker, watchers, router, history, guard,
             mock(JvmDiscoveryService.class), new MarkedInstanceRegistry(), new JdiHealthMonitor(),
             mock(LocalProjectClasspathProvider.class), mock(FastLogpointService.class));
         when(connection.getVM()).thenReturn(target.vm);
@@ -63,20 +64,23 @@ class SuspensionSessionNavigateTest {
         final IntegerValue one = mockInteger(1);
         when(target.vm.mirrorOf(1)).thenReturn(one);
         when(target.vm.mirrorOf(3)).thenReturn(three);
-        for (var thread : List.of(manual, bystander, monitor, wait)) {
+        for (FakeSuspendModel.FakeThread thread : List.of(manual, bystander, monitor, wait)) {
             stack(thread.ref, two);
         }
 
         tools.jdwp_suspend_thread(manual.ref.uniqueID());
         assertThat(tools.jdwp_evaluate_expression(manual.ref.uniqueID(), "amount + 1", null)).endsWith(": 3");
         assertThat(manual.count).isEqualTo(1);
-        final var all = session.route(target.breakpointEvent(event, EventRequest.SUSPEND_ALL), event.ref, true);
+        assertThat(tools.jdwp_evaluate_expression(manual.ref.uniqueID(), "amount()", 0))
+            .contains("is held by jdwp_suspend_thread", "an evaluation needs it stopped at an event of its own");
+        assertThat(manual.count).isEqualTo(1);
+        final SuspensionSession.Context all = session.route(target.breakpointEvent(event, EventRequest.SUSPEND_ALL), event.ref, false);
         session.begin(all);
         session.beginProcessing(all);
         session.candidate(all, new BreakpointTracker.LastBreakpoint(event.ref, 42));
         session.finish(all);
         session.presentCurrent();
-        for (var thread : List.of(bystander, monitor, wait)) {
+        for (FakeSuspendModel.FakeThread thread : List.of(bystander, monitor, wait)) {
             assertThat(tools.jdwp_assert_expression("amount + 1", "3", thread.ref.uniqueID(), 0)).startsWith("OK");
             assertThat(thread.count).isEqualTo(1);
         }
@@ -87,11 +91,16 @@ class SuspensionSessionNavigateTest {
         assertThat(bystander.count).isEqualTo(1);
         assertThat(event.count).isEqualTo(1);
         assertThat(session.dispatcherInvocations()).isEmpty();
-        verifyNoInteractions(compiler);
+        verify(compiler).invocationLease(manual.ref);
 
+        assertThat(tools.jdwp_evaluate_expression(bystander.ref.uniqueID(), "amount()", 0))
+            .contains("is parked by another thread's stop", "an evaluation needs it stopped at an event of its own");
         assertThat(tools.jdwp_evaluate_expression(monitor.ref.uniqueID(), "amount()", 0))
-            .contains("not interpreted: method call");
+            .contains("is BLOCKED waiting on a Java monitor");
+        assertThat(bystander.count).isEqualTo(1);
         assertThat(monitor.count).isEqualTo(1);
+        verify(compiler).invocationLease(bystander.ref);
+        verifyNoMoreInteractions(compiler);
     }
 
     private static IntegerValue mockInteger(int number) {
@@ -100,7 +109,65 @@ class SuspensionSessionNavigateTest {
         return value;
     }
 
-    private static void stack(ThreadReference thread, IntegerValue value) throws Exception {
+    /** Sends a call through the tool worker and evaluates both watcher plans from the same stopped thread. */
+    @Test
+    void invokesOnTheToolWorkerAndKeepsMixedWatchersUsable() throws Exception {
+        final FakeSuspendModel target = new FakeSuspendModel();
+        final FakeSuspendModel.FakeThread event = target.thread("event");
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
+        final SuspensionSession session = tracker.openSuspensionSession(target.vm, history);
+        guard.bind(session);
+        final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
+        when(compiler.invocationLease(event.ref)).thenAnswer(call -> guard.lease(event.ref));
+        final JDIConnectionService connection = mock(JDIConnectionService.class);
+        when(connection.getVM()).thenReturn(target.vm);
+        final WatcherManager watchers = new WatcherManager();
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.INTERPRETER);
+        final JDWPTools tools = new JDWPTools(connection, tracker, watchers, router, history, guard,
+            mock(JvmDiscoveryService.class), new MarkedInstanceRegistry(), new JdiHealthMonitor(),
+            mock(LocalProjectClasspathProvider.class), mock(FastLogpointService.class));
+        final IntegerValue value = mockInteger(2);
+        when(connection.formatFieldValue(value)).thenReturn("2");
+        final CallFrame frame = stack(event.ref, value);
+        final Thread toolThread = Thread.currentThread();
+        when(frame.self().invokeMethod(event.ref, frame.method(), List.of(), ObjectReference.INVOKE_SINGLE_THREADED))
+            .thenAnswer(call -> {
+                assertThat(Thread.currentThread()).isNotSameAs(toolThread);
+                assertThat(guard.isEvaluating(event.ref)).isTrue();
+                return value;
+            });
+
+        final SuspensionSession.Context stop = session.route(
+            target.breakpointEvent(event, EventRequest.SUSPEND_EVENT_THREAD), event.ref, false);
+        session.begin(stop);
+        session.beginProcessing(stop);
+        session.candidate(stop, new BreakpointTracker.LastBreakpoint(event.ref, 42));
+        session.finish(stop);
+        session.presentCurrent();
+
+        assertThat(tools.jdwp_evaluate_expression(event.ref.uniqueID(), "amount()", 0)).endsWith(": 2");
+        watchers.createWatcher("local", 42, "amount");
+        watchers.createWatcher("call", 42, "amount()");
+        assertThat(tools.jdwp_evaluate_watchers(event.ref.uniqueID(), "current_frame", 42))
+            .contains("amount = 2", "amount() = 2");
+        verify(compiler, times(2)).invocationLease(event.ref);
+        verifyNoMoreInteractions(compiler);
+        assertThat(guard.isEvaluating(event.ref)).isFalse();
+        assertThat(event.count).isEqualTo(1);
+    }
+
+    /**
+     * Mirrors for an invocation on a fake frame.
+     *
+     * @param self receiver exposed by the frame
+     * @param method method available on the receiver
+     */
+    private record CallFrame(ObjectReference self, Method method) {}
+
+    /** Supplies a frame with a local and an invocable instance method. */
+    private static CallFrame stack(ThreadReference thread, IntegerValue value) throws Exception {
         final StackFrame frame = mock(StackFrame.class);
         final Location location = mock(Location.class);
         final ClassType owner = mock(ClassType.class);
@@ -108,6 +175,14 @@ class SuspensionSessionNavigateTest {
         final IntegerType type = mock(IntegerType.class);
         when(type.name()).thenReturn("int");
         when(owner.name()).thenReturn("example.App");
+        final Method method = mock(Method.class);
+        when(method.name()).thenReturn("amount");
+        when(method.signature()).thenReturn("()I");
+        when(method.declaringType()).thenReturn(owner);
+        when(method.returnType()).thenReturn(type);
+        when(owner.methods()).thenReturn(List.of(method));
+        final ObjectReference self = mock(ObjectReference.class);
+        when(frame.thisObject()).thenReturn(self);
         when(location.declaringType()).thenReturn(owner);
         when(frame.location()).thenReturn(location);
         when(frame.visibleVariables()).thenReturn(List.of(amount));
@@ -117,6 +192,7 @@ class SuspensionSessionNavigateTest {
         when(thread.frameCount()).thenReturn(1);
         when(thread.frames(0, 1)).thenReturn(List.of(frame));
         when(thread.frame(0)).thenReturn(frame);
+        return new CallFrame(self, method);
     }
 
     /** Refuses a result that mixes pre-resume locals with post-resume fields. */

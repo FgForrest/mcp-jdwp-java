@@ -23,6 +23,21 @@ final class CountingJdwpConnection extends Connection implements AutoCloseable {
     record Command(int set, int command) {
     }
 
+    /** A barrier before the next actual JDWP DisableCollection command. */
+    @FunctionalInterface
+    interface PinBarrier {
+        /** Waits for the target fixture to finish collecting. */
+        void run() throws IOException;
+    }
+
+    /** One-shot barrier installed by a fixture. */
+    private @org.jspecify.annotations.Nullable PinBarrier pinBarrier;
+
+    /** Pauses the next pin while preserving the actual command and reply. */
+    synchronized void beforeNextPin(PinBarrier barrier) {
+        pinBarrier = barrier;
+    }
+
     private final Socket socket;
     private final DataInputStream input;
     private final Map<Integer, Command> pending = new ConcurrentHashMap<>();
@@ -78,10 +93,18 @@ final class CountingJdwpConnection extends Connection implements AutoCloseable {
         return packet;
     }
 
+    /** Counts commands and runs the optional one-shot pin barrier before forwarding. */
     @Override
     public synchronized void writePacket(byte[] packet) throws IOException {
         if ((packet[8] & REPLY) == 0) {
-            pending.put(id(packet), new Command(Byte.toUnsignedInt(packet[9]), Byte.toUnsignedInt(packet[10])));
+            final Command command = new Command(Byte.toUnsignedInt(packet[9]), Byte.toUnsignedInt(packet[10]));
+            final PinBarrier barrier = pinBarrier;
+            // Pause DisableCollection before sending it so the target can collect the unpinned result.
+            if (barrier != null && command.set() == 9 && command.command() == 7) {
+                pinBarrier = null;
+                barrier.run();
+            }
+            pending.put(id(packet), command);
         }
         socket.getOutputStream().write(packet);
     }
