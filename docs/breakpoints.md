@@ -163,7 +163,7 @@ All three respect the same fail-safe rule: if the log expression fails to evalua
 
 ### 5a. Fast logpoints — evaluation moved into the target
 
-Fast probes and their arming evaluations compile. If the compiler reports an inaccessible member, an ordinary breakpoint condition or logpoint can interpret supported private-field navigation and incurs debugger round trips on each hit.
+Fast probes, their arming evaluations and fast-breakpoint captures compile under Java access rules. If the compiler reports an inaccessible member, an ordinary breakpoint condition or logpoint can interpret supported private-field navigation or use the compiled reflection retry. Ordinary conditions and logpoints incur debugger round trips on each hit. [Compiled member access](expression-evaluation.md#compiled-member-access)
 
 "Does not suspend" above is the agent's view; the thread *is* parked for the whole evaluation — several JDWP round trips per hit, one hit at a time on the single event dispatcher thread, and a method with a JVMTI breakpoint stays interpreted. `jdwp_set_fast_logpoint` (package `fastlogpoint`) removes the debugger from the per-hit path. It changes the running application's bytecode and requires the user's explicit approval.
 

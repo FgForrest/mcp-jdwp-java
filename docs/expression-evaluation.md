@@ -214,7 +214,7 @@ Same tokenizer technique for `this` → `_this`. The wrapper's `evaluate()` is a
 
 ### Compilation cache
 
-The cache key includes the wrapper package, the ordered frame and binding types and names, and the expression source.
+The cache key includes the wrapper package, the wrapper mode, the ordered frame and binding types and names, and the expression source.
 
 Eviction: full flush at 100 entries. LRU bookkeeping is not worth the complexity when the miss cost (compile + inject) dwarfs the cost of recompiling a few hot entries. A connection reset or a change to the compiler classpath also replaces the cache. Full discussion in [memory-and-references.md](memory-and-references.md) § 6.
 
@@ -246,7 +246,11 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The compiled wrapper follows Java access rules. Its package determines which package-accessible members it can reach. Private fields can be read directly by the navigation interpreter. A private field inside a compiled block or ordinary method call still requires an access path legal in the wrapper.
+The wrapper's first compile uses Java access rules. For ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints, ECJ visibility errors can trigger a retry with reflective access on JDK 17 and 21. A loop, `try` block, lambda, switch or anonymous class can read an inaccessible field or call an inaccessible method or constructor. For example, `{ int n = 0; for (Item i : store.items) n += i.qty; return n; }` can read private application fields. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
+
+The retry uses ECJ source positions and bindings. The wrapper looks up and caches each member with its own defining loader, and casts results to their declared type or an accessible supertype. A reflected call rethrows the original target exception. The compiler makes up to four rewrite passes and reports the original diagnostics if the source still fails to compile.
+
+Private field writes and explicit uses of an inaccessible type name, including in local declarations, can still produce compiler errors. Method references and constructors that need an enclosing instance retain Java access checks. If a member is in a JDK package closed to the wrapper, such as `String.value` with the standard JDK settings, the reply includes the original visibility diagnostic and a module note. Fast probes, including fast-breakpoint captures and arming-hit evaluations, use direct Java access rules and retain their ordinary-tool hint.
 
 ### VMStart suspension
 

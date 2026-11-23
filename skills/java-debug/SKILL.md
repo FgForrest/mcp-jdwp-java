@@ -174,7 +174,7 @@ Test fails at one input, passes at another. Stepping through every iteration is 
 **Approach C — conditional logpoint (best of both):**
 `jdwp_set_logpoint("MyClass", 42, "\"i=\" + i + \" v=\" + value", condition="value < 0")` — logs only when the suspicious shape appears.
 
-A failed condition records `CONDITION_ERROR` and processes the hit as though the condition were true. A suspending breakpoint stops and a logpoint proceeds with its log expression. Ordinary conditions can read private fields directly, for example `condition="!this.ready"`. Calls outside the supported String, Enum and box intrinsics use compilation, so a condition that calls through a private field can still hit a Java access error.
+A failed condition records `CONDITION_ERROR` and processes the hit as though the condition were true. A suspending breakpoint stops and a logpoint proceeds with its log expression. Ordinary conditions can read private fields directly, for example `condition="!this.ready"`. Calls outside the supported String, Enum and box intrinsics use compilation. On JDK 17 and 21, ordinary conditions can read private application fields and call private methods through the compiled reflection retry.
 
 ### "Trace many call sites without stopping"
 
@@ -316,7 +316,7 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 
 ## Critical Gotchas
 
-- **Read private fields directly.** Ordinary expressions can use fields, arrays, casts, operators, marks and event bindings without invoking. A private read such as `this.buffer.position` works in an expression, assertion, watcher, condition or logpoint. Fast probes and their arming hits use compilation. Ordinary method calls and lambdas also compile.
+- **Read private fields directly.** Ordinary expressions can use fields, arrays, casts, operators, marks and event bindings without invoking. A private read such as `this.buffer.position` works in an expression, assertion, watcher, condition or logpoint. Ordinary compilation on JDK 17 and 21 can also reach private application field reads, method calls and constructors inside blocks and lambdas. Closed JDK packages, private field writes and declarations naming inaccessible types can still fail. Fast probes, their arming hits and fast-breakpoint captures follow Java access rules.
 - **Write application types fully qualified in expressions.** Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types. For a type from your package or an import, write `com.acme.Status.ACTIVE`, not `Status.ACTIVE`. Otherwise the expression is compiled, and the compiled wrapper has no imports either, so the simple name usually fails there too.
 - **Block mode** (`{ ...; return X; }`) compiles in evaluation, assertions, watchers, conditions and logpoints. The generated method declares `throws Throwable` so checked exceptions can escape and be reported. Compiled expressions follow Java access rules from the generated wrapper's package.
 - **`set_local` / `set_field` only support** primitives, `String`, and `null`. To mutate a complex object, mutate its individual fields.

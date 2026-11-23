@@ -72,7 +72,7 @@ public class JdiExpressionEvaluator {
     /**
      * Static method name on every wrapper class; signature is `(<context vars>) -> Object`.
      */
-    private static final String EVALUATION_METHOD_NAME = "evaluate";
+    static final String EVALUATION_METHOD_NAME = "evaluate";
     /**
      * Threshold for the full-flush eviction — see {@link CompilerState#cache()}.
      */
@@ -109,8 +109,8 @@ public class JdiExpressionEvaluator {
                                  InMemoryJavaCompiler.@Nullable Configuration options,
                                  Map<String, CachedCompilation> cache) {}
 
-    /** Compiled classes and whether they can enter the wrapper cache for the captured options. */
-    private record Compilation(Map<String, byte[]> classes, boolean cacheable) {}
+    /** Compiled classes, their optional access diagnostic, and eligibility for the captured cache. */
+    private record Compilation(Map<String, byte[]> classes, @Nullable String accessDiagnostic, boolean cacheable) {}
 
     public JdiExpressionEvaluator(
         InMemoryJavaCompiler compiler,
@@ -1285,24 +1285,31 @@ public class JdiExpressionEvaluator {
 
         final CachedCompilation cached = cache.get(cacheKey);
 
-        final String className;
-        final byte[] bytecode;
+        final CachedCompilation wrapper;
 
         if (cached != null) {
             // Cache hit — reuse previously compiled class name and bytecode
-            className = cached.className;
-            bytecode = cached.bytecode;
+            wrapper = cached;
         } else {
             // Cache miss — generate unique class name, compile, and cache
             final String uniqueId = UUID.randomUUID().toString().replace("-", "");
-            className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
-
+            final String className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
             final String sourceCode = generateSourceCode(className, context, expression, renderCapture, retainResult);
 
-            final Compilation compilation = compileWithClasspathContext(className, sourceCode, state);
-            bytecode = findCompiledBytecode(compilation.classes(), className);
+            // Only ordinary evaluations may rewrite access. Both arming entries retain their result.
+            final Compilation compilation = compileWithClasspathContext(className, sourceCode, state, !retainResult);
+            final byte[] bytecode = findCompiledBytecode(compilation.classes(), className);
+            final Map<String, byte[]> auxiliary = new LinkedHashMap<>();
+            if (!retainResult) {
+                for (Map.Entry<String, byte[]> emitted : compilation.classes().entrySet()) {
+                    if (emitted.getValue() != bytecode) {
+                        auxiliary.put(emitted.getKey(), emitted.getValue());
+                    }
+                }
+            }
+            wrapper = new CachedCompilation(className, bytecode, Map.copyOf(auxiliary), compilation.accessDiagnostic());
             if (compilation.cacheable()) {
-                cache.put(cacheKey, new CachedCompilation(className, bytecode));
+                cache.put(cacheKey, wrapper);
             }
         }
 
@@ -1326,11 +1333,28 @@ public class JdiExpressionEvaluator {
         try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
             final ClassLoaderReference classLoader = frameLoader != null ? frameLoader : systemClassLoader(vm, thread);
             if (retainResult) {
-                return RemoteCodeExecutor.execute(vm, thread, classLoader, className, bytecode, EVALUATION_METHOD_NAME,
-                    context.getValues(), true, readAndReport);
+                return RemoteCodeExecutor.execute(vm, thread, classLoader, wrapper.className(), wrapper.bytecode(),
+                    EVALUATION_METHOD_NAME, context.getValues(), true, readAndReport);
             }
-            value = RemoteCodeExecutor.execute(vm, thread, classLoader, className, bytecode, EVALUATION_METHOD_NAME,
-                context.getValues());
+            if (!wrapper.auxiliary().isEmpty()) {
+                RemoteCodeExecutor.defineAuxiliaryClasses(vm, thread, classLoader, wrapper.className(), wrapper.auxiliary());
+            }
+            try {
+                value = RemoteCodeExecutor.execute(vm, thread, classLoader, wrapper.className(), wrapper.bytecode(),
+                    EVALUATION_METHOD_NAME, context.getValues());
+            } catch (JdiEvaluationException failure) {
+                // Read the marker while this invocation still holds its lease.
+                final @Nullable String diagnostic = wrapper.accessDiagnostic();
+                if (diagnostic != null) {
+                    final @Nullable String module = RemoteCodeExecutor.closedMemberAccessModule(failure, wrapper.className());
+                    if (module != null) {
+                        final boolean jdkModule = module.startsWith("java.") || module.startsWith("jdk.");
+                        final String kind = jdkModule ? "JDK module" : "module";
+                        throw new JdiEvaluationException(diagnostic + "\nThe member is in a " + kind + " that is not open.");
+                    }
+                }
+                throw failure;
+            }
         }
         return readAndReport.apply(value);
     }
@@ -1520,7 +1544,7 @@ public class JdiExpressionEvaluator {
      */
     private FastLogpointProbe compileProbe(String className, List<FastLogpointProbeSource.Parameter> parameters,
                                            CompilerState state, String sourceCode) throws JdiEvaluationException {
-        final Map<String, byte[]> compiledCode = compileWithClasspathContext(className, sourceCode, state).classes();
+        final Map<String, byte[]> compiledCode = compileWithClasspathContext(className, sourceCode, state, false).classes();
         if (compiledCode.size() > 1) {
             // The probe is defined as a single class; a nested/anonymous class in the user code
             // would compile to a second class file that is never defined in the target.
@@ -1740,13 +1764,13 @@ public class JdiExpressionEvaluator {
      * the current workspace's scan without waiting. Retries once if ready, or throws a pending
      * exception if discovery is still running or the retry's classpath is superseded.
      */
-    private Compilation compileWithClasspathContext(String className, String sourceCode, CompilerState state)
-        throws JdiEvaluationException {
+    private Compilation compileWithClasspathContext(String className, String sourceCode, CompilerState state,
+                                                    boolean allowMemberAccess) throws JdiEvaluationException {
         final InMemoryJavaCompiler.Configuration options = state.options();
         try {
-            final Map<String, byte[]> classes = options != null ? compiler.compile(className, sourceCode, options)
-                : compiler.compile(className, sourceCode);
-            return new Compilation(classes, true);
+            final InMemoryJavaCompiler.EvaluationCompilation compiled =
+                compileSource(className, sourceCode, options, allowMemberAccess);
+            return new Compilation(compiled.classes(), compiled.accessDiagnostic(), true);
         } catch (JdiEvaluationException failure) {
             final Snapshot captured = state.snapshot();
             if (captured == null) {
@@ -1768,31 +1792,44 @@ public class JdiExpressionEvaluator {
                 }
                 final LocalProjectClasspathProvider.Breakdown ready = status.breakdown();
                 if (ready != null && options != null) {
-                    return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready);
+                    return retryWithLocalClasspath(className, sourceCode, state.vm(), options, current, ready, allowMemberAccess);
                 }
             }
             throw withDiscoveryProblem(failure, status);
         }
     }
 
+    /** Sends only ordinary wrappers through the compiler entry point that can retry member access. */
+    private InMemoryJavaCompiler.EvaluationCompilation compileSource(String className, String sourceCode,
+                                                                     InMemoryJavaCompiler.@Nullable Configuration options,
+                                                                     boolean allowMemberAccess)
+        throws JdiEvaluationException {
+        if (allowMemberAccess) {
+            return InMemoryJavaCompiler.compileEvaluation(compiler, className, sourceCode, options);
+        }
+        final Map<String, byte[]> classes = options != null ? compiler.compile(className, sourceCode, options)
+            : compiler.compile(className, sourceCode);
+        return new InMemoryJavaCompiler.EvaluationCompilation(classes, null);
+    }
+
     /** Retries once with local entries and accepts the result only while its snapshot is current. */
     private Compilation retryWithLocalClasspath(String className, String sourceCode, @Nullable VirtualMachine vm,
                                                InMemoryJavaCompiler.Configuration remote, Snapshot current,
-                                               LocalProjectClasspathProvider.Breakdown ready)
+                                               LocalProjectClasspathProvider.Breakdown ready, boolean allowMemberAccess)
         throws JdiEvaluationException {
         final InMemoryJavaCompiler.Configuration merged = new InMemoryJavaCompiler.Configuration(
             remote.jdkPath(), mergeClasspaths(remote.classpath(), ready.all()), remote.targetMajorVersion());
         requireCurrentRetryClasspath(vm, current);
-        final Map<String, byte[]> classes;
+        final InMemoryJavaCompiler.EvaluationCompilation compiled;
         try {
-            classes = compiler.compile(className, sourceCode, merged);
+            compiled = compileSource(className, sourceCode, merged, allowMemberAccess);
         } catch (JdiEvaluationException failure) {
             requireCurrentRetryClasspath(vm, current);
             throw withDiscoveryProblem(failure, current.status());
         }
         // The retry does not populate the cache tied to the captured remote-only options.
         requireCurrentRetryClasspath(vm, current);
-        return new Compilation(classes, false);
+        return new Compilation(compiled.classes(), compiled.accessDiagnostic(), false);
     }
 
     /** Rejects superseded options or results without waiting on discovery or invoking the target. */
@@ -1958,9 +1995,10 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Holds a compiled class name and its bytecode for caching across evaluations.
+     * Holds the wrapper and any companion class files together with the original visibility diagnostic.
      */
-    private record CachedCompilation(String className, byte[] bytecode) {
+    private record CachedCompilation(String className, byte[] bytecode, Map<String, byte[]> auxiliary,
+                                     @Nullable String accessDiagnostic) {
     }
 
     /**

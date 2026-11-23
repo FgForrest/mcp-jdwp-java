@@ -10,6 +10,7 @@ import one.edee.mcp.jdwp.*;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.evaluation.fixture.PrivateMembers;
 import one.edee.mcp.jdwp.evaluation.fixture.TypeBindingFixture;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.interpret.Interpreter;
@@ -176,6 +177,79 @@ class InterpreterHarnessLiveTest {
                 return context.render(context.thread().virtualMachine().mirrorOf(1));
             });
         }
+    }
+
+    /** Verifies private access in ordinary compiled blocks and lambdas on each target JDK. */
+    @Test
+    void compilesPrivateMembersAndPreservesTargetFailures() throws Exception {
+        final String owner = PrivateMembers.class.getName();
+        final String internal = "{ for (int i = 0; i < 1; i++) return text.value; return null; }";
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            withFixture(javaHome, fixture -> {
+                final JdiExpressionEvaluator evaluator = fixture.evaluator(new InMemoryJavaCompiler());
+                replay(fixture.vm(), List.of(), fixture.connection(), compiledEngine(evaluator), thread -> {
+                    evaluator.configureCompilerClasspath(thread);
+                    assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (int i = 0; i < 2; i++) "
+                        + "sum += this.secret; return sum; }")).isEqualTo("42");
+                    assertThat(evaluateBlock(evaluator, thread,
+                        "((java.util.function.IntSupplier) () -> this.privateMethod()).getAsInt()")).isEqualTo("22");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return " + owner + ".hidden().hiddenAmount; }"))
+                        .isEqualTo("41");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return " + owner + ".TOTAL; }")).isEqualTo("12");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return new " + owner + "(5).amount; }"))
+                        .isEqualTo("5");
+                    final String anonymous = "{ return new java.util.function.IntSupplier() { "
+                        + "public int getAsInt() { return _this.secret; } }.getAsInt(); }";
+                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("21");
+                    assertThat(evaluateBlock(evaluator, thread, anonymous)).isEqualTo("21");
+                    assertThat(evaluateBlock(evaluator, thread, "{ int sum = 0; for (" + owner + " entry : new "
+                        + owner + "().entries) sum += entry.amount; return sum; }")).isEqualTo("7");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return new " + owner + "().hidden.hiddenAmount; }"))
+                        .isEqualTo("41");
+                    assertThat(evaluateBlock(evaluator, thread, "{ return switch (n) { case 2 -> new "
+                        + owner + "().select(\"abc\"); default -> 0; }; }")).isEqualTo("3");
+                    assertThat(evaluateBlock(evaluator, thread, "{ try { new " + owner + "().checked(); "
+                        + "} catch (java.io.IOException expected) { return 45; } return 0; }")).isEqualTo("45");
+                    assertThat(evaluateBlock(evaluator, thread, "{ " + owner + ".receiver().ordered("
+                        + owner + ".argument(\"A\"), " + owner + ".argument(\"B\")); return " + owner + ".trace(); }"))
+                        .isEqualTo("RABM");
+                    final String direct = "{ new " + owner + "().throwDirectly(); return null; }";
+                    final String reflected = "{ ((Runnable) () -> new " + owner + "().fail()).run(); return null; }";
+                    final Throwable directFailure = org.assertj.core.api.Assertions.catchThrowable(
+                        () -> evaluateBlock(evaluator, thread, direct));
+                    assertThat(directFailure).hasMessage("Target VM threw exception: java.lang.IllegalStateException");
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread, reflected))
+                        .hasMessage(directFailure.getMessage());
+                    assertThatThrownBy(() -> evaluateBlock(evaluator, thread,
+                        "{ new " + owner + "().failInaccessible(); return null; }"))
+                        .hasMessage("Target VM threw exception: java.lang.reflect.InaccessibleObjectException");
+                    final String caught = "{ try { return text.value; } catch (RuntimeException e) { return null; } }";
+                    for (String inaccessible : List.of(internal, internal, caught)) {
+                        assertThatThrownBy(() -> evaluateBlock(evaluator, thread, inaccessible))
+                            .hasMessageContaining("The field java.lang.String.value is not visible")
+                            .hasMessageContaining("The member is in a JDK module that is not open.")
+                            .hasMessageNotContaining("InaccessibleObjectException");
+                    }
+                }, new StringBuilder(), null);
+                return true;
+            });
+        }
+    }
+
+    /** Evaluates with a fresh frame after each prior invocation invalidated its mirror. */
+    private static String evaluateBlock(JdiExpressionEvaluator evaluator, ThreadReference thread, String source)
+        throws Exception {
+        final Value value = evaluator.evaluate(thread.frame(0), source);
+        if (value instanceof StringReference string) {
+            return string.value();
+        }
+        if (value instanceof ObjectReference boxed) {
+            final Field field = boxed.referenceType().fieldByName("value");
+            if (field != null) {
+                return String.valueOf(boxed.getValue(field));
+            }
+        }
+        return String.valueOf(value);
     }
 
     private static Entry mainRow(String id, String expression) {

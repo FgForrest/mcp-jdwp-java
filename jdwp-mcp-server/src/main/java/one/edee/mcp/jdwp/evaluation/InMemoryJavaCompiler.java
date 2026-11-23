@@ -91,10 +91,24 @@ public class InMemoryJavaCompiler {
         }
     }
 
-    /**
-     * Materialises the source for {@code className} under {@code tempDir}, creating any required
-     * package subdirectories. Returns the path of the written {@code .java} file.
-     */
+    /** A compilation with a member-visibility error and no unrelated errors known to ECJ. */
+    private static final class MemberAccessFailure extends JdiEvaluationException {
+        /** Serialization version for this compiler exception. */
+        @java.io.Serial
+        private static final long serialVersionUID = 1L;
+
+        /** Retains the original diagnostic text and source positions as formatted by JSR-199. */
+        MemberAccessFailure(String message) {
+            super(message);
+        }
+    }
+
+    /** Compiled wrapper classes and the original diagnostic needed if target reflection is blocked. */
+    record EvaluationCompilation(Map<String, byte[]> classes, @Nullable String accessDiagnostic) {}
+
+    /** Maximum number of source rewrites for a single ordinary evaluation. */
+    private static final int MEMBER_ACCESS_ROUNDS = 4;
+
     /**
      * "Line 7 ({@code return (Object) (sold());}): The method sold() is undefined …" — the line of
      * the generated source the problem is on, so it reads without the temporary file.
@@ -110,6 +124,10 @@ public class InMemoryJavaCompiler {
         return "Line " + lineNumber + (code.isEmpty() ? "" : " (`" + code + "`)") + ": " + message;
     }
 
+    /**
+     * Materialises the source for {@code className} under {@code tempDir}, creating any required
+     * package subdirectories. Returns the path of the written {@code .java} file.
+     */
     private static Path writeSourceFileToTemp(Path tempDir, String className, String sourceCode) throws IOException {
         final @Nullable String[] packageAndClass = getPackageAndClassName(className);
         Path packageDir = tempDir;
@@ -187,6 +205,59 @@ public class InMemoryJavaCompiler {
     }
 
     /**
+     * Runs the existing compiler first, then retries eligible ordinary wrappers with member access.
+     * Both paths use the same compiler entry point and captured options.
+     */
+    static EvaluationCompilation compileEvaluation(InMemoryJavaCompiler compiler, String className, String source,
+                                                   @Nullable Configuration config) throws JdiEvaluationException {
+        final @Nullable Configuration snapshot = config != null ? config : compiler.currentConfiguration();
+        try {
+            final Map<String, byte[]> classes = config != null ? compiler.compile(className, source, config)
+                : compiler.compile(className, source);
+            return new EvaluationCompilation(classes, null);
+        } catch (MemberAccessFailure original) {
+            if (snapshot == null) {
+                throw original;
+            }
+            return compiler.retryMemberAccess(className, source, snapshot, original);
+        }
+    }
+
+    /** Rewrites at most four rounds, keeping the original failure if any round cannot proceed. */
+    private EvaluationCompilation retryMemberAccess(String className, String source, Configuration config,
+                                                    MemberAccessFailure original) throws JdiEvaluationException {
+        try {
+            final Path directory = Files.createTempDirectory("mcp-member-access-");
+            final Path file = directory.resolve(className.substring(className.lastIndexOf('.') + 1) + ".java");
+            try {
+                String current = source;
+                for (int round = 0; round < MEMBER_ACCESS_ROUNDS; round++) {
+                    Files.writeString(file, current);
+                    final @Nullable String rewritten = MemberAccessRewrite.rewrite(className, file, current, config, round == 0);
+                    if (rewritten == null) {
+                        break;
+                    }
+                    try {
+                        return new EvaluationCompilation(compile(className, rewritten, config), original.getMessage());
+                    } catch (MemberAccessFailure accessRemains) {
+                        current = rewritten;
+                    }
+                }
+            } finally {
+                try {
+                    Files.deleteIfExists(file);
+                    Files.deleteIfExists(directory);
+                } catch (IOException cleanup) {
+                    log.warn("[Compiler] Failed to delete temporary member-access directory: {}", directory, cleanup);
+                }
+            }
+        } catch (IOException | RuntimeException | JdiEvaluationException retryFailure) {
+            log.debug("[Compiler] Member-access retry failed for {}", className, retryFailure);
+        }
+        throw original;
+    }
+
+    /**
      * Compiles on the evaluator's tool worker or dispatcher using options captured with its wrapper
      * cache. Returns the generated bytecode by class name. Throws {@link JdiEvaluationException}
      * if options are missing, compiler I/O fails, or ECJ rejects the source.
@@ -237,6 +308,9 @@ public class InMemoryJavaCompiler {
                 final String message = "Compilation failed:\n" + errors;
                 final boolean missingTypes = diagnostics.getDiagnostics().stream()
                     .anyMatch(d -> mayResolveWithClasspath(d, sourceCode, config));
+                if (hasMemberAccessFailure(diagnostics.getDiagnostics())) {
+                    throw new MemberAccessFailure(message);
+                }
                 throw missingTypes ? new MissingClasspathTypes(message) : new JdiEvaluationException(message);
             }
 
@@ -261,6 +335,28 @@ public class InMemoryJavaCompiler {
                 }
             }
         }
+    }
+
+    /** Checks structured ECJ diagnostics before doing another binding pass. */
+    private static boolean hasMemberAccessFailure(List<Diagnostic<? extends JavaFileObject>> problems) {
+        boolean access = false;
+        for (Diagnostic<? extends JavaFileObject> problem : problems) {
+            if (problem.getKind() != Diagnostic.Kind.ERROR) {
+                continue;
+            }
+            final int id;
+            try {
+                id = Integer.parseInt(problem.getCode());
+            } catch (NumberFormatException unknownProblem) {
+                return false;
+            }
+            if (MemberAccessRewrite.isAccessProblem(id)) {
+                access = true;
+            } else if (!MemberAccessRewrite.canFollowAccessProblem(id)) {
+                return false;
+            }
+        }
+        return access;
     }
 
     /** Returns whether adding classpath entries could resolve this ECJ error in a compile with {@code config}. */
@@ -304,7 +400,7 @@ public class InMemoryJavaCompiler {
     /**
      * Builds the JDT compiler option list from the configured target version, JDK path, and classpath.
      */
-    private static List<String> buildCompilerOptions(Configuration config) {
+    static List<String> buildCompilerOptions(Configuration config) {
         final String versionStr = sourceVersion(config);
         final List<String> options = new ArrayList<>(Arrays.asList("-source", versionStr, "-target", versionStr));
         options.add("-g"); // Preserve local variable names

@@ -115,13 +115,13 @@ Navigation avoids creating a wrapper class. String literals and concatenation ca
 
 Every successful `defineClass` call **permanently adds a class** to a target-VM classloader. Classes are not unloaded by the MCP server. Unloading a class requires its defining `ClassLoader` to become unreachable, which the server cannot orchestrate from the outside.
 
-`RemoteCodeExecutor.loadClass` (`evaluation/RemoteCodeExecutor.java:119-123`) guards this with a `vm.classesByName(name)` check first: if a class with that name already exists, reuse it instead of calling `defineClass` again (which would throw `LinkageError`). This is what makes the in-memory compilation cache safe to reuse — a cache hit does not re-inject the bytecode.
+`RemoteCodeExecutor.loadClass` checks `vm.classesByName(name)` and reuses a definition in the same loader. A cache hit in the same loader needs no further injection.
 
 ### Bounded by the cache, then leaked forever
 
 The compilation cache holds up to 100 entries (`JdiExpressionEvaluator.java:57`). When it fills, the entire map is cleared in one shot. The next `evaluate()` compiles a fresh wrapper with a brand-new UUID-suffixed name. The **previously injected classes stay loaded in the target classloader** — they are simply never referenced again.
 
-So a long-lived target VM session, with an agent that evaluates many distinct expressions, accumulates `mcp.jdi.evaluation.ExpressionEvaluator_<UUID>` classes in its classloader. Each wrapper is a small class — a few methods, no fields, typically 1–4 KB of bytecode. A session that crosses the 100-entry threshold three times has 300 stranded wrapper classes. The target's class-loader metaspace grows accordingly: order of hundreds of KB to a few MB for normal use, never gigabytes.
+So a long-lived target VM session, with an agent that evaluates many distinct expressions, accumulates `mcp.jdi.evaluation.ExpressionEvaluator_<UUID>` classes in its classloader. A direct wrapper typically uses 1–4 KB of bytecode. Wrappers that retry member access also retain a cache of reflected members. Compiled local and anonymous classes add companion definitions to the same loader. A session that crosses the 100-entry threshold three times has at least 300 wrapper classes. The target's class-loader metaspace grows accordingly: order of hundreds of KB to a few MB for normal use, never gigabytes.
 
 If a session does enough churn to make this matter, the answer is to disconnect-and-reconnect (the target's classloader hierarchy persists across reconnects — the wrappers are still there until the JVM dies). For automated agents doing thousands of distinct evaluations, this is a real consideration; for interactive debugging, it is below the noise floor.
 
@@ -139,7 +139,7 @@ Only compiled evaluations populate the wrapper cache. Navigation evaluates a fre
 private final Map<String, CachedCompilation> compilationCache = new ConcurrentHashMap<>();
 ```
 
-Where `CachedCompilation` carries `(className, bytecode)`. The key is `context.getSignature() + "###" + expression` (`JdiExpressionEvaluator.java:557`) — `getSignature()` produces the ordered `(type, name)` list of all visible variables in the frame (locals, `this`, injected `$exception` / `$oldValue` / etc., marks). Two structurally-identical frames evaluating the same expression hit the same compiled class; a difference in even one local's type produces a fresh compile.
+Each `CachedCompilation` holds the wrapper name, its bytecode, any companion class files, and the original visibility diagnostic when compilation retried member access. The key includes the wrapper package and mode, the ordered types and names of frame variables and bindings, and the expression. Two structurally identical frames evaluating the same expression can share the compiled wrapper. A difference in a binding type or wrapper mode produces a fresh compile.
 
 ### Capacity and eviction
 
