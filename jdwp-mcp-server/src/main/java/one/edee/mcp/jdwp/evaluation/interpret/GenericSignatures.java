@@ -21,7 +21,12 @@ final class GenericSignatures {
     /** This class only interprets signature metadata. */
     private GenericSignatures() {}
 
-    /** The parameter and result type signatures of a non-generic method. */
+    /**
+     * The type signatures of a non-generic method.
+     *
+     * @param parameters parameter signatures in declaration order
+     * @param result return type signature
+     */
     record MethodTypes(List<String> parameters, String result) {}
 
     /** Splits a non-generic JVM method signature into its component types. */
@@ -167,6 +172,7 @@ final class GenericSignatures {
             path.remove(type);
             return own;
         }
+        // Substitute this type's arguments into each edge before moving toward the member owner.
         final List<String> parents = declaration == null ? List.of() : sequence(declaration, formalEnd(declaration));
         Map<String, String> inherited = null;
         for (ReferenceType parent : JdiTypes.parents(type)) {
@@ -181,6 +187,7 @@ final class GenericSignatures {
                 }
             }
             final Map<String, String> candidate = bindings(parent, parentUse, owner, path, captureTypes);
+            // A diamond is usable only if every path agrees on the member owner's arguments.
             if (inherited != null && !inherited.equals(candidate)) {
                 throw Planner.compile("inconsistent generic receiver types");
             }
@@ -193,6 +200,7 @@ final class GenericSignatures {
     /** Reduces the capture's intersection only when a single most specific bound can be proven. */
     private static String captureUpper(JdiTypes types, ReferenceType owner, Formal formal,
                                        String wildcard, Map<String, String> bindings) {
+        // A lower-bounded or unbounded wildcard contributes only the declaration's upper bounds.
         String upper = wildcard.startsWith("+") ? wildcard.substring(1) : "Ljava/lang/Object;";
         for (String declared : formal.bounds()) {
             final String bound = substitute(declared, bindings);
@@ -265,7 +273,12 @@ final class GenericSignatures {
         throw Planner.compile("cannot read formal type parameters");
     }
 
-    /** A formal parameter and its declared upper bounds. */
+    /**
+     * A formal type parameter and its constraints.
+     *
+     * @param name type variable name
+     * @param bounds upper bound signatures in declaration order
+     */
     private record Formal(String name, List<String> bounds) {}
 
     /** Extracts formal names for comparisons of parameterized argument types. */
@@ -363,6 +376,7 @@ final class GenericSignatures {
         }
         final StringBuilder result = new StringBuilder(signature.length());
         int start = 0;
+        // Preserve each owner and member class segment while substituting only its arguments.
         while (open >= 0) {
             result.append(signature, start, open + 1);
             int index = open + 1;
@@ -409,6 +423,7 @@ final class GenericSignatures {
             } else if (token == '>') {
                 depth--;
             } else if (depth == 0 && token != ';') {
+                // A dot in a JVM signature separates member classes. JDI uses their binary names.
                 binary.append(switch (token) {
                     case '/' -> '.';
                     case '.' -> '$';

@@ -52,7 +52,7 @@ public final class EvaluationRouter {
 
     /** How many times planning re-reads a frame that was invalidated while it was being planned. */
     private static final int FRAME_READ_ATTEMPTS = 3;
-    /** Compiling evaluator used for everything the interpreter cannot navigate. */
+    /** Evaluator for expressions routed to compilation. */
     private final JdiExpressionEvaluator compiler;
     /** Selected engine mode. */
     private final Mode mode;
@@ -199,7 +199,7 @@ public final class EvaluationRouter {
             this.requireOriginalStop = requireOriginalStop;
         }
 
-        /** Plans and runs the input, falling back to the compiler when the interpreter cannot handle it. */
+        /** Replans the input on the invocation worker and evaluates it through the selected engine. */
         public <T> T evaluate(Input input, FrameSource frames, Map<String, Value> bindings,
                               Interpreter.Result<T> result) throws Exception {
             final Planner.Plan plan = prepare(input, thread, frames, bindings, true);
@@ -236,11 +236,12 @@ public final class EvaluationRouter {
     }
 
     /**
-     * Runs the plan with the interpreter and falls back to the compiler, attaching the fallback reason to compiler failures.
+     * Runs the selected engine and includes the interpreter's refusal reason when fallback compilation fails.
      */
     private <T> T run(Input input, ThreadReference thread, FrameSource frames, Map<String, Value> bindings, Planner.Plan plan,
                       ConfigureClasspath configure, Interpreter.Result<T> result) throws Exception {
         if (plan instanceof Planner.Invoke invocation) {
+            // Keep invocation failures outside the compiler fallback path to avoid replaying target calls.
             return Interpreter.execute(invocation, thread, compiler, this::recordInvocation, result);
         }
         try {

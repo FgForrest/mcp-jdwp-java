@@ -35,7 +35,12 @@ public final class Planner {
         @Override public KindOfPlan kind() { return KindOfPlan.NAVIGATE; }
     }
 
-    /** A plan that needs a method invocation in the target. */
+    /**
+     * An interpreted plan that may invoke target code.
+     *
+     * @param vm virtual machine that owns the plan's mirrors
+     * @param read executable expression plan
+     */
     public record Invoke(VirtualMachine vm, Interpreter.Read read) implements Plan {
         /** Returns {@link KindOfPlan#INVOKE}. */
         @Override public KindOfPlan kind() { return KindOfPlan.INVOKE; }
@@ -61,10 +66,18 @@ public final class Planner {
     }
 
     /**
-     * A typed value reader. Constant metadata preserves Java folding and identity rules.
-     * The target preparation binds provenance-sensitive reads before target code runs.
-     * Floating-point provenance tracks constant subexpressions, and the erased result type
-     * identifies the generic reads that may require a cast at their use.
+     * A typed value reader with the source information needed to preserve Java semantics.
+     *
+     * @param type static expression type
+     * @param read executable reader for the value
+     * @param constant proven Java constant value, or null when unavailable
+     * @param constantCandidate whether the expression may be a Java constant
+     * @param stringIdentity whether a String constant may affect identity comparison
+     * @param runtimeType captured runtime type for erased lookup, or null if unavailable
+     * @param targetUse reader preparation for a value passed into target code
+     * @param losslessConcat whether the concatenation is safe across a JDWP string transfer
+     * @param floatingOperand whether floating-point provenance affects target string formatting
+     * @param erasedResult JVM result type when it differs from the generic source type
      */
     private record Node(StaticType type, Interpreter.Read read, @Nullable Object constant,
                         boolean constantCandidate, boolean stringIdentity, @Nullable ReferenceType runtimeType,
@@ -95,7 +108,13 @@ public final class Planner {
         }
     }
 
-    /** A flow-scoped pattern variable and the scope active before it was introduced. */
+    /**
+     * A pattern variable visible on a definitely matched branch.
+     *
+     * @param name local name used in the expression
+     * @param value reader for the matched value
+     * @param enclosing previously visible pattern binding, or null at the end of the scope chain
+     */
     private record PatternBinding(String name, Node value, @Nullable PatternBinding enclosing) {}
 
     /** A visible local variable of the frame with its value at the time of planning. */
@@ -475,7 +494,7 @@ public final class Planner {
         return value;
     }
 
-    /** Plans a String constant, which the JVM interns. */
+    /** Plans a String constant with its interned identity preserved when it crosses into target code. */
     private Node stringConstant(String value) {
         final ReferenceType string = types.bootstrap("java.lang.String");
         final Interpreter.Read read = ctx -> ctx.mirror(value);
@@ -1023,6 +1042,7 @@ public final class Planner {
         final Object folded = constantType && condition.constant() instanceof Boolean test
             && yes.constant() != null && no.constant() != null
             ? foldConditional(test, yes, no, type) : null;
+        // A generic branch may need a different cast depending on how the conditional is used.
         if (takenYes.erasedResult() != null || takenNo.erasedResult() != null) {
             throw compile("conditional branches need a context-dependent generic cast");
         }
@@ -1296,6 +1316,7 @@ public final class Planner {
         final Node qualifier = implicit ? receiver : callQualifier(call.receiver);
         final int arity = call.arguments == null ? 0 : call.arguments.length;
         final ReferenceType lookup;
+        // Resolve the source receiver before selecting a method, using a captured class only for erased lookup.
         if (implicit) {
             lookup = declaring;
         } else if (qualifier == null) {
@@ -1429,6 +1450,7 @@ public final class Planner {
         if (qualifier == null) {
             receiverRead = ctx -> null;
         } else if (method.isStatic()) {
+            // Java still evaluates a value used to qualify a static call.
             receiverRead = memberRead(qualifier, qualifier.read());
         } else {
             receiverRead = memberRead(qualifier, targetRead(qualifier));
@@ -1438,6 +1460,7 @@ public final class Planner {
             argumentReads.add(targetRead(argument));
         }
         return new Node(result, ctx -> {
+            // Retain the receiver through argument evaluations, which can also invoke target code.
             final Value object = ctx.keep(receiverRead.run(ctx));
             return ctx.call(method, object, readArguments(argumentReads, ctx), nonvirtual, constructor);
         }, null, false, false, null, null, false, isFloating(result), erasureForCast(result, erased));

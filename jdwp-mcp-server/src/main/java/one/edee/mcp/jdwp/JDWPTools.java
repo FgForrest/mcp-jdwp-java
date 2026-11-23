@@ -1383,6 +1383,7 @@ public class JDWPTools {
     }
 
 
+    /** Evaluates Java in the selected suspended stack frame and renders the result or diagnostic. */
     @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Supports private reads and single-candidate calls. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_expression(
         @McpToolParam(required = false, description = "Thread unique ID — defaults to the thread of the current stop") @Nullable Long threadId,
@@ -1482,6 +1483,7 @@ public class JDWPTools {
                 return evaluations.readOnly(plan, value -> reply.apply(formatValue(value)));
             });
         } catch (EvaluationRouter.NeedsInvocation fallback) {
+            // Release the frame reservation before checking invocation admission.
             final String invokeGuard = checkSafeToInvoke(thread);
             if (invokeGuard != null) {
                 return evaluations.refused(invokeGuard, fallback);
@@ -1494,7 +1496,7 @@ public class JDWPTools {
     }
 
     /**
-     * Creates an evaluation job whose compiled fallback runs only while the stop the tool started at still holds the thread.
+     * Creates an invocation job with a stop check for evaluations that replan as navigation.
      */
     private EvaluationRouter.ToolJob evaluationJob(ThreadReference thread) {
         final SuspensionSession session = breakpointTracker.suspensionSession();
@@ -6234,6 +6236,7 @@ public class JDWPTools {
         final List<WatcherGroup> groups = watcherGroups(view, count, breakpointId, fullStack, result);
         final Map<String, Value> marks = markedInstances.buildBindings();
         final List<Planner.Plan> plans = new ArrayList<>();
+        // Check the whole batch before reporting any result so a single job can own all invocations.
         if (job == null) {
             for (WatcherGroup group : groups) {
                 for (Watcher watcher : group.watchers()) {

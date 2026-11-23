@@ -250,6 +250,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
         private final Map<String, Session> map = new HashMap<>(Map.of("key", new Session()));
     }
 
+    /** A session value whose member is accessed through a substituted generic type. */
     public static final class Session {
         private final String role = "reader";
 
@@ -273,6 +274,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
         READY, DONE
     }
 
+    /** Supplies a static interface method for invocation tests. */
     public interface StaticMethods {
         /** Records an interface-static invocation. */
         static int twice(int value) {
@@ -285,6 +287,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
         public static int initialized = ++initializations;
     }
 
+    /** Supplies a concatenation operand whose string conversion returns null. */
     public static final class NullString {
         /** Records conversion of the object operand and returns a Java null. */
         @Override
@@ -295,6 +298,7 @@ public class InterpreterTarget extends InterpreterTargetBase {
     }
 }
 
+/** Supplies a stopped frame with package-private members. */
 final class PackageStop {
     final int code = 33;
 

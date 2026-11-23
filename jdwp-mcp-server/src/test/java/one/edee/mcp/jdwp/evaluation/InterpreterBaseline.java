@@ -14,6 +14,7 @@ import java.util.function.ToLongFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/** Verifies and reports JDWP traffic and timing for the expression evaluation probes. */
 final class InterpreterBaseline {
     private static final Command CLASS_INVOKE = new Command(3, 3);
     private static final Command OBJECT_INVOKE = new Command(9, 6);
@@ -63,6 +64,17 @@ final class InterpreterBaseline {
         }
     }
 
+    /**
+     * One measured evaluation.
+     *
+     * @param before packet counts before this evaluation
+     * @param configured packet counts after classpath configuration
+     * @param after packet counts after result formatting
+     * @param classpathNanos time spent configuring the classpath
+     * @param compileNanos time spent in the compiler
+     * @param totalNanos elapsed time for the measured operation
+     * @param bytes bytecode emitted by the compiler
+     */
     record Sample(Map<Command, Long> before, Map<Command, Long> configured, Map<Command, Long> after,
                   long classpathNanos, long compileNanos, long totalNanos, int bytes) {
         void verify(boolean cold) {

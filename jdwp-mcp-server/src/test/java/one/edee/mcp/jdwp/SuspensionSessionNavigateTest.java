@@ -158,7 +158,12 @@ class SuspensionSessionNavigateTest {
         assertThat(event.count).isEqualTo(1);
     }
 
-    /** Mirrors used by the call available in the fake frame. */
+    /**
+     * Mirrors for an invocation on a fake frame.
+     *
+     * @param self receiver exposed by the frame
+     * @param method method available on the receiver
+     */
     private record CallFrame(ObjectReference self, Method method) {}
 
     /** Supplies a frame with a local and an invocable instance method. */

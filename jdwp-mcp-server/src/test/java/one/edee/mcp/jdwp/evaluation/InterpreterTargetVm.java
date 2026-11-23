@@ -13,6 +13,12 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * A running fixture JVM with its loopback debugger endpoint.
+ *
+ * @param process target JVM process owned by this scope
+ * @param port JDWP port announced by the target
+ */
 record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
     static final String CLASS = InterpreterTarget.class.getName();
 

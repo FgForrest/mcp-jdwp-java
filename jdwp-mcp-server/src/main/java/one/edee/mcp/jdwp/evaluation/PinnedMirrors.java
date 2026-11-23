@@ -10,13 +10,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 /**
- * Objects the debugger creates in the target for a call — a method argument, a binding — pinned
- * against garbage collection until {@link #close}. An object created through JDI is referenced by
- * nothing in the target until it is pinned, so a GC in between collects it, and the call it was
- * made for fails with {@link ObjectCollectedException}. Each object is pinned right after its
- * creation, and created again when a GC collected it first.
- * <p>
- * Not thread-safe: one instance serves one call on one thread, in a try-with-resources block.
+ * Keeps target object mirrors alive for the lifetime of one debugger operation.
+ * Each scope belongs to one debugger thread and releases its pins on {@link #close}.
  */
 public final class PinnedMirrors implements AutoCloseable {
     /**
@@ -35,7 +30,7 @@ public final class PinnedMirrors implements AutoCloseable {
     }
 
     /**
-     * Creates an object in the target with {@code creation} and pins it until {@link #close}.
+     * Obtains a target mirror from a repeatable supplier and pins it until {@link #close}.
      *
      * @throws ObjectCollectedException when a GC collected the object on every attempt
      */
@@ -45,6 +40,7 @@ public final class PinnedMirrors implements AutoCloseable {
             try {
                 return keep(object);
             } catch (ObjectCollectedException e) {
+                // Retry only when collection wins the handoff between obtaining the mirror and pinning it.
                 if (attempt == PIN_ATTEMPTS) {
                     throw e;
                 }

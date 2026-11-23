@@ -349,7 +349,12 @@ class InterpreterHarnessLiveTest {
     /** Prefix used for fixture types and static calls in expressions. */
     private static final String INVOCATION_PREFIX = INVOCATION_TARGET + ".";
 
-    /** Expression and key for its javac oracle. */
+    /**
+     * An expression paired with its fixture oracle.
+     *
+     * @param id case key used by the compiled fixture
+     * @param expression source evaluated at the stop
+     */
     private record InvocationRow(String id, String expression) {}
 
     /** Regressions and controls for target calls. */
@@ -508,6 +513,7 @@ class InterpreterHarnessLiveTest {
             owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
             final Planner.Plan plan = auto.prepare(auto.parse(row.expression()), thread, () -> thread.frame(0), Map.of());
             final int before = thread.suspendCount();
+            // Count only the auto run's static invocations when checking the boxing retry.
             final CountingJdwpConnection.Command staticInvoke = new CountingJdwpConnection.Command(3, 3);
             final long invokesBefore = wire.snapshot().getOrDefault(staticInvoke, 0L);
             if (row.id().equals("result-gc") || row.id().equals("helper-retry")) {
@@ -578,7 +584,16 @@ class InterpreterHarnessLiveTest {
         checks.assertAll();
     }
 
-    /** A binding pattern and its expected routing on each supported target. */
+    /**
+     * A binding-pattern expression and its expectations on the supported targets.
+     *
+     * @param id case name used in assertion failures
+     * @param source expression with abbreviated fixture qualifiers
+     * @param java17 expected Java 17 evaluation plan
+     * @param java21 expected Java 21 evaluation plan
+     * @param javac17Diagnostic required Java 17 javac error fragment, or null when not checked
+     * @param javac21Diagnostic required Java 21 javac error fragment, or null when not checked
+     */
     private record PatternRow(String id, String source, Planner.KindOfPlan java17, Planner.KindOfPlan java21,
                               @Nullable String javac17Diagnostic, @Nullable String javac21Diagnostic) {
         /** Expands the fixture's short type qualifier to a name in scope for both compilers. */
@@ -619,6 +634,7 @@ class InterpreterHarnessLiveTest {
             final Planner.Plan plan = auto.prepare(auto.parse(source), thread, () -> thread.frame(0), Map.of());
             checks.assertThat(plan.kind()).as(row.id()).isEqualTo(java17 ? row.java17() : row.java21());
             final int suspendCount = thread.suspendCount();
+            // Replay rejected rows and the read-only controls. The other cases assert routing only.
             if (diagnostic != null || row.id().equals("plain-instanceof") || row.id().equals("unconditional-pattern")) {
                 final String actual = observe(owner, trace, calls,
                     () -> auto.evaluateEvent(source, thread, Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
@@ -970,6 +986,7 @@ class InterpreterHarnessLiveTest {
             if (entry.expectedPlan() == Planner.KindOfPlan.ERROR) {
                 return plannerError(context);
             }
+            // Strict mode makes an accidental compiler fallback fail an interpreted row.
             final EvaluationRouter router = entry.expectedPlan() == Planner.KindOfPlan.COMPILE ? auto : strict;
             final Planner.Plan plan = router.prepare(router.parse(entry.expression()), context.thread(), context::frame,
                 context.bindings());

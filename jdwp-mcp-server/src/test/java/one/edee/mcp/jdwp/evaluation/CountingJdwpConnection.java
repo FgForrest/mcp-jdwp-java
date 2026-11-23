@@ -99,6 +99,7 @@ final class CountingJdwpConnection extends Connection implements AutoCloseable {
         if ((packet[8] & REPLY) == 0) {
             final Command command = new Command(Byte.toUnsignedInt(packet[9]), Byte.toUnsignedInt(packet[10]));
             final PinBarrier barrier = pinBarrier;
+            // Pause DisableCollection before sending it so the target can collect the unpinned result.
             if (barrier != null && command.set() == 9 && command.command() == 7) {
                 pinBarrier = null;
                 barrier.run();

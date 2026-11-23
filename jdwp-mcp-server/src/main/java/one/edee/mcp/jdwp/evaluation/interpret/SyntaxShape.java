@@ -110,6 +110,7 @@ public final class SyntaxShape extends ASTVisitor {
         }
         final String name = new String(call.selector);
         final int count = call.arguments == null ? 0 : call.arguments.length;
+        // Source-only coverage cannot tell an intrinsic from a same-named application method.
         if (call.typeArguments == null && !call.receiver.isImplicitThis() && !call.receiver.isSuper()
             && (count == 0 && (name.equals("length") || name.equals("isEmpty") || name.equals("name")
                 || name.equals("ordinal") || boxConversion(name) != null)
@@ -176,7 +177,7 @@ public final class SyntaxShape extends ASTVisitor {
         return compiled("increment or decrement");
     }
 
-    /** Type patterns and plain instanceof use reads only. */
+    /** Leaves plain type tests and binding patterns eligible for static planning. */
     @Override
     public boolean visit(InstanceOfExpression expression, BlockScope scope) {
         return expression.pattern == null || expression.pattern instanceof TypePattern || compiled("instanceof pattern");

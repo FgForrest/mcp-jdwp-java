@@ -15,8 +15,14 @@ import static one.edee.mcp.jdwp.evaluation.interpret.PrimitiveOps.Kind;
  */
 final class JdiTypes {
     /**
-     * Compile-time type of a node, including any unresolved erasure or intersection bounds.
-     * A capture keeps its upper bound for member lookup and retains its identity as a captured type.
+     * A node's source type and the metadata needed to prove Java type conversions.
+     *
+     * @param kind primitive kind, or null for references and null values
+     * @param reference reference type available for member lookup, or null if unavailable or inapplicable
+     * @param imprecise whether erasure prevents an exact source type from being known
+     * @param bounds conjunctive bounds of an intersection type
+     * @param genericSignature source type signature, or null when absent
+     * @param captured whether the lookup type represents a wildcard's upper bound
      */
     record StaticType(@Nullable Kind kind, @Nullable ReferenceType reference, boolean imprecise,
                       List<ReferenceType> bounds, @Nullable String genericSignature, boolean captured) {
@@ -149,6 +155,7 @@ final class JdiTypes {
         if (nested < 0 || reference.isStatic()) {
             return true;
         }
+        // A non-static member type may carry arguments from its enclosing declaration.
         final ReferenceType owner = signatureType(name.substring(0, nested), reference);
         return owner != null && plainPatternReference(owner);
     }

@@ -76,6 +76,7 @@ final class CallCandidates {
         }
         if (!name.equals("<init>")) {
             for (ReferenceType parent : JdiTypes.parents(type)) {
+                // Package-private membership requires an unbroken inheritance path in the receiver's package.
                 final boolean samePackage = inheritsPackage && packageName(parent).equals(packageName(root));
                 collect(parent, root, name, methods, bridges, visited, samePackage, relaxedAccess);
             }
@@ -101,6 +102,7 @@ final class CallCandidates {
         if (JdiTypes.assignable(next, previous)) {
             return true;
         }
+        // Unrelated declarations are interchangeable only when their source types are known to agree.
         if (!JdiTypes.assignable(previous, next)
             && (!candidate.signature().equals(prior.signature())
                 || candidate.genericSignature() != null || prior.genericSignature() != null)) {

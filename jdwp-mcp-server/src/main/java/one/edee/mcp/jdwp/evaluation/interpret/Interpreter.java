@@ -117,6 +117,7 @@ public final class Interpreter {
                     value = object.invokeMethod(current, method, args, options);
                 }
             } catch (InvocationException e) {
+                // A target exception still counts as an executed call.
                 calls++;
                 throw new CallFailure(RemoteCodeExecutor.targetException(e));
             } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException e) {
