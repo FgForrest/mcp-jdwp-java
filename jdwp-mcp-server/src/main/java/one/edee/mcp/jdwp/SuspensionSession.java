@@ -342,9 +342,11 @@ public final class SuspensionSession {
      * @param threadRelease targeted release progress and recovery failures, if any
      * @param refusal       the blocker that ended a targeted wait, if any
      * @param otherUnseen   unseen stops of other threads when a thread was selected
+     * @param pendingContext the covering set still queued or processing at the deadline, if any
      */
     public record NextStop(Outcome outcome, @Nullable StopReport report, @Nullable ReleaseResult released,
-                           @Nullable ThreadRelease threadRelease, @Nullable String refusal, int otherUnseen) {
+                           @Nullable ThreadRelease threadRelease, @Nullable String refusal, int otherUnseen,
+                           @Nullable String pendingContext) {
         /** The selected stop without its captured presentation details. */
         public BreakpointTracker.@Nullable LastBreakpoint stop() {
             return report == null ? null : report.stop();
@@ -765,17 +767,32 @@ public final class SuspensionSession {
      * This can read a closed session and neither releases a hold nor waits for a new event.
      */
     synchronized @Nullable StopReport presentPublishedStop(long threadId) {
-        final Context unseen = oldestUnseen(threadId);
-        if (unseen != null) {
-            return present(unseen);
+        return presentPublishedStop(threadId, false);
+    }
+
+    /**
+     * Selects the oldest unseen matching report, otherwise reads the first matching presented one
+     * without making it current. Live inspection requires the report still to hold its thread.
+     */
+    synchronized @Nullable StopReport presentPublishedStop(long threadId, boolean heldOnly) {
+        if (heldOnly && closed) {
+            return null;
         }
+        StopReport presented = null;
         for (Context context : contexts) {
             final StopReport report = context.report;
-            if (report != null && report.threadId() == threadId && context.state == State.HELD) {
-                return report;
+            if (report == null || report.threadId() != threadId || context.state != State.HELD
+                || (heldOnly && !covers(context, report.stop().thread()))) {
+                continue;
+            }
+            if (!context.reported) {
+                return present(context);
+            }
+            if (presented == null) {
+                presented = report;
             }
         }
-        return null;
+        return presented;
     }
 
     /**
@@ -878,7 +895,8 @@ public final class SuspensionSession {
     /**
      * The wait behind {@link #nextStop} and {@link #awaitStepStop}, under the session monitor.
      * A reset invalidates a step's retained outcome, even when already presented.
-     * Recovery holds end a targeted wait only when they cover its thread.
+     * Recovery holds end a targeted wait only when they cover its thread. A targeted next-stop
+     * wait lets all covering queued or processing contexts settle before its release pass.
      *
      * @param thread          the thread whose stop is awaited, or {@code null} for any thread
      * @param startGeneration the generation the wait belongs to; a later one ends it with {@link Outcome#RESET}
@@ -894,16 +912,19 @@ public final class SuspensionSession {
         List<ReleaseFailure> recoveryFailures = List.of();
         StopReport report = null;
         String refusal = null;
+        String pendingContext = null;
         final Outcome outcome;
         while (true) {
             if (step != null && generation != startGeneration) {
                 outcome = Outcome.RESET;
                 break;
             }
+            final Context pending = thread != null && step == null && !closed && generation == startGeneration
+                ? coveringPendingContext(thread) : null;
             Context selected = null;
             if (step != null) {
                 selected = step.endingStop;
-            } else if (threadId == null || generation == startGeneration) {
+            } else if (pending == null && (threadId == null || generation == startGeneration)) {
                 selected = oldestUnseen(threadId);
             }
             if (selected != null && step != null && selected.reported) {
@@ -935,13 +956,15 @@ public final class SuspensionSession {
                     outcome = Outcome.RESUME_FAILED;
                     break;
                 }
-                refusal = releaseRefusal(thread, step != null);
-                if (refusal != null) {
-                    outcome = Outcome.REFUSED;
-                    break;
+                if (pending == null || leases.containsKey(thread)) {
+                    refusal = releaseRefusal(thread, step != null);
+                    if (refusal != null) {
+                        outcome = Outcome.REFUSED;
+                        break;
+                    }
                 }
             }
-            if (releasePending) {
+            if (pending == null && releasePending) {
                 releasePending = false;
                 if (thread == null) {
                     if (pendingSteps.isEmpty()) {
@@ -969,16 +992,19 @@ public final class SuspensionSession {
             }
             final long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
             if (remainingMs <= 0) {
+                if (pending != null) {
+                    pendingContext = describePendingContext(pending);
+                }
                 outcome = Outcome.TIMEOUT;
                 break;
             }
             waitForChange(remainingMs, thread);
         }
-        return endWait(outcome, report, released, threadRelease, refusal, threadId, recoveryFailures);
+        return endWait(outcome, report, released, threadRelease, refusal, threadId, recoveryFailures, pendingContext);
     }
 
     /**
-     * Parks on the session monitor until routing, publication, reset, close or timeout. A targeted wait is
+     * Parks on the session monitor until routing, publication, release, reset, close or timeout. A targeted wait is
      * counted in {@link #targetedWaiters} while it is parked.
      */
     private void waitForChange(long remainingMs, @Nullable ThreadReference thread) throws InterruptedException {
@@ -1770,7 +1796,7 @@ public final class SuspensionSession {
         return holding;
     }
 
-    /** Attempts one authorized watchdog release and remembers the failure if JDI rejects it. */
+    /** Performs a watchdog release and wakes a waiter on the freed thread, or remembers the JDI failure. */
     @Nullable
     private String attemptWatchdogRelease(Context context, ThreadReference owner, Lease lease, ObjectReference monitor) {
         try {
@@ -1785,6 +1811,9 @@ public final class SuspensionSession {
                 released = set + " (its other threads stay parked)";
             }
             context.watchdogFailures.remove(owner);
+            if (targetedWaiters.containsKey(owner)) {
+                notifyAll();
+            }
             return released;
         } catch (RuntimeException e) {
             context.watchdogFailures.put(owner, new WatchdogReleaseFailure(lease, monitor, e));
@@ -2063,6 +2092,24 @@ public final class SuspensionSession {
         return releaseRefusal(thread, false);
     }
 
+    /** Finds the first queued or processing set whose suspension the thread is still subject to. */
+    @Nullable
+    private Context coveringPendingContext(ThreadReference thread) {
+        for (Context context : contexts) {
+            if ((context.state == State.QUEUED || context.state == State.PROCESSING) && covers(context, thread)) {
+                return context;
+            }
+        }
+        return null;
+    }
+
+    /** Identifies an unsettled set and its event thread for a refusal or timeout. */
+    private static String describePendingContext(Context context) {
+        final String state = context.state == State.QUEUED ? "waiting to be processed" : "being processed";
+        return "context#" + context.id + " (" + describeSet(context) + ") is " + state;
+    }
+
+    /** Explains blockers while allowing a step waiter to wait through its own landing. */
     @Nullable
     private String releaseRefusal(ThreadReference thread, boolean awaitingOwnStep) {
         if (!awaitingOwnStep && leases.containsKey(thread)) {
@@ -2079,13 +2126,8 @@ public final class SuspensionSession {
                 continue;
             }
             switch (context.state) {
-                case QUEUED -> {
-                    return "context#" + context.id + " (" + describeSet(context)
-                        + ") is waiting to be processed — try again";
-                }
-                case PROCESSING -> {
-                    return "context#" + context.id + " (" + describeSet(context)
-                        + ") is being processed — try again";
+                case QUEUED, PROCESSING -> {
+                    return describePendingContext(context) + " — try again";
                 }
                 case RELEASE_FAILED -> {
                     return automaticReleaseFailure(context).describe() + " — retry with jdwp_resume";
@@ -2156,7 +2198,7 @@ public final class SuspensionSession {
         return new ThreadRelease(null, holders, failures, closed);
     }
 
-    /** Resumes the set and commits its release, or leaves it owned by the context on failure. */
+    /** Resumes the set and wakes targeted waiters if it was pending, or leaves it owned on failure. */
     private void release(Context context) {
         if (context.state == State.RELEASED) {
             return;
@@ -2168,6 +2210,7 @@ public final class SuspensionSession {
         if (borrower == null || context.policy == EventRequest.SUSPEND_ALL) {
             resumeSet(context, borrower);
         }
+        final boolean wasPending = context.state == State.QUEUED || context.state == State.PROCESSING;
         context.state = State.RELEASED;
         if (context == current) {
             current = null;
@@ -2181,6 +2224,9 @@ public final class SuspensionSession {
         context.automaticReleaseFailure = null;
         context.watchdogFailures.clear();
         contexts.remove(context);
+        if (wasPending && !targetedWaiters.isEmpty()) {
+            notifyAll();
+        }
     }
 
     /** Names a finished set whose automatic release failed and identifies its event thread when available. */
@@ -2212,10 +2258,10 @@ public final class SuspensionSession {
         return failures;
     }
 
-    /** Keeps release progress and later failures, sampling pending sets only for a global wait. */
+    /** Keeps release progress, failures and timeout details, counting pending sets for a global wait. */
     private NextStop endWait(Outcome outcome, @Nullable StopReport report, @Nullable ReleaseResult released,
                              @Nullable ThreadRelease threadRelease, @Nullable String refusal,
-                             @Nullable Long threadId, List<ReleaseFailure> laterFailures) {
+                             @Nullable Long threadId, List<ReleaseFailure> laterFailures, @Nullable String pendingContext) {
         if (threadId != null) {
             if (threadRelease != null) {
                 // A failed first pass ends the wait immediately, so later failures can only follow a successful pass.
@@ -2224,7 +2270,8 @@ public final class SuspensionSession {
             } else if (!laterFailures.isEmpty()) {
                 threadRelease = new ThreadRelease(null, List.of(), laterFailures, closed);
             }
-            return new NextStop(outcome, report, null, threadRelease, refusal, unseenCountExcept(threadId));
+            return new NextStop(outcome, report, null, threadRelease, refusal, unseenCountExcept(threadId),
+                pendingContext);
         }
         if (released != null || !laterFailures.isEmpty()) {
             final int pending = closed ? 0 : (int) contexts.stream()
@@ -2238,7 +2285,7 @@ public final class SuspensionSession {
                     released.recovered(), failures, closed);
             }
         }
-        return new NextStop(outcome, report, released, null, refusal, 0);
+        return new NextStop(outcome, report, released, null, refusal, 0, null);
     }
 
     /** Retries a finished set and retains the latest failure and retry thread ID if its resume still throws. */

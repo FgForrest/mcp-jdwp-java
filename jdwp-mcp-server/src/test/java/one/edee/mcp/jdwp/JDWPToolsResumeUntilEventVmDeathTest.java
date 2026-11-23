@@ -715,42 +715,38 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(session.unseenCount()).isEqualTo(1);
 	}
 
-	@ParameterizedTest
-	@ValueSource(booleans = {true, false})
-	@DisplayName("a foreign stop-all unblocks an active targeted wait as soon as it is queued or published")
-	void shouldRefuseForeignStopAllThatArrivesDuringTargetedWait(boolean publishStop) throws Exception {
-		final CompletableFuture<String> waiting = startTargetedWait(1_000);
+	/** An active wait reports an unseen stop-all when it is published on another thread. */
+	@Test
+	void shouldRefuseForeignStopAllThatPublishesDuringTargetedWait() throws Exception {
+		final CompletableFuture<String> waiting = startTargetedWait(10_000);
 		final FakeSuspendModel.FakeThread worker = model.thread("worker");
 		synchronized (session) {
-			if (publishStop) {
-				publish(new BreakpointTracker.LastBreakpoint(worker.ref, 21), EventRequest.SUSPEND_ALL);
-			} else {
-				session.route(model.breakpointEvent(worker, EventRequest.SUSPEND_ALL), worker.ref, false);
-			}
+			publish(new BreakpointTracker.LastBreakpoint(worker.ref, 21), EventRequest.SUSPEND_ALL);
 		}
 
-		assertThat(waiting.get(5, TimeUnit.SECONDS)).contains("Wait for thread 1 blocked", "thread worker", "Released before waiting")
-			.contains(publishStop ? "breakpoint 21" : "waiting to be processed").doesNotContain("[TIMEOUT]");
+		assertThat(waiting.get(5, TimeUnit.SECONDS)).contains("Wait for thread 1 blocked", "thread worker",
+			"Released before waiting", "breakpoint 21", "not seen yet").doesNotContain("[TIMEOUT]");
 		assertThat(main.count).isEqualTo(1);
-		assertThat(session.unseenCount()).isEqualTo(publishStop ? 1 : 0);
+		assertThat(session.unseenCount()).isEqualTo(1);
 	}
 
-	/** Checks that a targeted resume wakes before the dispatcher publishes a covering set on T. */
+	/** A covering set that remains queued or processing at the deadline is named in the timeout. */
 	@ParameterizedTest
-	@ValueSource(ints = {EventRequest.SUSPEND_EVENT_THREAD, EventRequest.SUSPEND_ALL})
-	@DisplayName("a routed event on the selected thread wakes the targeted resume even before publication")
-	void shouldRefuseOwnQueuedSet(int policy) throws Exception {
-		final CompletableFuture<String> waiting = startTargetedWait(30_000);
-		final SuspensionSession.Context landing =
-			session.route(model.breakpointEvent(main, policy), main.ref, false);
-		try {
-			// A deadline wake would also detect the queued set, so require a reply before it.
-			assertThat(waiting.get(2, TimeUnit.SECONDS)).contains("Wait for thread 1 blocked",
-				"context#" + landing.id(), "waiting to be processed");
-			assertThat(session.stateOf(landing)).isEqualTo(SuspensionSession.State.QUEUED);
-		} finally {
-			session.close();
+	@ValueSource(booleans = {false, true})
+	void shouldReportUnsettledSetOnTargetedTimeout(boolean processing) throws Exception {
+		when(jdiService.getVM()).thenReturn(model.vm);
+		final FakeSuspendModel.FakeThread worker = model.thread("worker");
+		final SuspensionSession.Context context =
+			session.route(model.breakpointEvent(worker, EventRequest.SUSPEND_ALL), worker.ref, false);
+		if (processing) {
+			session.begin(context);
 		}
+
+		assertThat(tools.jdwp_resume_until_event(25, main.ref.uniqueID())).contains("[TIMEOUT]",
+			"context#" + context.id(), "thread worker", processing ? "being processed" : "waiting to be processed")
+			.doesNotContain("try again", "Released before waiting");
+		assertThat(main.count).isEqualTo(1);
+		assertThat(session.unseenCount()).isZero();
 	}
 
 	@Test

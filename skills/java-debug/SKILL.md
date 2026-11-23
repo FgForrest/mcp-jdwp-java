@@ -70,7 +70,7 @@ Every debug session follows this sequence:
 2. **Attach** following the port-resolution priority above. `jdwp_wait_for_attach` polls until the JVM is listening, then attaches. For a test launched with `suspend=y`, pass `requireVmStart=true` to check that it is the fresh test JVM.
 3. **Set breakpoints** at suspected bug locations: `jdwp_set_breakpoint(className, lineNumber)`. Add exception breakpoints or logpoints as needed.
 4. **Resume and wait** with `jdwp_resume_until_event()`. It presents an unseen stop immediately or releases presented stops and manual holds before waiting (30 seconds by default). Pass `threadId=T` when you want to resume and wait on one thread.
-5. **Inspect in one call:** `jdwp_get_breakpoint_context()` — returns thread, top frames, locals (incl. `this`), and `this` field dump.
+5. **Inspect in one call** with `jdwp_get_breakpoint_context()`. It returns the thread, top frames, locals, and `this` fields. Pass `threadId=T` to inspect a particular suspended thread.
 6. **Form a hypothesis,** test it: step through, `jdwp_assert_expression(...)` to check invariants, `jdwp_set_local`/`jdwp_set_field` to mutate state and ask "would the test pass if X were Y?"
 7. **Resume to next event** with `jdwp_resume_until_event`. When done with a test run, disconnect and check that the test JVM and background build shell have ended. Use the cleanup steps under Critical Gotchas if either is still running. Launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
@@ -368,7 +368,7 @@ To bulk-clear: `jdwp_clear(types="...", filter="...")`. The `types` parameter is
 
 When you land at a breakpoint and don't know what to look at:
 
-1. `jdwp_get_breakpoint_context()` — one-shot dump: thread + top frames + locals + `this` fields. 90% of the time this is all you need.
+1. `jdwp_get_breakpoint_context()` shows the thread, top frames, locals, and `this` fields. With `threadId=T`, it presents T's oldest unseen stop or shows T's held, presented stop. If T is suspended without a published stop of its own, it shows T's frames and says so.
 2. For each interesting `Object#N` reference: `jdwp_get_fields(objectId)` to drill in, then `jdwp_to_string(objectId)` for a quick view.
 3. `jdwp_assert_expression(<expression>, <expected>)` to test "is the state what I expected?" — much terser than evaluating and eyeballing.
 
@@ -382,10 +382,10 @@ When you land at a breakpoint and don't know what to look at:
 
 ## State-checking semantics of resume_until_event
 
-`jdwp_resume_until_event(threadId=T)` presents T's oldest unseen stop immediately and reports how many unseen stops from other threads remain held (when there are any). It can find a thread the session holds or is stepping, including a virtual thread omitted from the VM's enumeration. If T is already running or has a pending step, the call waits without releasing anything. Otherwise it releases only T before waiting.
+`jdwp_resume_until_event(threadId=T)` presents T's oldest unseen stop once any event set covering T has finished processing and reports how many unseen stops from other threads remain held (when there are any). It can find a thread the session holds or is stepping, including a virtual thread omitted from the VM's enumeration. If T is already running or has a pending step, the call waits without releasing anything. Otherwise it releases only T before waiting.
 
-If either targeted tool returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying. A replacement JVM can reuse an old ID.
+If a targeted context, wait, or resume call returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying. A replacement JVM can reuse an old ID.
 
-The wait can return a blocker even after it starts, including an event on T that is queued for processing. Retry a queued event once the dispatcher has processed it. A step with `wait=true` waits through processing of its own landing. If another thread has an unseen stop-all holding T, use unfiltered `jdwp_resume_until_event()` to present that stop in order. If a step is pending on T, use `jdwp_resume_thread(threadId=T)` to free T from the presented hold, then continue the targeted wait. That resume resolves session-owned virtual threads by ID too. A blocker leaves the step armed. If a selected stop coincides with a disconnect, the VM-death or VM-gone reply identifies that stop.
+The targeted wait lets queued or processing event sets that suspend T settle before releasing any of T's holds. If the deadline expires first, `[TIMEOUT]` names the pending set and its event thread. An evaluation running on T still causes a refusal. A step with `wait=true` waits through processing of its own landing. If another thread has an unseen stop-all holding T, use unfiltered `jdwp_resume_until_event()` to present that stop in order. If a step is pending on T, use `jdwp_resume_thread(threadId=T)` to free T from the presented hold, then continue the targeted wait. That resume resolves session-owned virtual threads by ID too. A blocker leaves the step armed. If a selected stop coincides with a disconnect, the VM-death or VM-gone reply identifies that stop.
 
 When live thread or frame reads fail, a wait or presenting getter can still identify the selected stop from the saved report. A reset during a waiting step returns `[NO_EVENT]`, even if another call already presented the ending stop.

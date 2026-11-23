@@ -706,15 +706,15 @@ jdwp_resume_until_event(timeoutMs=30000)
 → blocks until next breakpoint/step/exception, returns context immediately
 ```
 
-An unfiltered `jdwp_resume_until_event()` presents the oldest unseen stop immediately. With no unseen stop, it releases presented stops and manual holds before waiting, unless any step is pending. Pass `threadId=T` to present the oldest unseen stop on T and, if a release is needed, release only T. A pending step suppresses the targeted release pass only when the step is on T. If T is already running, the call can wait for its next stop without releasing anything. Other threads' unseen stops stay suspended and the reply counts them when there are any. The wait identifies a blocker, such as another thread's unseen stop-all, even if it arrives after the wait starts.
+An unfiltered `jdwp_resume_until_event()` presents the oldest unseen stop immediately. With no unseen stop, it releases presented stops and manual holds before waiting, unless any step is pending. Pass `threadId=T` to present the oldest unseen stop on T and, if a release is needed, release only T. A pending step suppresses the targeted release pass only when the step is on T. If T is already running, the call can wait for its next stop without releasing anything. Other threads' unseen stops stay suspended and the reply counts them when there are any. A targeted wait lets queued and processing sets that suspend T settle before releasing any of T's holds. If another thread's stop-all then publishes unseen, the wait identifies that blocker.
 
 The reply describes how the wait ended.
 
 - `Event fired …` — a BP / step / exception suspended a thread; the message includes thread + stop site
-- `[TIMEOUT] …` — the wait expired without an event; the message offers `wait_more` / `reconnect` / `abort` and reports JDI health so the agent never blindly hangs
+- `[TIMEOUT] …` — the wait expired without a stop. The message offers `wait_more` / `reconnect` / `abort`, reports JDI health, and names any covering set still queued or processing in a targeted wait.
 - `[RESUME_FAILED] …` — a release failed or lease debt remains unpaid. A targeted wait reports only recovery holds affecting its thread. The reply reports completed releases and gives targeted retry calls when available.
 - `[VM_DEATH] …` — the target VM died. The reply names a selected stop if there was one.
-- `[CONNECTION_CHANGED] …` — a targeted wait or resume fetched a VM from a different connection. Verify the target and look up a fresh ID with `jdwp_get_threads` before retrying.
+- `[CONNECTION_CHANGED] …` — a targeted wait, resume, or context call detected a connection change. Verify the target and look up a fresh ID with `jdwp_get_threads` before retrying.
 - `[NO_EVENT] …` — `jdwp_reset` ran while the call waited. See the reset reply for any holds retained after a failed release, then set breakpoints again.
 
 The same soft-wait envelope wraps `jdwp_wait_for_attach`, so bootstrap and resume share one "wait sensibly, decide deliberately" idiom.
@@ -743,7 +743,7 @@ When the target VM is restarted, or the JDI session wedges and you need a fresh 
 jdwp_get_breakpoint_context(maxFrames=5, includeThisFields=true)
 ```
 
-Returns thread info, top stack frames, locals at frame 0, and `this` fields in a single call — replaces the four-call sequence `get_current_thread → get_stack → get_locals → get_fields(this)` that an agent would otherwise need at every breakpoint hit.
+Returns thread info, top stack frames, locals at frame 0, and `this` fields in a single call. Pass `threadId=T` to inspect a specific suspended thread. The reply includes T's event tag and any captures when T holds a published stop, or says that no stop of its own is recorded.
 
 ### Stepping: when it's worth it
 
@@ -781,7 +781,7 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_get_locals`             | `threadId`, `frameIndex`                  | Local variables at a frame (includes `this`)          |
 | `jdwp_get_fields`             | `objectId`                                | Object fields, collection elements, or array contents |
 | `jdwp_to_string`              | `objectId`, `threadId?`                   | Invoke `toString()` on a cached object                |
-| `jdwp_get_breakpoint_context` | `maxFrames?`, `includeThisFields?`        | One-shot context dump at the current breakpoint, including any fast-breakpoint capture |
+| `jdwp_get_breakpoint_context` | `maxFrames?`, `includeThisFields?`, `threadId?` | Context dump for the current stop or a selected suspended thread, including any fast-breakpoint capture |
 | `jdwp_get_current_thread`     | —                                         | Thread ID of the last breakpoint hit                  |
 
 ### Execution control (7)

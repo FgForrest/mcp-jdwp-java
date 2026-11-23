@@ -29,6 +29,8 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 1. Check the server log if your installation writes one — the JDWP MCP server logs JDI operations and errors there.
 2. Reconnect the MCP server: run `/mcp` in Claude Code and reconnect `jdwp-inspector`. This spawns a fresh subprocess. In Codex, start a new session; Codex starts its MCP servers per session.
 
+A reply ending in `⚠ Ignored unknown parameter(s)` lists the supplied names the tool ignored and the names it accepts. The tool call has already run with its recognized arguments.
+
 ## A resume reply reports a failed hold
 
 `jdwp_resume_until_event` returns `[RESUME_FAILED]` when a release or lease debt repayment fails before or during the wait. In a targeted wait, a recovery ends the wait only if it holds the selected thread. Use `jdwp_resume_thread(threadId=…)` with the reported debtor or event thread ID. Retrying a failed automatic stop-all releases its VM-wide suspension. A set without an event thread has no targeted retry.
@@ -38,8 +40,8 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 ## A thread-targeted wait was refused or a step timed out
 
 - If an unseen stop-all holds the selected thread, use `jdwp_resume_until_event()` to inspect unseen stops in order until you reach the named blocker. Then retry with `threadId`.
-- If a targeted resume or wait returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying.
-- If a covering event set is queued or processing, let the dispatcher settle it and retry.
+- If a targeted context, resume, or wait call returns `[CONNECTION_CHANGED]`, use `jdwp_get_threads` to verify the target and look up a fresh thread ID before retrying.
+- A targeted wait lets covering event sets settle within its deadline. If one is still queued or processing at the deadline, `[TIMEOUT]` identifies the set and its event thread. A direct `jdwp_resume_thread` can still refuse while that set is pending.
 - If a step with `wait=true` times out, continue with `jdwp_resume_until_event(threadId=T)`. If either wait reports another thread's unseen stop-all, present that stop first, then use `jdwp_resume_thread(threadId=T)` to free T before continuing the wait.
 
 ## JDWP port is already in use

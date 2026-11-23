@@ -11,6 +11,8 @@ import com.sun.jdi.request.StepRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
@@ -20,6 +22,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -528,6 +532,130 @@ class SuspensionSessionTest {
 		assertThat(next.stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(7));
 	}
 
+	/** A covering set can publish from either dispatcher state without releasing a manual hold. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void targetedWaitPresentsOwnSetAfterDispatch(boolean processing) throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false);
+		if (processing) {
+			session.begin(context);
+		}
+		final FutureTask<SuspensionSession.NextStop> waiting = targetedWaiter();
+		try {
+			synchronized (session) {
+				assertThat(t.count).isEqualTo(2);
+				session.begin(context);
+				session.candidate(context, new BreakpointTracker.LastBreakpoint(t.ref, 7));
+				assertThat(session.finish(context)).isTrue();
+			}
+
+			final SuspensionSession.NextStop next = waiting.get(3, TimeUnit.SECONDS);
+			assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
+			assertThat(next.stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(7));
+			assertThat(t.count).isEqualTo(2);
+		} finally {
+			session.close();
+		}
+	}
+
+	/** A non-stopping set releases first, then the same wait releases T and waits for a later hit. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void targetedWaitReleasesManualHoldOnlyAfterSetSettles(boolean processing) throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false);
+		if (processing) {
+			session.begin(context);
+		}
+		final CountDownLatch manualReleased = new CountDownLatch(1);
+		doAnswer(invocation -> {
+			assertThat(t.count).isEqualTo(1);
+			t.count--;
+			manualReleased.countDown();
+			return null;
+		}).when(t.ref).resume();
+		final FutureTask<SuspensionSession.NextStop> waiting = targetedWaiter();
+		try {
+			synchronized (session) {
+				assertThat(t.count).isEqualTo(2);
+				session.begin(context);
+				assertThat(session.finish(context)).isFalse();
+			}
+
+			assertThat(manualReleased.await(3, TimeUnit.SECONDS)).isTrue();
+			assertThat(waiting.isDone()).isFalse();
+			stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 8);
+			final SuspensionSession.NextStop next = waiting.get(3, TimeUnit.SECONDS);
+			assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.STOPPED);
+			assertThat(next.stop()).isNotNull().satisfies(stop -> assertThat(stop.id()).isEqualTo(8));
+			assertThat(next.threadRelease()).isNotNull().satisfies(release -> assertThat(release.holders()).hasSize(1));
+		} finally {
+			session.close();
+		}
+	}
+
+	/** A foreign stop-all becomes a refusal only when its stop is published and unseen. */
+	@Test
+	void targetedWaitRefusesForeignStopAllAfterDispatch() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(u, EventRequest.SUSPEND_ALL), u.ref, false);
+		session.begin(context);
+		final FutureTask<SuspensionSession.NextStop> waiting = targetedWaiter();
+		try {
+			synchronized (session) {
+				assertThat(t.count).isEqualTo(2);
+				session.candidate(context, new BreakpointTracker.LastBreakpoint(u.ref, 9));
+				assertThat(session.finish(context)).isTrue();
+			}
+
+			final SuspensionSession.NextStop next = waiting.get(3, TimeUnit.SECONDS);
+			assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+			assertThat(next.refusal()).contains("breakpoint 9", "thread u", "not seen yet");
+			assertThat(t.count).isEqualTo(2);
+			assertThat(session.unseenCount()).isEqualTo(1);
+		} finally {
+			session.close();
+		}
+	}
+
+	/** A deadline expires with the context still processing and every hold still owned. */
+	@Test
+	void targetedWaitTimesOutWhileSetIsProcessing() throws Exception {
+		assertThat(session.suspendThread(t.ref)).isNull();
+		final SuspensionSession.Context context = session.route(
+			model.breakpointEvent(u, EventRequest.SUSPEND_ALL), u.ref, false);
+		session.begin(context);
+
+		final SuspensionSession.NextStop next = session.nextStop(25, t.ref);
+		assertThat(next.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(next.threadRelease()).isNull();
+		assertThat(t.count).isEqualTo(2);
+		assertThat(session.stateOf(context)).isEqualTo(SuspensionSession.State.PROCESSING);
+	}
+
+	/** Starts a targeted wait and checks it has parked before the test lets the dispatcher proceed. */
+	private FutureTask<SuspensionSession.NextStop> targetedWaiter() throws InterruptedException {
+		final CountDownLatch started = new CountDownLatch(1);
+		final FutureTask<SuspensionSession.NextStop> result = new FutureTask<>(() -> {
+			started.countDown();
+			return session.nextStop(15_000, t.ref);
+		});
+		final Thread waiter = new Thread(result, "session-targeted-wait-test");
+		waiter.setDaemon(true);
+		waiter.start();
+		assertThat(started.await(3, TimeUnit.SECONDS)).isTrue();
+		final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+		while (waiter.getState() != Thread.State.TIMED_WAITING && !result.isDone() && System.nanoTime() < deadline) {
+			Thread.yield();
+		}
+		assertThat(waiter.getState()).isEqualTo(Thread.State.TIMED_WAITING);
+		return result;
+	}
+
 	@Test
 	@DisplayName("a thread-targeted wait presents that thread's oldest stop and leaves earlier foreign stops unseen")
 	void filteredWaitPresentsOnlyMatchingStop() throws Exception {
@@ -581,26 +709,26 @@ class SuspensionSessionTest {
 		assertThat(session.unseenCount()).isEqualTo(1);
 	}
 
+	/** Both dispatcher states retain their event identity in an expired targeted wait. */
 	@Test
-	@DisplayName("a covering queued or processing context refuses a targeted release and identifies the event")
-	void filteredWaitRefusesCoveringUnfinishedSet() throws Exception {
+	void filteredWaitIdentifiesCoveringUnfinishedSetAtDeadline() throws Exception {
 		final SuspensionSession.Context blocker = session.route(model.breakpointEvent(u, EventRequest.SUSPEND_ALL),
 			u.ref, false);
 
 		final SuspensionSession.NextStop queued = session.nextStop(0, t.ref);
-		assertThat(queued.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
-		assertThat(queued.refusal()).contains("context#" + blocker.id(), "breakpoint", "thread u",
+		assertThat(queued.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(queued.pendingContext()).contains("context#" + blocker.id(), "breakpoint", "thread u",
 			"waiting to be processed");
 
 		session.begin(blocker);
 		final SuspensionSession.NextStop processing = session.nextStop(0, t.ref);
-		assertThat(processing.outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
-		assertThat(processing.refusal()).contains("context#" + blocker.id(), "breakpoint", "thread u",
+		assertThat(processing.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(processing.pendingContext()).contains("context#" + blocker.id(), "breakpoint", "thread u",
 			"being processed");
 		assertThat(model.counts()).isEqualTo(Map.of("t", 1, "u", 1, "w", 1));
 	}
 
-	/** Distinguishes a targeted resume's refusal from the step waiter's own landing exception. */
+	/** Both wait paths can await the step's own landing without releasing its context. */
 	@Test
 	@DisplayName("a pending step skips release and lets its own step waiter await publication")
 	void filteredWaitOnlyWaitsForPendingStep() throws Exception {
@@ -615,7 +743,9 @@ class SuspensionSessionTest {
 		final SuspensionSession.Context landing = session.route(
 			model.breakpointEvent(t, EventRequest.SUSPEND_EVENT_THREAD), t.ref, false);
 		session.begin(landing);
-		assertThat(session.nextStop(0, t.ref).outcome()).isEqualTo(SuspensionSession.Outcome.REFUSED);
+		final SuspensionSession.NextStop dispatching = session.nextStop(0, t.ref);
+		assertThat(dispatching.outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
+		assertThat(dispatching.pendingContext()).contains("context#" + landing.id());
 		assertThat(session.awaitStepStop(0, step).outcome()).isEqualTo(SuspensionSession.Outcome.TIMEOUT);
 		assertThat(session.stepPending(t.ref)).isTrue();
 		assertThat(model.counts()).isEqualTo(Map.of("t", 1, "u", 1, "w", 0));
