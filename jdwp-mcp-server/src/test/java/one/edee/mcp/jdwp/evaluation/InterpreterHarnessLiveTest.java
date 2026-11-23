@@ -11,6 +11,7 @@ import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.InterpreterCorpus.Entry;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import one.edee.mcp.jdwp.evaluation.fixture.TypeBindingFixture;
+import one.edee.mcp.jdwp.evaluation.fixture.InvocationTarget;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.interpret.Interpreter;
 import one.edee.mcp.jdwp.evaluation.interpret.Planner;
@@ -20,15 +21,18 @@ import org.assertj.core.api.SoftAssertions;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -338,6 +342,231 @@ class InterpreterHarnessLiveTest {
                     java.util.TreeMap::new, java.util.stream.Collectors.counting())));
             System.out.printf("COMPILE reasons %s: %s%n", javaHome.getFileName(), reasons);
         }
+    }
+
+    /** Target class of the isolated invocation cases. */
+    private static final String INVOCATION_TARGET = InvocationTarget.class.getName();
+    /** Prefix used for fixture types and static calls in expressions. */
+    private static final String INVOCATION_PREFIX = INVOCATION_TARGET + ".";
+
+    /** Expression and key for its javac oracle. */
+    private record InvocationRow(String id, String expression) {}
+
+    /** Regressions and controls for target calls. */
+    private static final List<InvocationRow> INVOCATION_ROWS = List.of(
+        new InvocationRow("pattern-pin", INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX + "Payload p && "
+            + INVOCATION_PREFIX + "clearAndCollect() && p.mark()"),
+        new InvocationRow("pattern-false", INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX
+            + "Payload shadow ? true : shadow.mark()"),
+        new InvocationRow("pattern-shadow", "!(" + INVOCATION_PREFIX + "slot instanceof " + INVOCATION_PREFIX + "Payload shadow) || shadow.mark()"),
+        new InvocationRow("literal-identity", INVOCATION_PREFIX + "sameToken(\"token\")"),
+        new InvocationRow("constant-concat-identity", INVOCATION_PREFIX + "sameToken(\"to\" + \"ken\")"),
+        new InvocationRow("wildcard-overload", INVOCATION_PREFIX + "source.get().ping()"),
+        new InvocationRow("wildcard-unbounded", INVOCATION_PREFIX + "unbounded.get().ping()"),
+        new InvocationRow("wildcard-lower", INVOCATION_PREFIX + "lower.get().ping()"),
+        new InvocationRow("constant-receiver", INVOCATION_PREFIX + "sameToken((\"to\" + \"ken\").toString())"),
+        new InvocationRow("constant-field", INVOCATION_PREFIX + "sameToken(" + INVOCATION_PREFIX + "TOKEN)"),
+        new InvocationRow("dynamic-final-field", INVOCATION_PREFIX + "sameToken(" + INVOCATION_PREFIX + "DYNAMIC)"),
+        new InvocationRow("conditional-token", INVOCATION_PREFIX + "sameToken(" + INVOCATION_PREFIX
+            + "yes ? (String) \"token\" : " + INVOCATION_PREFIX + "DYNAMIC)"),
+        new InvocationRow("safe-integer-concat", INVOCATION_PREFIX + "codeUnit(\"\" + " + INVOCATION_PREFIX + "later())"),
+        new InvocationRow("surrogate-constructor", "new " + INVOCATION_PREFIX + "StringInput(\"\" + "
+            + INVOCATION_PREFIX + "isolatedChar()).code"),
+        new InvocationRow("constant-constructor", "new " + INVOCATION_PREFIX + "StringInput(\"to\" + \"ken\").same"),
+        new InvocationRow("erased-field", INVOCATION_PREFIX + "erased.get().flag"),
+        new InvocationRow("erased-call", INVOCATION_PREFIX + "erased.get().mark()"),
+        new InvocationRow("private-varargs", INVOCATION_PREFIX + "choice.pick(1)"),
+        new InvocationRow("private-default", INVOCATION_PREFIX + "defaultChild.sample()"),
+        new InvocationRow("unqualified-static", "ownString()"),
+        new InvocationRow("nested-generics", INVOCATION_PREFIX + "nested.get().get().ping()"),
+        new InvocationRow("generic-bridge", INVOCATION_PREFIX + "bridge.choose(\"arg\")"),
+        new InvocationRow("super-default", "super.inheritedDefault()"),
+        new InvocationRow("interface-default", INVOCATION_PREFIX + "api.inheritedDefault()"),
+        new InvocationRow("interface-object", INVOCATION_PREFIX + "api.toString()"),
+        new InvocationRow("surrogate-object", INVOCATION_PREFIX + "codeUnit(" + INVOCATION_PREFIX + "isolatedText() + \"\")"),
+        new InvocationRow("surrogate-char", INVOCATION_PREFIX + "codeUnit(\"\" + " + INVOCATION_PREFIX + "isolatedChar())"),
+        new InvocationRow("surrogate-string-intrinsic", INVOCATION_PREFIX + "isolatedString().length()"),
+        new InvocationRow("surrogate-folded-char", INVOCATION_PREFIX + "codeUnit(\"\" + (char) 0xD800)"),
+        new InvocationRow("float-double", "\"\" + " + INVOCATION_PREFIX + "fraction + \"/\" + " + INVOCATION_PREFIX + "decimal"),
+        new InvocationRow("constructor", "new " + one.edee.mcp.jdwp.evaluation.fixture.InterpreterTarget.class.getName() + ".OnlyConstructor(" + INVOCATION_PREFIX + "later()).number"),
+        new InvocationRow("unboxing-null", INVOCATION_PREFIX + "take(" + INVOCATION_PREFIX + "missing, " + INVOCATION_PREFIX + "later())"),
+        new InvocationRow("target-exception", INVOCATION_PREFIX + "explode()"),
+        new InvocationRow("cold-null-object", "new " + one.edee.mcp.jdwp.evaluation.fixture.InterpreterTarget.class.getName() + ".NullString() + " + INVOCATION_PREFIX + "ownString()"),
+        new InvocationRow("boxing-cache", "this.choose(127) == this.choose(127) && this.choose(128) != this.choose(128)"),
+        new InvocationRow("result-gc", INVOCATION_PREFIX + "fresh().mark()")
+    );
+
+    /** Stops only the event thread and checks invocation results, traces and pin handoff. */
+    @Test
+    void preservesJavaInvocationSemantics(@TempDir Path temp) throws Exception {
+        for (Path javaHome : InterpreterTargetVm.javaHomes()) {
+            final Path gcResult = Files.createTempDirectory(temp, "target-").resolve("gc-done");
+            try (InterpreterTargetVm target = InterpreterTargetVm.start(javaHome, INVOCATION_TARGET, gcResult.toString());
+                 CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+                final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
+                try {
+                    final EventRequestManager requests = vm.eventRequestManager();
+                    final ClassPrepareRequest load = requests.createClassPrepareRequest();
+                    load.addClassFilter(INVOCATION_TARGET);
+                    load.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    load.enable();
+                    boolean checked = false;
+                    while (!checked) {
+                        final EventSet events = vm.eventQueue().remove(30_000);
+                        assertThat(events).as("events before the fixture stop").isNotNull();
+                        try {
+                            for (Event event : events) {
+                                if (event instanceof ClassPrepareEvent prepare) {
+                                    requests.deleteEventRequest(prepare.request());
+                                    final BreakpointRequest stop = requests.createBreakpointRequest(
+                                        prepare.referenceType().methodsByName("invocationStop").get(0).location());
+                                    stop.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                                    stop.enable();
+                                } else if (event instanceof BreakpointEvent breakpoint) {
+                                    requests.deleteEventRequest(breakpoint.request());
+                                    checkStop(vm, breakpoint, wire, target, gcResult);
+                                    checked = true;
+                                } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
+                                    throw new AssertionError("fixture exited before the stop");
+                                }
+                            }
+                        } finally {
+                            events.resume();
+                        }
+                    }
+                } finally {
+                    vm.dispose();
+                }
+            }
+        }
+    }
+
+    /** Runs each engine from the same fixture state at the stop. */
+    private static void checkStop(VirtualMachine vm, BreakpointEvent breakpoint, CountingJdwpConnection wire,
+                                  InterpreterTargetVm target, Path gcResult) throws Exception {
+        final ThreadReference thread = breakpoint.thread();
+        final ClassType owner = (ClassType) breakpoint.location().declaringType();
+        final ObjectReference receiver = thread.frame(0).thisObject();
+        final Field trace = owner.fieldByName("trace");
+        final Field calls = owner.fieldByName("calls");
+        final Method reset = owner.methodsByName("reset").get(0);
+        final Method golden = owner.methodsByName("invocationGolden").get(0);
+        final EvaluationGuard guard = new EvaluationGuard();
+        final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connectionFor(vm, guard),
+            guard, InterpreterHarnessLiveTest.noLocalClasspath());
+        final EvaluationRouter auto = new EvaluationRouter(evaluator, EvaluationRouter.Mode.AUTO);
+        final EvaluationRouter compiler = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+        final EvaluationRouter.ToolJob compiledJob = compiler.toolJob(thread, () -> {});
+        final SoftAssertions checks = new SoftAssertions();
+        for (InvocationRow row : INVOCATION_ROWS) {
+            owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
+            final String expected = observe(owner, trace, calls, () -> renderInvocationValue(receiver.invokeMethod(thread, golden,
+                List.of(vm.mirrorOf(row.id())), ObjectReference.INVOKE_SINGLE_THREADED)));
+            owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
+            final Planner.Plan plan = auto.prepare(auto.parse(row.expression()), thread, () -> thread.frame(0), Map.of());
+            final int before = thread.suspendCount();
+            if (row.id().equals("result-gc")) {
+                wire.beforeNextPin(() -> collectBeforePin(target, gcResult));
+            }
+            final String actual = observe(owner, trace, calls,
+                () -> auto.evaluateEvent(row.expression(), thread, Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
+            assertThat(thread.suspendCount()).as(row.id()).isEqualTo(before);
+            assertThat(guard.isEvaluating(thread)).as(row.id()).isFalse();
+            owner.invokeMethod(thread, reset, List.of(), ClassType.INVOKE_SINGLE_THREADED);
+            final String compiled = observe(owner, trace, calls, () -> compiledJob.evaluate(compiler.parse(row.expression()),
+                () -> thread.frame(0), Map.of(), InterpreterHarnessLiveTest::renderInvocationValue));
+            checks.assertThat(thread.suspendCount()).as(row.id() + " suspend count").isEqualTo(before);
+            switch (row.id()) {
+                case "result-gc" -> {
+                    checks.assertThat(plan.kind()).isEqualTo(Planner.KindOfPlan.INVOKE);
+                    checks.assertThat(actual).isEqualTo("JdiEvaluationException: The result was collected by the target's "
+                        + "garbage collector before the debugger could pin it. 1 target call already ran. "
+                        + "Re-running the expression repeats that call. [1 fresh>]");
+                    checks.assertThat(compiled).isEqualTo(expected);
+                }
+                case "pattern-shadow", "pattern-false", "erased-field", "erased-call" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id()).endsWith("[0 ]");
+                }
+                case "surrogate-object", "surrogate-char", "surrogate-constructor", "surrogate-folded-char", "private-varargs" -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.COMPILE);
+                    checks.assertThat(actual).as(row.id()).isEqualTo(expected);
+                }
+                case "unboxing-null" -> {
+                    checks.assertThat(plan.kind()).isEqualTo(Planner.KindOfPlan.INVOKE);
+                    checks.assertThat(actual).contains("Interpreter raised java.lang.NullPointerException").endsWith("[0 ]");
+                    checks.assertThat(expected).endsWith("[0 ]");
+                }
+                default -> {
+                    checks.assertThat(plan.kind()).as(row.id()).isEqualTo(Planner.KindOfPlan.INVOKE);
+                    checks.assertThat(actual).as(row.id()).isEqualTo(expected);
+                }
+            }
+        }
+        checks.assertAll();
+    }
+
+    /** Wakes the running GC worker and waits for it to confirm collection before forwarding the pin. */
+    private static void collectBeforePin(InterpreterTargetVm target, Path gcResult) throws IOException {
+        target.process().getOutputStream().write(1);
+        target.process().getOutputStream().flush();
+        final long timeout = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+        while (System.nanoTime() < timeout) {
+            if (Files.exists(gcResult)) {
+                final String outcome = Files.readString(gcResult);
+                if (!outcome.isEmpty()) {
+                    if (!outcome.equals("collected")) {
+                        throw new IOException("GC worker retained the result");
+                    }
+                    return;
+                }
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+        }
+        throw new IOException("Target GC worker did not finish");
+    }
+
+    /** Action measured with the fixture trace. */
+    @FunctionalInterface
+    private interface Evaluation {
+        /** Evaluates and renders an expression. */
+        String run() throws Exception;
+    }
+
+    /** Records the result and the target trace, including failures. */
+    private static String observe(ClassType owner, Field trace, Field calls, Evaluation evaluation) {
+        String value;
+        try {
+            value = evaluation.run();
+        } catch (InvocationException e) {
+            value = RemoteCodeExecutor.targetException(e).getMessage();
+        } catch (Exception e) {
+            final String message = e.getMessage().replaceAll("\\R+", " ").trim();
+            value = message.startsWith("Target VM threw exception:") ? message
+                : e.getClass().getSimpleName() + ": " + message;
+        }
+        return value + " [" + ((IntegerValue) owner.getValue(calls)).value() + " "
+            + ((StringReference) owner.getValue(trace)).value() + "]";
+    }
+
+    /** Renders target strings and boxed primitive values for direct comparison. */
+    private static String renderInvocationValue(@Nullable Value value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof StringReference string) {
+            return string.value();
+        }
+        if (value instanceof ObjectReference object) {
+            final Field field = object.referenceType().fieldByName("value");
+            return field == null ? object.referenceType().name() : object.getValue(field).toString();
+        }
+        return value.toString();
     }
 
     /** Checks that an unloaded hiding member triggers the compiled fallback on each target JDK. */

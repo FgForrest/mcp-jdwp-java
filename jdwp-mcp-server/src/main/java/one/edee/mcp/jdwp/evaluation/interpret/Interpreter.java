@@ -65,9 +65,41 @@ public final class Interpreter {
             return Objects.requireNonNull(Objects.requireNonNull(patterns).get(slot));
         }
 
-        /** Runs a bound JDI call and pins its result without retrying the call. */
+        /** Runs user code once and pins the resulting value. */
         @Nullable Value call(Method method, @Nullable Value receiver, List<@Nullable Value> args,
                              boolean nonvirtual, boolean constructor) {
+            final Value result = invoke(method, receiver, args, nonvirtual, constructor);
+            try {
+                return keep(result);
+            } catch (ObjectCollectedException e) {
+                throw collected("The result", e);
+            }
+        }
+
+        /** Recreates the result of a side-effect-free helper when collection wins the pin race. */
+        Value repeatableCall(Method method, @Nullable Value receiver, List<@Nullable Value> args) {
+            try {
+                return pins.pin(() -> (ObjectReference) Objects.requireNonNull(
+                    invoke(method, receiver, args, false, false)));
+            } catch (ObjectCollectedException e) {
+                throw collected("The helper result", e);
+            }
+        }
+
+        /** Reports a collection failure without replaying prior target calls. */
+        private CallFailure collected(String subject, ObjectCollectedException cause) {
+            final String message = subject + " was collected by the target's garbage collector before the debugger could pin it.";
+            if (calls == 0) {
+                return new CallFailure(new JdiEvaluationException(message, cause));
+            }
+            final String count = calls == 1 ? "1 target call already ran. Re-running the expression repeats that call."
+                : calls + " target calls already ran. Re-running the expression repeats those calls.";
+            return new CallFailure(new JdiEvaluationException(message + " " + count, cause));
+        }
+
+        /** Sends one invocation using the already bound method and arguments. */
+        private @Nullable Value invoke(Method method, @Nullable Value receiver, List<@Nullable Value> args,
+                                       boolean nonvirtual, boolean constructor) {
             final ThreadReference current = Objects.requireNonNull(thread);
             final ReferenceType owner = method.declaringType();
             final int single = ObjectReference.INVOKE_SINGLE_THREADED;
@@ -91,7 +123,7 @@ public final class Interpreter {
                 throw new CallFailure(new JdiEvaluationException("Failed to execute remote code: " + e.getMessage(), e));
             }
             calls++;
-            return keep(value);
+            return value;
         }
 
         /** Converts a host-side literal or folded constant into a mirror in the target VM. */
@@ -165,28 +197,14 @@ public final class Interpreter {
                 value = context.keep(plan.read().run(context));
             } catch (CallFailure failure) {
                 throw failure.failure;
-            } catch (Planner.Refusal refusal) {
-                refuseAfterCalls(refusal, context.calls);
-                throw refusal;
-            } catch (ClassNotPreparedException | ObjectCollectedException failure) {
-                final Planner.Refusal refusal = Planner.compile(failure instanceof ObjectCollectedException
-                    ? "object was collected" : "type is not prepared");
-                refuseAfterCalls(refusal, context.calls);
-                throw refusal;
+            } catch (ObjectCollectedException failure) {
+                throw context.collected("A mirror used by the expression", failure).failure;
             } catch (NullPointerException | ArithmeticException | ClassCastException | IndexOutOfBoundsException e) {
                 throw new RaisedException(e);
             } finally {
                 evaluated.accept(context.calls);
             }
             return result.accept(value);
-        }
-    }
-
-    /** Reports a refusal as an error once even one call has completed. */
-    private static void refuseAfterCalls(Planner.Refusal refusal, int calls) throws JdiEvaluationException {
-        if (calls != 0 && refusal.plan instanceof Planner.Compile fallback) {
-            throw new JdiEvaluationException("Interpreter refused after " + calls
-                + (calls == 1 ? " invocation: " : " invocations: ") + fallback.reason());
         }
     }
 

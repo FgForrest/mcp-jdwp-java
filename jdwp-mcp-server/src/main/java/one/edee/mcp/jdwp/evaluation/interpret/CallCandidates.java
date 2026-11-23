@@ -30,10 +30,7 @@ final class CallCandidates {
     static Collection<Method> named(JdiTypes types, ReferenceType type, @Nullable StaticType receiver, String name) {
         final Map<String, Method> methods = new LinkedHashMap<>();
         final List<Method> bridges = new ArrayList<>();
-        collect(type, type, name, methods, bridges, new HashSet<>());
-        for (Method bridge : bridges) {
-            collapseBridge(types, receiver, methods, bridge);
-        }
+        collect(type, type, name, methods, bridges, new HashSet<>(), true, false);
         if ((type instanceof InterfaceType || type instanceof ArrayType) && OBJECT_METHODS.contains(name)) {
             final ReferenceType object = types.bootstrap("java.lang.Object");
             for (Method method : object.methodsByName(name)) {
@@ -42,12 +39,20 @@ final class CallCandidates {
                 }
             }
         }
+        // Access relaxation is a separate lookup. An existing Java member controls the name.
+        if (methods.isEmpty() && bridges.isEmpty() && !name.equals("<init>")) {
+            collect(type, type, name, methods, bridges, new HashSet<>(), true, true);
+        }
+        for (Method bridge : bridges) {
+            collapseBridge(types, receiver, methods, bridge);
+        }
         return methods.values();
     }
 
-    /** Collects declared and inherited methods. Static interface members are never inherited. */
+    /** Collects methods inherited through Java membership, or through the debugger's access extension. */
     private static void collect(ReferenceType type, ReferenceType root, String name, Map<String, Method> methods,
-                                List<Method> bridges, Set<ReferenceType> visited) {
+                                List<Method> bridges, Set<ReferenceType> visited,
+                                boolean inheritsPackage, boolean relaxedAccess) {
         if (!visited.add(type)) {
             return;
         }
@@ -55,7 +60,9 @@ final class CallCandidates {
             if (method.name().equals(name)
                 && (name.equals("<init>") || (!method.isConstructor() && !method.isStaticInitializer()))
                 && (!method.isSynthetic() || method.isBridge())
-                && (!method.isStatic() || !(type instanceof InterfaceType) || type.equals(root))) {
+                && (!method.isStatic() || !(type instanceof InterfaceType) || type.equals(root))
+                && (type.equals(root) || relaxedAccess
+                    || (!method.isPrivate() && (!method.isPackagePrivate() || inheritsPackage)))) {
                 if (method.isBridge()) {
                     bridges.add(method);
                     continue;
@@ -69,9 +76,16 @@ final class CallCandidates {
         }
         if (!name.equals("<init>")) {
             for (ReferenceType parent : JdiTypes.parents(type)) {
-                collect(parent, root, name, methods, bridges, visited);
+                final boolean samePackage = inheritsPackage && packageName(parent).equals(packageName(root));
+                collect(parent, root, name, methods, bridges, visited, samePackage, relaxedAccess);
             }
         }
+    }
+
+    /** Returns the declared package from a binary class name. */
+    private static String packageName(ReferenceType type) {
+        final String name = type.name();
+        return name == null ? "" : name.substring(0, Math.max(0, name.lastIndexOf('.')));
     }
 
     /** Picks the most specific declaration of a signature, keeping class members ahead of interface members. */
@@ -147,6 +161,11 @@ final class CallCandidates {
     static Method single(Collection<Method> candidates, int arity, String name) {
         @Nullable Method chosen = null;
         for (Method method : candidates) {
+            if (method.isVarArgs()) {
+                throw Planner.compile("varargs method: " + name);
+            }
+        }
+        for (Method method : candidates) {
             // Count from the descriptor. Matching arity must not depend on whether a formal type is loaded.
             if (parameterCount(method.signature()) == arity) {
                 if (chosen != null) {
@@ -156,15 +175,7 @@ final class CallCandidates {
             }
         }
         if (chosen == null) {
-            for (Method method : candidates) {
-                if (method.isVarArgs()) {
-                    throw Planner.compile("varargs method: " + name);
-                }
-            }
             throw Planner.compile("no candidate with matching arity: " + name);
-        }
-        if (chosen.isVarArgs()) {
-            throw Planner.compile("varargs method: " + name);
         }
         final String generic = chosen.genericSignature();
         if (generic != null && generic.startsWith("<")) {

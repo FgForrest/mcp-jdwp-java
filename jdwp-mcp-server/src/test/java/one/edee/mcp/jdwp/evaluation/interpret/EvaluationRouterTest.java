@@ -92,34 +92,24 @@ class EvaluationRouterTest {
         assertThat(router.diagnostics()).contains("mode compiler").doesNotContain("not interpreted");
     }
 
-    /** A late field lookup refusal must not replay a target call or read the invalidated frame. */
+    /** Unknown member types must select fallback without leasing the thread or running the getter. */
     @Test
-    void reportsARefusalAfterInvokingWithoutTryingTheCompiler() throws Exception {
+    void refusesAnErasedFieldLookupBeforeInvoking() throws Exception {
         final JdiExpressionEvaluator compiler = mock(JdiExpressionEvaluator.class);
-        final EvaluationGuard guard = new EvaluationGuard();
-        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.AUTO);
+        final EvaluationRouter router = new EvaluationRouter(compiler, EvaluationRouter.Mode.INTERPRETER);
         final VirtualMachine vm = mock(VirtualMachine.class);
         final ThreadReference thread = mock(ThreadReference.class);
         final StackFrame frame = mock(StackFrame.class);
         final Location location = mock(Location.class);
         final ClassType owner = mock(ClassType.class);
         final ClassType erased = mock(ClassType.class);
-        final ClassType runtime = mock(ClassType.class);
         final ObjectReference receiver = mock(ObjectReference.class);
-        final ObjectReference result = mock(ObjectReference.class);
         final Method method = mock(Method.class);
-        final Field first = mock(Field.class);
-        final Field second = mock(Field.class);
-        final int options = ObjectReference.INVOKE_SINGLE_THREADED;
-        final AtomicBoolean ran = new AtomicBoolean();
 
         when(thread.virtualMachine()).thenReturn(vm);
         when(thread.frame(0)).thenReturn(frame);
         when(frame.thisObject()).thenReturn(receiver);
-        when(frame.location()).thenAnswer(call -> {
-            assertThat(ran).isFalse();
-            return location;
-        });
+        when(frame.location()).thenReturn(location);
         when(location.declaringType()).thenReturn(owner);
         when(method.name()).thenReturn("take");
         when(method.signature()).thenReturn("()Ljava/lang/Object;");
@@ -127,25 +117,42 @@ class EvaluationRouterTest {
         when(method.declaringType()).thenReturn(owner);
         when(method.returnType()).thenReturn(erased);
         when(owner.methods()).thenReturn(List.of(method));
-        when(result.referenceType()).thenReturn(runtime);
-        when(first.name()).thenReturn("value");
-        when(second.name()).thenReturn("value");
-        when(runtime.allFields()).thenReturn(List.of(first, second));
-        when(compiler.invocationLease(thread)).thenAnswer(call -> guard.lease(thread));
-        when(receiver.invokeMethod(thread, method, List.of(), options)).thenAnswer(call -> {
-            assertThat(guard.isEvaluating(thread)).isTrue();
-            ran.set(true);
-            return result;
-        });
 
         assertThatThrownBy(() -> router.evaluateEvent("take().value", thread, Map.of(), String::valueOf))
             .isInstanceOf(JdiEvaluationException.class)
-            .hasMessage("Interpreter refused after 1 invocation: field hiding on an erased type: value");
-        verify(compiler).invocationLease(thread);
-        verifyNoMoreInteractions(compiler);
-        verify(result).disableCollection();
-        verify(result).enableCollection();
-        assertThat(guard.isEvaluating(thread)).isFalse();
+            .hasMessage("not interpreted: field lookup depends on an erased receiver: value");
+        verifyNoInteractions(compiler, receiver);
+    }
+
+    /** Recreates a repeatable helper result when GC wins the first pin, without repeating its inputs. */
+    @Test
+    void retriesOnlyTheCollectedHelperResult() throws Exception {
+        final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
+        final EvaluationGuard guard = new EvaluationGuard();
+        final ThreadReference thread = mock(ThreadReference.class);
+        final ClassType owner = mock(ClassType.class);
+        final Method helper = mock(Method.class);
+        final ObjectReference first = mock(ObjectReference.class);
+        final ObjectReference next = mock(ObjectReference.class);
+        final List<Value> arguments = List.of(mock(IntegerValue.class));
+        final int options = ClassType.INVOKE_SINGLE_THREADED;
+        when(evaluator.invocationLease(thread)).thenAnswer(call -> guard.lease(thread));
+        when(helper.declaringType()).thenReturn(owner);
+        when(helper.isStatic()).thenReturn(true);
+        when(owner.invokeMethod(thread, helper, arguments, options)).thenReturn(first, next);
+        doThrow(new ObjectCollectedException()).when(first).disableCollection();
+
+        final Planner.Invoke plan = new Planner.Invoke(mock(VirtualMachine.class),
+            context -> context.repeatableCall(helper, null, arguments));
+        final Value result = Interpreter.execute(plan, thread, evaluator, count -> assertThat(count).isEqualTo(2),
+            value -> {
+                verify(next, never()).enableCollection();
+                return value;
+            });
+        assertThat(result).isSameAs(next);
+        verify(owner, times(2)).invokeMethod(thread, helper, arguments, options);
+        verify(first, never()).enableCollection();
+        verify(next).enableCollection();
     }
 
     /** A dispatcher result based on an invalidated frame is refused without a retry or compilation. */

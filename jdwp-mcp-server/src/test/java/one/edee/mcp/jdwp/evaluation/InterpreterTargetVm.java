@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -23,17 +24,25 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
             .toList();
     }
 
+    /** Starts the default interpreter fixture. */
     static InterpreterTargetVm start(Path javaHome) throws Exception {
+        return start(javaHome, CLASS);
+    }
+
+    /** Starts a named fixture and passes its arguments through to main. */
+    static InterpreterTargetVm start(Path javaHome, String targetClass, String... arguments) throws Exception {
         final String classpath = Path.of(InterpreterTarget.class.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
-        final Process process = new ProcessBuilder(
+        final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0",
-            "-cp", classpath, CLASS).redirectErrorStream(true).start();
+            "-cp", classpath, targetClass));
+        command.addAll(List.of(arguments));
+        final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
-        final var port = new CompletableFuture<Integer>();
-        final var drain = new Thread(() -> {
-            try (var output = new BufferedReader(new InputStreamReader(process.getInputStream(),
+        final CompletableFuture<Integer> port = new CompletableFuture<>();
+        final Thread drain = new Thread(() -> {
+            try (BufferedReader output = new BufferedReader(new InputStreamReader(process.getInputStream(),
                     StandardCharsets.UTF_8))) {
                 final String prefix = "Listening for transport dt_socket at address: ";
                 final StringBuilder startup = new StringBuilder();

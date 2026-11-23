@@ -56,15 +56,30 @@ final class GenericSignatures {
         return descriptor.append(')').toString();
     }
 
-    /** Returns the static member type after substituting receiver arguments through the inheritance path. */
+    /** Returns the readable type of a result, applying capture upper bounds to wildcards. */
+    static StaticType resultType(JdiTypes types, Type erased, @Nullable String signature,
+                                 @Nullable StaticType receiver, ReferenceType owner) {
+        return memberType(types, erased, signature, receiver, owner, true);
+    }
+
+    /** Returns the input type of a member, keeping unknown wildcard captures non-assignable. */
     static StaticType memberType(JdiTypes types, Type erased, @Nullable String signature,
                                  @Nullable StaticType receiver, ReferenceType owner) {
+        return memberType(types, erased, signature, receiver, owner, false);
+    }
+
+    /** Returns the static member type after substituting receiver arguments through the inheritance path. */
+    private static StaticType memberType(JdiTypes types, Type erased, @Nullable String signature,
+                                         @Nullable StaticType receiver, ReferenceType owner, boolean upperBounds) {
         if (signature == null || !(erased instanceof ReferenceType erasedReference)) {
             return JdiTypes.of(erased, null);
         }
         final Map<String, String> bindings = receiver == null || receiver.reference() == null
-            ? Map.of() : bindings(receiver.reference(), receiver.genericSignature(), owner, new HashSet<>());
-        final String resolved = substitute(signature, bindings);
+            ? Map.of() : bindings(receiver.reference(), receiver.genericSignature(), owner, new HashSet<>(), upperBounds);
+        final String substituted = substitute(signature, bindings);
+        // Keep variance in nested type arguments. Only a value read from a capture has
+        // the capture's upper bound as its member-lookup type.
+        final String resolved = upperBounds && substituted.startsWith("+") ? substituted.substring(1) : substituted;
         if (resolved.startsWith("T") || resolved.startsWith("+") || resolved.startsWith("-") || resolved.equals("*")) {
             return new StaticType(null, erasedReference, true);
         }
@@ -108,7 +123,7 @@ final class GenericSignatures {
         if (unbounded) {
             return true;
         }
-        final Map<String, String> actual = bindings(sourceType, from.genericSignature(), targetType, new HashSet<>());
+        final Map<String, String> actual = bindings(sourceType, from.genericSignature(), targetType, new HashSet<>(), false);
         final List<String> names = formals(targetType.genericSignature());
         if (names.size() != expected.size()) {
             return false;
@@ -123,17 +138,30 @@ final class GenericSignatures {
 
     /** Projects a receiver signature onto a superclass or superinterface. */
     private static Map<String, String> bindings(ReferenceType type, @Nullable String use, ReferenceType owner,
-                                                Set<ReferenceType> path) {
+                                                Set<ReferenceType> path, boolean upperBounds) {
         if (!path.add(type)) {
             return Map.of();
         }
         final String declaration = type.genericSignature();
-        final List<String> names = formals(declaration);
+        final List<Formal> formals = readFormals(declaration);
         final List<String> values = use == null ? List.of() : arguments(use);
         final Map<String, String> own = new HashMap<>();
-        if (names.size() == values.size()) {
-            for (int index = 0; index < names.size(); index++) {
-                own.put(names.get(index), values.get(index));
+        if (formals.size() == values.size()) {
+            for (int index = 0; index < formals.size(); index++) {
+                own.put(formals.get(index).name(), values.get(index));
+            }
+            if (upperBounds) {
+                for (Formal formal : formals) {
+                    final String value = own.get(formal.name());
+                    if (value != null && (value.equals("*") || value.startsWith("-") || value.startsWith("+"))) {
+                        if (formal.intersection()) {
+                            throw Planner.compile("wildcard capture has intersection bounds");
+                        }
+                        if (!value.startsWith("+")) {
+                            own.put(formal.name(), "+" + substitute(formal.bound(), own));
+                        }
+                    }
+                }
             }
         }
         if (type.equals(owner)) {
@@ -148,12 +176,12 @@ final class GenericSignatures {
             }
             String parentUse = null;
             for (String signature : parents) {
-                if (binaryName(signature).equals(parent.name()) && (names.isEmpty() || !own.isEmpty())) {
+                if (binaryName(signature).equals(parent.name()) && (formals.isEmpty() || !own.isEmpty())) {
                     parentUse = substitute(signature, own);
                     break;
                 }
             }
-            final Map<String, String> candidate = bindings(parent, parentUse, owner, path);
+            final Map<String, String> candidate = bindings(parent, parentUse, owner, path, upperBounds);
             if (inherited != null && !inherited.equals(candidate)) {
                 throw Planner.compile("inconsistent generic receiver types");
             }
@@ -200,9 +228,21 @@ final class GenericSignatures {
         throw Planner.compile("cannot read formal type parameters");
     }
 
-    /** Extracts formal names, skipping class and interface bounds. */
+    /** A formal parameter and its first declared upper bound. */
+    private record Formal(String name, String bound, boolean intersection) {}
+
+    /** Extracts formal names for comparisons of parameterized argument types. */
     private static List<String> formals(@Nullable String declaration) {
-        final List<String> result = new ArrayList<>();
+        final List<String> names = new ArrayList<>();
+        for (Formal formal : readFormals(declaration)) {
+            names.add(formal.name());
+        }
+        return names;
+    }
+
+    /** Extracts the leading formal parameter declarations and their first bounds. */
+    private static List<Formal> readFormals(@Nullable String declaration) {
+        final List<Formal> result = new ArrayList<>();
         if (declaration != null) {
             final int end = formalEnd(declaration);
             int index = 1;
@@ -211,11 +251,16 @@ final class GenericSignatures {
                 if (colon <= index || colon >= end) {
                     throw Planner.compile("cannot read formal type parameters");
                 }
-                result.add(declaration.substring(index, colon));
+                final String name = declaration.substring(index, colon);
                 index = colon + 1;
-                if (declaration.charAt(index) != ':') {
-                    index = typeEnd(declaration, index);
+                if (declaration.charAt(index) == ':') {
+                    // An empty class bound is followed by the first interface bound.
+                    index++;
                 }
+                final int boundEnd = typeEnd(declaration, index);
+                result.add(new Formal(name, declaration.substring(index, boundEnd),
+                    declaration.charAt(boundEnd) == ':'));
+                index = boundEnd;
                 while (declaration.charAt(index) == ':') {
                     index = typeEnd(declaration, index + 1);
                 }

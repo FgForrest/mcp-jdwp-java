@@ -240,16 +240,11 @@ public final class EvaluationRouter {
      */
     private <T> T run(Input input, ThreadReference thread, FrameSource frames, Map<String, Value> bindings, Planner.Plan plan,
                       ConfigureClasspath configure, Interpreter.Result<T> result) throws Exception {
-        Planner.Plan effective = plan;
         if (plan instanceof Planner.Invoke invocation) {
-            try {
-                return Interpreter.execute(invocation, thread, compiler, this::recordInvocation, result);
-            } catch (Planner.Refusal refusal) {
-                effective = refusal.plan;
-            }
+            return Interpreter.execute(invocation, thread, compiler, this::recordInvocation, result);
         }
         try {
-            return readOnly(effective, result);
+            return readOnly(plan, result);
         } catch (NeedsInvocation needs) {
             final String reason = Objects.requireNonNull(needs.reason);
             if (mode != Mode.COMPILER) {

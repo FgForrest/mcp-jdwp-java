@@ -174,6 +174,54 @@ class InterpreterPlannerTest {
         verifyNoInteractions(value, self);
     }
 
+    /** Access relaxation only contributes a name when Java membership finds none. */
+    @Test
+    void separatesPackageMembershipFromRelaxedAccess() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType base = type(vm, "foreign.Base", null);
+        final ClassType samePackage = type(vm, "foreign.Peer", null);
+        final ClassType owner = type(vm, "app.Example", null);
+        final IntegerType integer = mock(IntegerType.class);
+        final Method hidden = call(base, "select", "(I)I", integer, List.of(integer));
+        final Method ordinary = call(owner, "select", "()I", integer, List.of());
+        final Method privateOnly = call(base, "privateOnly", "()I", integer, List.of());
+        when(hidden.isPackagePrivate()).thenReturn(true);
+        when(privateOnly.isPrivate()).thenReturn(true);
+        when(owner.superclass()).thenReturn(base);
+        when(samePackage.superclass()).thenReturn(base);
+        when(owner.methods()).thenReturn(List.of(ordinary));
+        when(base.methods()).thenReturn(List.of(hidden, privateOnly));
+
+        final JdiTypes types = new JdiTypes(vm, owner, null);
+        assertThat(CallCandidates.named(types, owner, JdiTypes.of(owner, null), "select"))
+            .containsExactly(ordinary);
+        assertThat(CallCandidates.named(types, samePackage, JdiTypes.of(samePackage, null), "select"))
+            .containsExactly(hidden);
+        assertThat(CallCandidates.named(types, owner, JdiTypes.of(owner, null), "privateOnly"))
+            .containsExactly(privateOnly);
+    }
+
+    /** An enum can overload final methods whose JDK implementations ordinarily have read-only shortcuts. */
+    @Test
+    void appliesMembershipBeforeEnumIntrinsics() throws Exception {
+        final VirtualMachine vm = mock(VirtualMachine.class);
+        final ClassType enumType = type(vm, "java.lang.Enum", null);
+        final ClassType owner = type(vm, "app.Option", null);
+        final ClassType string = type(vm, "java.lang.String", null);
+        final ClassType object = type(vm, "java.lang.Object", null);
+        final BooleanType bool = mock(BooleanType.class);
+        final Method equality = call(enumType, "equals", "(Ljava/lang/Object;)Z", bool, List.of(object));
+        final Method overload = call(owner, "equals", "(Ljava/lang/String;)Z", bool, List.of(string));
+        when(enumType.methods()).thenReturn(List.of(equality));
+        when(owner.methods()).thenReturn(List.of(overload));
+        when(owner.superclass()).thenReturn(enumType);
+        final StackFrame frame = typeFrame(owner, mock(Method.class));
+        when(frame.thisObject()).thenReturn(mock(ObjectReference.class));
+
+        assertThat(Planner.plan(vm, frame, Map.of(), ExpressionParser.parse("this.equals(null)")))
+            .isEqualTo(new Planner.Compile("multiple candidates of the same arity: equals"));
+    }
+
     /** A substituted generic override is one source signature even when the JVM also needs a bridge. */
     @Test
     void collapsesAGenericOverrideAndItsBridge() throws Exception {
@@ -188,6 +236,9 @@ class InterpreterPlannerTest {
         when(owner.genericSignature()).thenReturn("Lapp/Base<Ljava/lang/String;>;");
         when(base.genericSignature()).thenReturn("<T:Ljava/lang/Object;>Ljava/lang/Object;");
         when(string.signature()).thenReturn("Ljava/lang/String;");
+        when(string.isInitialized()).thenReturn(true);
+        final Method intern = call(string, "intern", "()Ljava/lang/String;", string, List.of());
+        when(string.methodsByName("intern", "()Ljava/lang/String;")).thenReturn(List.of(intern));
         final String erased = "(Ljava/lang/Object;)Ljava/lang/Object;";
         final Method inherited = call(base, "take", erased, object, List.of(object));
         when(inherited.genericSignature()).thenReturn("(TT;)TT;");
