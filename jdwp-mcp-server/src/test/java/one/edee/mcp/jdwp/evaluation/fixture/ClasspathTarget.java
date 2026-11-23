@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit;
 
 /** Exercises isolated classpaths and application methods that resemble loader accessors. */
 public final class ClasspathTarget {
+    /** The gate the overridden getter waits on until the repository worker finishes. */
     private static final CountDownLatch REPOSITORIES_READY = new CountDownLatch(1);
     /** Read by JDI to detect an accidental invocation of the private helper. */
     public static volatile boolean privateAccessorEntered;
@@ -31,6 +32,7 @@ public final class ClasspathTarget {
                 }, "repository-worker");
                 repositoryWorker.setDaemon(true);
                 repositoryWorker.start();
+                // Ensure the bystander is running before the breakpoint can suspend it.
                 acquired.await();
                 if (args[0].equals("blocking-context-getter")) {
                     final Thread thread = new Thread(ClasspathTarget::conditionStop, "blocking-context-thread") {

@@ -298,6 +298,7 @@ class ClasspathDiscoveryLiveTest {
             final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard,
                 null, new MarkedInstanceRegistry(), router);
             try {
+                // Pause at class preparation so the breakpoint is armed before fixture code runs.
                 final ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
                 prepare.addClassFilter(ClasspathTarget.class.getName());
                 prepare.setSuspendPolicy(EventRequest.SUSPEND_ALL);

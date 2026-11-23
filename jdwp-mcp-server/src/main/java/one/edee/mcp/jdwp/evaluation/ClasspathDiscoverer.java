@@ -18,15 +18,21 @@ import java.util.*;
 public class ClasspathDiscoverer {
 
     private static final Logger log = LoggerFactory.getLogger(ClasspathDiscoverer.class);
+    /** The JDK class that declares the inherited context loader field. */
     private static final String THREAD = "java.lang.Thread";
+    /** The JDK class that declares the parent loader field. */
     private static final String LOADER = "java.lang.ClassLoader";
+    /** The base type that defines the public URL accessor contract. */
     private static final String URL_LOADER = "java.net.URLClassLoader";
+    /** The JDK loader base that can mirror the launch classpath. */
     private static final String BUILTIN_LOADER = "jdk.internal.loader.BuiltinClassLoader";
+    /** The JDI descriptor for the public URL accessor. */
     private static final String GET_URLS_SIGNATURE = "()[Ljava/net/URL;";
 
     private final VirtualMachine vm;
+    /** The admission guard for accessor invocations. */
     private final EvaluationGuard guard;
-    /** Reuses a completed accessor call if this attempt loses a cache-publication race. */
+    /** The accessor outcome retained across publication retries. */
     private @Nullable ContextOutcome contextOutcome;
 
     /** Binds discovery and optional invocation admission to the target connection. */
@@ -139,10 +145,22 @@ public class ClasspathDiscoverer {
             : failure.getClass().getSimpleName() + ": " + message;
     }
 
-    /** The known entries from a completed URL read and whether they mirror the launch path. */
+    /**
+     * The repositories from one completed loader read.
+     *
+     * @param entries decoded paths in loader order
+     * @param builtin whether the loader is a JDK built-in
+     */
     private record LoaderUrls(Set<String> entries, boolean builtin) {}
 
-    /** A deferred getter and its diagnostic, owned by the thread that supplied it. */
+    /**
+     * A deferred context getter owned by the thread that supplied it.
+     *
+     * @param thread the thread whose effective context loader is pending
+     * @param getter the overridden accessor
+     * @param owner the thread class named in diagnostics
+     * @param problem the current diagnostic for the pending lookup
+     */
     private record PendingContext(ThreadReference thread, Method getter, String owner, String problem) {
         /** A collected mirror or known dead thread can no longer service a pending getter. */
         boolean active() {
@@ -157,29 +175,47 @@ public class ClasspathDiscoverer {
         }
     }
 
-    /** The outcome of one getter call, including a successful null result. */
+    /**
+     * The outcome of one getter call, including a successful null result.
+     *
+     * @param lookup the pending getter that was attempted
+     * @param loader the effective context loader, which can be null
+     * @param failure the diagnostic if the attempt failed
+     */
     private record ContextOutcome(PendingContext lookup, @Nullable ClassLoaderReference loader,
                                   @Nullable String failure) {}
 
     /**
-     * A single attempt, seeded from successful reads in the previous attempt. The published walk is
-     * read-only. Replaying the roots preserves child-to-parent order even when a parent is found later.
+     * A discovery attempt that carries forward completed reads, pending getters and terminal diagnostics.
+     * Replaying the roots preserves child-to-parent order when a previously unreadable parent is found.
      */
     private final class Walk {
+        /** The launch entries, or null until the JDWP command succeeds. */
         private @Nullable Set<String> launch;
+        /** Whether the initial context lookup has supplied a usable root or a genuine null. */
         private boolean contextComplete;
+        /** Context roots in discovery order, keyed by the originating thread ID. */
         private final Map<Long, @Nullable ClassLoaderReference> contexts = new LinkedHashMap<>();
+        /** Effective context getters awaiting a tool evaluation on their owning threads. */
         private final Map<Long, PendingContext> pendingContexts = new LinkedHashMap<>();
+        /** Terminal URL layout diagnostics keyed by loader object ID. */
         private final Map<Long, String> unsupported = new LinkedHashMap<>();
+        /** Frame defining loaders in first-seen order. */
         private final Set<ClassLoaderReference> definingRoots = new LinkedHashSet<>();
+        /** Completed URL reads available to later walks. */
         private final Map<ClassLoaderReference, LoaderUrls> urls = new HashMap<>();
+        /** Completed parent reads, including null at the end of a chain. */
         private final Map<ClassLoaderReference, @Nullable ClassLoaderReference> parents = new HashMap<>();
+        /** Loaders already visited in this attempt. */
         private final Set<ClassLoaderReference> visited = new HashSet<>();
+        /** The ordered classpath contributed by this attempt. */
         private final Set<String> entries = new LinkedHashSet<>();
+        /** Retryable discovery failures encountered in this attempt. */
         private final List<String> problems = new ArrayList<>();
+        /** The JDI field shared by parent reads in this attempt. */
         private @Nullable Field parentField;
 
-        /** Copies only reads that completed, leaving per-attempt diagnostics and output empty. */
+        /** Seeds a fresh attempt with reusable state from the previous result. */
         private Walk(@Nullable DiscoveryResult previous) {
             if (previous != null) {
                 final Walk old = previous.walk;
@@ -195,7 +231,7 @@ public class ClasspathDiscoverer {
             }
         }
 
-        /** Visits the initial context chain followed by defining chains in first-seen order. */
+        /** Visits context chains before defining chains, in first-seen order within each group. */
         private void discover(ThreadReference thread, @Nullable ClassLoaderReference definingLoader, boolean tool) {
             if (launch == null) {
                 readLaunch();
@@ -245,6 +281,7 @@ public class ClasspathDiscoverer {
             final long id = thread.uniqueID();
             String owner = THREAD;
             boolean knownGetter = true;
+            // A usable field root can coexist with a pending effective getter.
             if (!contextComplete && !pendingContexts.containsKey(id)) {
                 try {
                     final ReferenceType type = thread.referenceType();
@@ -269,6 +306,7 @@ public class ClasspathDiscoverer {
                 }
                 final ContextOutcome outcome = contextOutcome;
                 if (outcome != null) {
+                    // Replace only this thread's provisional context root.
                     if (outcome.failure() == null) {
                         contexts.put(id, outcome.loader());
                         pendingContexts.remove(id);
@@ -308,6 +346,7 @@ public class ClasspathDiscoverer {
             for (ClassLoaderReference loader = root; loader != null && visited.add(loader); ) {
                 LoaderUrls paths = urls.get(loader);
                 final boolean needsUrls = paths == null && !unsupported.containsKey(loader.uniqueID());
+                // A cached null parent marks the end of a chain.
                 if (needsUrls || !parents.containsKey(loader)) {
                     try {
                         final ClassType type = (ClassType) loader.referenceType();
@@ -345,6 +384,7 @@ public class ClasspathDiscoverer {
                 unsupported.put(loader.uniqueID(), problem);
             } catch (Exception e) {
                 incomplete(type.name(), "could not read loader URLs: " + describe(e));
+                // Keep paths read before the failure available to this compile.
                 entries.addAll(found);
             }
             return null;
@@ -376,6 +416,7 @@ public class ClasspathDiscoverer {
         Field ucp = null;
         ClassType urlBase = null;
         boolean builtin = false;
+        // Keep the nearest ucp field while looking for a recognized loader base.
         for (ClassType current = type; current != null && !LOADER.equals(current.name()); current = current.superclass()) {
             if (ucp == null) {
                 ucp = declaredField(current, "ucp");
@@ -514,6 +555,7 @@ public class ClasspathDiscoverer {
     public static final class DiscoveryResult {
         private final String localJdkPath;
         private final int targetMajorVersion;
+        /** The published loader state and diagnostics for this connection. */
         private final Walk walk;
 
         /** Captures the walk and its diagnostics for reporting. */
@@ -541,6 +583,7 @@ public class ClasspathDiscoverer {
 
         /** Reports distinct class and reason pairs, including pending getters whose threads are alive. */
         public @Nullable String problem() {
+            // Give outstanding getters priority in the capped status line.
             final Map<String, Integer> counts = new LinkedHashMap<>();
             for (final PendingContext lookup : walk.pendingContexts.values()) {
                 if (lookup.active()) {

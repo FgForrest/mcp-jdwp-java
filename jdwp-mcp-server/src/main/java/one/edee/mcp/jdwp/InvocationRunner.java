@@ -51,7 +51,7 @@ public final class InvocationRunner {
      */
     private static final long BLOCKER_TIMEOUT_MS = 2_000;
 
-    /** The worker can annotate the job while it is waiting on host-side classpath discovery. */
+    /** The active tool job for admission checks and local classpath wait reporting. */
     private static final ThreadLocal<Job<?>> CURRENT_JOB = new ThreadLocal<>();
 
     private static final int PENDING = 0;

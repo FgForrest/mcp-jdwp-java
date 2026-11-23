@@ -92,8 +92,8 @@ public class JdiExpressionEvaluator {
     private final LocalProjectClasspathProvider localClasspathProvider;
 
     /**
-     * Compilation cache keyed by wrapper package, context signature, and expression. Frames with
-     * the same local types and names can reuse the compiled wrapper in the same package.
+     * The current compiler inputs and their wrapper cache. Frames with the same local types and
+     * names can reuse a compiled wrapper for the same package and expression.
      * Flushes the whole map at {@link #MAX_CACHE_SIZE}. Compiler reconfiguration replaces the map
      * so a concurrent compilation can only populate the cache it started with.
      */
@@ -103,8 +103,15 @@ public class JdiExpressionEvaluator {
     /**
      * Binds the VM and discovery snapshot to the options and wrapper cache. A tool worker or
      * dispatcher captures one state so each compilation uses the options that own its cache.
-     * {@code localEntriesAdded} records whether the merge changed the remote-only classpath. The
-     * remote snapshot belongs to these options, even if a tool publishes a new classpath in parallel.
+     *
+     * @param vm the target connection for these inputs
+     * @param snapshot the local project discovery state
+     * @param localEntriesAdded whether local discovery expanded the remote classpath
+     * @param remote the remote snapshot used to build these options
+     * @param remoteClasspath the remote entries before merging the local project
+     * @param remoteProblem the discovery diagnostic captured at configuration time
+     * @param options the ECJ options for this state
+     * @param cache the compiled wrappers reusable with these options
      */
     private record CompilerState(@Nullable VirtualMachine vm, @Nullable Snapshot snapshot,
                                  boolean localEntriesAdded,
@@ -1663,6 +1670,7 @@ public class JdiExpressionEvaluator {
         }
 
         final String discovered;
+        // Tool preparation already ran remote discovery outside the compiler monitor.
         if (prepared) {
             discovered = null;
         } else if (loader == null) {
@@ -1784,6 +1792,7 @@ public class JdiExpressionEvaluator {
                 : compiler.compile(className, sourceCode);
             return new Compilation(classes, true);
         } catch (JdiEvaluationException failure) {
+            // Recheck pending getter diagnostics against the snapshot used for this compile.
             final RemoteClasspath remote = state.remote();
             final String remoteProblem = remote == null ? state.remoteProblem() : remote.discovery().problem();
             final Snapshot captured = state.snapshot();

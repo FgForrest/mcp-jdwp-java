@@ -22,9 +22,9 @@ import java.util.stream.Stream;
  * {@code java.*} system classes when compiling expression-evaluator wrapper classes; without this
  * discovery the compiler can't produce bytecode for the target.
  * <p>
- * One-shot, stateful helper: holds {@link #targetMajorVersion} after a successful
- * {@link #discoverMatchingJdk} so callers can read it without re-running discovery. NOT a Spring
- * bean — instantiated manually by {@link ClasspathDiscoverer} per discovery call.
+ * {@link ClasspathDiscoverer} uses this helper when starting a classpath walk without a prior
+ * snapshot. On success it captures {@link #targetMajorVersion} alongside the local JDK path for
+ * use by subsequent walks.
  * <p>
  * Search strategy (in order):
  * 1. The target JVM's startup {@code java.home} if readable through JDI and accessible locally.

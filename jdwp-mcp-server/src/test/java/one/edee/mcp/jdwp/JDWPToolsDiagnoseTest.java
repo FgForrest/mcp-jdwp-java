@@ -96,11 +96,6 @@ class JDWPToolsDiagnoseTest {
 		assertThat(result).contains("INTERPRETATION:");
 	}
 
-	/**
-	 * Regression for P1-5: the MCP server's own JVM row must be filtered out of the rendered
-	 * inventory — the agent can never attach to it, so the row is pure noise. Other JVMs on the
-	 * list continue to render normally.
-	 */
 	/** Shows a remote classpath gap without restarting discovery. */
 	@Test
 	void reportsIncompleteRemoteClasspath() {
@@ -113,6 +108,7 @@ class JDWPToolsDiagnoseTest {
 			"classpath discovery was incomplete: example.Loader: could not read parent", "▸ Local project classpath");
 	}
 
+	/** Keeps other JVMs in the rendered inventory while filtering out the MCP server's own row. */
 	@Test
 	@DisplayName("THIS PROCESS row is filtered from the JVM block (P1-5)")
 	void shouldFlagThisProcessRow() {

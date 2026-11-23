@@ -71,11 +71,10 @@ import java.util.function.Consumer;
  * <p>
  * Promotion contract: the main listener loop does not call
  * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} directly — promotion happens
- * lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call. Logpoint and
- * conditional-BP handlers DO end up calling it indirectly the first time after connect (via
- * {@code configureCompilerClasspathForEvent} → {@code discoverClasspath} → {@code getVM}); the safety-net
- * promoter is strictly passive (it never calls {@code invokeMethod} on the target VM), so it is
- * safe to invoke from any event-processing context.
+ * lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call. When a dispatcher
+ * compile triggers the initial classpath discovery, compiler setup can reach the same promoter
+ * through {@code getVM()}. The promoter uses debugger reads and is safe in any event-processing
+ * context.
  * <p>
  * Fast logpoints: a breakpoint event that belongs to a fast logpoint's one-shot arming request is
  * handed to {@link FastLogpointService#handleArmingHit} instead of {@link #handleBreakpointEvent},

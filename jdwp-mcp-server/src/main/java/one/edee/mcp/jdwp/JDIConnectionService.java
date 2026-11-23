@@ -60,8 +60,9 @@ import static one.edee.mcp.jdwp.ThreadFormatting.isJvmInternalThread;
  * - Post-mortem cleanup driven by {@link JdiEventListener}'s VM-death hook (see
  * {@link #notifyVmDied()}), distinct from the user-initiated {@link #disconnect()} path.
  * <p>
- * Thread-safety: all public mutators are `synchronized` on the service instance; the object cache
- * is a {@link ConcurrentHashMap}; the classpath/JDK fields are `volatile` for cross-thread reads.
+ * Connection transitions and classpath publication use the service monitor. Classpath walks run
+ * outside that monitor. The object cache is a {@link ConcurrentHashMap}, and the classpath/JDK
+ * fields are volatile for cross-thread reads.
  */
 @Service
 public class JDIConnectionService {
@@ -1609,7 +1610,7 @@ public class JDIConnectionService {
         return value.toString();
     }
 
-    /** Discovers repositories reachable from the compilation thread's context loader. */
+    /** Discovers the context classpath without supplying a frame defining loader. */
     public @Nullable String discoverClasspath(@Nullable ThreadReference thread) {
         return discoverClasspath(thread, null);
     }
@@ -1632,7 +1633,13 @@ public class JDIConnectionService {
         return discoverClasspath(thread, definingLoader, InvocationRunner.isWorkerFor(thread));
     }
 
-    /** A published classpath and the discovery snapshot that produced it. */
+    /**
+     * A published classpath and the discovery snapshot that produced it.
+     *
+     * @param vm the connection that owns the snapshot
+     * @param path the joined entries when any are available
+     * @param discovery the classpath entries, JDK information and loader state
+     */
     public record RemoteClasspath(VirtualMachine vm, @Nullable String path, DiscoveryResult discovery) {}
 
     /** Reads the published classpath without taking the connection monitor. */
@@ -1694,6 +1701,7 @@ public class JDIConnectionService {
                     if (vm != currentVm) {
                         return null;
                     }
+                    // Rebase the walk on the result published while discovery was in flight.
                     if (classpathDiscovery != previous) {
                         continue;
                     }

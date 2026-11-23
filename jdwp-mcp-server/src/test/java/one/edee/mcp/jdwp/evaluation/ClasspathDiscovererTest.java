@@ -49,16 +49,27 @@ import static org.mockito.Mockito.when;
 
 /** Exercises remote classpath discovery using only JDI mirrors. */
 class ClasspathDiscovererTest {
+    /** The target VM mirror that supplies the launch classpath. */
     private final PathSearchingVirtualMachine vm = mock(PathSearchingVirtualMachine.class);
+    /** The default compilation thread. */
     private final ThreadReference thread = mock(ThreadReference.class);
+    /** The base thread type used to look up the inherited context field. */
     private final ClassType threadType = type("java.lang.Thread");
+    /** The base loader type used to look up the parent field. */
     private final ClassType classLoaderType = type("java.lang.ClassLoader");
+    /** The type that establishes the public URL accessor contract. */
     private final ClassType urlLoaderType = type("java.net.URLClassLoader");
+    /** The base type for fixtures that use the JDK built-in layout. */
     private final ClassType builtinLoaderType = type("jdk.internal.loader.BuiltinClassLoader");
+    /** The System mirror available during JDK discovery. */
     private final ClassType systemType = type("java.lang.System");
+    /** The URL mirror type shared by loader fixtures. */
     private final ClassType urlType = type("java.net.URL");
+    /** The inherited parent field read during a loader walk. */
     private final Field parent = field(classLoaderType, "parent");
+    /** The inherited field used for the initial context root. */
     private final Field context = field(threadType, "contextClassLoader");
+    /** The URL field read when extracting a classpath entry. */
     private final Field path = field(urlType, "path");
 
     /** Supplies the JDK version and home from debugger reads. */
@@ -332,6 +343,7 @@ class ClasspathDiscovererTest {
             assertThat(connection.discoverClasspath(thread, plugin)).contains("/app.jar");
         }
         for (final ClassLoaderReference plugin : plugins) {
+            // Measure only the requests sent after the initial walk.
             clearInvocations(plugin);
         }
         for (int i = 0; i < 3; i++) {
