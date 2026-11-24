@@ -187,7 +187,7 @@ class JDWPToolsEvaluateExpressionTest {
 	 * When the evaluator throws "X cannot be resolved" AND {@code X} matches a field on
 	 * {@code this}'s declared type, the tool enriches the error with a hint that points at
 	 * {@code this.X}, which a compiled expression resolves. The hint should mention the offending
-	 * field, the {@code this} type, and {@code jdwp_get_fields(<id>)} for a look at the object.
+	 * field, the {@code this} type, and {@code jdwp_get_fields(<objectId>)} for a look at the object.
 	 */
 	@Test
 	@DisplayName("a bare field name that cannot be resolved is answered with this.<name>")

@@ -1181,7 +1181,7 @@ public class FastLogpointService {
             + "session: " + String.join(", ", names) + ". "
             + (restorable
             ? "jdwp_restore_fast_logpoints(id) restores the class's original bytecode, but only with the user's "
-            + "approval; jdwp_clear_breakpoint(id) only disables them and leaves the class instrumented."
+            + "approval; jdwp_clear_breakpoint(breakpointId) only disables them and leaves the class instrumented."
             : "They cannot be removed until the JVM restarts (the class changed after they were installed).")
             + " Use " + kind.fallbackTool + " meanwhile.";
     }
@@ -1513,7 +1513,7 @@ public class FastLogpointService {
             }
             out.append('\n');
         }
-        return out.append("Report them to the user and leave them alone unless asked: jdwp_clear_breakpoint(id) disables "
+        return out.append("Report them to the user and leave them alone unless asked: jdwp_clear_breakpoint(breakpointId) disables "
             + "one (no bytecode change); jdwp_restore_fast_logpoints(id) restores a RECOVERED class's original "
             + "bytecode, only with the user's approval.").toString();
     }

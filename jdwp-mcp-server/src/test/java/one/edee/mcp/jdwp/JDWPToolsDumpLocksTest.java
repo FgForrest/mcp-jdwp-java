@@ -87,7 +87,7 @@ class JDWPToolsDumpLocksTest {
 			.contains("transfer-A-to-B")
 			.contains("transfer-B-to-A")
 			.contains("one.edee.Account@101")
-			.contains("jdwp_suspend_thread(id)");
+			.contains("jdwp_suspend_thread(threadId)");
 		// snapshot suspend/resume must be balanced
 		verify(vm).suspend();
 		verify(vm).resume();

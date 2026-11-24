@@ -764,7 +764,7 @@ public class JDWPTools {
                 renderThreadsCompact(result, threads);
             }
 
-            result.append("\n→ jdwp_get_stack(id) for a suspended thread.");
+            result.append("\n→ jdwp_get_stack(threadId) for a suspended thread.");
             return result.toString();
         } catch (Exception e) {
             return errorReply(e);
@@ -837,7 +837,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Dump the monitor lock graph: which threads are blocked on a Java monitor, who holds it, and any deadlock cycles. Use this for 'why is everything stuck?' / suspected deadlock. Takes a transient VM-wide suspend/resume snapshot — balanced, so threads return to their prior state and a genuine deadlock stays deadlocked (this is a read-only probe in practice). NOTE: only synchronized-monitor contention shows here; threads parked in Object.wait() or java.util.concurrent Locks do not. Follow up with jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a member.")
+    @McpTool(description = "Dump the monitor lock graph: which threads are blocked on a Java monitor, who holds it, and any deadlock cycles. Use this for 'why is everything stuck?' / suspected deadlock. Takes a transient VM-wide suspend/resume snapshot — balanced, so threads return to their prior state and a genuine deadlock stays deadlocked (this is a read-only probe in practice). NOTE: only synchronized-monitor contention shows here; threads parked in Object.wait() or java.util.concurrent Locks do not. Follow up with jdwp_suspend_thread(threadId) then jdwp_get_stack(threadId) to inspect a member.")
     public String jdwp_dump_locks(
         @McpToolParam(required = false, description = "Include JVM/JDK/test-runner internal threads (default: false)") @Nullable Boolean includeSystemThreads) {
         try {
@@ -966,7 +966,7 @@ public class JDWPTools {
             }
         }
         out.append(waitingNote);
-        out.append("\n→ jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a blocked thread "
+        out.append("\n→ jdwp_suspend_thread(threadId) then jdwp_get_stack(threadId) to inspect a blocked thread "
             + "(it will never stop at a breakpoint on its own).");
         return out.toString();
     }
@@ -1041,7 +1041,7 @@ public class JDWPTools {
                 result.append(String.format("Local variables in frame %d:\n\n", frameIndex));
 
                 // Synthetic 'this' entry for instance methods. Cached so the user can immediately call
-                // jdwp_get_fields(<id>) without a separate eval round-trip.
+                // jdwp_get_fields(<objectId>) without a separate eval round-trip.
                 final ObjectReference thisObj = frame.thisObject();
                 if (thisObj != null) {
                     result.append(String.format("this (%s) = %s\n",
@@ -3719,7 +3719,7 @@ public class JDWPTools {
         + "yet is waited for. Arms on the next hit of the line — that one hit pauses "
         + "one thread briefly and is logged through the debugger. Read hits with jdwp_get_events (FAST_LOGPOINT entries; "
         + "buffer overruns are reported as FAST_LOGPOINT_DROPPED); hits still unread when the target exits are read "
-        + "before it goes (FAST_LOGPOINT_READ_AT_EXIT). jdwp_clear_breakpoint(id), jdwp_reset, "
+        + "before it goes (FAST_LOGPOINT_READ_AT_EXIT). jdwp_clear_breakpoint(breakpointId), jdwp_reset, "
         + "jdwp_disconnect and server shutdown restore the original bytecode. If the server dies without restoring it, "
         + "the next attach lists the leftover (jdwp_overview) — see jdwp_restore_fast_logpoints.")
     public String jdwp_set_fast_logpoint(
@@ -3867,7 +3867,7 @@ public class JDWPTools {
         + "Wait for the stop with jdwp_resume_until_event. stopOnce=true "
         + "(default) stops at the first hit that meets the condition; calling the tool again with the same arguments "
         + "re-arms it. A condition that throws stops once and is then only recorded (FAST_BREAKPOINT_ERROR "
-        + "in jdwp_get_events). jdwp_clear_breakpoint(id), jdwp_reset, jdwp_disconnect and server shutdown restore "
+        + "in jdwp_get_events). jdwp_clear_breakpoint(breakpointId), jdwp_reset, jdwp_disconnect and server shutdown restore "
         + "the original bytecode.")
     public String jdwp_set_fast_breakpoint(
         @McpToolParam(description = "Fully qualified class name") String className,
@@ -4058,7 +4058,7 @@ public class JDWPTools {
         + "removes every such fast logpoint and fast breakpoint in that class. CONSENT PROTOCOL: call it without "
         + "userApproved first — nothing changes and a briefing is returned (what is removed, what was and was not "
         + "verified). Relay it to the user and ask; pass userApproved=true only after the user agreed in this "
-        + "conversation. jdwp_clear_breakpoint(id) is the no-consent alternative: it only switches the leftover off. "
+        + "conversation. jdwp_clear_breakpoint(breakpointId) is the no-consent alternative: it only switches the leftover off. "
         + "Never restore leftovers on your own initiative.")
     public String jdwp_restore_fast_logpoints(
         @McpToolParam(description = "ID of a RECOVERED fast logpoint or fast breakpoint, as listed by jdwp_overview") int id,
@@ -6402,7 +6402,7 @@ public class JDWPTools {
                 result.append(String.format("   Expression: %s\n\n", w.getExpression()));
             }
 
-            result.append("\n→ jdwp_evaluate_watchers(threadId, \"current_frame\", bpId) when the BP fires.");
+            result.append("\n→ jdwp_evaluate_watchers(threadId, \"current_frame\", breakpointId) when the BP fires.");
             return result.toString();
 
         } catch (Exception e) {
