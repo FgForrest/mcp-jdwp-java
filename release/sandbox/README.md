@@ -50,10 +50,10 @@ You are about to play JDWP test flight #1 (SessionStoreTest) on port 5005.
 
 The rules:
 1. The java-debug skill is your playbook. Use it.
-2. Everything under src/main/ is OFF LIMITS until you can finish this sentence at a
-   breakpoint: "My evidence is X, my hypothesis is Y, the source I'd like to read to
-   confirm is Z." The failing test class itself is fair game — it's the problem
-   statement.
+2. Everything under src/main/ is OFF LIMITS until the debugger has shown you enough
+   to finish this sentence: "My evidence is X, my hypothesis is Y, the source I'd
+   like to read to confirm is Z." Recorded events count as evidence. The failing
+   test class itself is fair game — it's the problem statement.
 3. Don't fix the bug. Diagnose it. The broken state is load-bearing for future flights.
 4. Don't read this project's main README or the spoiler blocks anywhere — that's cheating.
 5. Score yourself: count every jdwp_* call, from the first call after attaching until
@@ -111,11 +111,11 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 ### #5 The Masked Email
 
-**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** 6
+**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** 7
 
 **Symptom:** `[User email after recording the audit event] expected: "jordan@example.com" but was: "j***@example.com"` — recording an audit event should preserve the user's email address.
 
-**Solved when:** you name the call in `record` after which the stored email is different, with the value the JVM showed before and after it, and the statement that changes it.
+**Solved when:** you list the writes to the stored email that the JVM reports, name the call in `record` after which the value is different, with the value before and after it, and the statement that changes it.
 
 ### #6 The Doppelgänger Cart
 
@@ -125,7 +125,7 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 ### #7 The Lost Like
 
-**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** 3
+**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** 4
 
 **Symptom:** `[Total likes after two users like the post] expected: 2 but was: 1` — each user's like should count toward the post's total.
 

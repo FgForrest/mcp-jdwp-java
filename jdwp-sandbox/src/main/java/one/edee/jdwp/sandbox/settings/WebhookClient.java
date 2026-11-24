@@ -2,7 +2,7 @@ package one.edee.jdwp.sandbox.settings;
 
 import static java.lang.System.Logger.Level.DEBUG;
 
-/** Configures outbound webhook delivery. */
+/** Client for outbound webhook delivery. */
 final class WebhookClient {
 
 	private static final int DELIVERY_ATTEMPTS = 3;

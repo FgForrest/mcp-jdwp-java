@@ -8,7 +8,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** �
 
 ## Rules
 
-1. **Everything under `src/main/` is off-limits** until you can finish this sentence at the breakpoint: *"My evidence is X, my hypothesis is Y, the source I'd like to read to confirm is Z."* You may read the failing test for the problem statement.
+1. **Everything under `src/main/` is off-limits** until the debugger has shown you enough to finish this sentence: *"My evidence is X, my hypothesis is Y, the source I'd like to read to confirm is Z."* Recorded events count as evidence. You may read the failing test for the problem statement.
 2. **Do not fetch the main project README's "Reveal root cause" sections.** Those are spoilers. The user wants to verify the debugger experience works for them, not be told the answer by a search.
 3. **Do not modify sandbox source files.** Even if you spot the bug, the goal here is diagnosis, not patching. The broken state is load-bearing.
 4. **Use the `java-debug` skill that ships with the `jdwp-debugging` plugin.** Its "Core Workflow" section is the canonical sequence. The JDWP tools come from the plugin's `jdwp-inspector` MCP server (in Claude Code their names start with `mcp__plugin_jdwp-debugging_jdwp-inspector__`).
@@ -24,7 +24,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** �
 3. **Attach.** `jdwp_wait_for_attach(port=5005, requireVmStart=true)`. If the launch used a different port, use that port. If the port is occupied, check the listening process as in step 7.
 4. **Set breakpoints from the symptom outward.** Start at the failing assertion or the line nearest the user-visible wrongness. Use line breakpoints, conditional breakpoints, exception breakpoints, and field watchpoints as the situation calls for. Many flights are *much* harder to crack with the wrong tool; pick deliberately.
 5. **Inspect with `jdwp_get_breakpoint_context`** — one call returns the firing thread, the top frames, locals (including `this`), and the field dump of `this`. That replaces four separate get_* calls.
-6. **Form a hypothesis at the breakpoint, then read the source to confirm.** State the hypothesis to the user *before* reading. This is how you avoid "I read it and it must mean X" — at runtime, the JVM tells you what it actually does.
+6. **Form a hypothesis from debugger evidence, then read the source to confirm.** State the hypothesis to the user *before* reading. This is how you avoid "I read it and it must mean X" — at runtime, the JVM tells you what it actually does.
 7. **Between flights:** End the flight with `jdwp_disconnect()`. If the verified socket owner is your still-running test JVM, use `kill <pid>` with that PID. For a TCP peer or an unverified or missing PID, check the listener with `ss -ltnp 'sport = :<port>'` or `lsof -nP -iTCP:<port> -sTCP:LISTEN` first. Stop the background `mvn test` shell if needed and confirm both have exited. Stopping the shell alone can leave the forked Surefire JVM running. Launch the next test and attach with `jdwp_wait_for_attach(port=…, requireVmStart=true)`.
 
 ## Tool reminders

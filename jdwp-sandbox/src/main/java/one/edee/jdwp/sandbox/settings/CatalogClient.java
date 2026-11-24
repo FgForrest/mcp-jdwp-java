@@ -4,7 +4,7 @@ import java.time.Duration;
 
 import static java.lang.System.Logger.Level.DEBUG;
 
-/** Configures connections to the product catalog. */
+/** Client for the product catalog. */
 final class CatalogClient {
 
 	void start(final HttpSettings settings) {

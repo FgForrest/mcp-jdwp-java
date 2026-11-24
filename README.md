@@ -272,7 +272,7 @@ The order was created at `2026-10-31T23:30:00Z`, which is `2026-11-01 00:30` in 
 **Debug path (3 calls after attaching)**
 
 1. `jdwp_set_breakpoint(className="one.edee.jdwp.sandbox.report.MonthlyReport", lineNumber=17, condition="order.createdAt().atZone(java.time.ZoneOffset.UTC).getMonthValue() == 10")`.
-2. `jdwp_resume_until_event()` stops on the one excluded October order. The stop takes about 5 s on an idle machine and up to 10 s on a busy one.
+2. `jdwp_resume_until_event(timeoutMs=60000)` stops on the one excluded October order. The condition runs on every excluded order, so the stop takes a few seconds and can take longer on a busy machine. On `[TIMEOUT]`, call it again.
 3. `jdwp_evaluate_expression(expression="order + \" counted in \" + creationMonth")` returns `Order[number=7565, createdAt=2026-10-31T23:30:00Z] counted in 2026-11`.
 
 </details>
@@ -281,11 +281,11 @@ The order was created at `2026-10-31T23:30:00Z`, which is `2026-11-01 00:30` in 
 
 ### #5 The Masked Email
 
-**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** 6 | **Exercises:** field watchpoint blind spot + stepping
+**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** 7 | **Exercises:** field watchpoint blind spot + stepping
 
 **Symptom:** `[User email after recording the audit event] expected: "jordan@example.com" but was: "j***@example.com"` — recording an audit event should preserve the user's email address.
 
-**Solved when:** you name the call in `record` after which the stored email is different, with the value the JVM showed before and after it, and the statement that changes it.
+**Solved when:** you list the writes to the stored email that the JVM reports, name the call in `record` after which the value is different, with the value before and after it, and the statement that changes it.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
@@ -294,16 +294,17 @@ The order was created at `2026-10-31T23:30:00Z`, which is `2026-11-01 00:30` in 
 
 JDI watchpoints see the `putfield` and `getfield` bytecodes and JNI field access. `Field.set` ends in an `Unsafe` store straight to memory, which trips no watchpoint in either mode. A modification watchpoint with constructor writes enabled stops once at `User.java:12` when the original email is assigned. On the next resume, `[VM_DEATH]` reports one hit even though the assertion sees the masked email. `User.setEmail` is never called.
 
-**Debug path (6 calls after attaching)**
+**Debug path (7 calls after attaching)**
 
-1. `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.audit.User", fieldName="email", mode="modification", excludeConstructors=true)`.
+1. `jdwp_set_field_breakpoint(className="one.edee.jdwp.sandbox.audit.User", fieldName="email", mode="modification")`.
 2. `jdwp_set_breakpoint(className="one.edee.jdwp.sandbox.audit.AuditLog", lineNumber=17)`.
-3. `jdwp_resume_until_event()` stops before `masker.fieldsFor(user)`.
-4. `jdwp_evaluate_expression(expression="user.getEmail()")` returns `"jordan@example.com"`.
-5. `jdwp_step_over(wait=true)` lands at `AuditLog.java:18`. The watchpoint stays silent.
-6. `jdwp_evaluate_expression(expression="user.getEmail()")` returns `"j***@example.com"`.
+3. `jdwp_resume_until_event()` stops at `User.java:12` for the only reported write, from `null` to `"jordan@example.com"`.
+4. `jdwp_resume_until_event()` stops at `AuditLog.java:17` before `masker.fieldsFor(user)`.
+5. `jdwp_evaluate_expression(expression="user.getEmail()")` returns `"jordan@example.com"`.
+6. `jdwp_step_over(wait=true)` lands at `AuditLog.java:18`. The watchpoint stays silent even though the value changes.
+7. `jdwp_evaluate_expression(expression="user.getEmail()")` returns `"j***@example.com"`.
 
-For the eight-call route, place the line breakpoint on `AuditLogTest.java:15` using `jdwp_set_breakpoint(className="one.edee.jdwp.sandbox.audit.AuditLogTest", lineNumber=15)`. After resuming, `jdwp_step_into(wait=true)` lands on the timestamp assignment, and `jdwp_step_over(wait=true)` reaches line 17. Continue with the same before-and-after evaluations.
+From the call at `AuditLogTest.java:15`, `jdwp_step_into(wait=true)` and one `jdwp_step_over(wait=true)` reach the same line.
 
 The change across `masker.fieldsFor(user)` gives you the hypothesis to check in `PiiMasker`. To verify the exact write in a fresh run, use `jdwp_set_breakpoint(className="one.edee.jdwp.sandbox.audit.PiiMasker", lineNumber=26)` and `jdwp_resume_until_event()`. Call `jdwp_evaluate_expression(expression="((one.edee.jdwp.sandbox.audit.User) entity).getEmail()")` before and after `jdwp_step_over(wait=true)`. The value changes across `field.set(entity, mask(name, text))`.
 
@@ -330,7 +331,7 @@ The change across `masker.fieldsFor(user)` gives you the hypothesis to check in 
 
 ### #7 The Lost Like
 
-**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** 3 | **Exercises:** logpoints (non-stopping)
+**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** 4 | **Exercises:** logpoints (non-stopping)
 
 **Symptom:** `[Total likes after two users like the post] expected: 2 but was: 1` — each user's like should count toward the post's total.
 
@@ -343,13 +344,12 @@ Two workers load separate copies of the same post with zero likes, increment the
 
 The repository's `ConcurrentHashMap` makes individual map operations thread-safe. The load–change–save sequence spans several operations and can interleave across workers. A suspending breakpoint parks the workers and requires following and releasing their stops to reconstruct the sequence. A field logpoint on `Post.reactions` can record the map reference and reads before the merge. The like count changes inside the map, and saving writes the repository entry, so the field logpoint misses each worker's saved count.
 
-**Debug path (3 calls after attaching)**
+**Debug path (4 calls after attaching)**
 
-1. `jdwp_set_logpoint(className="one.edee.jdwp.sandbox.likes.LikeService", lineNumber=17, expression="Thread.currentThread().getName() + \" saves \" + post.likes() + \" over \" + repository.likesFor(postId)")`.
-2. `jdwp_resume_until_event()` runs through both saves and returns `[VM_DEATH]`.
-3. `jdwp_get_events()` shows `Maya saves 1 over 0` and `Noah saves 1 over 1`. The names can trade places.
-
-For the four-call route, add `jdwp_set_logpoint(className="one.edee.jdwp.sandbox.likes.LikeService", lineNumber=16, expression="Thread.currentThread().getName() + \" loaded \" + post.likes()")` before resuming. The two load hits show `0` for both workers, and the two save hits show `1` for both.
+1. `jdwp_set_logpoint(className="one.edee.jdwp.sandbox.likes.LikeService", lineNumber=16, expression="Thread.currentThread().getName() + \" loaded \" + post.likes()")`.
+2. `jdwp_set_logpoint(className="one.edee.jdwp.sandbox.likes.LikeService", lineNumber=17, expression="Thread.currentThread().getName() + \" saves \" + post.likes()")`.
+3. `jdwp_resume_until_event()` runs through both saves and returns `[VM_DEATH]`.
+4. `jdwp_get_events()` shows `Maya loaded 0`, `Noah loaded 0`, `Maya saves 1`, and `Noah saves 1`. The order of the events can vary.
 
 </details>
 

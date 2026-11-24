@@ -4,7 +4,7 @@ import java.util.Properties;
 
 import static java.lang.System.Logger.Level.DEBUG;
 
-/** Configures the export of service metrics to a collector. */
+/** Exporter for service metrics. */
 final class MetricsReporter {
 
 	void start(final HttpSettings settings) {

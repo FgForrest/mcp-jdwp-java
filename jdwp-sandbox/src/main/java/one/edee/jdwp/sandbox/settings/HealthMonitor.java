@@ -2,7 +2,7 @@ package one.edee.jdwp.sandbox.settings;
 
 import static java.lang.System.Logger.Level.WARNING;
 
-/** Checks the timing configuration for service health probes. */
+/** Monitor for periodic service health probes. */
 final class HealthMonitor {
 
 	private static final int POLL_INTERVAL_MILLIS = 30_000;

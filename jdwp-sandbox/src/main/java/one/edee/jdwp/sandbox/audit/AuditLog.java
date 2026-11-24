@@ -19,4 +19,9 @@ public final class AuditLog {
 		final String entry = "%s account.access user=%d attributes=%s".formatted(timestamp, accountId, attributes);
 		entries.add(entry);
 	}
+
+	/** Returns an unmodifiable copy of the recorded audit entries. */
+	public List<String> entries() {
+		return List.copyOf(entries);
+	}
 }
