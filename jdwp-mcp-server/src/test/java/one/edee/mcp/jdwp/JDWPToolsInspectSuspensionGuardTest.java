@@ -26,7 +26,7 @@ import static org.mockito.Mockito.when;
  * never stop at a breakpoint on its own. The old {@code get_stack} message ("must be stopped at a
  * breakpoint") was a dead end, and {@code get_locals} had no suspend check at all and leaked the
  * raw {@code IncompatibleThreadStateException}. Both must now point the caller at
- * {@code jdwp_suspend_thread(id)} — the actual deadlock-inspection path.
+ * {@code jdwp_suspend_thread(threadId)} — the actual deadlock-inspection path.
  */
 @DisplayName("get_stack / get_locals — not-suspended inspection guard")
 class JDWPToolsInspectSuspensionGuardTest {

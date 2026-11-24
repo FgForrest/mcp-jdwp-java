@@ -31,7 +31,7 @@ import static org.mockito.Mockito.when;
  * ({@code jdwp_set_breakpoint_dependency}, {@code jdwp_clear_breakpoint_dependency},
  * {@code jdwp_disarm_until_trigger}), the optional {@code triggerBreakpointId} argument on
  * {@code jdwp_set_breakpoint} and {@code jdwp_set_exception_breakpoint}, the cascade-on-clear path
- * in {@code jdwp_clear_breakpoint(id)} (kind-agnostic), the
+ * in {@code jdwp_clear_breakpoint(breakpointId)} (kind-agnostic), the
  * {@code chain=trigger=#N} suffix in {@code jdwp_overview} / {@code jdwp_diagnose}, and the
  * chain-stuck interpretation hint emitted by the diagnostic.
  *

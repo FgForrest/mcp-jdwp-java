@@ -118,6 +118,25 @@ public class WatcherManager {
     }
 
     /**
+     * Resolves a trimmed UUID or prefix of at least {@value Watcher#DISPLAY_ID_LENGTH} characters
+     * and deletes its unique match under the same lock.
+     * Returns the deleted watcher, an empty list if absent, or the untouched matches if ambiguous.
+     */
+    public synchronized List<Watcher> deleteWatcherByIdOrPrefix(String id) {
+        if (id.length() < Watcher.DISPLAY_ID_LENGTH) {
+            return List.of();
+        }
+        final List<Watcher> matches = watchersById.values().stream()
+            .filter(watcher -> watcher.getId().startsWith(id))
+            .sorted(Comparator.comparing(Watcher::getId))
+            .toList();
+        if (matches.size() == 1) {
+            deleteWatcher(matches.get(0).getId());
+        }
+        return matches;
+    }
+
+    /**
      * Deletes all watchers attached to a specific breakpoint.
      *
      * @param breakpointId JDWP breakpoint request ID

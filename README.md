@@ -519,6 +519,8 @@ This works from VM start, so it is the attach prologue for a failing test: launc
 
 Pass `forceLoad=true` only when you need the breakpoint to bind *immediately* — the server will call `Class.forName` in the target VM to load the class up front. That runs the class's `<clinit>` (early static init, eager dependency loads), which can mask lazy-init / classloader-leak diagnostics. Use sparingly. It needs a thread stopped at an event to run the load, so at VM start it cannot load anything: the breakpoint is deferred instead, and the reply says `forceLoad=true could not load it`.
 
+If `Class.forName` throws and the class is visible afterwards, the tool handles it as a loaded class and appends a warning with the target exception. A class whose initialization failed is unusable until the target restarts. If the class is still missing, the tool defers the breakpoint and includes the exception in the deferral note.
+
 ### Exception breakpoints
 
 ```
@@ -806,7 +808,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
-| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, trigger chaining; `forceLoad=true` binds immediately and runs `<clinit>`) |
+| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, trigger chaining). `forceLoad=true` attempts to load and initialize the class immediately. |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`, `forceLoad?` | Non-stopping line breakpoint that logs expression result |
 | `jdwp_set_fast_logpoint`          | `className`, `lineNumber`, `expression`, `condition?`, `userApproved?`, `bufferSize?`, `forceLoad?` | **Rare, consent required.** Logpoint evaluated inside the target by injected bytecode — hits never suspend. Arms with standing approval for the exact probe at this host:port, or asks for `userApproved=true` after a risk briefing |
 | `jdwp_set_fast_breakpoint`        | `className`, `lineNumber`, `condition`, `userApproved?`, `suspendPolicy?`, `stopOnce?`, `forceLoad?`, `capture?` | **Rare, consent required.** Evaluates the condition inside the target and optionally captures a value on each true stop, including the arming hit. Arms with standing approval for the exact probe at this host:port, or asks for `userApproved=true` after a risk briefing |
@@ -854,7 +856,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 | Tool                                | Parameters                            | Description                                         |
 |-------------------------------------|---------------------------------------|-----------------------------------------------------|
 | `jdwp_attach_watcher`               | `breakpointId`, `label`, `expression` | Attach expression watcher to a breakpoint           |
-| `jdwp_detach_watcher`               | `watcherId`                           | Remove a watcher                                    |
+| `jdwp_detach_watcher`               | `watcherId`                           | Remove a watcher using its displayed ID or full UUID. |
 | `jdwp_list_watchers_for_breakpoint` | `breakpointId`                        | List watchers on a specific breakpoint              |
 | `jdwp_evaluate_watchers`            | `threadId`, `scope?`, `breakpointId?` | Evaluate watchers (`current_frame` by default, or `full_stack`) |
 

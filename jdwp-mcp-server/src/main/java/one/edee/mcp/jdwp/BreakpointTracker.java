@@ -229,7 +229,7 @@ public class BreakpointTracker {
 
     /**
      * Mints a synthetic ID from the shared breakpoint ID space for a breakpoint kind this tracker
-     * does not store itself (fast logpoints), so {@code jdwp_clear_breakpoint(id)} can route every
+     * does not store itself (fast logpoints), so {@code jdwp_clear_breakpoint(breakpointId)} can route every
      * kind by one number.
      */
     public int allocateId() {

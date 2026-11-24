@@ -10,6 +10,8 @@ import com.sun.jdi.VMDisconnectedException;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 
@@ -27,6 +29,8 @@ class RemoteCodeExecutorTargetExceptionTest {
 
 	private static final String TYPE = "java.lang.IllegalStateException";
 	private static final String WITHOUT_MESSAGE = "Target VM threw exception: " + TYPE;
+	private static final String INITIALIZER_ERROR = "java.lang.ExceptionInInitializerError";
+	private static final String INITIALIZER_REPORT = "Target VM threw exception: " + INITIALIZER_ERROR;
 
 	@Test
 	@DisplayName("the message follows the type")
@@ -87,6 +91,78 @@ class RemoteCodeExecutorTargetExceptionTest {
 
 		assertThatThrownBy(() -> RemoteCodeExecutor.targetException(new InvocationException(exception)))
 			.isSameAs(disconnected);
+	}
+
+	/** Both JDK layouts expose the cause as a field, with the usual message limits. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void reportsInitializerCause(boolean legacyField) {
+		final ObjectReference cause = exception("boom\n" + "x".repeat(400));
+		final ObjectReference error = initializerError(legacyField, cause);
+
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error)))
+			.hasMessage(INITIALIZER_REPORT + " (cause: " + TYPE + ": boom " + "x".repeat(295) + "…)");
+	}
+
+	/** Null, self-reference and an unreadable field all leave the initializer error alone. */
+	@Test
+	void omitsAbsentOrUnreadableCause() {
+		final ObjectReference error = initializerError(false, null);
+		final Field cause = error.referenceType().allFields().get(1);
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error))).hasMessage(INITIALIZER_REPORT);
+
+		when(error.getValue(cause)).thenReturn(error);
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error))).hasMessage(INITIALIZER_REPORT);
+
+		when(error.getValue(cause)).thenThrow(new IllegalArgumentException("unreadable field"));
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error))).hasMessage(INITIALIZER_REPORT);
+	}
+
+	/** A collected cause leaves the outer error report intact. */
+	@Test
+	void omitsCollectedCause() {
+		final ObjectReference cause = exception("gone");
+		when(cause.type()).thenThrow(new ObjectCollectedException());
+		final ObjectReference error = initializerError(false, cause);
+
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error))).hasMessage(INITIALIZER_REPORT);
+	}
+
+	/** Other Errors are reported once and an initializer error's cause is only read one level deep. */
+	@Test
+	void reportsOnlyOneLevelAndOnlyForInitializerErrors() {
+		final ObjectReference nested = initializerError(false, exception("hidden"));
+		final ObjectReference error = initializerError(false, nested);
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(error)))
+			.hasMessage(INITIALIZER_REPORT + " (cause: " + INITIALIZER_ERROR + ")");
+
+		final ObjectReference unwrapped = initializerError(false, exception("hidden"));
+		when(unwrapped.referenceType().name()).thenReturn("java.lang.AssertionError");
+		assertThat(RemoteCodeExecutor.targetException(new InvocationException(unwrapped)))
+			.hasMessage("Target VM threw exception: java.lang.AssertionError");
+	}
+
+	/** Builds a mirror using the current or legacy initializer-error layout. */
+	private static ObjectReference initializerError(boolean legacyField, @Nullable ObjectReference cause) {
+		final ObjectReference error = exception(null);
+		final ReferenceType type = error.referenceType();
+		final Field detail = type.allFields().get(0);
+		final ReferenceType throwable = detail.declaringType();
+		final Field causeField = mock(Field.class);
+		when(type.name()).thenReturn(INITIALIZER_ERROR);
+		when(causeField.name()).thenReturn(legacyField ? "exception" : "cause");
+		when(causeField.declaringType()).thenReturn(legacyField ? type : throwable);
+		if (legacyField) {
+			final Field unsetCause = mock(Field.class);
+			when(unsetCause.name()).thenReturn("cause");
+			when(unsetCause.declaringType()).thenReturn(throwable);
+			when(error.getValue(unsetCause)).thenReturn(error);
+			when(type.allFields()).thenReturn(List.of(detail, unsetCause, causeField));
+		} else {
+			when(type.allFields()).thenReturn(List.of(detail, causeField));
+		}
+		when(error.getValue(causeField)).thenReturn(cause);
+		return error;
 	}
 
 	private static String reported(@Nullable String message) {
