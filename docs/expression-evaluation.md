@@ -288,7 +288,7 @@ The compiler makes up to four rewrite passes and reports the original diagnostic
 
 ### Exceptions thrown by evaluated code
 
-A target exception is reported by type and message on one line, such as `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is `Throwable.detailMessage`, read as a field without invoking anything, cut at 300 characters. A message that a class builds in `getMessage()`, such as the JVM's helpful `NullPointerException` text, is not in the field, so the reply has the type only. `jdwp_to_string` and `EVALUATION_COMPLETED_LATE` report target exceptions the same way.
+A target exception is reported by type and message on one line, such as `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is `Throwable.detailMessage`, read as a field without invoking anything, cut at 300 characters. A message that a class builds in `getMessage()`, such as the JVM's helpful `NullPointerException` text, is not in the field, so the reply has the type only. For `ExceptionInInitializerError`, the report also includes the immediate cause when readable, using `Throwable.cause` or the older `ExceptionInInitializerError.exception` field. The same one-line and 300-character rules apply to the cause's message. `jdwp_to_string` and `EVALUATION_COMPLETED_LATE` report target exceptions the same way.
 
 Fast probes describe a failure inside the target by their own rule: an application exception type is named without its message.
 

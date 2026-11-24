@@ -15,6 +15,7 @@ import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdkDiscoveryService.JdkNotFoundException;
 import one.edee.mcp.jdwp.evaluation.PinnedMirrors;
+import one.edee.mcp.jdwp.evaluation.RemoteCodeExecutor;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
@@ -1764,6 +1765,7 @@ public class JDIConnectionService {
      * thread); it avoids a fallback scan of {@code allThreads()}.
      *
      * @see #findOrForceLoadClass(String, ThreadReference)
+     * @throws ForceLoadFailure when target code throws during {@code Class.forName}
      */
     @Nullable
     public ReferenceType findOrForceLoadClass(String className) {
@@ -1821,7 +1823,8 @@ public class JDIConnectionService {
      * {@link VirtualMachine#classesByName} until first referenced; a force-load makes them appear at
      * once. A breakpoint does not need that — their {@link com.sun.jdi.event.ClassPrepareEvent} is
      * delivered when they load, bootstrap classes included. Returns {@code null} if the class cannot
-     * be found or force-loaded — always at VM start, where no thread can run {@code Class.forName}.
+     * be found and the debugger could not perform the load, for example at VM start when no thread
+     * can run {@code Class.forName}.
      *
      * <p><b>This method has observable side effects on the target application</b> — running
      * {@code <clinit>} triggers static-field init, cascade-loads dependencies, may register
@@ -1849,6 +1852,9 @@ public class JDIConnectionService {
      * may have nulled the field, and a {@link com.sun.jdi.VMDisconnectedException} from the disposed
      * reference is already handled here, whereas a {@code null} re-read would silently discard a
      * successful force-load.
+     *
+     * @throws ForceLoadFailure when target code throws during {@code Class.forName}, carrying the
+     *         formatted exception and the class if the post-invocation lookup still finds it
      */
     @Nullable
     public ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread) {
@@ -1922,23 +1928,44 @@ public class JDIConnectionService {
                     ClassType.INVOKE_SINGLE_THREADED);
             }
             log.info("[JDI] Force-loaded class '{}' via Class.forName", className);
+        } catch (InvocationException e) {
+            final String description = RemoteCodeExecutor.describe(e);
+            log.warn("[JDI] Could not force-load class '{}': {}", className, description);
+            final ReferenceType visibleType = findAfterForceLoad(vmRef, className);
+            throw new ForceLoadFailure(description, visibleType, e);
         } catch (Exception e) {
             log.warn("[JDI] Could not force-load class '{}': {} ({})",
                 className, e.getMessage(), e.getClass().getSimpleName());
             return null;
         }
 
-        // Phase 3: post-invoke lookup. Use the VM reference captured in Phase 1 rather than
-        // re-reading `this.vm`: a concurrent disconnect can null out the field even though our
-        // forceLoad just succeeded against the captured instance, and that disposed reference will
-        // throw VMDisconnectedException from any JDI call — already handled by the surrounding
-        // try/catch chain. Re-reading `this.vm` would silently discard a successful force-load.
+        return findAfterForceLoad(vmRef, className);
+    }
+
+    /** Phase 3 looks up the class on the captured VM, including when initialization failed. */
+    private @Nullable ReferenceType findAfterForceLoad(VirtualMachine vmRef, String className) {
         try {
             final List<ReferenceType> afterForceLoad = vmRef.classesByName(className);
             return afterForceLoad.isEmpty() ? null : afterForceLoad.get(0);
         } catch (Exception e) {
             log.debug("[JDI] Phase 3 lookup for '{}' failed after force-load: {}", className, e.getMessage());
             return null;
+        }
+    }
+
+    /** The target answered with an exception. A failed initializer can still leave a visible class. */
+    static final class ForceLoadFailure extends RuntimeException {
+        private final @Nullable ReferenceType visibleType;
+
+        /** Carries target text for both immediate replies and late invocation events. */
+        ForceLoadFailure(String description, @Nullable ReferenceType visibleType, InvocationException cause) {
+            super("Class.forName threw " + description, cause);
+            this.visibleType = visibleType;
+        }
+
+        /** Returns the class found after the invocation, if the VM still reports it. */
+        @Nullable ReferenceType visibleType() {
+            return visibleType;
         }
     }
 

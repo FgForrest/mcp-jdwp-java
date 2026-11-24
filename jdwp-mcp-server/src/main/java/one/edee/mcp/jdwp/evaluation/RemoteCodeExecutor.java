@@ -39,6 +39,10 @@ public final class RemoteCodeExecutor {
      * JNI signature for the four-argument `defineClass(String, byte[], int, int)` overload.
      */
     private static final String CLASSLOADER_DEFINE_CLASS_SIGNATURE = "(Ljava/lang/String;[BII)Ljava/lang/Class;";
+    /**
+     * The wrapper HotSpot puts around an exception thrown by a static initializer; it has no message of its own.
+     */
+    private static final String INITIALIZER_ERROR = "java.lang.ExceptionInInitializerError";
 
     private RemoteCodeExecutor() {
     }
@@ -147,11 +151,12 @@ public final class RemoteCodeExecutor {
      * message on one line. The message is target text and only ever shown, never interpreted.
      */
     public static JdiEvaluationException targetException(InvocationException failure) {
-        return new JdiEvaluationException("Target VM threw exception: " + describe(failure.exception()), failure);
+        return new JdiEvaluationException("Target VM threw exception: " + describe(failure), failure);
     }
 
-    /** The type and one-line message of a thrown object; {@code unknown} when the target has collected it. */
-    private static String describe(@Nullable ObjectReference exception) {
+    /** The type and one-line message of a target failure, including an initializer error's immediate cause. */
+    public static String describe(InvocationException failure) {
+        final ObjectReference exception = failure.exception();
         if (exception == null) {
             return "unknown";
         }
@@ -161,12 +166,49 @@ public final class RemoteCodeExecutor {
         } catch (ObjectCollectedException collected) {
             return "unknown";
         }
+        final String description = typeAndMessage(exception, type);
+        if (!INITIALIZER_ERROR.equals(type)) {
+            return description;
+        }
+        final String cause = describeInitializerCause(exception);
+        return cause == null ? description : description + " (cause: " + cause + ")";
+    }
+
+    /** The type of a throwable and, when its field holds one, its message on the same line; invokes nothing. */
+    private static String typeAndMessage(ObjectReference exception, String type) {
         final String message = JdiEventListener.detailMessage(exception);
         if (message == null) {
             return type;
         }
         final String singleLine = message.replaceAll("(?U)\\s+", " ").strip();
         return singleLine.isEmpty() ? type : type + ": " + singleLine;
+    }
+
+    /** Reads just the immediate initializer cause, tolerating a collected or unreadable mirror. */
+    private static @Nullable String describeInitializerCause(ObjectReference exception) {
+        try {
+            final List<Field> fields = exception.referenceType().allFields();
+            final ObjectReference cause = readCause(exception, fields, "java.lang.Throwable", "cause");
+            // Before JDK 12, ExceptionInInitializerError stored its cause in its own field.
+            final ObjectReference resolved = cause != null ? cause
+                : readCause(exception, fields, INITIALIZER_ERROR, "exception");
+            return resolved == null ? null : typeAndMessage(resolved, resolved.type().name());
+        } catch (RuntimeException e) {
+            log.debug("[Eval] Initializer error cause not readable: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** Reads the named cause field on its declaring type, skipping the unset self-reference. */
+    private static @Nullable ObjectReference readCause(ObjectReference exception, List<Field> fields,
+                                                       String declaringType, String fieldName) {
+        for (final Field field : fields) {
+            if (fieldName.equals(field.name()) && declaringType.equals(field.declaringType().name())) {
+                final Value value = exception.getValue(field);
+                return value instanceof ObjectReference cause && !cause.equals(exception) ? cause : null;
+            }
+        }
+        return null;
     }
 
     /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */

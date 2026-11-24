@@ -102,6 +102,39 @@ class JDWPToolsFreshAttachLiveTest {
 		assertThat(connection.getVM().allThreads()).noneMatch(thread -> thread.isSuspended());
 	}
 
+	/** A live Class.forName failure leaves a prepared class that still accepts a line breakpoint. */
+	@Test
+	void forceLoadReportsFailedInitializationAndBindsBreakpoint() throws Exception {
+		launchTarget("");
+		final String badInit = Target.BadInit.class.getName();
+		assertThat(tools.jdwp_wait_for_attach("127.0.0.1", port, 5_000, true)).contains("suspended at VM_START");
+		final int waitLine = lineOf("// MARK: wait");
+		assertThat(tools.jdwp_set_breakpoint(Target.class.getName(), waitLine, null, null, null, null, null))
+			.startsWith("Breakpoint deferred");
+		assertThat(tools.jdwp_resume_until_event(5_000))
+			.startsWith("Event fired at " + Target.class.getName() + ":" + waitLine);
+		assertThat(connection.getVM().classesByName(badInit)).isEmpty();
+
+		final String reply = tools.jdwp_set_breakpoint(
+			badInit, lineOf("// MARK: failing initializer"), null, null, null, null, true);
+
+		assertThat(reply).startsWith("Breakpoint set at " + badInit).containsOnlyOnce("Warning: forceLoad=true")
+			.contains("java.lang.ExceptionInInitializerError (cause: java.lang.IllegalStateException: config missing)",
+				"NoClassDefFoundError");
+	}
+
+	/** The line of this source file that carries {@code marker} after its code. */
+	private static int lineOf(String marker) throws IOException {
+		final List<String> lines = Files.readAllLines(
+			Path.of("src/test/java/one/edee/mcp/jdwp/JDWPToolsFreshAttachLiveTest.java"));
+		for (int i = 0; i < lines.size(); i++) {
+			if (lines.get(i).endsWith("; " + marker)) {
+				return i + 1;
+			}
+		}
+		throw new IllegalStateException(marker + " not found");
+	}
+
 	@Test
 	void rejectsAttachWhenJdwpStartsAtAnApplicationException() throws Exception {
 		final Path marker = targetFiles.resolve("main-entered");
@@ -206,7 +239,19 @@ class JDWPToolsFreshAttachLiveTest {
 					System.in.read();
 				}
 			} else {
-				System.in.read();
+				System.in.read(); // MARK: wait
+			}
+		}
+
+		/** A class that will stay loaded after its initializer fails. */
+		public static class BadInit {
+			static {
+				failInitialization();
+			}
+
+			/** Provides an executable line for the force-loaded breakpoint. */
+			private static void failInitialization() {
+				throw new IllegalStateException("config missing"); // MARK: failing initializer
 			}
 		}
 	}
