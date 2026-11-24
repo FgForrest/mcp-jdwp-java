@@ -58,6 +58,16 @@ class JdiExpressionEvaluatorGetDeclaredTypeTest {
 
 			assertThat(invokeGetDeclaredType(type)).isEqualTo("com.example.Foo");
 		}
+
+		/** A public generated class can have a dollar-digit name. */
+		@Test
+		void shouldKeepPublicClassWithDollarDigitName() throws Exception {
+			final ClassType type = mock(ClassType.class);
+			when(type.name()).thenReturn("com.example.$1");
+			when(type.isPublic()).thenReturn(true);
+
+			assertThat(invokeGetDeclaredType(type)).isEqualTo("com.example.$1");
+		}
 	}
 
 	@Nested

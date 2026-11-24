@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
+import one.edee.mcp.jdwp.JdiEventListener;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.jspecify.annotations.Nullable;
@@ -141,11 +142,31 @@ public final class RemoteCodeExecutor {
         }
     }
 
-    /** Formats a target exception identically for compiled and interpreted Java. */
+    /**
+     * Formats a target exception for Java evaluation and {@code jdwp_to_string} with its type and
+     * message on one line. The message is target text and only ever shown, never interpreted.
+     */
     public static JdiEvaluationException targetException(InvocationException failure) {
-        final ObjectReference exception = failure.exception();
-        final String type = exception != null ? exception.type().name() : "unknown";
-        return new JdiEvaluationException("Target VM threw exception: " + type, failure);
+        return new JdiEvaluationException("Target VM threw exception: " + describe(failure.exception()), failure);
+    }
+
+    /** The type and one-line message of a thrown object; {@code unknown} when the target has collected it. */
+    private static String describe(@Nullable ObjectReference exception) {
+        if (exception == null) {
+            return "unknown";
+        }
+        final String type;
+        try {
+            type = exception.type().name();
+        } catch (ObjectCollectedException collected) {
+            return "unknown";
+        }
+        final String message = JdiEventListener.detailMessage(exception);
+        if (message == null) {
+            return type;
+        }
+        final String singleLine = message.replaceAll("(?U)\\s+", " ").strip();
+        return singleLine.isEmpty() ? type : type + ": " + singleLine;
     }
 
     /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */

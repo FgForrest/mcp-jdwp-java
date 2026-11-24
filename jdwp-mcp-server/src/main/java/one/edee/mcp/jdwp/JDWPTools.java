@@ -8,6 +8,7 @@ import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.RemoteCodeExecutor;
 import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.evaluation.interpret.Planner;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
@@ -104,14 +105,10 @@ public class JDWPTools {
         "sun.reflect.",
         "jdk.internal.invoke."
     };
-    /**
-     * Pre-compiled pattern for {@link #parseUnresolvedFieldName}. Recognises three JDT compile-error
-     * forms: "X cannot be resolved", "field a.b.c.X is not visible", and "X is not visible".
-     */
-    private static final Pattern UNRESOLVED_FIELD_PATTERN = Pattern.compile(
-        "([A-Za-z_][A-Za-z_0-9]*)\\s+cannot be resolved"
-            + "|field\\s+\\S*?\\.([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
-            + "|([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
+    /** Matches a JDT diagnostic, capturing the identifier and the full reason it failed. */
+    private static final Pattern FIELD_DIAGNOSTIC_PATTERN = Pattern.compile(
+        "(?<name>\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)\\s+"
+            + "(?<problem>cannot be resolved(?: to a (?:variable|type)| or is not a field)?|is not visible)"
     );
     /**
      * Renders an event timestamp as {@code HH:mm:ss.SSS} (UTC, to match the stored {@link Instant}).
@@ -328,31 +325,29 @@ public class JDWPTools {
         return false;
     }
 
-    /**
-     * Pure regex extraction of an unresolved/invisible field name from a JDT compile error message.
-     * Recognises three forms emitted by the Eclipse JDT compiler:
-     * <ul>
-     *   <li>{@code "X cannot be resolved"} — the wrapper class never saw the identifier</li>
-     *   <li>{@code "field a.b.c.X is not visible"} — the wrapper class saw the field but visibility failed</li>
-     *   <li>{@code "X is not visible"} — bare-name variant emitted by some compiler versions</li>
-     * </ul>
-     * Static + package-private so it can be unit-tested without a JDI connection.
-     *
-     * @param message the raw compiler error string
-     * @return the field/identifier name if any of the three patterns match, otherwise {@code null}
-     */
+    /** The kinds of name-resolution diagnostics relevant to field hints. */
+    enum FieldDiagnosticKind { BARE, QUALIFIED, TYPE, NOT_VISIBLE }
+
+    /** The name and kind captured from one compiler diagnostic. */
+    record FieldDiagnostic(String name, FieldDiagnosticKind kind) {}
+
+    /** Returns the first matching JDT diagnostic, or {@code null} if none matched. */
     @Nullable
-    static String parseUnresolvedFieldName(@Nullable String message) {
+    static FieldDiagnostic parseFieldDiagnostic(@Nullable String message) {
         if (message == null) {
             return null;
         }
-        final Matcher m = UNRESOLVED_FIELD_PATTERN.matcher(message);
-        if (!m.find()) {
+        final Matcher match = FIELD_DIAGNOSTIC_PATTERN.matcher(message);
+        if (!match.find()) {
             return null;
         }
-        return m.group(1) != null ? m.group(1)
-            : m.group(2) != null ? m.group(2)
-              : m.group(3);
+        final FieldDiagnosticKind kind = switch (match.group("problem")) {
+            case "cannot be resolved to a type" -> FieldDiagnosticKind.TYPE;
+            case "cannot be resolved or is not a field" -> FieldDiagnosticKind.QUALIFIED;
+            case "is not visible" -> FieldDiagnosticKind.NOT_VISIBLE;
+            default -> FieldDiagnosticKind.BARE;
+        };
+        return new FieldDiagnostic(match.group("name"), kind);
     }
 
     /**
@@ -1277,8 +1272,13 @@ public class JDWPTools {
             // very thread this invokeMethod is waiting on.
             final Value result = invocations.run(thread, "toString() of object #" + objectId, () -> {
                 try (EvaluationGuard.Lease lease = evaluationGuard.lease(thread)) {
-                    return obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
-                        ObjectReference.INVOKE_SINGLE_THREADED);
+                    // Read the target exception while the lease is held, hence the inner try.
+                    try {
+                        return obj.invokeMethod(thread, toStringMethod, Collections.emptyList(),
+                            ObjectReference.INVOKE_SINGLE_THREADED);
+                    } catch (InvocationException failure) {
+                        throw RemoteCodeExecutor.targetException(failure);
+                    }
                 }
             });
 
@@ -1423,8 +1423,9 @@ public class JDWPTools {
                 return vmDisconnectedMessage("jdwp_evaluate_expression");
             }
             final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-            final String enriched = evaluatedThreadId != null
-                ? enrichEvaluationError(msg, evaluatedThreadId, frameIndex) : msg;
+            // A target exception's message is the target's own text, not a compile diagnostic.
+            final String enriched = evaluatedThreadId != null && !isTargetException(e)
+                ? enrichEvaluationError(msg, expression, evaluatedThreadId, frameIndex) : msg;
             return "Error evaluating expression: " + enriched;
         }
     }
@@ -1535,9 +1536,14 @@ public class JDWPTools {
     }
 
     /** Adds a field-inspection hint to a compiled unresolved-name diagnostic. */
-    private String enrichEvaluationError(String originalMessage, long threadId, @Nullable Integer frameIndex) {
-        final String unresolved = parseUnresolvedFieldName(originalMessage);
-        if (unresolved == null) {
+    private String enrichEvaluationError(String originalMessage, String expression, long threadId,
+                                         @Nullable Integer frameIndex) {
+        final FieldDiagnostic diagnostic = parseFieldDiagnostic(originalMessage);
+        if (diagnostic == null || diagnostic.kind() == FieldDiagnosticKind.TYPE) {
+            return originalMessage;
+        }
+        final String unresolved = diagnostic.name();
+        if (diagnostic.kind() == FieldDiagnosticKind.QUALIFIED && !spellsThisField(expression, unresolved)) {
             return originalMessage;
         }
 
@@ -1552,7 +1558,8 @@ public class JDWPTools {
             if (thisObj == null) {
                 return originalMessage;
             }
-            final Field field = thisObj.referenceType().allFields().stream()
+            final ReferenceType thisType = thisObj.referenceType();
+            final Field field = thisType.allFields().stream()
                 .filter(f -> f.name().equals(unresolved))
                 .findFirst()
                 .orElse(null);
@@ -1560,28 +1567,29 @@ public class JDWPTools {
                 return originalMessage;
             }
             jdiService.cacheObject(thisObj);
-            final String thisType = thisObj.referenceType().name();
-            final boolean classIsPublic = thisObj.referenceType() instanceof ClassType ct && ct.isPublic();
-            final boolean fieldIsPublic = field.isPublic();
+            final long objectId = thisObj.uniqueID();
             final StringBuilder hint = new StringBuilder(originalMessage);
             hint.append("\n\nHint: '").append(unresolved).append("' is a field on this (")
-                .append(thisType).append(", Object#").append(thisObj.uniqueID()).append(").");
-            if (classIsPublic && fieldIsPublic) {
-                hint.append(" Auto-rewrite should have handled this — please report the expression that triggered it.");
+                .append(thisType.name()).append(", Object#").append(objectId).append(").");
+            final ReferenceType owner = field.declaringType();
+            if (diagnostic.kind() == FieldDiagnosticKind.BARE && JdiExpressionEvaluator.canNameFromWrapper(owner)
+                && (!field.isPrivate() || owner.equals(thisType))) {
+                hint.append(" Write this.").append(unresolved).append(" in the expression, or call jdwp_get_fields(")
+                    .append(objectId).append(") to inspect the object.");
             } else {
-                if (!classIsPublic) {
-                    hint.append(" The enclosing class is package-private (or non-public),");
-                } else {
-                    hint.append(" The field is non-public,");
-                }
-                hint.append(" so the expression wrapper cannot reference it directly. Workaround:")
-                    .append(" call jdwp_get_fields(").append(thisObj.uniqueID()).append(')')
-                    .append(" to inspect the field, or jdwp_to_string for a quick view.");
+                hint.append(" The compiled expression cannot reference this field here, so call jdwp_get_fields(")
+                    .append(objectId).append(") to inspect it or jdwp_to_string for a quick view.");
             }
             return hint.toString();
         } catch (Exception probeFailure) {
             return originalMessage;
         }
+    }
+
+    /** Whether the expression qualifies {@code fieldName} with its own {@code this}, as in {@code this.fieldName}. */
+    private static boolean spellsThisField(String expression, String fieldName) {
+        return Pattern.compile("(?<![.\\p{javaJavaIdentifierPart}])this\\s*\\.\\s*" + Pattern.quote(fieldName)
+            + "(?!\\p{javaJavaIdentifierPart})").matcher(expression).find();
     }
 
     @McpTool(description = "Resume the stops you have seen: every stop a tool presented (jdwp_resume_until_event, "
@@ -2260,6 +2268,10 @@ public class JDWPTools {
      * length-≥2 cycle cannot livelock the catch handler.
      */
     private static boolean isVmGone(@Nullable Throwable t) {
+        if (isTargetException(t)) {
+            // The target answered; a transport error in the message is the application's own.
+            return false;
+        }
         Throwable cur = t;
         for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
             if (isTransportFailureFrame(cur)) {
@@ -2270,6 +2282,18 @@ public class JDWPTools {
                 return false;
             }
             cur = next;
+        }
+        return false;
+    }
+
+    /** Whether code evaluated in the target threw: JDI reports that as an {@link InvocationException}. */
+    private static boolean isTargetException(@Nullable Throwable t) {
+        Throwable cur = t;
+        for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
+            if (cur instanceof InvocationException) {
+                return true;
+            }
+            cur = cur.getCause();
         }
         return false;
     }
@@ -6325,7 +6349,7 @@ public class JDWPTools {
     @McpTool(description = "Evaluate watchers on a suspended thread's stack based on a scope. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call. Returns '[STILL_RUNNING] ...' when the invoked code does not finish within 20 s (it may wait for a lock a suspended thread holds): it keeps running in the target, the reply names what blocks it, and its result is recorded later as EVALUATION_COMPLETED_LATE (jdwp_get_events).")
     public String jdwp_evaluate_watchers(
         @McpToolParam(description = "Thread unique ID") long threadId,
-        @McpToolParam(description = "Evaluation scope: 'current_frame' (default) or 'full_stack'") String scope,
+        @McpToolParam(required = false, description = "Evaluation scope: 'current_frame' (default) or 'full_stack'") @Nullable String scope,
         @McpToolParam(required = false, description = "Optional: The specific breakpoint ID that was hit. If provided, evaluation is much faster for 'current_frame' scope") @Nullable Integer breakpointId) {
         try {
             // Fall back to the last breakpoint ID when the caller omits the parameter
@@ -6344,7 +6368,7 @@ public class JDWPTools {
 
                     Thread must be stopped at a breakpoint to evaluate watchers.""", threadId);
             }
-            final String effectiveScope = scope.isBlank() ? "current_frame" : scope;
+            final String effectiveScope = (scope == null || scope.isBlank()) ? "current_frame" : scope;
             final Integer effectiveBreakpointId = breakpointId;
             try {
                 evaluations.requireReadOnlyMode();

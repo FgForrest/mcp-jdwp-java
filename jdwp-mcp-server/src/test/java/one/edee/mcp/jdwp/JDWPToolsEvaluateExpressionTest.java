@@ -3,13 +3,17 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IntegerValue;
+import com.sun.jdi.InvocationException;
 import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
+import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.RemoteCodeExecutor;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 
 import java.net.ConnectException;
@@ -18,6 +22,8 @@ import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
@@ -28,6 +34,7 @@ import one.edee.mcp.jdwp.evaluation.interpret.EvaluationRouter;
 import one.edee.mcp.jdwp.fastlogpoint.FastLogpointService;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.lang.reflect.Modifier;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
@@ -49,6 +56,8 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("jdwp_evaluate_expression")
 class JDWPToolsEvaluateExpressionTest {
+
+	private static final String COMPILED_BLOCK = "{ for (int i = 0; i < 1; i++) { } %s }";
 
 	private JDIConnectionService jdiService;
 	private BreakpointTracker breakpointTracker;
@@ -177,43 +186,189 @@ class JDWPToolsEvaluateExpressionTest {
 	/**
 	 * When the evaluator throws "X cannot be resolved" AND {@code X} matches a field on
 	 * {@code this}'s declared type, the tool enriches the error with a hint that points at
-	 * {@code jdwp_get_fields}. The hint should mention the offending field, the {@code this}
-	 * type, and the {@code jdwp_get_fields(<id>)} workaround call.
+	 * {@code this.X}, which a compiled expression resolves. The hint should mention the offending
+	 * field, the {@code this} type, and {@code jdwp_get_fields(<id>)} for a look at the object.
 	 */
 	@Test
-	@DisplayName("enriches 'cannot be resolved' errors with a field-on-this hint")
+	@DisplayName("a bare field name that cannot be resolved is answered with this.<name>")
 	void shouldEnrichEvaluationErrorWithFieldHint() throws Exception {
-		final ThreadReference thread = mock(ThreadReference.class);
-		final StackFrame frame = mock(StackFrame.class);
-		final ObjectReference thisObj = mock(ObjectReference.class);
-		// Non-public class so the hint actually fires the "workaround" branch.
-		final ClassType thisType = mock(ClassType.class);
-		final Field field = mock(Field.class);
-		when(jdiService.getVM()).thenReturn(vm);
-		when(vm.allThreads()).thenReturn(List.of(thread));
-		when(thread.uniqueID()).thenReturn(1L);
-		when(thread.isSuspended()).thenReturn(true);
-		when(thread.frame(0)).thenReturn(frame);
-		// First evaluate() throws; the enrichment then re-resolves thread/frame to probe `this`.
-		when(evaluator.evaluate(eq(frame), eq("secret"), anyMap()))
-			.thenThrow(new JdiEvaluationException("secret cannot be resolved to a variable"));
-		when(frame.thisObject()).thenReturn(thisObj);
-		when(thisObj.referenceType()).thenReturn(thisType);
-		when(thisType.name()).thenReturn("com.example.Hidden");
-		when(thisType.isPublic()).thenReturn(false);
-		when(thisType.allFields()).thenReturn(List.of(field));
-		when(field.name()).thenReturn("secret");
-		when(field.isPublic()).thenReturn(false);
-		when(thisObj.uniqueID()).thenReturn(42L);
-
-		final String result = tools.jdwp_evaluate_expression(1L, "secret", null);
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted("return secret;"),
+			"secret cannot be resolved to a variable", false, false);
 
 		assertThat(result).startsWith("Error evaluating expression:");
 		assertThat(result).contains("secret cannot be resolved");
 		assertThat(result).contains("Hint:");
 		assertThat(result).contains("'secret' is a field on this");
 		assertThat(result).contains("com.example.Hidden");
+		assertThat(result).contains("Write this.secret");
 		assertThat(result).contains("jdwp_get_fields(42)");
+		assertThat(result).doesNotContain("cannot reference it directly");
+	}
+
+	/** A block resolves no bare field name, not even a public one of a public class. */
+	@Test
+	@DisplayName("a public field named bare in a block is answered with this.<name>")
+	void shouldHintThisForPublicFieldInBlock() throws Exception {
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted("return secret;"),
+			"secret cannot be resolved", true, true);
+
+		assertThat(result).contains("Write this.secret").doesNotContain("please report");
+	}
+
+	/** The compiler uses a nameable supertype for these receivers, which lacks their own fields. */
+	@ParameterizedTest
+	@CsvSource({
+		"Outer$Nested, true, this . secret, or is not a field",
+		"Outer$Nested, true, secret, to a variable",
+		"Outer$1Local, false, this . secret, or is not a field",
+		"Outer$1Local, false, secret, to a variable",
+		"Outer$1, false, this . secret, or is not a field",
+		"Outer$1, false, secret, to a variable"
+	})
+	void shouldInspectFieldsOfUnnameableReceivers(String binaryName, boolean privateClass, String fieldAccess,
+												  String diagnosticSuffix) throws Exception {
+		final ClassType receiver = receiverType("com.example." + binaryName, privateClass ? Modifier.PRIVATE : 0);
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted("return " + fieldAccess + ";"),
+			new JdiEvaluationException("secret cannot be resolved " + diagnosticSuffix), receiver, receiver, Modifier.PUBLIC);
+
+		assertThat(result).contains("compiled expression cannot reference", "jdwp_get_fields(42)",
+			"jdwp_to_string for a quick view").doesNotContain("Write this.");
+	}
+
+	/** A private field declared by a superclass cannot be selected through the subclass receiver. */
+	@Test
+	void shouldInspectPrivateInheritedField() throws Exception {
+		final ClassType receiver = receiverType("com.example.Child", Modifier.PUBLIC);
+		final ClassType parent = receiverType("com.example.Parent", Modifier.PUBLIC);
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted("return secret;"),
+			new JdiEvaluationException("secret cannot be resolved to a variable"), receiver, parent, Modifier.PRIVATE);
+
+		assertThat(result).contains("compiled expression cannot reference", "jdwp_get_fields(42)")
+			.doesNotContain("Write this.");
+	}
+
+	/** A matching field on {@code this} does not explain a missing type or another receiver's field. */
+	@ParameterizedTest
+	@CsvSource({
+		"return other.secret;, or is not a field",
+		"secret x = null; return x;, to a type"
+	})
+	void shouldKeepUnrelatedDiagnostics(String statement, String diagnosticSuffix) throws Exception {
+		final String diagnostic = "secret cannot be resolved " + diagnosticSuffix;
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted(statement), diagnostic, true, true);
+
+		assertThat(result).isEqualTo("Error evaluating expression: " + diagnostic);
+	}
+
+	/** A later diagnostic for the same name must not override the first diagnostic's meaning. */
+	@Test
+	void shouldUseTheMatchedDiagnosticWithSeveralProblems() throws Exception {
+		final String diagnostic = "Compilation failed:\nLine 1: The field com.example.Hidden.secret is not visible"
+			+ "\nLine 2: secret cannot be resolved to a variable";
+		final String result = evaluateFailing(COMPILED_BLOCK.formatted("int x = this.secret;\nreturn secret;"),
+			diagnostic, true, true);
+
+		assertThat(result).startsWith("Error evaluating expression: " + diagnostic)
+			.contains("jdwp_get_fields(42)").doesNotContain("Write this.");
+	}
+
+	/** The user qualified the name already, so {@code this.X} is no advice. */
+	@Test
+	@DisplayName("a field that is not visible is answered with jdwp_get_fields only")
+	void shouldNotHintThisForInvisibleField() throws Exception {
+		final String result = evaluateFailing("this.secret",
+			"The field com.example.Hidden.secret is not visible", true, false);
+
+		assertThat(result).contains("compiled expression cannot reference", "jdwp_get_fields(42)",
+			"jdwp_to_string for a quick view").doesNotContain("Write this.");
+	}
+
+	/** Target code can throw a message that reads like a compile error. */
+	@Test
+	@DisplayName("the message of a target exception gets no field hint")
+	void shouldNotHintOnTargetException() throws Exception {
+		final String result = evaluateFailing("secret", targetException("javax.script.ScriptException",
+			"secret cannot be resolved"), false, false);
+
+		assertThat(result).isEqualTo("Error evaluating expression: "
+			+ "Target VM threw exception: javax.script.ScriptException: secret cannot be resolved");
+	}
+
+	/** The target answered, so its own failed connection does not mean that it is gone. */
+	@Test
+	@DisplayName("a transport error thrown by target code is not reported as [VM_DEATH]")
+	void shouldNotMistakeTargetTransportErrorForVmDeath() throws Exception {
+		final String result = evaluateFailing("client.ping()", targetException("java.net.ConnectException",
+			"Connection refused"), false, false);
+
+		assertThat(result).isEqualTo("Error evaluating expression: "
+			+ "Target VM threw exception: java.net.ConnectException: Connection refused");
+	}
+
+	/** Evaluates {@code expression}, whose evaluation fails with the diagnostic, where {@code this} has a field {@code secret}. */
+	private String evaluateFailing(String expression, String diagnostic, boolean publicClass, boolean publicField)
+		throws Exception {
+		return evaluateFailing(expression, new JdiEvaluationException(diagnostic), publicClass, publicField);
+	}
+
+	/** Evaluates {@code expression}, whose evaluation fails, where {@code this} has a field {@code secret}. */
+	private String evaluateFailing(String expression, JdiEvaluationException failure, boolean publicClass,
+								   boolean publicField) throws Exception {
+		final ClassType receiver = receiverType("com.example.Hidden", publicClass ? Modifier.PUBLIC : 0);
+		return evaluateFailing(expression, failure, receiver, receiver, publicField ? Modifier.PUBLIC : Modifier.PRIVATE);
+	}
+
+	/** Mirrors a named class with the supplied access flags. */
+	private static ClassType receiverType(String name, int modifiers) {
+		final ClassType type = mock(ClassType.class);
+		when(type.name()).thenReturn(name);
+		when(type.isPublic()).thenReturn(Modifier.isPublic(modifiers));
+		when(type.isPrivate()).thenReturn(Modifier.isPrivate(modifiers));
+		return type;
+	}
+
+	/** Evaluates a failure with a field {@code secret} declared by {@code fieldOwner}. */
+	private String evaluateFailing(String expression, JdiEvaluationException failure, ClassType thisType,
+								   ClassType fieldOwner, int fieldModifiers) throws Exception {
+		final ThreadReference thread = mock(ThreadReference.class);
+		final StackFrame frame = mock(StackFrame.class);
+		final ObjectReference thisObj = mock(ObjectReference.class);
+		final Field field = mock(Field.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frame(0)).thenReturn(frame);
+		// evaluate() throws; the enrichment then re-resolves thread/frame to probe `this`.
+		when(evaluator.evaluate(eq(frame), eq(expression), anyMap())).thenThrow(failure);
+		when(frame.thisObject()).thenReturn(thisObj);
+		when(thisObj.referenceType()).thenReturn(thisType);
+		when(thisType.allFields()).thenReturn(List.of(field));
+		when(field.name()).thenReturn("secret");
+		when(field.declaringType()).thenReturn(fieldOwner);
+		when(field.isPublic()).thenReturn(Modifier.isPublic(fieldModifiers));
+		when(field.isPrivate()).thenReturn(Modifier.isPrivate(fieldModifiers));
+		when(thisObj.uniqueID()).thenReturn(42L);
+		return tools.jdwp_evaluate_expression(1L, expression, null);
+	}
+
+	/** What the evaluator throws when the evaluated code fails with an exception of its own. */
+	private static JdiEvaluationException targetException(String typeName, String message) {
+		final ObjectReference exception = mock(ObjectReference.class);
+		final ReferenceType type = mock(ReferenceType.class);
+		final ReferenceType throwable = mock(ReferenceType.class);
+		final Field detailMessage = mock(Field.class);
+		final StringReference string = mock(StringReference.class);
+		when(exception.type()).thenReturn(type);
+		when(exception.referenceType()).thenReturn(type);
+		when(type.name()).thenReturn(typeName);
+		when(type.allFields()).thenReturn(List.of(detailMessage));
+		when(detailMessage.name()).thenReturn("detailMessage");
+		when(detailMessage.declaringType()).thenReturn(throwable);
+		when(throwable.name()).thenReturn("java.lang.Throwable");
+		when(exception.getValue(detailMessage)).thenReturn(string);
+		when(string.value()).thenReturn(message);
+		return RemoteCodeExecutor.targetException(new InvocationException(exception));
 	}
 
 	/**

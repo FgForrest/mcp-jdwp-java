@@ -29,7 +29,9 @@ This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `i
 1. Check the server log if your installation writes one — the JDWP MCP server logs JDI operations and errors there.
 2. Reconnect the MCP server: run `/mcp` in Claude Code and reconnect `jdwp-inspector`. This spawns a fresh subprocess. In Codex, start a new session; Codex starts its MCP servers per session.
 
-A reply ending in `⚠ Ignored unknown parameter(s)` lists the supplied names the tool ignored and the names it accepts. The tool call has already run with its recognized arguments.
+A reply starting with `Error: <tool> did not run. Missing required parameter(s):` lists the parameters to add. Nothing changed, so call the tool again with them.
+
+A reply ending in `⚠ Ignored unknown parameter(s)` lists the supplied names the tool ignored and the names it accepts. Unless the reply says that the tool did not run, the call has already run with its recognized arguments.
 
 ## A resume reply reports a failed hold
 
@@ -74,6 +76,8 @@ Check `jdwp_overview(types="fast_breakpoint")` for the capture expression and pr
 Ordinary expressions and supported read-only blocks can read private fields on manual holds and blocked threads. Follow the field path directly from a local or `this` to reach a private member of a package-private class in another package. Supported calls can reach private and package-private methods on a thread stopped at its own event. Same-arity overloads, varargs, generic methods, lambdas and unsupported block constructs use compilation. A `not interpreted` reply explains the fallback. Check `jdwp_diagnose` for engine counts and classpath discovery status.
 
 On JDK 17 and 21, ordinary compilation can retry access errors on application field reads, method calls and constructors. A closed JDK package adds a module note to the original diagnostic. Assignment targets, inaccessible types and expression-qualified constants keep the original access checks. Type-qualified constants are inlined without class initialization. If a fast probe or its arming evaluation reports "not visible", use an ordinary breakpoint condition or logpoint for private members.
+
+If the unresolved name is a field of `this`, write `this.<field>`. Compiled expressions do not resolve a bare field name in a `{ … }` block, nor a private one anywhere. In a private nested, local or anonymous class, the wrapper binds `this` as a nameable supertype. For the class's own fields or a private field inherited from a superclass, use `jdwp_get_fields` or an expression the interpreter supports, such as a direct field read without loops or lambdas.
 
 Symptoms: `jdwp_evaluate_expression`, `jdwp_assert_expression`, a logpoint, or a conditional breakpoint returns a JDT compile diagnostic like `X cannot be resolved to a type` / `cannot be resolved to a variable`, or `configureCompilerClasspath` throws `Classpath discovery failed for the current connection: neither the target VM classloader hierarchy nor the local project yielded any classpath entries`.
 

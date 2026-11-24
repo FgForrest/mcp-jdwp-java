@@ -237,12 +237,13 @@ class InterpreterHarnessLiveTest {
                     final String reflected = "{ ((Runnable) () -> new " + owner + "().fail()).run(); return null; }";
                     final Throwable directFailure = org.assertj.core.api.Assertions.catchThrowable(
                         () -> evaluateBlock(evaluator, thread, direct));
-                    assertThat(directFailure).hasMessage("Target VM threw exception: java.lang.IllegalStateException");
+                    assertThat(directFailure)
+                        .hasMessage("Target VM threw exception: java.lang.IllegalStateException: fixture failure");
                     assertThatThrownBy(() -> evaluateBlock(evaluator, thread, reflected))
                         .hasMessage(directFailure.getMessage());
                     assertThatThrownBy(() -> evaluateBlock(evaluator, thread,
                         "{ new " + owner + "().failInaccessible(); return null; }"))
-                        .hasMessage("Target VM threw exception: java.lang.reflect.InaccessibleObjectException");
+                        .hasMessage("Target VM threw exception: java.lang.reflect.InaccessibleObjectException: application failure");
                     final String caught = "{ try { return text.value; } catch (RuntimeException e) { return null; } }";
                     for (String inaccessible : List.of(internal, internal, caught)) {
                         assertThatThrownBy(() -> evaluateBlock(evaluator, thread, inaccessible))
@@ -1682,7 +1683,8 @@ class InterpreterHarnessLiveTest {
             case "short-circuit-and", "short-circuit-or" ->
                 assertThat(observation.calls()).as(id).isEqualTo(new Calls(0, ""));
             case "target-exception" -> {
-                assertThat(observation.outcome().rendered()).isEqualTo("Target VM threw exception: java.lang.IllegalStateException");
+                assertThat(observation.outcome().rendered())
+                    .isEqualTo("Target VM threw exception: java.lang.IllegalStateException: fixture invocation");
                 assertThat(observation.calls()).isEqualTo(new Calls(1, "E"));
             }
             case "boxing-cache-hit", "boxing-cache-miss" -> {
