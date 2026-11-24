@@ -1,5 +1,7 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VirtualMachine;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
@@ -19,6 +21,7 @@ import java.util.Objects;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Calls every published tool without its required parameters, as an agent that guessed a parameter
@@ -28,13 +31,15 @@ import static org.mockito.Mockito.mock;
 class JDWPToolsRequiredParametersTest {
 
 	private BreakpointTracker tracker;
+	private JDIConnectionService connection;
 	private List<SyncToolSpecification> tools;
 
 	/** Builds the tool specifications the way the server publishes them. */
 	@BeforeEach
 	void setUp() {
 		tracker = new BreakpointTracker();
-		final JDWPTools jdwpTools = JDWPToolsTestSupport.newTools(mock(JDIConnectionService.class), tracker,
+		connection = mock(JDIConnectionService.class);
+		final JDWPTools jdwpTools = JDWPToolsTestSupport.newTools(connection, tracker,
 			mock(WatcherManager.class), mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
 			new JvmDiscoveryService());
 		final DefaultListableBeanFactory beans = new DefaultListableBeanFactory();
@@ -74,6 +79,22 @@ class JDWPToolsRequiredParametersTest {
 
 		assertThat(text(call(clear, Map.of("breakpointId", id)))).doesNotContain("did not run");
 		assertThat(tracker.getAllPendingBreakpoints()).doesNotContainKey(id);
+	}
+
+	/** An omitted scope reaches the watcher tool as null. Blank and omitted scope use frame zero. */
+	@Test
+	void shouldDefaultWatcherScopeWhenOmittedOrBlank() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(connection.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		final SyncToolSpecification watchers = tools.stream()
+			.filter(tool -> tool.tool().name().equals("jdwp_evaluate_watchers")).findFirst().orElseThrow();
+
+		assertThat(text(call(watchers, Map.of("threadId", 1L, "scope", "  ")))).contains("Scope: current_frame");
+		assertThat(text(call(watchers, Map.of("threadId", 1L)))).contains("Scope: current_frame");
 	}
 
 	private static McpSchema.CallToolResult call(SyncToolSpecification tool, Map<String, Object> arguments) {

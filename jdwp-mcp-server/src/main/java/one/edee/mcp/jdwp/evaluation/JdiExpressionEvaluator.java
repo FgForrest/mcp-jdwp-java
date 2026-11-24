@@ -832,16 +832,12 @@ public class JdiExpressionEvaluator {
      * unaddressable from source anywhere.
      */
     private static boolean isReachableFromWrapper(ReferenceType type, String wrapperPackage) {
-        if (type.isPublic()) {
-            return true;
-        }
-        if (type.isPrivate()) {
-            return false;
-        }
-        if (!packageOf(type.name()).equals(wrapperPackage)) {
-            return false;
-        }
-        return !isLocalOrAnonymous(type.name());
+        return type.isPublic() || (canNameFromWrapper(type) && packageOf(type.name()).equals(wrapperPackage));
+    }
+
+    /** Whether a wrapper in a suitable package can name the type. */
+    public static boolean canNameFromWrapper(ReferenceType type) {
+        return type.isPublic() || (!type.isPrivate() && !isLocalOrAnonymous(type.name()));
     }
 
     /**

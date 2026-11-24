@@ -278,7 +278,7 @@ Primitive byte mirrors are host-side objects. The server uploads the wrapper byt
 
 ### Compiled member access
 
-The interpreter reads private fields and handles supported private calls in expressions and blocks. The navigation interpreter can follow one field path through private fields and package-private classes across package boundaries. The compiled wrapper starts with Java access rules for its package. When ECJ finds eligible visibility errors on JDK 17 or 21, ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints can retry private field reads, method calls and constructors through reflection. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve.
+The interpreter reads private fields and handles supported private calls in expressions and blocks. The navigation interpreter can follow one field path through private fields and package-private classes across package boundaries. The compiled wrapper starts with Java access rules for its package. When ECJ finds eligible visibility errors on JDK 17 or 21, ordinary evaluations, assertions, watchers, breakpoint conditions and logpoints can retry private field reads, method calls and constructors through reflection. Use an explicit receiver such as `this.store` for a frame member whose bare name the wrapper cannot resolve. In a private nested, local or anonymous class, the wrapper binds `this` as a nameable supertype, so use `jdwp_get_fields` or an interpreted read for the class's own fields.
 
 The retry uses ECJ bindings and caches reflected members with the wrapper's defining loader. Values retain their exact types. Statements and void-compatible lambdas can discard the result. Assignment targets, inaccessible types, method references, constructors requiring an enclosing instance, and lambdas whose overload selection could change keep their original access checks.
 
@@ -288,7 +288,9 @@ The compiler makes up to four rewrite passes and reports the original diagnostic
 
 ### Exceptions thrown by evaluated code
 
-A target exception is reported by type and message on one line, such as `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is `Throwable.detailMessage`, read as a field without invoking anything, cut at 300 characters. A message that a class builds in `getMessage()`, such as the JVM's helpful `NullPointerException` text, is not in the field, so the reply has the type only.
+A target exception is reported by type and message on one line, such as `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is `Throwable.detailMessage`, read as a field without invoking anything, cut at 300 characters. A message that a class builds in `getMessage()`, such as the JVM's helpful `NullPointerException` text, is not in the field, so the reply has the type only. `jdwp_to_string` and `EVALUATION_COMPLETED_LATE` report target exceptions the same way.
+
+Fast probes describe a failure inside the target by their own rule: an application exception type is named without its message.
 
 ### VMStart suspension
 
@@ -303,7 +305,7 @@ An exception breakpoint on a class that is not loaded yet — JDK classes such a
 Watchers are MCP-side expression bookmarks attached to breakpoints. They use the same evaluation pipeline:
 
 1. `jdwp_attach_watcher(breakpointId, label, expression)` — registers an expression to evaluate when a specific breakpoint hits.
-2. `jdwp_evaluate_watchers(threadId, scope, breakpointId?)` — evaluates all watchers for the current context.
+2. `jdwp_evaluate_watchers(threadId, scope?, breakpointId?)` evaluates watchers in the current frame when `scope` is omitted or blank. Pass `full_stack` to check matching breakpoints across the stack.
 3. The router plans each watcher. An all-navigation batch runs as a frame inspection. A batch that needs to invoke or compile runs on the invocation worker and uses a fresh frame per watcher.
 
 Watchers are dual-indexed by watcher UUID and breakpoint ID via `WatcherManager`. They are cleared on `jdwp_reset()` and on disconnect/reconnect.

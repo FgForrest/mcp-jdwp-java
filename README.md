@@ -856,7 +856,7 @@ Resume replies list which holds were released and which failed, with the JDI exc
 | `jdwp_attach_watcher`               | `breakpointId`, `label`, `expression` | Attach expression watcher to a breakpoint           |
 | `jdwp_detach_watcher`               | `watcherId`                           | Remove a watcher                                    |
 | `jdwp_list_watchers_for_breakpoint` | `breakpointId`                        | List watchers on a specific breakpoint              |
-| `jdwp_evaluate_watchers`            | `threadId`, `scope`, `breakpointId?`  | Evaluate watchers (`current_frame` or `full_stack`) |
+| `jdwp_evaluate_watchers`            | `threadId`, `scope?`, `breakpointId?` | Evaluate watchers (`current_frame` by default, or `full_stack`) |
 
 ### Marked instances (3)
 

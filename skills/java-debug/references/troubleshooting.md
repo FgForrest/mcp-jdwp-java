@@ -77,7 +77,7 @@ Ordinary expressions and supported read-only blocks can read private fields on m
 
 On JDK 17 and 21, ordinary compilation can retry access errors on application field reads, method calls and constructors. A closed JDK package adds a module note to the original diagnostic. Assignment targets, inaccessible types and expression-qualified constants keep the original access checks. Type-qualified constants are inlined without class initialization. If a fast probe or its arming evaluation reports "not visible", use an ordinary breakpoint condition or logpoint for private members.
 
-If the unresolved name is a field of `this`, write `this.<field>`. Compiled expressions do not resolve a bare field name in a `{ … }` block, nor a private one anywhere.
+If the unresolved name is a field of `this`, write `this.<field>`. Compiled expressions do not resolve a bare field name in a `{ … }` block, nor a private one anywhere. In a private nested, local or anonymous class, the wrapper binds `this` as a nameable supertype. For the class's own fields or a private field inherited from a superclass, use `jdwp_get_fields` or an expression the interpreter supports, such as a direct field read without loops or lambdas.
 
 Symptoms: `jdwp_evaluate_expression`, `jdwp_assert_expression`, a logpoint, or a conditional breakpoint returns a JDT compile diagnostic like `X cannot be resolved to a type` / `cannot be resolved to a variable`, or `configureCompilerClasspath` throws `Classpath discovery failed for the current connection: neither the target VM classloader hierarchy nor the local project yielded any classpath entries`.
 

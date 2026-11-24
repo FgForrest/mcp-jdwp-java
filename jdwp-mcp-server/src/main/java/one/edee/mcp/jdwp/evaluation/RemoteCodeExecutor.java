@@ -143,16 +143,30 @@ public final class RemoteCodeExecutor {
     }
 
     /**
-     * Formats a target exception identically for compiled and interpreted Java: its type and, on the
-     * same line, its message. The message is target text and only ever shown, never interpreted.
+     * Formats a target exception for Java evaluation and {@code jdwp_to_string} with its type and
+     * message on one line. The message is target text and only ever shown, never interpreted.
      */
     public static JdiEvaluationException targetException(InvocationException failure) {
-        final ObjectReference exception = failure.exception();
-        final String type = exception != null ? exception.type().name() : "unknown";
-        final String message = exception != null ? JdiEventListener.detailMessage(exception) : null;
-        final String described = message == null || message.isBlank()
-            ? type : type + ": " + message.strip().replaceAll("\\s+", " ");
-        return new JdiEvaluationException("Target VM threw exception: " + described, failure);
+        return new JdiEvaluationException("Target VM threw exception: " + describe(failure.exception()), failure);
+    }
+
+    /** The type and one-line message of a thrown object; {@code unknown} when the target has collected it. */
+    private static String describe(@Nullable ObjectReference exception) {
+        if (exception == null) {
+            return "unknown";
+        }
+        final String type;
+        try {
+            type = exception.type().name();
+        } catch (ObjectCollectedException collected) {
+            return "unknown";
+        }
+        final String message = JdiEventListener.detailMessage(exception);
+        if (message == null) {
+            return type;
+        }
+        final String singleLine = message.replaceAll("(?U)\\s+", " ").strip();
+        return singleLine.isEmpty() ? type : type + ": " + singleLine;
     }
 
     /** Returns the name of the module that blocked wrapper reflection, or null for another failure. */

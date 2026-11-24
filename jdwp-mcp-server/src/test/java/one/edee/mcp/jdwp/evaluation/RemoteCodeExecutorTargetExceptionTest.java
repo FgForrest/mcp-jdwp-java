@@ -6,6 +6,7 @@ import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
+import com.sun.jdi.VMDisconnectedException;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -13,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -37,12 +39,14 @@ class RemoteCodeExecutorTargetExceptionTest {
 	void shouldReportTypeOnlyWithoutMessage() {
 		assertThat(reported(null)).isEqualTo(WITHOUT_MESSAGE);
 		assertThat(reported(" ")).isEqualTo(WITHOUT_MESSAGE);
+		assertThat(reported("\u0085\u2028\u2029")).isEqualTo(WITHOUT_MESSAGE);
 	}
 
 	@Test
 	@DisplayName("a message of several lines stays on one")
 	void shouldKeepMessageOnOneLine() {
-		assertThat(reported("first\r\n  second\nthird")).isEqualTo(WITHOUT_MESSAGE + ": first second third");
+		assertThat(reported("first\r\n  second\nthird\u0085fourth\u2028fifth\u2029sixth"))
+			.isEqualTo(WITHOUT_MESSAGE + ": first second third fourth fifth sixth");
 	}
 
 	@Test
@@ -60,6 +64,29 @@ class RemoteCodeExecutorTargetExceptionTest {
 
 		assertThat(RemoteCodeExecutor.targetException(new InvocationException(exception)).getMessage())
 			.isEqualTo(WITHOUT_MESSAGE);
+	}
+
+	/** Collection of the throwable mirror preserves the invocation failure. */
+	@Test
+	void shouldPreserveInvocationFailureWhenThrowableWasCollected() {
+		final ObjectReference exception = exception("gone");
+		when(exception.type()).thenThrow(new ObjectCollectedException());
+		final InvocationException failure = new InvocationException(exception);
+
+		assertThat(RemoteCodeExecutor.targetException(failure))
+			.hasMessage("Target VM threw exception: unknown")
+			.hasCauseReference(failure);
+	}
+
+	/** A disconnect during the type read still reaches the caller. */
+	@Test
+	void shouldPropagateVmDisconnectWhenReadingType() {
+		final ObjectReference exception = mock(ObjectReference.class);
+		final VMDisconnectedException disconnected = new VMDisconnectedException();
+		when(exception.type()).thenThrow(disconnected);
+
+		assertThatThrownBy(() -> RemoteCodeExecutor.targetException(new InvocationException(exception)))
+			.isSameAs(disconnected);
 	}
 
 	private static String reported(@Nullable String message) {
