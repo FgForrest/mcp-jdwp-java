@@ -310,6 +310,8 @@ Watchers are MCP-side expression bookmarks attached to breakpoints. They use the
 
 Watchers are dual-indexed by watcher UUID and breakpoint ID via `WatcherManager`. They are cleared on `jdwp_reset()` and on disconnect/reconnect.
 
+Pass the displayed eight-character ID or full UUID to `jdwp_detach_watcher(watcherId)`. If several watchers match, the reply lists their labels, breakpoints and full IDs so you can pick one.
+
 ## 6. Logpoint and conditional-breakpoint evaluation
 
 Logpoints (`jdwp_set_logpoint`), exception logpoints (`jdwp_set_exception_logpoint`), field watchpoints / field logpoints (`jdwp_set_field_breakpoint`, `jdwp_set_field_logpoint`), and conditional breakpoints all use the expression evaluation pipeline:

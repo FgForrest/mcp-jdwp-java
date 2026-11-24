@@ -48,6 +48,8 @@ import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static one.edee.mcp.jdwp.watchers.Watcher.DISPLAY_ID_LENGTH;
+
 /**
  * Single MCP-facing surface for the JDWP debugger. Each {@code @McpTool} method is auto-discovered
  * by the Spring AI MCP framework and exposed as an invocable tool; a small number of read-only
@@ -5813,7 +5815,7 @@ public class JDWPTools {
         appendSectionHeader(out, "Watchers", shown.size(), all.size());
         for (Watcher w : shown) {
             out.append(String.format("  [%s] %s  on BP #%d  \"%s\"\n",
-                w.getId().substring(0, 8), w.getLabel(), w.getBreakpointId(), w.getExpression()));
+                w.getId().substring(0, DISPLAY_ID_LENGTH), w.getLabel(), w.getBreakpointId(), w.getExpression()));
         }
         return shown.size();
     }
@@ -5887,7 +5889,7 @@ public class JDWPTools {
         out.append(String.format("Watchers: %d match%s\n", matches.size(), matches.size() == 1 ? "" : "es"));
         for (Watcher w : matches) {
             appendBulkClearLine(out, String.format("[%s] %s on BP #%d",
-                w.getId().substring(0, 8), w.getLabel(), w.getBreakpointId()));
+                w.getId().substring(0, DISPLAY_ID_LENGTH), w.getLabel(), w.getBreakpointId()));
             watcherManager.deleteWatcher(w.getId());
         }
         return matches.size();
@@ -6347,7 +6349,7 @@ public class JDWPTools {
             // four times. The agent already knows the BP and label they passed in; what they need
             // back is the short watcher id for follow-up detach calls.
             return String.format("✓ Watcher [%s] \"%s\" attached to BP #%d (expr: %s)",
-                watcherId.substring(0, 8), label, breakpointId, expression.trim());
+                watcherId.substring(0, DISPLAY_ID_LENGTH), label, breakpointId, expression.trim());
 
         } catch (Exception e) {
             log.error("[Watcher] Error attaching watcher", e);
@@ -6356,25 +6358,28 @@ public class JDWPTools {
     }
 
     @McpTool(description = "Detach a watcher from its breakpoint using the watcher ID")
-    public String jdwp_detach_watcher(@McpToolParam(description = "Watcher ID (UUID returned by jdwp_attach_watcher)") String watcherId) {
+    public String jdwp_detach_watcher(@McpToolParam(description = "Watcher ID as shown by jdwp_attach_watcher or jdwp_overview") String watcherId) {
         try {
-            final Watcher watcher = watcherManager.getWatcher(watcherId);
-            if (watcher == null) {
+            final String id = watcherId.strip();
+            final List<Watcher> matches = watcherManager.deleteWatcherByIdOrPrefix(id);
+            if (matches.isEmpty()) {
                 return String.format(
-                    "Error: Watcher '%s' not found.\n\nUse jdwp_overview(types=\"watcher\") to see active watchers.", watcherId
+                    "Error: Watcher '%s' not found.\n\nUse jdwp_overview(types=\"watcher\") to see active watchers.", id
                 );
             }
-
-            final String label = watcher.getLabel();
-            final int breakpointId = watcher.getBreakpointId();
-
-            final boolean deleted = watcherManager.deleteWatcher(watcherId);
-            if (deleted) {
-                return String.format("✓ Watcher detached: '%s' (ID: %s, Breakpoint: %d)", label, watcherId, breakpointId);
-            } else {
-                return "Error: Failed to detach watcher";
+            if (matches.size() > 1) {
+                final StringBuilder reply = new StringBuilder("Error: Watcher ID prefix '").append(id)
+                    .append("' is ambiguous. Use a full ID from these matches:");
+                for (final Watcher watcher : matches) {
+                    reply.append(String.format("\n  %s '%s' (BP #%d)",
+                        watcher.getId(), watcher.getLabel(), watcher.getBreakpointId()));
+                }
+                return reply.toString();
             }
 
+            final Watcher watcher = matches.get(0);
+            return String.format("✓ Watcher detached: '%s' (ID: %s, Breakpoint: %d)",
+                watcher.getLabel(), id, watcher.getBreakpointId());
         } catch (Exception e) {
             log.error("[Watcher] Error detaching watcher", e);
             return errorReply(e);
@@ -6398,7 +6403,7 @@ public class JDWPTools {
 
             for (int i = 0; i < watchers.size(); i++) {
                 final Watcher w = watchers.get(i);
-                result.append(String.format("%d. [%s] %s\n", i + 1, w.getId().substring(0, 8), w.getLabel()));
+                result.append(String.format("%d. [%s] %s\n", i + 1, w.getId().substring(0, DISPLAY_ID_LENGTH), w.getLabel()));
                 result.append(String.format("   Expression: %s\n\n", w.getExpression()));
             }
 
@@ -6506,7 +6511,7 @@ public class JDWPTools {
                 location.lineNumber(), group.breakpointId()));
             for (Watcher watcher : group.watchers()) {
                 final String expression = watcher.getExpression();
-                result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
+                result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, DISPLAY_ID_LENGTH), watcher.getLabel()));
                 try {
                     final String value = job != null
                         ? job.evaluate(evaluations.parse(expression), () -> view.frame(group.index()),

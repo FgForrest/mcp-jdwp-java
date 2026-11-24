@@ -14,6 +14,9 @@ import java.util.UUID;
  * {@link JdiExpressionEvaluator} against the breakpoint's stack frame.
  */
 public class Watcher {
+    /** Number of UUID characters shown in abbreviated watcher IDs. */
+    public static final int DISPLAY_ID_LENGTH = 8;
+
     private final String id;
     private final String label;
     private final int breakpointId;

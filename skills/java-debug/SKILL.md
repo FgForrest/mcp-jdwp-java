@@ -275,7 +275,7 @@ Several values are interesting at one BP and you don't want to issue N separate 
 
 1. Attach watchers (one per expression): `jdwp_attach_watcher(breakpointId=1, label="total", expression="order.getTotal()")`, then `(breakpointId=1, label="items", expression="order.getItems().size()")`, ...
 2. At each BP hit: `jdwp_evaluate_watchers(threadId, scope="current_frame", breakpointId=1)` — returns every watcher's value (and an inline `[ERROR: ...]` per watcher that fails — others continue). The total line splits succeeded vs errored so partial failures are explicit.
-3. `jdwp_list_watchers_for_breakpoint(1)` / `jdwp_overview(types="watcher", filter="...")` to list, `jdwp_detach_watcher(<short-id>)` to remove.
+3. `jdwp_list_watchers_for_breakpoint(1)` / `jdwp_overview(types="watcher", filter="...")` to list, `jdwp_detach_watcher(watcherId)` to remove using the displayed ID or full UUID.
 
 ### "The target JVM died / I need to re-run with new breakpoints"
 
