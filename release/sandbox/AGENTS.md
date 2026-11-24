@@ -8,7 +8,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** â
 
 ## Rules
 
-1. **Do not read sandbox source files until you have a debugger-driven hypothesis.** You may read the failing test (it states the symptom; that is the legitimate problem statement). Production sources under `src/main/java/.../` are off-limits until you can finish this sentence at the breakpoint: *"My evidence is X, my hypothesis is Y, the source I'd like to read to confirm is Z."*
+1. **Everything under `src/main/` is off-limits** until you can finish this sentence at the breakpoint: *"My evidence is X, my hypothesis is Y, the source I'd like to read to confirm is Z."* You may read the failing test for the problem statement.
 2. **Do not fetch the main project README's "Reveal root cause" sections.** Those are spoilers. The user wants to verify the debugger experience works for them, not be told the answer by a search.
 3. **Do not modify sandbox source files.** Even if you spot the bug, the goal here is diagnosis, not patching. The broken state is load-bearing.
 4. **Use the `java-debug` skill that ships with the `jdwp-debugging` plugin.** Its "Core Workflow" section is the canonical sequence. The JDWP tools come from the plugin's `jdwp-inspector` MCP server (in Claude Code their names start with `mcp__plugin_jdwp-debugging_jdwp-inspector__`).
@@ -30,7 +30,7 @@ The scenarios are designed to expose bugs that **source-level reading misses** â
 ## Tool reminders
 
 - **`jdwp_resume_until_event`** blocks until the next breakpoint / step / exception event, or times out (default 30s). On timeout, the response includes a structured diagnostic â€” *read it* rather than blindly retrying with a larger timeout.
-- **`jdwp_set_field_breakpoint(className, fieldName, mode)`** suspends when bytecode reads (`mode="access"`) or writes (`"modification"`) the field: the `getfield`/`putfield` instructions (and JNI field access). It does not see writes made through `Field.set` or `Unsafe`, which store straight to memory.
+- **`jdwp_set_field_breakpoint(className, fieldName, mode)`** suspends when bytecode reads (`mode="access"`) or writes (`"modification"`) the field.
 - **`jdwp_set_exception_breakpoint`** catches at the throw site, *before* the stack unwinds â€” invaluable when wrappers (`CompletionException`, `RuntimeException` cause chains) obscure the original.
 - **`jdwp_assert_expression(expression, expected)`** is your sanity check: "is the hash what I think it is?", "is the total what I think it is?". Returns OK, or MISMATCH with the expected and actual value.
 - **`jdwp_evaluate_expression(expression)`** is your "what is this right now?" tool. Use freely.
@@ -56,7 +56,7 @@ After all flights, score against the scorecard in `README.md`. Top of card is "B
 
 ## What you must not do
 
-- Read sandbox `src/main/java/...` files before debugging.
+- Read anything under `src/main/` before debugging.
 - Fetch the main project README's `<details>Reveal root cause</details>` blocks.
 - Edit sandbox source files.
 - Skip flights because they look hard.

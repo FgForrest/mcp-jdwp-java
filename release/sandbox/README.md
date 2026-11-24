@@ -2,7 +2,7 @@
 
 Eleven deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach your agent — Claude Code or Codex — via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
 
-Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. The suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
+Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. The suite exercises expression evaluation and assertions, exception and conditional breakpoints, field watchpoints, stepping, event history, marked instances, logpoints, runtime mutation, multi-thread inspection, and in-target probes.
 
 This is the companion sandbox for the [jdwp-debugging plugin](https://github.com/FgForrest/mcp-jdwp-java) for Claude Code and Codex. Install the plugin first, then come back here.
 
@@ -50,10 +50,10 @@ You are about to play JDWP test flight #1 (SessionStoreTest) on port 5005.
 
 The rules:
 1. The java-debug skill is your playbook. Use it.
-2. Sandbox source under src/main/java/.../ is OFF LIMITS until you can finish this
-   sentence at a breakpoint: "My evidence is X, my hypothesis is Y, the source I'd
-   like to read to confirm is Z." The failing test class itself is fair game — it's
-   the problem statement.
+2. Everything under src/main/ is OFF LIMITS until you can finish this sentence at a
+   breakpoint: "My evidence is X, my hypothesis is Y, the source I'd like to read to
+   confirm is Z." The failing test class itself is fair game — it's the problem
+   statement.
 3. Don't fix the bug. Diagnose it. The broken state is load-bearing for future flights.
 4. Don't read this project's main README or the spoiler blocks anywhere — that's cheating.
 5. Score yourself: count every jdwp_* call, from the first call after attaching until
@@ -93,23 +93,29 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 **Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
 
-### #3 The Time Traveler's Config
+### #3 The Overwritten Timeout
 
-**Difficulty:** Hard | **Test:** `ConfigurationProviderTest` | **Package:** `config` | **Par:** 4
+**Difficulty:** Moderate | **Test:** `ApplicationTest` | **Package:** `settings` | **Par:** ?
 
-**Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
+**Symptom:** `[HTTP timeout after application startup in milliseconds] expected: 5000 but was: 0` — HTTP requests should use the configured timeout after startup.
 
-### #4 The Audit That Lies
+**Solved when:** you name, from the running JVM, the component whose call set the final timeout value.
 
-**Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank` | **Par:** 4
+### #4 The Missing Order
 
-**Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
+**Difficulty:** Hard | **Test:** `MonthlyReportTest` | **Package:** `report` | **Par:** ?
 
-### #5 The Field That Lies
+**Symptom:** `[Number of orders created in October 2026] expected: 7600 but was: 7599` — the sales system recorded 7600 orders in October 2026, and the monthly report is one short.
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3
+**Solved when:** you identify the missing order by number and creation time and explain why the report does not count it.
 
-**Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
+### #5 The Masked Email
+
+**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** ?
+
+**Symptom:** `[User email after recording the audit event] expected: "jordan@example.com" but was: "j***@example.com"` — recording an audit event should preserve the user's email address.
+
+**Solved when:** you name the call in `record` after which the stored email is different, with the value the JVM showed before and after it, and the statement that changes it.
 
 ### #6 The Doppelgänger Cart
 
@@ -117,17 +123,21 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 **Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
 
-### #7 The Heisenbug Race
+### #7 The Lost Like
 
-**Difficulty:** Hard | **Test:** `RaceCounterTest` | **Package:** `race` | **Par:** 3
+**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** ?
 
-**Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
+**Symptom:** `[Total likes after two users like the post] expected: 2 but was: 1` — each user's like should count toward the post's total.
 
-### #8 The Magic Patch
+**Solved when:** you show from the running JVM, thread by thread, how the total ends at 1.
 
-**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 4
+### #8 The Vanished Endpoint
 
-**Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
+**Difficulty:** Warm-up | **Test:** `OrderClientTest` | **Package:** `client` | **Par:** ?
+
+**Symptom:** `[HTTP status for the order listing] expected: 200 but was: 404` — requesting the order list should succeed.
+
+**Solved when:** you show what is wrong with the client's request and, with only that corrected in the running JVM, the unchanged test passes.
 
 ### #9 The Polite Standoff
 
