@@ -13,7 +13,7 @@ This is the companion sandbox for the [jdwp-debugging plugin](https://github.com
 | JDK | 17 or newer |
 | Maven | 3.9 or newer |
 | Claude Code or Codex | Latest |
-| Plugin | `jdwp-debugging` 2.13.0 or later in Claude Code and Codex |
+| Plugin | `jdwp-debugging` 2.14.0 or later in Claude Code and Codex |
 
 Verify:
 
@@ -95,7 +95,7 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 ### #3 The Overwritten Timeout
 
-**Difficulty:** Moderate | **Test:** `ApplicationTest` | **Package:** `settings` | **Par:** ?
+**Difficulty:** Moderate | **Test:** `ApplicationTest` | **Package:** `settings` | **Par:** 3
 
 **Symptom:** `[HTTP timeout after application startup in milliseconds] expected: 5000 but was: 0` — HTTP requests should use the configured timeout after startup.
 
@@ -103,15 +103,15 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 ### #4 The Missing Order
 
-**Difficulty:** Hard | **Test:** `MonthlyReportTest` | **Package:** `report` | **Par:** ?
+**Difficulty:** Hard | **Test:** `MonthlyReportTest` | **Package:** `report` | **Par:** 3
 
-**Symptom:** `[Number of orders created in October 2026] expected: 7600 but was: 7599` — the sales system recorded 7600 orders in October 2026, and the monthly report is one short.
+**Symptom:** `[Number of orders created in October 2026] expected: 7600 but was: 7599` — the sales system correctly recorded 7600 orders in October 2026, and the monthly report is one short.
 
 **Solved when:** you identify the missing order by number and creation time and explain why the report does not count it.
 
 ### #5 The Masked Email
 
-**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** ?
+**Difficulty:** Hard | **Test:** `AuditLogTest` | **Package:** `audit` | **Par:** 6
 
 **Symptom:** `[User email after recording the audit event] expected: "jordan@example.com" but was: "j***@example.com"` — recording an audit event should preserve the user's email address.
 
@@ -125,15 +125,15 @@ If you'd rather the agent pick the flight: replace the first line with `You are 
 
 ### #7 The Lost Like
 
-**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** ?
+**Difficulty:** Moderate | **Test:** `LikeServiceTest` | **Package:** `likes` | **Par:** 3
 
 **Symptom:** `[Total likes after two users like the post] expected: 2 but was: 1` — each user's like should count toward the post's total.
 
-**Solved when:** you show from the running JVM, thread by thread, how the total ends at 1.
+**Solved when:** you show, thread by thread and without holding either of them, how the total ends at 1.
 
 ### #8 The Vanished Endpoint
 
-**Difficulty:** Warm-up | **Test:** `OrderClientTest` | **Package:** `client` | **Par:** ?
+**Difficulty:** Warm-up | **Test:** `OrderClientTest` | **Package:** `client` | **Par:** 5
 
 **Symptom:** `[HTTP status for the order listing] expected: 200 but was: 404` — requesting the order list should succeed.
 
