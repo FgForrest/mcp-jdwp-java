@@ -71,7 +71,7 @@ The repository is one plugin with two manifests. Claude Code reads `.claude-plug
 
 When adding new code, do not introduce un-annotated nullable slots — if a value can legitimately be null, annotate the declaration with `@Nullable` from `org.jspecify.annotations`. `jdwp-sandbox` is intentionally unmarked: its classes are deliberately broken debugging targets and annotations there would muddy the exercises.
 
-**MCP tool parameters:** Every `@McpToolParam(required = false)` parameter is nullable at runtime — the MCP framework passes `null` when the client omits the value. These parameters are a system boundary, not internal code. Always null-guard them before dereferencing, even though `@NullMarked` makes them look non-null. Boxed types (`Integer`, `Boolean`, `Long`) will NPE on auto-unbox; `String` will NPE on `.isBlank()` or `.toLowerCase()`. The standard patterns are:
+**MCP tool parameters:** A call that omits a required parameter never reaches the tool: `ClientWorkspaceConfig` refuses it and names the parameter. Every `@McpToolParam(required = false)` parameter is nullable at runtime — the MCP framework passes `null` when the client omits the value. These parameters are a system boundary, not internal code. Always null-guard them before dereferencing, even though `@NullMarked` makes them look non-null. Boxed types (`Integer`, `Boolean`, `Long`) will NPE on auto-unbox; `String` will NPE on `.isBlank()` or `.toLowerCase()`. The standard patterns are:
 - `Integer`: `(param != null && param > 0) ? param : defaultValue`
 - `Boolean`: `param != null && param` (default false) or `param == null || param` (default true)
 - `String`: `(param == null || param.isBlank()) ? "default" : param`

@@ -154,6 +154,72 @@ class ClientWorkspaceConfigTest {
 		assertThat(callWithArguments(null, original)).isSameAs(original);
 	}
 
+	/** Refuses a call that omits a required parameter, naming it as the schema describes it. */
+	@Test
+	void shouldRefuseCallWithoutRequiredParameters() {
+		final String frame = "  frame — Frame index";
+		final String thread = "  threadId — Thread unique ID";
+
+		assertThat(refusal(Map.of())).isEqualTo(refusalOf(frame, thread));
+		assertThat(refusal(null)).isEqualTo(refusalOf(frame, thread));
+		assertThat(refusal(Map.of("frame", 2))).isEqualTo(refusalOf(thread));
+	}
+
+	/** Treats an explicit null like an omitted required parameter. */
+	@Test
+	void shouldRefuseNullForRequiredParameter() {
+		final Map<String, Object> arguments = new LinkedHashMap<>();
+		arguments.put("frame", 2);
+		arguments.put("threadId", null);
+
+		assertThat(refusal(arguments)).isEqualTo(refusalOf("  threadId — Thread unique ID"));
+	}
+
+	/** Names the unknown parameter next to the missing one, the usual sign of a misspelled name. */
+	@Test
+	void shouldReportUnknownParameterOfRefusedCall() {
+		assertThat(refusal(Map.of("frame", 2, "thread", 1L))).isEqualTo(refusalOf("  threadId — Thread unique ID")
+			+ "\n⚠ Ignored unknown parameter(s): thread. jdwp_probe accepts: frame, threadId, note.");
+	}
+
+	/** Runs the tool when every required parameter is present and an optional one is not. */
+	@Test
+	void shouldRunWithoutOptionalParameter() {
+		final McpSchema.CallToolResult original = result("ok");
+		assertThat(requiringTool(original).callHandler().apply(null,
+			new McpSchema.CallToolRequest("jdwp_probe", Map.of("frame", 0, "threadId", 1L)))).isSameAs(original);
+	}
+
+	private static String refusalOf(String... missing) {
+		return "Error: jdwp_probe did not run. Missing required parameter(s):\n" + String.join("\n", missing);
+	}
+
+	/** Text of the error reply to a call that must not reach the handler. */
+	private static String refusal(@Nullable Map<String, Object> arguments) {
+		final McpSchema.CallToolResult reply = requiringTool(null).callHandler()
+			.apply(null, new McpSchema.CallToolRequest("jdwp_probe", arguments));
+		assertThat(reply.isError()).isTrue();
+		assertThat(reply.content()).hasSize(1);
+		return ((McpSchema.TextContent) reply.content().get(0)).text();
+	}
+
+	/** A wrapped tool with two required and one optional parameter; a null {@code reply} forbids running it. */
+	private static SyncToolSpecification requiringTool(McpSchema.@Nullable CallToolResult reply) {
+		final Map<String, Object> properties = new LinkedHashMap<>();
+		properties.put("frame", Map.of("type", "integer", "description", "Frame index"));
+		properties.put("threadId", Map.of("type", "integer", "description", "Thread unique ID"));
+		properties.put("note", Map.of("type", "string", "description", "Optional note"));
+		final McpSchema.Tool tool = McpSchema.Tool.builder().name("jdwp_probe")
+			.inputSchema(new McpSchema.JsonSchema("object", properties, List.of("frame", "threadId"), false, null, null))
+			.build();
+		return ClientWorkspaceConfig.observingWorkspace(new SyncToolSpecification(tool, (exchange, request) -> {
+			if (reply == null) {
+				throw new AssertionError("the handler ran");
+			}
+			return reply;
+		}), provider(new ClientWorkspace()));
+	}
+
 	/** Calls a wrapped tool with a fixed schema and verifies that the handler still runs. */
 	private static McpSchema.CallToolResult callWithArguments(
 		@Nullable Map<String, Object> arguments, McpSchema.CallToolResult original

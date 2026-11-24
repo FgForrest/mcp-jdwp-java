@@ -318,7 +318,7 @@ public class JdiEventListener {
      * {@code null} when unset or unreadable.
      */
     @Nullable
-    static String detailMessage(ObjectReference exception) {
+    public static String detailMessage(ObjectReference exception) {
         try {
             for (Field field : exception.referenceType().allFields()) {
                 if ("detailMessage".equals(field.name()) && "java.lang.Throwable".equals(field.declaringType().name())) {

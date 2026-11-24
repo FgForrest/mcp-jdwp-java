@@ -200,7 +200,9 @@ The server reads no timeout variables; how long a server may take to start and a
 - **Codex** has its own defaults. `mcp.json` cannot change them (a stdio entry allows only `type`, `command`, `args`, `env` and `cwd`), so a plugin install lives with them: the launcher's first start, which downloads or builds the JAR, can outlast the startup wait, and the next session finds the JAR (§ 8). A manual registration sets `startup_timeout_sec` and `tool_timeout_sec` on its `[mcp_servers.jdwp-inspector]` entry in `~/.codex/config.toml`.
 - **Which calls need a long client wait.** A tool's invocation in the target — `jdwp_evaluate_expression`, including an evaluation still waiting for background classpath discovery — is bounded at 20 s by `InvocationRunner` and then answers `[STILL_RUNNING]` ([threading-and-safety.md](threading-and-safety.md) § 5). What blocks longer are `jdwp_resume_until_event` and `jdwp_wait_for_attach`, for as long as the `timeoutMs` the agent passes (default 30 s), and the step tools with `wait=true`, for up to 30 s. The client's tool-call timeout must exceed that. Maven discovery starts at attach and has a 180 s process budget. If a tool deadline expires during this host-side wait, `[STILL_RUNNING]` identifies local classpath discovery and directs the caller to `jdwp_diagnose`.
 
-### Unknown tool arguments
+### Tool arguments
+
+A call without a value for a required argument, or with `null` for one, does not reach the tool. The reply is an error that names each missing argument with its schema description. `ClientWorkspaceConfig` checks this for every tool, because Spring AI passes a missing argument on as `null` and a primitive parameter then fails on unboxing.
 
 A tool still runs when the call supplies undeclared argument names. The reply appends one `⚠ Ignored unknown parameter(s)` line to its text, listing the ignored names and the names declared by the tool. Omitted and empty arguments and reserved MCP metadata keys produce no warning.
 

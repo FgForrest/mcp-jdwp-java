@@ -286,6 +286,10 @@ Type-qualified constants are inlined without class initialization. Expression-qu
 
 The compiler makes up to four rewrite passes and reports the original diagnostics if compilation still fails. A closed package such as the one containing `String.value` also produces a module note. The executor defines only the primary wrapper, so reaching a separately emitted local or anonymous class can produce `NoClassDefFoundError`. Lambdas use JVM linkage. Fast probes, including fast-breakpoint captures and arming-hit evaluations, use direct Java access rules and retain their ordinary-tool hint.
 
+### Exceptions thrown by evaluated code
+
+A target exception is reported by type and message on one line, such as `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is `Throwable.detailMessage`, read as a field without invoking anything, cut at 300 characters. A message that a class builds in `getMessage()`, such as the JVM's helpful `NullPointerException` text, is not in the field, so the reply has the type only.
+
 ### VMStart suspension
 
 At VMStart the JVM has yet to execute application code. Navigation can inspect marks and statics of loaded, initialized system classes. Interpreted calls, compiled evaluation, `jdwp_to_string` and force-loading require an invocation event later in the run. Set breakpoints at VMStart and resume to reach application frames. [Breakpoint class-prepare promotion](breakpoints.md#3-deferring-a-breakpoint-until-its-class-loads)

@@ -17,7 +17,7 @@ import java.util.Set;
 import java.util.function.BiFunction;
 
 /**
- * Observes client workspace metadata and reports undeclared arguments on tool calls.
+ * Observes client workspace metadata and checks the argument names of tool calls.
  *
  * <ul>
  *   <li>Declares the experimental capability {@value ClientWorkspace#CODEX_SANDBOX_STATE_META}, so
@@ -27,8 +27,8 @@ import java.util.function.BiFunction;
  *       completions and logging capabilities to it.</li>
  *   <li>Wraps the call handler of every annotated tool so that the request's {@code _meta} reaches
  *       {@link ClientWorkspace#observe} before the tool runs. Other clients ignore the capability
- *       and send no such {@code _meta}. The wrapper also appends a text warning when a request
- *       supplies undeclared arguments.</li>
+ *       and send no such {@code _meta}. The wrapper also refuses a request that lacks a required
+ *       argument and appends a text warning when one supplies undeclared arguments.</li>
  * </ul>
  */
 @Configuration
@@ -50,8 +50,8 @@ public class ClientWorkspaceConfig {
 
     /**
      * Wraps every {@link SyncToolSpecification} list bean (Spring AI's {@code toolSpecs}) so each
-     * tool call reports its {@code _meta} to {@link ClientWorkspace} first and warns about
-     * undeclared arguments after the handler runs. Static and lazy on
+     * tool call reports its {@code _meta} to {@link ClientWorkspace} first, runs only with its
+     * required arguments, and warns about undeclared ones. Static and lazy on
      * {@link ClientWorkspace}, as a {@link BeanPostProcessor} must not pull ordinary beans into
      * early initialisation.
      *
@@ -81,7 +81,8 @@ public class ClientWorkspaceConfig {
 
     /**
      * Returns a copy of {@code tool} whose handler reports the request's {@code _meta} to the
-     * workspace, delegates to the original handler, and warns about undeclared argument names.
+     * workspace, delegates to the original handler unless a required argument is missing, and warns
+     * about undeclared argument names.
      */
     static SyncToolSpecification observingWorkspace(SyncToolSpecification tool,
                                                     ObjectProvider<ClientWorkspace> clientWorkspace) {
@@ -89,9 +90,45 @@ public class ClientWorkspaceConfig {
             tool.callHandler();
         return new SyncToolSpecification(tool.tool(), (exchange, request) -> {
             clientWorkspace.getObject().observe(request.meta());
-            final McpSchema.CallToolResult result = handler.apply(exchange, request);
+            final McpSchema.CallToolResult refusal = refuseMissingArguments(tool.tool(), request.arguments());
+            final McpSchema.CallToolResult result = refusal != null ? refusal : handler.apply(exchange, request);
             return warnAboutUnknownArguments(tool.tool(), request.arguments(), result);
         });
+    }
+
+    /**
+     * The error reply to a call without a value for a required argument, or {@code null} when the
+     * tool can run. Nothing below checks this: Spring AI passes the tool method a {@code null}, and
+     * a primitive parameter fails on unboxing it before the method can name the argument.
+     */
+    private static McpSchema.@Nullable CallToolResult refuseMissingArguments(
+        McpSchema.Tool tool, @Nullable Map<String, Object> arguments
+    ) {
+        final McpSchema.JsonSchema schema = tool.inputSchema();
+        if (schema == null || schema.required() == null) {
+            return null;
+        }
+        final StringBuilder missing = new StringBuilder();
+        for (String name : schema.required()) {
+            if (arguments == null || arguments.get(name) == null) {
+                missing.append("\n  ").append(name).append(describe(schema, name));
+            }
+        }
+        if (missing.isEmpty()) {
+            return null;
+        }
+        final String reply = "Error: " + tool.name() + " did not run. Missing required parameter(s):" + missing;
+        return McpSchema.CallToolResult.builder().isError(true).textContent(List.of(reply)).build();
+    }
+
+    /** The schema's description of an argument as {@code " — description"}, or an empty string. */
+    private static String describe(McpSchema.JsonSchema schema, String name) {
+        final Map<String, Object> properties = schema.properties();
+        if (properties != null && properties.get(name) instanceof Map<?, ?> property
+            && property.get("description") instanceof String description) {
+            return " — " + description;
+        }
+        return "";
     }
 
     /** Adds one warning to the last existing text block, preserving every other part of the result. */

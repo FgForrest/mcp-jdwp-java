@@ -1423,7 +1423,8 @@ public class JDWPTools {
                 return vmDisconnectedMessage("jdwp_evaluate_expression");
             }
             final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-            final String enriched = evaluatedThreadId != null
+            // A target exception's message is the target's own text, not a compile diagnostic.
+            final String enriched = evaluatedThreadId != null && !isTargetException(e)
                 ? enrichEvaluationError(msg, evaluatedThreadId, frameIndex) : msg;
             return "Error evaluating expression: " + enriched;
         }
@@ -1566,7 +1567,11 @@ public class JDWPTools {
             final StringBuilder hint = new StringBuilder(originalMessage);
             hint.append("\n\nHint: '").append(unresolved).append("' is a field on this (")
                 .append(thisType).append(", Object#").append(thisObj.uniqueID()).append(").");
-            if (classIsPublic && fieldIsPublic) {
+            if (originalMessage.contains(unresolved + " cannot be resolved")) {
+                // Compiled code resolves no bare field name in a block, and no inaccessible one anywhere.
+                hint.append(" Write this.").append(unresolved).append(" in the expression, or call jdwp_get_fields(")
+                    .append(thisObj.uniqueID()).append(") to inspect the object.");
+            } else if (classIsPublic && fieldIsPublic) {
                 hint.append(" Auto-rewrite should have handled this — please report the expression that triggered it.");
             } else {
                 if (!classIsPublic) {
@@ -2260,6 +2265,10 @@ public class JDWPTools {
      * length-≥2 cycle cannot livelock the catch handler.
      */
     private static boolean isVmGone(@Nullable Throwable t) {
+        if (isTargetException(t)) {
+            // The target answered; a transport error in the message is the application's own.
+            return false;
+        }
         Throwable cur = t;
         for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
             if (isTransportFailureFrame(cur)) {
@@ -2270,6 +2279,18 @@ public class JDWPTools {
                 return false;
             }
             cur = next;
+        }
+        return false;
+    }
+
+    /** Whether code evaluated in the target threw: JDI reports that as an {@link InvocationException}. */
+    private static boolean isTargetException(@Nullable Throwable t) {
+        Throwable cur = t;
+        for (int i = 0; cur != null && i < MAX_CAUSE_DEPTH; i++) {
+            if (cur instanceof InvocationException) {
+                return true;
+            }
+            cur = cur.getCause();
         }
         return false;
     }
