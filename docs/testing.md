@@ -100,7 +100,7 @@ The 30 ms sleep is the only timing dependency in the test suite. It is a known f
 
 `jdwp-sandbox/` is a separate Maven module of **deliberately broken** Java classes. Each one has a paired test that is **expected to fail** when run normally — the failure is the exercise. Examples:
 
-- `bank/TransferService.java` — non-atomic transfer with a mid-state audit snapshot. Test "money invariant" fails because the audit captures the intermediate state.
+- `report/MonthlyReport.java` — the October report counts 7,599 of the 7,600 orders created that month. A conditional breakpoint isolates the missing row during the scan.
 - `deadlock/Account.java` — two transfers acquire locks in opposite orders and deadlock. Test fails when its join times out; diagnosed purely by thread inspection, no breakpoints.
 - `recursion/RecursiveCalculator.java` — actually correct! Used to verify the recursive-breakpoint protection works end-to-end with a real JVM.
 
