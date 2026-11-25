@@ -5,6 +5,133 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.16.0] — 2026-11-25
+
+### Fixed — a failed `forceLoad=true` says why (#86)
+
+`forceLoad=true` runs `Class.forName` in the target. When the class's static initializer
+threw, a line breakpoint answered a plain `Breakpoint set`. An exception or field
+breakpoint claimed that the class was not loaded and blamed VM start. Neither said that
+the debugger's own call had left the class unusable for the application.
+
+- **The reply names the exception** — it ends with
+  `Warning: forceLoad=true failed in the target: …`, the exception's type and message,
+  and the fact that the class cannot be used until the target restarts. The breakpoint
+  is still registered. Error replies of the same call carry the warning too.
+- **A class the target cannot find** is deferred as before. The note now names the
+  exception, such as `java.lang.ClassNotFoundException: com.example.Missing`, instead
+  of talking about VM start.
+- **A load that finishes after the deadline** is recorded as `failed: …` with the
+  exception. It was recorded as `returned null`.
+
+### Fixed — an exception thrown by target code keeps its message (#85, #86)
+
+- **Evaluations, watchers and logpoints** report type and message on one line, such as
+  `Target VM threw exception: java.lang.IllegalStateException: closed`. The message is
+  read as a field, without invoking anything, and cut at 300 characters. It is only
+  shown: a `Connection refused` thrown by the application is no longer reported as
+  `[VM_DEATH]`.
+- **`jdwp_to_string`** reports an exception thrown by `toString()` the same way. It
+  answered `Exception occurred in target VM`.
+- **`ExceptionInInitializerError`** has no message of its own, so the report adds its
+  cause.
+
+### Fixed — calls with missing or misspelled parameters (#85, #86)
+
+An agent called `jdwp_clear_breakpoint({"id": 1})`, as our own texts spelled it, and got
+a `NullPointerException` from inside the server.
+
+- **A call without a required parameter names it** — the server refuses the call before
+  the tool runs and quotes the parameter's description. An explicit `null` counts as
+  missing.
+- **Documented calls use the real parameter names** — `jdwp_clear_breakpoint(breakpointId)`,
+  `jdwp_get_stack(threadId)`, `jdwp_detach_watcher(watcherId)` and others in the tool
+  descriptions, the replies, the `java-debug` skill and the sandbox's agent instructions.
+- **`jdwp_evaluate_watchers.scope` is optional** — its description promised the default
+  `current_frame`, but the parameter was required.
+- **`jdwp_detach_watcher` accepts the ID the server shows** — every reply shows the first
+  eight characters of a watcher's ID, and only the full one was accepted, so a single
+  watcher could not be detached.
+
+### Fixed — the hint for a bare field name works (#85)
+
+The hint for a bare field name that does not compile claimed that the expression cannot
+reference the field. It now says `this.<field>` where that works, and points to
+`jdwp_get_fields` where compiled code cannot reach the field. A missing type or a field
+of another object no longer gets a hint about a field of `this`.
+
+### Changed — `jdwp_step_into` passes over the JDK (#88)
+
+On `base + "/orders"`, a step into landed in `java.lang.invoke`. On
+`take(YearMonth.of(2026, 10))` it landed in `YearMonth`, not in `take`.
+
+- **From application code the step can land in an application method the line calls**,
+  callbacks, reflection and proxies included, or on the next line.
+- **A step that starts inside the JDK** works as before. To stop inside a JDK method,
+  set a breakpoint in it.
+- **At the closing brace of a method only the JDK called**, such as `run()` of a pool
+  task, the step lands in the JDK caller, as before. If the last line itself returns to
+  the JDK, the step stays pending until the thread next runs application code.
+- **JDK-heavy lines get slower.** The JDWP agent watches every method entry on the way:
+  a stream sort of 200,000 boxed numbers took 15–17 s, against 1–2 s for a step over.
+  A `[TIMEOUT]` of such a step says so, and the step stays pending.
+
+### Fixed — a pending step that cannot land says so (#88)
+
+An unfiltered `jdwp_resume_until_event` releases nothing while a step is pending.
+
+- **The `[TIMEOUT]` reply names the stepping threads** and says that `jdwp_resume`
+  releases the stops already seen.
+- **A step whose thread ends before the step lands is dropped.** A wait for it answers
+  `[NO_EVENT]`, and later waits are not held up.
+
+### Fixed — compiled evaluations work when the server runs outside the project (#88)
+
+A lambda, a loop or another compiled expression failed with
+`com cannot be resolved to a type` when the server's working directory was not the
+target's project.
+
+- **Launch jars with a `Class-Path` manifest are expanded** — a Surefire fork, for
+  example, is started from one such jar.
+- **Relative classpath entries** resolve against the target's working directory when the
+  file exists there. They always resolved against the server's.
+
+### Fixed — logpoint errors say where, waiting threads are described correctly (#88)
+
+- **`FIELD_LOGPOINT_ERROR` and `LOGPOINT_ERROR`** name the place and the thread. The
+  field error also shows the values.
+- **A parked thread**, for example in `FutureTask.get()`, is reported as
+  `waiting (Object.wait or a park)`. It was reported as `inside Object.wait()` and
+  "will never stop at a breakpoint".
+
+### New — `jdwp_get_fields` shows the entries of a `ConcurrentHashMap` (#88)
+
+It printed about 30 internal fields and no entry. A notice says when the size and the
+entries differ because the map was being changed.
+
+### Changed — five test flights after real-life bugs (#87)
+
+Flights #3, #4, #5, #7 and #8 of the sandbox are new. Each one is a bug a Java developer
+has met at work, in code that reads like ordinary application code, and each needs its
+own tool.
+
+| # | Flight | Exercises | Par |
+|---|---|---|---|
+| 3 | The Overwritten Timeout | field watchpoint + stack | 3 |
+| 4 | The Missing Order | conditional breakpoint | 3 |
+| 5 | The Masked Email | field watchpoint blind spot + stepping | 7 |
+| 7 | The Lost Like | logpoints | 4 |
+| 8 | The Vanished Endpoint | runtime mutation (`jdwp_set_local`) | 5 |
+
+- **They replace** The Time Traveler's Config, The Audit That Lies, The Field That Lies,
+  The Heisenbug Race and The Magic Patch. Conditional breakpoints and stepping had no
+  flight before.
+- **Nothing gives the answer away** — the tests and the sandbox README state the
+  expectation, the symptom and what counts as solved. The tests of #2 and #9 lose the
+  comments that named the cause, and the sandbox's `AGENTS.md` puts everything under
+  `src/main/` off limits, resources included.
+- **The sandbox needs plugin 2.14.0 or later.**
+
 ## [2.15.0] — 2026-11-23
 
 ### New — thread-targeted context, and a thread wait that outlasts event processing (#83)
