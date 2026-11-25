@@ -86,7 +86,7 @@ class JDWPToolsInspectSuspensionGuardTest {
 
 			assertThat(result)
 				.contains("jdwp_suspend_thread(7)")
-				.contains("waiting (Object.wait or a park)", "until it is notified, unparked or its timeout ends")
+				.contains("waiting (Object.wait or a park)", "until it wakes up")
 				.doesNotContain("deadlock-inspection path");
 		}
 

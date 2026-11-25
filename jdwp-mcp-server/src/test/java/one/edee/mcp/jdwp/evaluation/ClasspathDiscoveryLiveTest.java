@@ -31,6 +31,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.tools.ToolProvider;
@@ -133,6 +134,79 @@ class ClasspathDiscoveryLiveTest {
                     });
             }
         }
+    }
+
+    /** Compares manifest URL resolution with the target's application loader. */
+    @ParameterizedTest
+    @MethodSource("one.edee.mcp.jdwp.evaluation.InterpreterTargetVm#javaHomes")
+    void followsManifestUrlsLikeTheApplicationLoader(Path javaHome, @TempDir Path root) throws Exception {
+        final Path real = Files.createDirectory(root.resolve("real"));
+        final Path classes = Files.createDirectory(root.resolve("classes"));
+        final Path realChoice = Files.createDirectory(real.resolve("choice"));
+        final Path linkChoice = Files.createDirectory(root.resolve("choice"));
+        final Path main = Files.writeString(root.resolve("Main.java"), """
+            package launchfixture;
+            public class Main {
+                public static void main(String[] args) throws Exception {
+                    stop(Class.forName("launchfixture.Dependency").getField("NUMBER").getInt(null));
+                }
+                public static void stop(int actual) {}
+            }
+            """);
+        final Path dependency = root.resolve("Dependency.java");
+        Files.writeString(dependency, """
+            package launchfixture;
+            public class Dependency { public static final int NUMBER = 42; }
+            """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", classes.toString(), main.toString(), dependency.toString())).isZero();
+        final Path packagePath = Path.of("launchfixture", "Dependency.class");
+        Files.copy(classes.resolve(packagePath), Files.createDirectories(realChoice.resolve("launchfixture"))
+            .resolve("Dependency.class"));
+        Files.writeString(dependency, """
+            package launchfixture;
+            public class Dependency { public static final int NUMBER = 99; }
+            """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", linkChoice.toString(), dependency.toString())).isZero();
+
+        final Path aliased = real.resolve("actual.jar");
+        ClasspathDiscovererTest.writeLaunchJar(aliased, "choice/");
+        final Path alias = Files.createSymbolicLink(root.resolve("alias.jar"), aliased);
+        final Path ordinary = root.resolve("ordinary.jar");
+        ClasspathDiscovererTest.writeLaunchJar(ordinary, "choice other.jar/");
+        ClasspathDiscovererTest.writeLaunchJar(root.resolve("other.jar"), "choice/");
+        final Path parent = root.resolve("parent.jar");
+        ClasspathDiscovererTest.writeLaunchJar(parent, "alias.jar");
+
+        final SoftAssertions checks = new SoftAssertions();
+        for (final Path jar : List.of(ordinary, alias, parent)) {
+            final List<String> launch = List.of("-cp", jar + File.pathSeparator + classes, "launchfixture.Main");
+            try (final InterpreterTargetVm target = InterpreterTargetVm.startIn(javaHome, root, launch);
+                 final CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+                withTarget(wire, "launchfixture.Main", "", "stop", EventRequest.SUSPEND_EVENT_THREAD,
+                    (vm, tracker, history, router, connection, session, type) -> {
+                        final ThreadReference thread = waitForStop(session).thread();
+                        final String actual = thread.frame(0).getArgumentValues().get(0).toString();
+                        final List<Path> expected;
+                        if (jar.equals(ordinary)) {
+                            expected = List.of(ordinary, classes);
+                        } else if (jar.equals(alias)) {
+                            expected = List.of(alias, realChoice, classes);
+                        } else {
+                            expected = List.of(parent, alias, linkChoice, classes);
+                        }
+                        checks.assertThat(actual).as("target value from %s", jar.getFileName())
+                            .isEqualTo(jar.equals(parent) ? "99" : "42");
+                        checks.assertThat(connection.discoverClasspath(thread)).as("classpath for %s", jar.getFileName())
+                            .isEqualTo(String.join(File.pathSeparator, expected.stream().map(Path::toString).toList()));
+                        checks.assertThat(router.evaluateEvent("java.util.stream.IntStream.of(0).map(i -> "
+                            + "launchfixture.Dependency.NUMBER).sum()", thread, Map.of(), connection::formatFieldValue))
+                            .as("compiled value from %s", jar.getFileName()).isEqualTo(actual);
+                    });
+            }
+        }
+        checks.assertAll();
     }
 
     /** Checks the captured legacy classpath, lazy discovery, and the stop-to-result packet budget. */

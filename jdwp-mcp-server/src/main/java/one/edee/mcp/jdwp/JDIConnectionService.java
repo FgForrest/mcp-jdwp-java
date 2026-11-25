@@ -1333,7 +1333,12 @@ public class JDIConnectionService {
             }
 
         } catch (Exception e) {
-            result.append("Error inspecting collection: ").append(e.getMessage());
+            if (kind == CollectionKind.CONCURRENT_MAP && e instanceof ObjectCollectedException) {
+                result.append("  ... (map changed during inspection)\n");
+            } else {
+                final String msg = e.getMessage();
+                result.append("Error inspecting collection: ").append(msg != null ? msg : e.getClass().getSimpleName());
+            }
         }
 
         return result.toString();
@@ -1341,37 +1346,33 @@ public class JDIConnectionService {
 
     /** Reads the striped size counters and renders entries using JDI field reads only. */
     private void appendConcurrentMapView(StringBuilder out, ObjectReference map) {
-        try {
-            final Value base = concurrentMapField(map, "baseCount");
-            long count = base instanceof LongValue value ? value.value() : 0L;
-            if (concurrentMapField(map, "counterCells") instanceof ArrayReference cells) {
-                for (final @Nullable Value cell : cells.getValues()) {
-                    if (cell instanceof ObjectReference counter && concurrentMapField(counter, "value") instanceof LongValue v) {
-                        count += v.value();
-                    }
+        final Value base = concurrentMapField(map, "baseCount");
+        long count = base instanceof LongValue value ? value.value() : 0L;
+        if (concurrentMapField(map, "counterCells") instanceof ArrayReference cells) {
+            for (final @Nullable Value cell : cells.getValues()) {
+                if (cell instanceof ObjectReference counter && concurrentMapField(counter, "value") instanceof LongValue v) {
+                    count += v.value();
                 }
             }
-            final int size = (int) Math.max(0L, Math.min(count, Integer.MAX_VALUE));
-            out.append(String.format("Size: %d\n\nEntries:\n", size));
-            if (concurrentMapField(map, "table") instanceof ArrayReference table) {
-                appendConcurrentMapEntries(out, table, size);
-            }
-        } catch (ObjectCollectedException e) {
-            out.append("  ... (map changed during inspection)\n");
         }
+        final int size = (int) Math.max(0L, Math.min(count, Integer.MAX_VALUE));
+        out.append(String.format("Size: %d\n\nEntries:\n", size));
+        final @Nullable Value table = concurrentMapField(map, "table");
+        appendConcurrentMapEntries(out, table instanceof ArrayReference array ? array : null, size);
     }
 
     /** Identifies a slot or the first slot of a cached table chunk. */
     private record ConcurrentMapBin(ArrayReference table, int index) {}
 
     /** Walks the original bins and their two replacements in each successive resize. */
-    private void appendConcurrentMapEntries(StringBuilder out, ArrayReference table, int size) {
+    private void appendConcurrentMapEntries(StringBuilder out, @Nullable ArrayReference table, int size) {
         final Map<ConcurrentMapBin, List<? extends @Nullable Value>> chunks = new HashMap<>();
         final Set<ObjectReference> keys = new HashSet<>();
         final Deque<ConcurrentMapBin> pending = new ArrayDeque<>();
-        final int length = table.length();
+        final int length = table == null ? 0 : table.length();
         int index = 0;
-        while (keys.size() < COLLECTION_VIEW_LIMIT && (index < length || !pending.isEmpty())) {
+        boolean chainCut = false;
+        while (table != null && keys.size() < COLLECTION_VIEW_LIMIT && (index < length || !pending.isEmpty())) {
             if (pending.isEmpty()) {
                 pending.push(new ConcurrentMapBin(table, index++));
             }
@@ -1399,16 +1400,20 @@ public class JDIConnectionService {
                     }
                 }
                 case "java.util.concurrent.ConcurrentHashMap$TreeBin" ->
-                    appendConcurrentMapChain(out, concurrentMapField(node, "first"), keys);
-                case "java.util.concurrent.ConcurrentHashMap$Node" -> appendConcurrentMapChain(out, node, keys);
+                    chainCut = appendConcurrentMapChain(out, concurrentMapField(node, "first"), keys);
+                case "java.util.concurrent.ConcurrentHashMap$Node" -> chainCut = appendConcurrentMapChain(out, node, keys);
                 default -> { /* Reservation nodes do not carry entries. */ }
             }
         }
-        appendOverflowFooter(out, size, "entries");
+        if (chainCut || index < length || !pending.isEmpty()) {
+            appendOverflowFooter(out, size, "entries");
+        } else if (keys.size() != size) {
+            out.append("  ... (size and entries differ — the map was being changed)\n");
+        }
     }
 
-    /** Renders a linked bin, deduplicating key references that survived a concurrent move. */
-    private void appendConcurrentMapChain(StringBuilder out, @Nullable Value first, Set<ObjectReference> keys) {
+    /** Renders a linked bin, deduplicates moved keys, and reports whether the row limit cut the chain. */
+    private boolean appendConcurrentMapChain(StringBuilder out, @Nullable Value first, Set<ObjectReference> keys) {
         @Nullable Value current = first;
         while (current instanceof ObjectReference node && keys.size() < COLLECTION_VIEW_LIMIT) {
             if (concurrentMapField(node, "key") instanceof ObjectReference key && keys.add(key)) {
@@ -1417,6 +1422,7 @@ public class JDIConnectionService {
             }
             current = concurrentMapField(node, "next");
         }
+        return current instanceof ObjectReference;
     }
 
     /** Reads a field from a known ConcurrentHashMap layout. */

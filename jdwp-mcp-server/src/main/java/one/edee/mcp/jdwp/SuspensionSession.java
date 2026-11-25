@@ -344,10 +344,11 @@ public final class SuspensionSession {
      * @param refusal       the blocker that ended a targeted wait, if any
      * @param otherUnseen   unseen stops of other threads when a thread was selected
      * @param pendingContext the covering set still queued or processing at the deadline, if any
+     * @param skippedStepRelease the timeout note when pending steps prevented a global release
      */
     public record NextStop(Outcome outcome, @Nullable StopReport report, @Nullable ReleaseResult released,
                            @Nullable ThreadRelease threadRelease, @Nullable String refusal, int otherUnseen,
-                           @Nullable String pendingContext) {
+                           @Nullable String pendingContext, String skippedStepRelease) {
         /** The selected stop without its captured presentation details. */
         public BreakpointTracker.@Nullable LastBreakpoint stop() {
             return report == null ? null : report.stop();
@@ -907,7 +908,10 @@ public final class SuspensionSession {
                                  @Nullable ArmedStep step) throws InterruptedException {
         final long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
         final Long threadId = thread == null ? null : thread.uniqueID();
+        final @Nullable ArmedStep watchedStep = step != null || thread == null ? step : pendingSteps.get(thread);
         boolean releasePending = step == null;
+        List<ArmedStep> blockingSteps = List.of();
+        String skippedStepRelease = "";
         ReleaseResult released = null;
         ThreadRelease threadRelease = null;
         List<ReleaseFailure> recoveryFailures = List.of();
@@ -945,9 +949,12 @@ public final class SuspensionSession {
                 outcome = Outcome.RESET;
                 break;
             }
-            if (step != null && pendingSteps.get(step.thread) != step) {
-                outcome = Outcome.STEP_ENDED;
-                break;
+            if (watchedStep != null) {
+                stepPending(watchedStep.thread);
+                if (watchedStep.threadEnded || (step != null && pendingSteps.get(step.thread) != step)) {
+                    outcome = Outcome.STEP_ENDED;
+                    break;
+                }
             }
             final Context pending = thread != null && step == null ? coveringPendingContext(thread) : null;
             if (thread != null) {
@@ -967,10 +974,13 @@ public final class SuspensionSession {
             if (pending == null && releasePending) {
                 releasePending = false;
                 if (thread == null) {
+                    pendingSteps.values().removeIf(this::retireEndedStep);
                     if (pendingSteps.isEmpty()) {
                         released = releaseAllLocked();
+                    } else {
+                        blockingSteps = List.copyOf(pendingSteps.values());
                     }
-                } else if (!pendingSteps.containsKey(thread)) {
+                } else if (watchedStep == null ? !stepPending(thread) : !pendingSteps.containsKey(thread)) {
                     if (releaseDeadlinePassed(deadline)) {
                         outcome = Outcome.TIMEOUT;
                         break;
@@ -996,6 +1006,14 @@ public final class SuspensionSession {
             }
             final long remainingNanos = deadline - System.nanoTime();
             if (remainingNanos <= 0) {
+                if (!blockingSteps.isEmpty()) {
+                    pendingSteps.values().removeIf(this::retireEndedStep);
+                    if (pendingSteps.isEmpty() && blockingSteps.stream().allMatch(armed -> armed.threadEnded)) {
+                        outcome = Outcome.STEP_ENDED;
+                        break;
+                    }
+                    skippedStepRelease = describeSkippedStepRelease(blockingSteps);
+                }
                 if (pending != null) {
                     pendingContext = describePendingContext(pending);
                 }
@@ -1004,7 +1022,24 @@ public final class SuspensionSession {
             }
             waitForChange(remainingNanos, thread);
         }
-        return endWait(outcome, report, released, threadRelease, refusal, threadId, recoveryFailures, pendingContext);
+        return endWait(outcome, report, released, threadRelease, refusal, threadId, recoveryFailures, pendingContext,
+            skippedStepRelease);
+    }
+
+    /** Names the pending steps that prevented a global wait from releasing anything. */
+    private String describeSkippedStepRelease(List<ArmedStep> blockingSteps) {
+        final List<ArmedStep> steps = pendingSteps.isEmpty() ? blockingSteps : List.copyOf(pendingSteps.values());
+        final String threads = String.join(", ", steps.stream().limit(5)
+            .map(armed -> safeName(armed.thread) + " (ID=" + armed.thread.uniqueID() + ')').toList());
+        final String more = steps.size() > 5 ? " and " + (steps.size() - 5) + " more" : "";
+        final String armed;
+        if (pendingSteps.isEmpty()) {
+            armed = ".";
+        } else {
+            armed = steps.size() == 1 ? ", and the step stays armed." : ", and the steps stay armed.";
+        }
+        return "\nThis call released nothing because it was waiting for a step on " + threads + more
+            + ". jdwp_resume releases the stops already seen" + armed;
     }
 
     /**
@@ -1146,6 +1181,7 @@ public final class SuspensionSession {
         private final StepRequest request;
         private final long generation;
         private @Nullable Context endingStop;
+        private boolean threadEnded;
 
         private ArmedStep(ThreadReference thread, StepRequest request, long generation) {
             this.thread = thread;
@@ -1382,7 +1418,38 @@ public final class SuspensionSession {
      * Whether a step is in flight on {@code thread}.
      */
     public synchronized boolean stepPending(ThreadReference thread) {
-        return pendingSteps.containsKey(thread);
+        final ArmedStep step = pendingSteps.get(thread);
+        if (step == null) {
+            return false;
+        }
+        if (retireEndedStep(step)) {
+            pendingSteps.remove(thread);
+            return false;
+        }
+        return true;
+    }
+
+    /** Deletes a dead thread's request and wakes its waiters before the caller removes the entry. */
+    private boolean retireEndedStep(ArmedStep step) {
+        try {
+            if (step.thread.status() != ThreadReference.THREAD_STATUS_ZOMBIE) {
+                return false;
+            }
+        } catch (ObjectCollectedException ignored) {
+            // The thread can no longer report a stop.
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+        step.threadEnded = true;
+        deleteQuietly(step.request);
+        notifyAll();
+        return true;
+    }
+
+    /** Whether a presented stop-all still holds threads in this session. */
+    synchronized boolean hasPresentedStopAll() {
+        return !closed && contexts.stream().anyMatch(context ->
+            context.state == State.HELD && context.reported && context.policy == EventRequest.SUSPEND_ALL);
     }
 
     /**
@@ -1461,6 +1528,7 @@ public final class SuspensionSession {
         candidates.addAll(manual);
         candidates.addAll(unpaidLeaseDebts.keySet());
         candidates.addAll(leases.keySet());
+        pendingSteps.values().removeIf(this::retireEndedStep);
         candidates.addAll(pendingSteps.keySet());
         final Map<ThreadReference, Set<Long>> held = new LinkedHashMap<>();
         for (ThreadReference thread : candidates) {
@@ -2294,7 +2362,8 @@ public final class SuspensionSession {
     /** Keeps release progress, failures and timeout details, counting pending sets for a global wait. */
     private NextStop endWait(Outcome outcome, @Nullable StopReport report, @Nullable ReleaseResult released,
                              @Nullable ThreadRelease threadRelease, @Nullable String refusal,
-                             @Nullable Long threadId, List<ReleaseFailure> laterFailures, @Nullable String pendingContext) {
+                             @Nullable Long threadId, List<ReleaseFailure> laterFailures, @Nullable String pendingContext,
+                             String skippedStepRelease) {
         if (threadId != null) {
             if (threadRelease != null) {
                 // A failed first pass ends the wait immediately, so later failures can only follow a successful pass.
@@ -2304,7 +2373,7 @@ public final class SuspensionSession {
                 threadRelease = new ThreadRelease(null, List.of(), laterFailures, closed);
             }
             return new NextStop(outcome, report, null, threadRelease, refusal, unseenCountExcept(threadId),
-                pendingContext);
+                pendingContext, skippedStepRelease);
         }
         if (released != null || !laterFailures.isEmpty()) {
             final int pending = closed ? 0 : (int) contexts.stream()
@@ -2318,7 +2387,7 @@ public final class SuspensionSession {
                     released.recovered(), failures, closed);
             }
         }
-        return new NextStop(outcome, report, released, null, refusal, 0, null);
+        return new NextStop(outcome, report, released, null, refusal, 0, null, skippedStepRelease);
     }
 
     /** Retries a finished set and retains the latest failure and retry thread ID if its resume still throws. */

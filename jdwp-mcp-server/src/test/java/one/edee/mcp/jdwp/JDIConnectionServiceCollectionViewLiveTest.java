@@ -12,6 +12,8 @@ import com.sun.jdi.Value;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -288,9 +290,45 @@ class JDIConnectionServiceCollectionViewLiveTest {
 		final ObjectReference map = concurrentMap(1, table, null);
 
 		assertThat(invokeGetCollectionView(map, 6L, "java.util.concurrent.ConcurrentHashMap"))
-			.contains("Size: 1", "table scan limit reached");
+			.contains("Size: 1", "table scan limit reached").doesNotContain("size and entries differ");
 		verify(table, org.mockito.Mockito.times(64)).getValues(anyInt(), anyInt());
 		verify(table, never()).getValue(anyInt());
+	}
+
+	/** Reports a mismatch whether the size was read before a removal or before an insertion. */
+	@ParameterizedTest
+	@ValueSource(longs = {0, 2, 51})
+	void shouldReportConcurrentMapSizeMismatch(long size) throws Exception {
+		final ObjectReference map = concurrentMap(size,
+			concurrentTable(concurrentEntry("Node", mockString("key"), null)), null);
+
+		assertThat(invokeGetCollectionView(map, 6L, "java.util.concurrent.ConcurrentHashMap"))
+			.contains("Size: " + size, "\"key\" = 1", "  ... (size and entries differ — the map was being changed)")
+			.doesNotContain("more entries");
+	}
+
+	/** A collected map ends the smart view before the raw fields are read. */
+	@Test
+	void shouldSkipRawFieldsWhenConcurrentMapIsCollected() throws Exception {
+		final ObjectReference map = concurrentMap(1, null, null);
+		final ReferenceType type = map.referenceType();
+		final Field table = type.fieldByName("table");
+		when(map.getValue(table)).thenThrow(new ObjectCollectedException());
+		when(type.allFields()).thenThrow(new ObjectCollectedException());
+
+		assertThat(invokeGetCollectionView(map, 6L, "java.util.concurrent.ConcurrentHashMap"))
+			.contains("... (map changed during inspection)").doesNotContain("Internal fields", "Error inspecting collection");
+		verify(type, never()).allFields();
+	}
+
+	/** Uses the exception type when a collection read fails without a message. */
+	@Test
+	void shouldNameCollectionInspectionExceptionWithoutMessage() throws Exception {
+		final ObjectReference map = mockConcurrentObject("java.util.HashMap");
+		when(map.referenceType()).thenThrow(new IllegalStateException());
+
+		assertThat(invokeGetCollectionView(map, 6L, "java.util.HashMap"))
+			.contains("Error inspecting collection: IllegalStateException");
 	}
 
 	/** Mirrors a ConcurrentHashMap with its striped counters and table. */

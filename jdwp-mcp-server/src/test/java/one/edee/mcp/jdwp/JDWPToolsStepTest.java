@@ -66,7 +66,8 @@ import static org.mockito.Mockito.when;
 class JDWPToolsStepTest {
 
 	private static final String JDK_STEP_TIMEOUT = "The step may be passing JDK code, which runs slowly while the step is pending "
-		+ "or may be blocking. A breakpoint in the method of interest is quicker.";
+		+ "or may be blocking. The thread may also have returned from the last application method to its JDK caller. "
+		+ "A breakpoint in the method of interest is quicker.";
 
 	private JDIConnectionService jdiService;
 	private BreakpointTracker breakpointTracker;
@@ -135,6 +136,7 @@ class JDWPToolsStepTest {
 		final ThreadReference thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(id);
 		when(thread.isSuspended()).thenReturn(true);
+		when(thread.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING);
 		when(thread.name()).thenReturn("thread-" + id);
 		try {
 			holdStop(thread, (int) id);
@@ -562,21 +564,69 @@ class JDWPToolsStepTest {
 		verify(stepping).resume();
 	}
 
-	/** Uses the real default wait and confirms the request survives it. */
+	/** Drops JDK exclusions only at a return with no application caller below it. */
+	@ParameterizedTest
+	@CsvSource({"172, java.lang.Thread, false, false", "177, java.lang.Thread, false, false",
+		"176, example.Work, false, true", "184, java.lang.Thread, false, true",
+		"177, java.lang.Thread, true, true"})
+	void shouldFilterStepIntoBasedOnReturnAndCaller(int opcode, String caller, boolean unreadable,
+													boolean filtered) throws Exception {
+		final ThreadReference thread = suspendedThread(1L);
+		stack(thread, "example.Work", caller, "jdk.internal.reflect.DirectMethodHandleAccessor");
+		final Method method = thread.frame(0).location().method();
+		when(method.bytecodes()).thenReturn(new byte[] {0, (byte) opcode});
+		when(thread.frame(0).location().codeIndex()).thenReturn(1L);
+		if (unreadable) {
+			when(thread.frame(1)).thenThrow(new InvalidStackFrameException());
+		}
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		final StepRequest request = stubStepRequestCreation(thread, StepRequest.STEP_INTO);
+
+		assertThat(tools.jdwp_step_into(1L)).startsWith("Step into started");
+
+		verify(request, times(filtered ? 5 : 0)).addClassExclusionFilter(any());
+		verify(thread, times(opcode == 184 ? 0 : 1)).frame(1);
+		verify(thread, times(filtered ? 0 : 1)).frame(2);
+	}
+
+	/** Checks the timeout advice while a presented stop-all still holds other threads. */
 	@Test
-	@DisplayName("a waiting step times out after the default wait and leaves the request armed")
 	void shouldLeaveTimedOutStepPending() throws Exception {
 		final ThreadReference stepping = suspendedThread(1L);
 		stack(stepping, "example.Work");
+		holdStop(stepping, 19, EventRequest.SUSPEND_ALL, true);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(stepping));
 		final StepRequest request = stubStepRequestCreation(stepping, StepRequest.STEP_INTO);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> session.awaitStepStop(0, invocation.getArgument(1)))
+			.when(session).awaitStepStop(eq(30_000L), any());
 
-		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_into(1L, true));
-		assertThat(reply.get(40, TimeUnit.SECONDS)).startsWith("Step into started")
-			.contains("still_waiting", "[TIMEOUT]", "30000ms", "jdwp_resume_until_event(threadId=1)", JDK_STEP_TIMEOUT);
+		assertThat(tools.jdwp_step_into(1L, true)).startsWith("Step into started")
+			.contains("still_waiting", "[TIMEOUT]", "30000ms", "jdwp_resume_until_event(threadId=1)", JDK_STEP_TIMEOUT,
+				"jdwp_resume releases them, and the step stays armed");
 		assertThat(session.stepPending(stepping)).isTrue();
 		verify(erm, never()).deleteEventRequest(request);
+	}
+
+	/** A global wait reports why its release was skipped and limits the step threads it names. */
+	@Test
+	void shouldReportPendingStepThreadsAfterGlobalTimeout() throws Exception {
+		when(jdiService.getVM()).thenReturn(vm);
+		final ThreadReference presented = suspendedThread(99L);
+		for (int i = 1; i <= 6; i++) {
+			final ThreadReference thread = suspendedThread(i);
+			final StepRequest request = stubStepRequestCreation(thread, StepRequest.STEP_OVER);
+			assertThat(session.step(thread, List::of, () -> request).refusal()).isNull();
+		}
+
+		final String reply = tools.jdwp_resume_until_event(20);
+		assertThat(reply).contains("[TIMEOUT]", "released nothing", "jdwp_resume releases the stops already seen",
+			"steps stay armed", "thread-1 (ID=1)", "thread-2 (ID=2)", "thread-3 (ID=3)", "thread-4 (ID=4)",
+			"thread-5 (ID=5)").doesNotContain("thread-6 (ID=6)");
+		verify(stops.get(presented), never()).resume();
 	}
 
 	/** Checks timeout advice for an unfiltered step into and a step out of application code. */

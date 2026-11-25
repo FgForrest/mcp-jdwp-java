@@ -53,22 +53,24 @@ public class ClasspathDiscoverer {
     private static Set<String> expandLaunchEntries(List<String> classPath, @Nullable String baseDirectory) {
         final Path base = absoluteLocalPath(baseDirectory);
         final Deque<String> pending = new ArrayDeque<>();
-        for (final String entry : classPath) {
-            final String trimmed = entry.trim();
-            if (!trimmed.isEmpty()) {
-                pending.addLast(resolveLaunchEntry(trimmed, base));
-            }
-        }
         final Set<String> found = new LinkedHashSet<>();
         final Set<Path> visited = new HashSet<>();
-        while (!pending.isEmpty()) {
-            final String entry = pending.removeFirst();
-            final Path path = absoluteLocalPath(entry);
-            if (path != null && !visited.add(path.normalize())) {
+        for (final String launch : classPath) {
+            final String trimmed = launch.trim();
+            if (trimmed.isEmpty()) {
                 continue;
             }
-            if (found.add(entry) && path != null && Files.isRegularFile(path)) {
-                enqueueManifestEntries(path, pending);
+            pending.addFirst(resolveLaunchEntry(trimmed, base));
+            // The first entry of the round comes from the launch classpath, the others from its manifests.
+            boolean launchEntry = true;
+            while (!pending.isEmpty()) {
+                final String entry = pending.removeFirst();
+                final Path path = absoluteLocalPath(entry);
+                final boolean unseen = path == null || visited.add(path.normalize());
+                if (unseen && found.add(entry) && path != null && Files.isRegularFile(path)) {
+                    enqueueManifestEntries(path, launchEntry, pending);
+                }
+                launchEntry = false;
             }
         }
         return found;
@@ -105,8 +107,8 @@ public class ClasspathDiscoverer {
         return entry;
     }
 
-    /** Pushes existing local links ahead of the remaining launch entries in manifest order. */
-    private static void enqueueManifestEntries(Path path, Deque<String> pending) {
+    /** Pushes existing local links ahead of the remaining entries in manifest order. */
+    private static void enqueueManifestEntries(Path path, boolean launchEntry, Deque<String> pending) {
         try (final JarFile jar = new JarFile(path.toFile(), false)) {
             final Manifest manifest = jar.getManifest();
             final String links = manifest == null ? null
@@ -114,11 +116,12 @@ public class ClasspathDiscoverer {
             if (links == null || links.isBlank()) {
                 return;
             }
-            final URI base = path.toUri();
+            // The application loader canonicalizes launch entries. Manifest URLs keep their own base.
+            final URI base = (launchEntry ? path.toRealPath() : path).toUri();
             final String[] tokens = links.trim().split("\\s+");
             for (int i = tokens.length - 1; i >= 0; i--) {
                 final Path entry = manifestEntry(base, tokens[i]);
-                if (entry != null && Files.exists(entry)) {
+                if (entry != null) {
                     pending.addFirst(entry.toString());
                 }
             }
@@ -127,11 +130,17 @@ public class ClasspathDiscoverer {
         }
     }
 
-    /** Resolves a single manifest URL and decodes it as a local file path. */
+    /** Resolves a local manifest link whose URL matches the kind of file at that path. */
     private static @Nullable Path manifestEntry(URI base, String token) {
         try {
             final URI resolved = base.resolve(token);
-            return "file".equalsIgnoreCase(resolved.getScheme()) ? Path.of(resolved) : null;
+            if (!"file".equalsIgnoreCase(resolved.getScheme())) {
+                return null;
+            }
+            final Path path = Path.of(resolved);
+            final boolean directory = resolved.getRawPath().endsWith("/");
+            final boolean matches = directory ? Files.isDirectory(path) : Files.isRegularFile(path);
+            return matches ? path : null;
         } catch (IllegalArgumentException e) {
             return null;
         }

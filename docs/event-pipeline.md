@@ -266,7 +266,7 @@ The list is what production code emits (`new EventHistory.DebugEvent(` across th
 5. **An evaluation is running on T** → return a refusal naming the evaluation. Registering a lease wakes targeted waiters for T.
 6. **A queued or processing context covers T** → wait on the session monitor before releasing any of T's holds. Publication, release, and watchdog removal of T's share wake the waiter. At the deadline, `[TIMEOUT]` identifies the context and its event thread.
 7. **Another thread's unseen stop-all covers T** → return a refusal naming the stop. This can happen after a covering context finishes processing and publishes.
-8. **First eligible release pass only** → without `threadId`, release eligible holds and retry failed releases as `jdwp_resume` does (§ 14), unless any step is pending. With `threadId=T`, release only the ordinary holds on T and skip the release when T has a pending step. Check the deadline before starting the targeted release pass and before starting each release in it. A failed attempt returns `RESUME_FAILED`, or `CLOSED` if the release reported a disconnect.
+8. **First eligible release pass only** → without `threadId`, release eligible holds and retry failed releases as `jdwp_resume` does (§ 14), unless any step is pending; the `[TIMEOUT]` reply then names the stepping threads. With `threadId=T`, release only the ordinary holds on T and skip the release when T has a pending step. Check the deadline before starting the targeted release pass and before starting each release in it. A failed attempt returns `RESUME_FAILED`, or `CLOSED` if the release reported a disconnect.
 9. **An unfiltered wait has a recovery hold** → `RESUME_FAILED` for any failed automatic release or unpaid lease debt still in the session. Automatic-release failures and new lease debt wake parked waiters.
 10. **Deadline passed** → `TIMEOUT`. Otherwise wait for the remaining time and select again.
 
@@ -385,7 +385,9 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 3. the request is stamped with the generation and recorded as T's pending step;
 4. T's ordinary holders are released with the same success checks as `releaseThread`.
 
-All three step requests exclude probe classes. A step into from application code also excludes the JDK packages, so it can land in an application callback or back in the caller. To stop inside a JDK method, set a breakpoint there. A step started inside the JDK uses only the probe exclusions. The same fallback applies when the frame view is available but its top frame cannot be read.
+All three step requests exclude probe classes. A step into from application code also excludes class names starting with `java.`, `javax.`, `jdk.`, `sun.`, or `com.sun.`. The step passes over application classes with those prefixes too. It can enter JDK packages outside them, such as `org.xml.sax`. A breakpoint in an excluded class still stops the thread.
+
+If a filtered step returns from the last application method to a JDK caller, it stays pending until the thread next runs application code, reaches another stop, or ends. If the step starts on a return instruction, such as a closing brace, and every caller matches the platform prefixes, it uses only the probe exclusions and can land in the JDK caller. A step started in a class with one of those prefixes also uses only the probe exclusions. The same fallback applies when the frame view is available but its top frame cannot be read.
 
 If a release fails, the session deletes the step request and drops its pending entry. The tool returns without waiting for a landing even when `wait=true`. The reply reports earlier successful releases and all failures. A disconnect returns `[VM_DEATH]` and directs the user to reattach.
 
@@ -395,7 +397,7 @@ The step tools return after arming by default. With `wait=true` they retain the 
 
 JDK code runs much slower while a filtered step into is pending, because the JDWP agent watches every method entry of the thread. Measured on JDK 17 and 21 with 200,000 random boxed integers: a stream sort with a reverse comparator took 15–17 s against 1–2 s for a step over, and a grouping took 7–8 s against less than 1 s.
 
-A newly armed step on the same thread replaces the pending step, and `jdwp_reset` clears it. The evaluation watchdog can cancel a queued step landing to release a monitor (§ 14). Disconnect, reconnect, or target VM exit ends the stepping session.
+A newly armed step on the same thread replaces the pending step, and `jdwp_reset` clears it. A step whose thread has ended is dropped when a wait or `heldThreads` next checks it; a wait for that step then returns `[NO_EVENT]`. The evaluation watchdog can cancel a queued step landing to release a monitor (§ 14). Disconnect, reconnect, or target VM exit ends the stepping session.
 
 Example, from stop-all hold B (every thread at count 1):
 
