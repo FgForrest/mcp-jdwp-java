@@ -25,6 +25,7 @@ import one.edee.mcp.jdwp.EvaluationRefusedException;
 import one.edee.mcp.jdwp.JDIConnectionService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -33,9 +34,14 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.net.URI;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.jar.Attributes;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -152,6 +158,67 @@ class ClasspathDiscovererTest {
         assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null).applicationClasspath())
             .containsExactly("target/classes");
         verify(application, never()).invokeMethod(any(), any(), any(), anyInt());
+    }
+
+    /** Resolves target-relative files and expands readable manifests in depth-first order. */
+    @Test
+    void expandsLocalLaunchJarsInSearchOrder(@TempDir Path root) throws Exception {
+        final Path classes = Files.createDirectory(root.resolve("classes"));
+        final Path absolute = Files.createDirectory(root.resolve("has spaces"));
+        final Path broken = Files.writeString(root.resolve("broken.jar"), "not a ZIP file");
+        final Path launch = root.resolve("launch.jar");
+        final Path child = root.resolve("child.jar");
+        writeLaunchJar(child, "launch.jar " + absolute.toUri());
+        writeLaunchJar(launch, "classes/ child.jar missing/ bad%ZZ https://example.invalid/a.jar broken.jar");
+        when(vm.baseDirectory()).thenReturn(root.toString());
+        when(vm.classPath()).thenReturn(List.of("launch.jar", child.toString(), "missing-local", "classes"));
+        final ClasspathDiscoverer discoverer = new ClasspathDiscoverer(vm, new EvaluationGuard());
+
+        final ClasspathDiscoverer.DiscoveryResult found = discoverer.discoverClasspath(thread, null, null);
+
+        assertThat(found.applicationClasspath()).containsExactly(launch.toString(), classes.toString(),
+            child.toString(), absolute.toString(), broken.toString(), "missing-local");
+        assertThat(found.problem()).isNull();
+        Files.delete(launch);
+        assertThat(discoverer.discoverClasspath(thread, null, found).applicationClasspath())
+            .containsExactlyElementsOf(found.applicationClasspath());
+        verify(vm).classPath();
+        verify(vm).baseDirectory();
+    }
+
+    /** Keeps JDWP's spelling when the target base or entry cannot be used locally. */
+    @Test
+    void keepsLaunchEntriesWhenBaseDoesNotResolveLocally(@TempDir Path root) throws Exception {
+        final List<String> entries = List.of("classes", "bad\0path");
+        when(vm.classPath()).thenReturn(entries);
+        for (final String base : List.of(root.resolve("remote").toString(), "relative", "bad\0base")) {
+            when(vm.baseDirectory()).thenReturn(base);
+            assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null)
+                .applicationClasspath()).containsExactlyElementsOf(entries);
+        }
+    }
+
+    /** Discovers a loader URL without expanding its local jar manifest. */
+    @Test
+    void expandsOnlyLaunchManifests(@TempDir Path root) throws Exception {
+        final Path loaderJar = root.resolve("loader.jar");
+        Files.createDirectory(root.resolve("classes"));
+        writeLaunchJar(loaderJar, "classes/");
+        final ClassLoaderReference loader = loader(urlLoaderType, urlLoaderType, url(loaderJar.toUri().getRawPath()));
+        when(thread.getValue(context)).thenReturn(loader);
+
+        assertThat(new ClasspathDiscoverer(vm, new EvaluationGuard()).discoverClasspath(thread, null, null)
+            .applicationClasspath()).containsExactly(loaderJar.toString());
+    }
+
+    /** Creates a real jar with the supplied manifest search path. */
+    static void writeLaunchJar(Path jar, String classPath) throws Exception {
+        final Manifest manifest = new Manifest();
+        manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, classPath);
+        try (final JarOutputStream output = new JarOutputStream(Files.newOutputStream(jar), manifest)) {
+            output.flush();
+        }
     }
 
     /** Reads the parent and never invokes a matching helper on a non-URL loader. */

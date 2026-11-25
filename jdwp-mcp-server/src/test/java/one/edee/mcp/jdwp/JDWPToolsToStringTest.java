@@ -417,7 +417,7 @@ class JDWPToolsToStringTest {
 	 * invoked on — the `notify()` that would wake it cannot fire while all threads are suspended.
 	 */
 	@Test
-	@DisplayName("refuses invocation when thread is inside Object.wait() (would hang)")
+	@DisplayName("refuses invocation on a waiting or parked thread")
 	void shouldRefuseWhenThreadIsInsideObjectWait() throws Exception {
 		final ObjectReference obj = mock(ObjectReference.class);
 		final ThreadReference thread = mock(ThreadReference.class);
@@ -431,7 +431,8 @@ class JDWPToolsToStringTest {
 
 		final String out = tools.jdwp_to_string(42L, 8L);
 
-		assertThat(out).startsWith("Error: Thread 'T-waiter' (#8) is inside Object.wait()");
+		assertThat(out).startsWith("Error: Thread 'T-waiter' (#8) is waiting (Object.wait or a park)")
+			.contains("invokeMethod can hang", "notify or unpark");
 		assertThat(out).contains("jdwp_get_stack(8)");
 		verify(obj, never()).invokeMethod(any(), any(), any(), anyInt());
 	}

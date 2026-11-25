@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.BooleanValue;
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.PathSearchingVirtualMachine;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.tools.ToolProvider;
@@ -37,10 +39,14 @@ import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
+import java.util.jar.Attributes;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -53,6 +59,155 @@ class ClasspathDiscoveryLiveTest {
     private static final Command CLASS_INVOKE = new Command(3, 3);
     /** JDWP ObjectReference.InvokeMethod. */
     private static final Command OBJECT_INVOKE = new Command(9, 6);
+    /** JDWP VirtualMachine.ClassPaths. */
+    private static final Command CLASS_PATHS = new Command(1, 13);
+
+    /** Compiles against target-only classes and measures a large launch classpath's first read. */
+    @ParameterizedTest
+    @ValueSource(strings = {"manifest", "relative", "400 jars"})
+    void compilesAgainstLocalLaunchPaths(String mode, @TempDir Path targetDirectory) throws Exception {
+        final Path classes = Files.createDirectory(targetDirectory.resolve("launch classes"));
+        final Path main = Files.writeString(targetDirectory.resolve("Main.java"), """
+            package launchfixture;
+            public class Main {
+                public static void main(String[] args) { stop(); }
+                public static void stop() {}
+            }
+            """);
+        final Path dependency = Files.writeString(targetDirectory.resolve("Dependency.java"), """
+            package launchfixture;
+            public class Dependency { public static int answer() { return 42; } }
+            """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", classes.toString(), main.toString(), dependency.toString())).isZero();
+        final List<String> launch;
+        final List<String> expected = new ArrayList<>();
+        if (mode.equals("manifest")) {
+            final Manifest manifest = new Manifest();
+            manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+            manifest.getMainAttributes().put(Attributes.Name.MAIN_CLASS, "launchfixture.Main");
+            manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, "launch%20classes/");
+            final Path jar = targetDirectory.resolve("launch.jar");
+            try (final JarOutputStream output = new JarOutputStream(Files.newOutputStream(jar), manifest)) {
+                output.flush();
+            }
+            launch = List.of("-jar", jar.toString());
+            expected.add(jar.toString());
+            expected.add(classes.toString());
+        } else {
+            final List<String> relative = new ArrayList<>(List.of("launch classes"));
+            expected.add(classes.toString());
+            if (mode.equals("400 jars")) {
+                for (int i = 0; i < 400; i++) {
+                    final String name = "dependency-" + i + ".jar";
+                    final Path jar = targetDirectory.resolve(name);
+                    ClasspathDiscovererTest.writeLaunchJar(jar, "");
+                    relative.add(name);
+                    expected.add(jar.toString());
+                }
+            }
+            launch = List.of("-cp", String.join(File.pathSeparator, relative), "launchfixture.Main");
+        }
+        assertThat(Path.of("").toAbsolutePath()).isNotEqualTo(targetDirectory);
+        for (final Path javaHome : InterpreterTargetVm.javaHomes()) {
+            try (final InterpreterTargetVm target = InterpreterTargetVm.startIn(javaHome, targetDirectory, launch);
+                 final CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+                withTarget(wire, "launchfixture.Main", mode, "stop", EventRequest.SUSPEND_EVENT_THREAD,
+                    (vm, tracker, history, router, connection, session, type) -> {
+                        final ThreadReference thread = waitForStop(session).thread();
+                        final Map<Command, Long> before = wire.snapshot();
+                        final long start = System.nanoTime();
+                        final String discovered = connection.discoverClasspath(thread);
+                        final long elapsed = System.nanoTime() - start;
+                        final Map<Command, Long> after = wire.snapshot();
+                        assertThat(((PathSearchingVirtualMachine) vm).baseDirectory()).isEqualTo(targetDirectory.toString());
+                        assertThat(wire.snapshot()).isEqualTo(after);
+                        System.out.printf("JDK %s, %s: first classpath discovery %.3f ms, %d packets%n",
+                            vm.version(), mode, elapsed / 1_000_000.0, packets(after) - packets(before));
+                        assertThat(after.getOrDefault(CLASS_PATHS, 0L)).isEqualTo(1L);
+                        assertThat(invocations(before, after)).isZero();
+                        assertThat(router.evaluateEvent("java.util.stream.IntStream.of(1).map(i -> "
+                            + "launchfixture.Dependency.answer()).sum()", thread, Map.of(), connection::formatFieldValue))
+                            .isEqualTo("42");
+                        assertThat(discovered).isEqualTo(String.join(File.pathSeparator, expected));
+                        assertThat(wire.snapshot().getOrDefault(CLASS_PATHS, 0L)).isEqualTo(1L);
+                    });
+            }
+        }
+    }
+
+    /** Compares manifest URL resolution with the target's application loader. */
+    @ParameterizedTest
+    @MethodSource("one.edee.mcp.jdwp.evaluation.InterpreterTargetVm#javaHomes")
+    void followsManifestUrlsLikeTheApplicationLoader(Path javaHome, @TempDir Path root) throws Exception {
+        final Path real = Files.createDirectory(root.resolve("real"));
+        final Path classes = Files.createDirectory(root.resolve("classes"));
+        final Path realChoice = Files.createDirectory(real.resolve("choice"));
+        final Path linkChoice = Files.createDirectory(root.resolve("choice"));
+        final Path main = Files.writeString(root.resolve("Main.java"), """
+            package launchfixture;
+            public class Main {
+                public static void main(String[] args) throws Exception {
+                    stop(Class.forName("launchfixture.Dependency").getField("NUMBER").getInt(null));
+                }
+                public static void stop(int actual) {}
+            }
+            """);
+        final Path dependency = root.resolve("Dependency.java");
+        Files.writeString(dependency, """
+            package launchfixture;
+            public class Dependency { public static final int NUMBER = 42; }
+            """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", classes.toString(), main.toString(), dependency.toString())).isZero();
+        final Path packagePath = Path.of("launchfixture", "Dependency.class");
+        Files.copy(classes.resolve(packagePath), Files.createDirectories(realChoice.resolve("launchfixture"))
+            .resolve("Dependency.class"));
+        Files.writeString(dependency, """
+            package launchfixture;
+            public class Dependency { public static final int NUMBER = 99; }
+            """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "17",
+            "-d", linkChoice.toString(), dependency.toString())).isZero();
+
+        final Path aliased = real.resolve("actual.jar");
+        ClasspathDiscovererTest.writeLaunchJar(aliased, "choice/");
+        final Path alias = Files.createSymbolicLink(root.resolve("alias.jar"), aliased);
+        final Path ordinary = root.resolve("ordinary.jar");
+        ClasspathDiscovererTest.writeLaunchJar(ordinary, "choice other.jar/");
+        ClasspathDiscovererTest.writeLaunchJar(root.resolve("other.jar"), "choice/");
+        final Path parent = root.resolve("parent.jar");
+        ClasspathDiscovererTest.writeLaunchJar(parent, "alias.jar");
+
+        final SoftAssertions checks = new SoftAssertions();
+        for (final Path jar : List.of(ordinary, alias, parent)) {
+            final List<String> launch = List.of("-cp", jar + File.pathSeparator + classes, "launchfixture.Main");
+            try (final InterpreterTargetVm target = InterpreterTargetVm.startIn(javaHome, root, launch);
+                 final CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+                withTarget(wire, "launchfixture.Main", "", "stop", EventRequest.SUSPEND_EVENT_THREAD,
+                    (vm, tracker, history, router, connection, session, type) -> {
+                        final ThreadReference thread = waitForStop(session).thread();
+                        final String actual = thread.frame(0).getArgumentValues().get(0).toString();
+                        final List<Path> expected;
+                        if (jar.equals(ordinary)) {
+                            expected = List.of(ordinary, classes);
+                        } else if (jar.equals(alias)) {
+                            expected = List.of(alias, realChoice, classes);
+                        } else {
+                            expected = List.of(parent, alias, linkChoice, classes);
+                        }
+                        checks.assertThat(actual).as("target value from %s", jar.getFileName())
+                            .isEqualTo(jar.equals(parent) ? "99" : "42");
+                        checks.assertThat(connection.discoverClasspath(thread)).as("classpath for %s", jar.getFileName())
+                            .isEqualTo(String.join(File.pathSeparator, expected.stream().map(Path::toString).toList()));
+                        checks.assertThat(router.evaluateEvent("java.util.stream.IntStream.of(0).map(i -> "
+                            + "launchfixture.Dependency.NUMBER).sum()", thread, Map.of(), connection::formatFieldValue))
+                            .as("compiled value from %s", jar.getFileName()).isEqualTo(actual);
+                    });
+            }
+        }
+        checks.assertAll();
+    }
 
     /** Checks the captured legacy classpath, lazy discovery, and the stop-to-result packet budget. */
     @Test
@@ -284,43 +439,49 @@ class ClasspathDiscoveryLiveTest {
     /** Attaches the counting transport and starts the dispatcher at a prepared breakpoint. */
     private static void withTarget(Path javaHome, String mode, String classpath, String stopMethod, int policy,
                                    Check check) throws Exception {
-        try (InterpreterTargetVm target = InterpreterTargetVm.startClass(javaHome, ClasspathTarget.class,
+        try (final InterpreterTargetVm target = InterpreterTargetVm.startClass(javaHome, ClasspathTarget.class,
                  mode, classpath);
-             CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
-            final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
-            final BreakpointTracker tracker = new BreakpointTracker();
-            final EventHistory history = new EventHistory();
-            final EvaluationGuard guard = new EvaluationGuard();
-            final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, guard);
-            final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection,
-                guard, InterpreterHarnessLiveTest.noLocalClasspath());
-            final EvaluationRouter router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
-            final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard,
-                null, new MarkedInstanceRegistry(), router);
+             final CountingJdwpConnection wire = CountingJdwpConnection.attach(target.port())) {
+            withTarget(wire, ClasspathTarget.class.getName(), mode, stopMethod, policy, check);
+        }
+    }
+
+    /** Runs the dispatcher against a target with a caller-supplied Java launch. */
+    private static void withTarget(CountingJdwpConnection wire, String mainClass, String mode, String stopMethod,
+                                   int policy, Check check) throws Exception {
+        final VirtualMachine vm = Bootstrap.virtualMachineManager().createVirtualMachine(wire);
+        final BreakpointTracker tracker = new BreakpointTracker();
+        final EventHistory history = new EventHistory();
+        final EvaluationGuard guard = new EvaluationGuard();
+        final JDIConnectionService connection = InterpreterHarnessLiveTest.connectionFor(vm, guard);
+        final JdiExpressionEvaluator evaluator = new JdiExpressionEvaluator(new InMemoryJavaCompiler(), connection,
+            guard, InterpreterHarnessLiveTest.noLocalClasspath());
+        final EvaluationRouter router = new EvaluationRouter(evaluator, EvaluationRouter.Mode.COMPILER);
+        final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard,
+            null, new MarkedInstanceRegistry(), router);
+        try {
+            // Pause at class preparation so the breakpoint is armed before fixture code runs.
+            final ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
+            prepare.addClassFilter(mainClass);
+            prepare.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            prepare.enable();
+            Objects.requireNonNull(vm.eventQueue().remove(15_000)).resume();
+            final EventSet prepared = Objects.requireNonNull(vm.eventQueue().remove(15_000));
+            final ReferenceType type = ((ClassPrepareEvent) prepared.iterator().next()).referenceType();
+            vm.eventRequestManager().deleteEventRequest(prepare);
+            final int first = arm(vm, tracker, type, stopMethod, policy);
+            if (mode.equals("private-accessor") || mode.equals("blocking-context-getter")) {
+                tracker.setCondition(first, "java.lang.Integer.parseInt(\"1\") == 1");
+            }
+            listener.start(vm);
+            final SuspensionSession session = Objects.requireNonNull(tracker.suspensionSession());
+            prepared.resume();
+            check.run(vm, tracker, history, router, connection, session, type);
+        } finally {
             try {
-                // Pause at class preparation so the breakpoint is armed before fixture code runs.
-                final ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
-                prepare.addClassFilter(ClasspathTarget.class.getName());
-                prepare.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-                prepare.enable();
-                Objects.requireNonNull(vm.eventQueue().remove(15_000)).resume();
-                final EventSet prepared = Objects.requireNonNull(vm.eventQueue().remove(15_000));
-                final ReferenceType type = ((ClassPrepareEvent) prepared.iterator().next()).referenceType();
-                vm.eventRequestManager().deleteEventRequest(prepare);
-                final int first = arm(vm, tracker, type, stopMethod, policy);
-                if (mode.equals("private-accessor") || mode.equals("blocking-context-getter")) {
-                    tracker.setCondition(first, "java.lang.Integer.parseInt(\"1\") == 1");
-                }
-                listener.start(vm);
-                final SuspensionSession session = Objects.requireNonNull(tracker.suspensionSession());
-                prepared.resume();
-                check.run(vm, tracker, history, router, connection, session, type);
+                vm.dispose();
             } finally {
-                try {
-                    vm.dispose();
-                } finally {
-                    listener.stop();
-                }
+                listener.stop();
             }
         }
     }

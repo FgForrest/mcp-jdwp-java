@@ -20,13 +20,9 @@ import static org.mockito.Mockito.when;
  * Guards the not-suspended error path of the read-only inspection tools
  * ({@link JDWPTools#jdwp_get_stack}, {@link JDWPTools#jdwp_get_locals}).
  *
- * <p>Regression context (issue #22): a thread blocked on a Java monitor
- * ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside {@code Object.wait()}
- * ({@link ThreadReference#THREAD_STATUS_WAIT}) but not JDI-suspended — the deadlock case — will
- * never stop at a breakpoint on its own. The old {@code get_stack} message ("must be stopped at a
- * breakpoint") was a dead end, and {@code get_locals} had no suspend check at all and leaked the
- * raw {@code IncompatibleThreadStateException}. Both must now point the caller at
- * {@code jdwp_suspend_thread(threadId)} — the actual deadlock-inspection path.
+ * <p>A monitor-blocked or waiting thread can only reach a breakpoint after it makes progress.
+ * Both inspection tools point callers to {@code jdwp_suspend_thread(threadId)} to see its frames
+ * immediately. The monitor-blocked message also identifies the deadlock-inspection path.
  */
 @DisplayName("get_stack / get_locals — not-suspended inspection guard")
 class JDWPToolsInspectSuspensionGuardTest {
@@ -73,12 +69,13 @@ class JDWPToolsInspectSuspensionGuardTest {
 
 			assertThat(result)
 				.contains("jdwp_suspend_thread(2644)")
+				.contains("until it gets the monitor")
 				.contains("deadlock-inspection path")
 				.doesNotContain("must be stopped at a breakpoint");
 		}
 
 		@Test
-		@DisplayName("a WAIT (Object.wait) not-suspended thread is pointed at jdwp_suspend_thread")
+		@DisplayName("a WAIT thread, including a parked thread, is pointed at jdwp_suspend_thread")
 		void shouldPointWaitingThreadAtSuspendThread() throws Exception {
 			final ThreadReference thread = notSuspendedThread(
 				7L, "consumer", ThreadReference.THREAD_STATUS_WAIT);
@@ -89,7 +86,8 @@ class JDWPToolsInspectSuspensionGuardTest {
 
 			assertThat(result)
 				.contains("jdwp_suspend_thread(7)")
-				.contains("Object.wait()");
+				.contains("waiting (Object.wait or a park)", "until it wakes up")
+				.doesNotContain("deadlock-inspection path");
 		}
 
 		@Test

@@ -430,12 +430,10 @@ public class JDWPTools {
     }
 
     /**
-     * Pre-flight check before any JDI {@code invokeMethod} call: a thread that is JDI-suspended on
-     * top of a Java-level monitor block ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside
-     * {@code Object.wait()} ({@link ThreadReference#THREAD_STATUS_WAIT}) cannot make progress when
-     * single-threaded resumed for an invocation — the lock it needs is held by another suspended
-     * thread, or the {@code notify()} that would wake it can never fire. JDI's {@code invokeMethod}
-     * has no timeout, so an invocation on such a thread hangs the MCP server indefinitely.
+     * Checks whether a single-threaded JDI {@code invokeMethod} can hang. A thread blocked on a
+     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) needs its owner to release it.
+     * A waiting thread ({@link ThreadReference#THREAD_STATUS_WAIT}) may need another thread to
+     * notify or unpark it. The invocation keeps the other threads suspended.
      * <p>
      * Returns an error message naming the contending state and recommending the safe alternative
      * ({@code jdwp_get_stack} / {@code jdwp_get_threads}) when the thread is unsafe to invoke on;
@@ -454,8 +452,8 @@ public class JDWPTools {
         }
         if (status == ThreadReference.THREAD_STATUS_WAIT) {
             return String.format(
-                "Error: Thread '%s' (#%d) is inside Object.wait() — invokeMethod would hang because "
-                + "the notify() that would wake it cannot fire while all threads are suspended. "
+                "Error: Thread '%s' (#%d) is waiting (Object.wait or a park). invokeMethod can hang because "
+                + "nothing can notify or unpark it while the other threads are suspended. "
                 + "Use jdwp_get_stack(%d) to inspect, or pick a different thread (any RUNNING-then-"
                 + "suspended thread is safe to invoke on).",
                 thread.name(), thread.uniqueID(), thread.uniqueID());
@@ -465,13 +463,11 @@ public class JDWPTools {
 
     /**
      * Builds the error returned when a thread the caller wants to <em>inspect</em>
-     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A thread parked on a
-     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside {@code Object.wait()}
-     * ({@link ThreadReference#THREAD_STATUS_WAIT}) — the deadlock case — will never stop at a
-     * breakpoint on its own, so the bare "stop it at a breakpoint" advice is a dead end for exactly
-     * the situation where reading the stack matters most. Point at {@code jdwp_suspend_thread}, which
-     * freezes the thread where it stands so its frames and locals become readable. For any other
-     * not-suspended status fall back to the same freeze-it advice alongside the breakpoint hint.
+     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A monitor-blocked
+     * thread can reach a breakpoint once it gets the monitor. A thread in
+     * {@link ThreadReference#THREAD_STATUS_WAIT} cannot reach one until it wakes up.
+     * {@code jdwp_suspend_thread} freezes either thread where it stands so its frames and locals
+     * become readable. For other statuses, include the option to stop at a breakpoint.
      *
      * <p>This is for read-only inspection only. {@code jdwp_suspend_thread} makes a MONITOR/WAIT
      * thread's frames inspectable, but it does <em>not</em> make {@code invokeMethod}-based tools
@@ -480,15 +476,19 @@ public class JDWPTools {
     private static String notSuspendedForInspection(ThreadReference thread) {
         final int status = thread.status();
         final long id = thread.uniqueID();
-        if (status == ThreadReference.THREAD_STATUS_MONITOR || status == ThreadReference.THREAD_STATUS_WAIT) {
-            final String parked = status == ThreadReference.THREAD_STATUS_MONITOR
-                ? "blocked on a Java monitor"
-                : "inside Object.wait()";
+        if (status == ThreadReference.THREAD_STATUS_MONITOR) {
             return String.format(
-                "Error: Thread '%s' (#%d) is %s but not JDI-suspended — it will never stop at a "
-                + "breakpoint on its own, so it cannot be inspected as-is. Call jdwp_suspend_thread(%d) "
+                "Error: Thread '%s' (#%d) is blocked on a Java monitor and is not JDI-suspended. "
+                + "It cannot reach a breakpoint until it gets the monitor. Call jdwp_suspend_thread(%d) "
                 + "to freeze it where it stands, then retry. This is the deadlock-inspection path.",
-                thread.name(), id, parked, id);
+                thread.name(), id, id);
+        }
+        if (status == ThreadReference.THREAD_STATUS_WAIT) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is waiting (Object.wait or a park) and is not JDI-suspended. "
+                + "It cannot reach a breakpoint until it wakes up. "
+                + "Call jdwp_suspend_thread(%d) to freeze it where it stands, then retry.",
+                thread.name(), id, id);
         }
         return String.format(
             "Error: Thread '%s' (#%d) is not suspended (status %s). Stop it at a breakpoint, or call "
@@ -1834,7 +1834,8 @@ public class JDWPTools {
                 final String envelope = stepTool == null ? renderSoftWaitEnvelope("jdwp_resume_until_event", deadlineMs)
                     : renderSoftWaitEnvelope(stepTool, deadlineMs, "call jdwp_resume_until_event(threadId=" + threadId
                         + ") to continue waiting for the pending step");
-                yield envelope + "\n\n" + timeoutDiagnostics(deadlineMs, threadId, next.pendingContext()) + suffix;
+                yield envelope + "\n\n" + timeoutDiagnostics(deadlineMs, threadId, next.pendingContext()) + suffix
+                    + next.skippedStepRelease();
             }
             case CLOSED -> renderWaitVmDeath(session, report) + releasedBeforeWait(next, threadId, true);
             case RESUME_FAILED -> {
@@ -2996,9 +2997,9 @@ public class JDWPTools {
         return jdwp_step_into(threadId, null);
     }
 
-    @McpTool(description = "Step into a method call (resumes the thread; JDI fires a STEP event on the first line of the callee). " +
-        "Thread must be suspended. Pass wait=true to block until the step lands, or call jdwp_resume_until_event(threadId) after it. " +
-        "Most useful when polymorphic dispatch is unclear and you can't tell from source which override will actually run.")
+    @McpTool(description = "Step into a method call. Thread must be suspended. From application code the step passes over the JDK: " +
+        "it can land in an application method the line calls or on the next line. To stop inside a JDK method, set a breakpoint in it. " +
+        "Pass wait=true to block until it lands, or call jdwp_resume_until_event(threadId) after it.")
     public String jdwp_step_into(
         @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the current stop's thread.") @Nullable Long threadId,
         @McpToolParam(required = false, description = WAIT_FOR_STEP_DESCRIPTION) @Nullable Boolean wait) {
@@ -3143,14 +3144,25 @@ public class JDWPTools {
             // stepped FROM. Helps the agent verify they're at the expected line without an
             // extra get_breakpoint_context call.
             String startLocation = "";
+            final List<String> jdkExclusions = new ArrayList<>();
             try {
-                if (view.count() > 0) {
+                final int frameCount = view.count();
+                if (frameCount > 0) {
                     final com.sun.jdi.Location loc = view.frame(0).location();
-                    startLocation = String.format(" from %s:%d",
-                        loc.declaringType().name(), loc.lineNumber());
+                    final String startClass = loc.declaringType().name();
+                    startLocation = String.format(" from %s:%d", startClass, loc.lineNumber());
+                    if (stepDepth == StepRequest.STEP_INTO && !isPlatformClassName(startClass)) {
+                        for (final String prefix : PLATFORM_PACKAGE_PREFIXES) {
+                            jdkExclusions.add(prefix + "*");
+                        }
+                        if (returnsToPlatform(loc, view, frameCount)) {
+                            jdkExclusions.clear();
+                        }
+                    }
                 }
             } catch (Exception ignore) {
-                // Best-effort — fall back to unannotated message.
+                // Without a readable start the step stays unfiltered, in case it starts in the JDK. Filters
+                // already chosen stay if the bytecode or a caller cannot be read.
             }
             final String fastStopNote = view.isFastStop()
                 ? " From a fast breakpoint's stop every kind of step first lands on the stop line, before its code."
@@ -3178,6 +3190,9 @@ public class JDWPTools {
                     // restarted by the JDWP agent and must not use up the count.
                     for (String probeClass : probeClasses) {
                         stepRequest.addClassExclusionFilter(probeClass);
+                    }
+                    for (final String exclusion : jdkExclusions) {
+                        stepRequest.addClassExclusionFilter(exclusion);
                     }
                     stepRequest.addCountFilter(1);
                     stepRequest.enable();
@@ -3211,8 +3226,20 @@ public class JDWPTools {
             try {
                 final SuspensionSession.NextStop next =
                     session.awaitStepStop(DEFAULT_STOP_WAIT_MS, java.util.Objects.requireNonNull(step.armed()));
+                final StringBuilder timeoutAdvice = new StringBuilder();
+                if (next.outcome() == SuspensionSession.Outcome.TIMEOUT) {
+                    if (session.hasPresentedStopAll()) {
+                        timeoutAdvice.append("\nPresented stop-alls still cover other threads. "
+                            + "jdwp_resume releases them, and the step stays armed.");
+                    }
+                    if (!jdkExclusions.isEmpty()) {
+                        timeoutAdvice.append("\nThe step may be passing JDK code, which runs slowly while the step is pending or may be blocking. "
+                            + "The thread may also have returned from the last application method to its JDK caller. "
+                            + "A breakpoint in the method of interest is quicker.");
+                    }
+                }
                 return reply + fastStopNote + "\n" + renderNextStop(session, next, DEFAULT_STOP_WAIT_MS, id,
-                    "jdwp_step_" + label);
+                    "jdwp_step_" + label) + timeoutAdvice;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return reply + fastStopNote + "\nWait interrupted";
@@ -3220,6 +3247,29 @@ public class JDWPTools {
         } catch (Exception e) {
             return errorReply(e);
         }
+    }
+
+    /** Checks for a return instruction with only platform classes below the current frame. */
+    private static boolean returnsToPlatform(com.sun.jdi.Location location, FrameView view, int frameCount)
+        throws IncompatibleThreadStateException {
+        final long index = location.codeIndex();
+        if (index < 0) {
+            return false;
+        }
+        final byte[] bytecodes = location.method().bytecodes();
+        if (index >= bytecodes.length) {
+            return false;
+        }
+        final int opcode = Byte.toUnsignedInt(bytecodes[(int) index]);
+        if (opcode < 0xAC || opcode > 0xB1) {
+            return false;
+        }
+        for (int i = 1; i < frameCount; i++) {
+            if (!isPlatformClassName(view.frame(i).location().declaringType().name())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Reports confirmed releases and failures using the thread identity read before attempting the releases. */

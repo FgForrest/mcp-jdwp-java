@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import one.edee.mcp.jdwp.evaluation.fixture.InterpreterTarget;
+import org.jspecify.annotations.Nullable;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -49,13 +50,21 @@ record InterpreterTargetVm(Process process, int port) implements AutoCloseable {
                                                List<String> arguments) throws Exception {
         final String classpath = Path.of(mainClass.getProtectionDomain().getCodeSource()
             .getLocation().toURI()).toString();
+        final List<String> launchArguments = new ArrayList<>(options);
+        launchArguments.addAll(List.of("-cp", classpath, mainClass.getName()));
+        launchArguments.addAll(arguments);
+        return startIn(javaHome, null, launchArguments);
+    }
+
+    /** Starts a fixture with the supplied Java launch arguments and optional working directory. */
+    static InterpreterTargetVm startIn(Path javaHome, @Nullable Path directory, List<String> launchArguments)
+        throws Exception {
         final List<String> command = new ArrayList<>(List.of(
             javaHome.resolve("bin/java").toString(),
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0"));
-        command.addAll(options);
-        command.addAll(List.of("-cp", classpath, mainClass.getName()));
-        command.addAll(arguments);
-        final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        command.addAll(launchArguments);
+        final Process process = new ProcessBuilder(command).directory(directory == null ? null : directory.toFile())
+            .redirectErrorStream(true).start();
 
         final CompletableFuture<Integer> port = new CompletableFuture<>();
         // Keep draining output after startup so a full pipe cannot block the fixture.

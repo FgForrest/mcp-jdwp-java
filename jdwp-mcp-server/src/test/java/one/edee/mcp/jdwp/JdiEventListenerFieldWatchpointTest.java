@@ -25,6 +25,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.util.Map;
+
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockEventSet;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.mockThread;
 import static one.edee.mcp.jdwp.JdiEventListenerTestSupport.runListenerWith;
@@ -329,6 +331,10 @@ class JdiEventListenerFieldWatchpointTest {
 
 		AccessWatchpointEvent event = mockAccessEvent(thread, req, "com.Foo", "session",
 			mockIntValue(1));
+		wireFiringMethod(event, "read", false, false);
+		final ReferenceType owner = event.field().declaringType();
+		when(event.location().declaringType()).thenReturn(owner);
+		when(event.location().lineNumber()).thenReturn(12);
 		EventSet eventSet = mockEventSet(event);
 
 		runListenerWith(listener, eventSet);
@@ -337,11 +343,44 @@ class JdiEventListenerFieldWatchpointTest {
 		assertThat(hasEventOfType("FIELD_LOGPOINT_ERROR")).isTrue();
 		assertThat(hasEventOfType("FIELD_LOGPOINT")).isFalse();
 		EventHistory.DebugEvent errEntry = firstEventOfType("FIELD_LOGPOINT_ERROR");
+		assertThat(errEntry.summary()).isEqualTo("Field com.Foo.session access on thread worker-log-err "
+			+ "at Foo.read:12: reads 1 — error evaluating 'broken.expr()': compile failure");
 		assertThat(errEntry.details())
 			.containsEntry("breakpointId", String.valueOf(bpId))
 			.containsEntry("field", "session")
+			.containsEntry("mode", "access")
+			.containsEntry("thread", "worker-log-err")
+			.containsEntry("location", "Foo.read:12")
 			.containsEntry("expression", "broken.expr()");
 		assertThat(errEntry.details().get("error")).contains("compile failure");
+	}
+
+	/** Records the write even when constructing a synthetic binding fails. */
+	@Test
+	void shouldRecordSiteAndValuesWhenFieldBindingsFail() throws Exception {
+		final ModificationWatchpointRequest request = mock(ModificationWatchpointRequest.class);
+		final int id = tracker.registerFieldBreakpoint(BreakpointTracker.FieldBreakpointSpec.logOnly(
+			"com.Bank", "balance", BreakpointTracker.FieldWatchMode.MODIFICATION,
+			"$newValue", null, null, null), null, request);
+		final ThreadReference thread = mockThread("writer", 4011L);
+		final ModificationWatchpointEvent event = mockModificationEvent(thread, request, "com.Bank", "balance",
+			mockIntValue(3), mockIntValue(5));
+		wireFiringMethod(event, "deposit", false, false);
+		final ReferenceType owner = event.field().declaringType();
+		when(event.location().declaringType()).thenReturn(owner);
+		when(event.location().lineNumber()).thenReturn(27);
+		when(event.virtualMachine().mirrorOf("balance")).thenThrow(new IllegalStateException("mirror failed"));
+		final EventSet set = mockEventSet(event);
+
+		runListenerWith(listener, set);
+
+		verify(set).resume();
+		final EventHistory.DebugEvent error = firstEventOfType("FIELD_LOGPOINT_ERROR");
+		assertThat(error.summary()).isEqualTo("Field com.Bank.balance modification on thread writer "
+			+ "at Bank.deposit:27: 3 -> 5 — its bindings could not be built: mirror failed");
+		assertThat(error.details()).containsExactlyInAnyOrderEntriesOf(Map.of(
+			"breakpointId", String.valueOf(id), "class", "com.Bank", "field", "balance",
+			"mode", "modification", "thread", "writer", "location", "Bank.deposit:27", "error", "mirror failed"));
 	}
 
 	@Test

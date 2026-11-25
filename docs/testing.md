@@ -13,15 +13,17 @@ There are four logical tiers of tests, all running under JUnit 5:
 | **In-process integration** | `InMemoryJavaCompilerPackageIntegrationTest` (`evaluation/InMemoryJavaCompilerPackageIntegrationTest.java:36`), `JdwpHandshakeProbeTest`, `JvmDiscoveryServiceConfirmAllTest` | Runs real Eclipse JDT against a tiny in-process classpath, or talks to a `FakeJdwpServer` over a loopback socket. |
 | **Sandbox** | The `jdwp-sandbox/` module | Deliberately broken classes designed to fail under JDWP. Skipped by default. |
 
-**No test forks a real Java process or attaches to a real JDWP port.** `ripgrep`-ing the test sources shows zero uses of `ProcessBuilder` or `AttachingConnector.attach`. The closest thing to "real network" is `FakeJdwpServer` — an in-process loopback `ServerSocket` that returns the 14-byte JDWP handshake.
+The default test run uses mocks and in-process fixtures such as `FakeJdwpServer`. The opt-in live suites below fork real JVMs and attach over JDWP. The sandbox supports manual verification. See § 4.
 
-Live-JVM verification is done **manually** via the sandbox module, not automatically in CI. See § 4.
+`evaluation/ClasspathDiscovererTest` uses mocked JDI loader chains and real local launch jars. `RemoteCodeExecutorPinningTest` and `RemoteCodeExecutorTargetExceptionTest` check mirror pinning and target exception reporting with mocked JDI.
 
 **Opt-in exceptions.** `fastlogpoint/FastLogpointLiveTest` forks a JVM with a JDWP agent and attaches, because bytecode redefinition, breakpoint re-creation and the live-bytecode guard cannot be faked with mocks. It is skipped unless `-Djdwp.live=true` is set, so CI never runs it. Run it with `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastLogpointLiveTest`; add `-Djdwp.live.jacocoAgent=<path to org.jacoco.agent-<version>-runtime.jar>` to also check that arming is refused for a JaCoCo-instrumented class. It prints the per-hit cost of a fast logpoint against `jdwp_set_logpoint`.
 
 `fastlogpoint/FastBreakpointLiveTest` does the same for fast breakpoints: stops in both modes and policies, condition errors, capture values and failures on arming and probe stops, receiver binding in interface default methods, overview while an arming capture is pending, capture truncation, capture at a co-located stop, capture across target garbage collection, stopping with a capture compiler error, recovery and restoration of capture probes, inspection and steps at the user's frame, evaluations that overlap a stop-all, a clear while a thread is stopped in the method (the restore waits for its release, also for two entries in one class), and watchers by fast-breakpoint ID. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=FastBreakpointLiveTest`.
 
 `fastlogpoint/SuspensionOwnershipLiveTest` drives suspension ownership (issue #45) against the same forked target (`LiveSession`, fixture `FastLogpointTarget`): its `lock-holder` thread holds `FastLogpointTarget.LOCK`, so an evaluation can be made to wait on a monitor whose owner a stop-all parks. It checks that the watchdog frees a dispatcher evaluation stuck behind a queued stop-all, and that `jdwp_resume` releases only the stop it holds; and, for #47 § 4, `jdwp_reset` during an evaluation, a fast logpoint and a fast breakpoint armed by one hit, a stop-all released while its evaluation outlives the tool's wait, a queued thread stop the watchdog cancels followed by a new stop of that thread, and a disconnect during an evaluation that does not return — each ending with every count at 0 and the workers making progress. Same opt-in: `mvn -pl jdwp-mcp-server test -Djdwp.live=true -Dtest=SuspensionOwnershipLiveTest`.
+
+`evaluation/ClasspathDiscoveryLiveTest` checks loader chains and compiled evaluations using manifest-only and relative launch classpaths. It counts JDWP commands and measures first-use discovery on a 400-jar classpath. `evaluation/ConcurrentMapLiveTest` inspects regular, treeified, empty, large and actively resizing maps. Set `-Djdwp.live.target.java.home` to a comma-separated list of JDK homes to run these fixtures on multiple JDKs.
 
 ## 2. Mocking JDI
 
@@ -121,7 +123,7 @@ The property-not-surefire-config distinction matters: it survives surefire upgra
 ## 5. Test-naming conventions
 
 - **`XxxTest`** — standard unit / mock test. The default.
-- **`XxxLiveTest`** — exercises a real production code path with a hand-built mock object graph (e.g. `JDIConnectionServiceCollectionViewLiveTest.java:47-233` builds a fake HashMap from `mock(ObjectReference.class)`). Despite the name, **there is no real JVM** — except in the opt-in `fastlogpoint/FastLogpointLiveTest` and `SuspensionOwnershipLiveTest` (§ 1). "Live" means "exercising the live production code path against realistic mock state". A misleading name, but the convention is what it is.
+- **`XxxLiveTest`** is the suffix for opt-in forked-JVM tests and some older mocked tests, such as `JDIConnectionServiceCollectionViewLiveTest`. The forked tests use `jdwp.live` to opt in.
 - **`XxxChainTest`** — tests for the breakpoint-chaining feature (`BreakpointTrackerChainTest`, `JdiEventListenerChainTest`).
 - **`XxxIntegrationTest`** — single example, `InMemoryJavaCompilerPackageIntegrationTest`. Actually invokes ECJ for end-to-end compilation. New tests that genuinely cross a real boundary should follow this name.
 - **`XxxTestSupport`** — shared scaffolding / factories. Package-private, `final` with private constructor.
@@ -148,10 +150,9 @@ The `jdwp-sandbox` module is intentionally **not** `@NullMarked` — its classes
 
 Some areas are deliberately under-covered:
 
-- **No automated live-JVM coverage in CI.** The full `JDIConnectionService.connect()` path, the JDI event-queue drainer against real JDI, and `RemoteCodeExecutor.defineClass()` injection are never exercised against a real target VM in CI. Verification is the sandbox — manual.
+- **No automated live-JVM coverage in CI.** The opt-in suites exercise real JDWP attachment, event draining and wrapper injection. The default CI run uses the unit and in-process tests.
 - **`transport/` is untested.** `MultiVersionStdioServerTransportProvider.java` and `StdioTransportConfig.java` have no test files. The override is small and the upstream behaviour is what we're working around, so the absence is defensible — but a smoke test that asserts `protocolVersions()` returns four entries would be cheap and useful.
 - **`marks/` and `watchers/` have no dedicated test directories.** Coverage is indirect via `JDWPToolsMarkInstanceTest`, `JDIConnectionServiceMarkLifecycleTest`, `JDWPToolsAttachWatcherTest`, etc.
-- **`ClasspathDiscoverer` and `RemoteCodeExecutor` have no `*Test` files** under `evaluation/`. Only `InMemoryJavaCompiler*`, `JdiExpressionEvaluator{GetDeclaredType, Rewrite}Test`, and `JdkDiscoveryService*Test` are present. Both `ClasspathDiscoverer` and `RemoteCodeExecutor` cross the JDWP wire, so unit-testing them well requires a substantial mock harness — the team has so far preferred to exercise them via the sandbox.
 - **`JDWPMcpServerApplication`** has no smoke test. It is a one-line `SpringApplication.run`, so the value would be low, but a "context loads" test would catch broken Spring wiring early.
 
 If you're adding code in any of those areas, consider adding the test that wasn't there. The patterns in the support classes will make it cheap.

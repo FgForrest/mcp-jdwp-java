@@ -497,7 +497,7 @@ jdwp_set_logpoint(
 )
 ```
 
-A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Boxed primitives appear as values, and other objects appear as `Object (type)`. Where even that pause matters — races, hot loops — see fast logpoints below.
+A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Boxed primitives appear as values, and other objects appear as `Object (type)`. Where even that pause matters — races, hot loops — see fast logpoints below. If the evaluation fails, `LOGPOINT_ERROR` names the class, line and thread.
 
 ### Fast logpoints (in-target, consent required)
 
@@ -539,7 +539,7 @@ jdwp_set_fast_breakpoint(
 )
 ```
 
-The first hit of the line goes through the debugger: if the condition holds, that hit is the stop; otherwise the server installs a probe, as for a fast logpoint. While local classpath discovery runs, arming can move to a later hit. The probe calls an empty `stop()` method only when the condition holds, and the debugger's breakpoint sits on `stop()` — so the instrumented method keeps running compiled. In the spike, a method holding a breakpoint that never fired ran at 74 ns per call against 7 ns; with a fast breakpoint the difference stayed within run-to-run noise. Wait for the stop with `jdwp_resume_until_event`; the report reads `fast_breakpoint=N, condition true`. The stack, locals, evaluation, `jdwp_set_local`, watchers and steps all work from the user's frame — the probe frames on top are hidden, and a step lands on the stop line. A condition that throws stops once and is then only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
+The first hit of the line goes through the debugger: if the condition holds, that hit is the stop; otherwise the server installs a probe, as for a fast logpoint. While local classpath discovery runs, arming can move to a later hit. The probe calls an empty `stop()` method only when the condition holds, and the debugger's breakpoint sits on `stop()` — so the instrumented method keeps running compiled. In the spike, a method holding a breakpoint that never fired ran at 74 ns per call against 7 ns; with a fast breakpoint the difference stayed within run-to-run noise. Wait for the stop with `jdwp_resume_until_event`; the report reads `fast_breakpoint=N, condition true`. The stack, locals, evaluation, `jdwp_set_local`, watchers and steps all work from the user's frame. At an installed probe's stop, its frames are hidden and a step first lands on the stop line. A condition that throws stops once and is then only counted (`FAST_BREAKPOINT_ERROR` in `jdwp_get_events`).
 
 Use optional `capture` for values that may change just after the condition holds. When a true hit passes the stop gate, the Java expression or `{ ...; return value; }` block runs on the hitting thread. The dispatcher evaluates capture on a true arming stop, and the installed probe evaluates it before suspension on later stops. Both expressions must be thread-safe and free of side effects. The result or failure appears as `Captured at the hit: …` in the stop, breakpoint context and event history. For several values, return one string. Changing or omitting the capture requires its own standing approval.
 
@@ -622,7 +622,7 @@ jdwp_set_field_logpoint(
 )
 ```
 
-Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR`. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
+Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR` with the site and the values. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
 
 Hard errors (no silent fallback): invalid `mode`, ambiguous or missing field, `objectFilterId` on a static field. The deferred path can't validate static-ness until class load, so it surfaces a warning Note in the response.
 
@@ -671,11 +671,11 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor, in `wait()` or parked. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
 On JDK 17 and 21, ordinary compilation can retry visibility errors on private application field reads, method calls and constructors through reflection. The retry preserves exact value types and inlines type-qualified constants without class initialization. Assignment targets, inaccessible types, expression-qualified constants and closed JDK packages can still produce access errors. Fast probes and their arming evaluations use Java access rules.
 
-The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath, the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
+The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath (relative entries resolve against the target's working directory when the file exists there, the manifest Class-Path of local jars is followed), the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 
@@ -802,9 +802,11 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 Use `wait=true` to append that step's landing or interrupting stop in the same call. If another call already presented that stop, the step reply identifies it as already presented. Stops on other threads stay unseen. The wait is bounded at 30 seconds. If it times out, the step stays pending. Use `jdwp_resume_until_event(threadId=T)` to continue waiting or to collect the stop after a step made with the default `wait=false`.
 
+JDK code runs much slower while a step into from application code is pending, because the JDWP agent watches every method entry. On a line that does a lot of work in the JDK, set a breakpoint where you want to stop and resume.
+
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
-- **`step_into`** — polymorphic dispatch is unclear; you can't tell from source which override will run.
+- **`step_into`** — polymorphic dispatch is unclear; you can't tell from source which override will run. From application code the step passes over the JDK. To stop inside a JDK method, set a breakpoint in it.
 - **`step_out`** — an exception/early-abort left you deep in a frame you don't care about and finding the caller line for a breakpoint is awkward.
 - **`step_over`** — the *single* next line, when observing a state mutation is faster than predicting it. More than ~3 in a row → set a breakpoint instead.
 
@@ -844,7 +846,7 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
 | `jdwp_resume_until_event` | `timeoutMs?`, `threadId?` | Resume and wait for the next stop, optionally scoped to one thread. Stop replies include any fast-breakpoint captures. Returns `[RESUME_FAILED]` on a failed release |
 | `jdwp_step_over`          | `threadId?`, `wait?` | Step over the current line and optionally wait for the thread's next stop |
-| `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call and optionally wait for the thread's next stop |
+| `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call, passing over the JDK from application code, and optionally wait for the thread's next stop |
 | `jdwp_step_out`           | `threadId?`, `wait?` | Step out of the current frame and optionally wait for the thread's next stop |
 
 Resume replies list which holds were released and which failed, with the JDI exception. For `[RESUME_FAILED]`, use `jdwp_resume_thread(threadId=…)` with the reported retry thread ID when available. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach. A step with `wait=true` includes any captures from the stop that ended it.

@@ -2,6 +2,7 @@ package one.edee.mcp.jdwp;
 
 import com.sun.jdi.InternalException;
 import com.sun.jdi.ObjectCollectedException;
+import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.request.BreakpointRequest;
@@ -887,6 +888,61 @@ class SuspensionSessionTest {
 		assertThat(processing.pendingContext()).contains("context#" + blocker.id(), "breakpoint", "thread u",
 			"being processed");
 		assertThat(model.counts()).isEqualTo(Map.of("t", 1, "u", 1, "w", 1));
+	}
+
+	/** A dead step cannot block the release of another thread's presented stop. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void deadStepDoesNotBlockGlobalWait(boolean collected) throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final StepRequest request = stepRequest();
+		final EventRequestManager manager = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(manager);
+		assertThat(session.step(t.ref, List::of, () -> request).refusal()).isNull();
+		presented(stopOn(u, EventRequest.SUSPEND_EVENT_THREAD, 2));
+		if (collected) {
+			when(t.ref.status()).thenThrow(new ObjectCollectedException());
+		} else {
+			t.status = ThreadReference.THREAD_STATUS_ZOMBIE;
+		}
+
+		assertThat(session.nextStop(0).released()).isNotNull();
+		assertThat(model.counts()).containsEntry("u", 0);
+		assertThat(session.stepPending(t.ref)).isFalse();
+		verify(manager).deleteEventRequest(request);
+	}
+
+	/** Both step wait paths report an ended step even if the thread dies while waiting. */
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void pendingStepThreadCanEndDuringWait(boolean targeted) throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final StepRequest request = stepRequest();
+		final EventRequestManager manager = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(manager);
+		final SuspensionSession.ArmedStep step = Objects.requireNonNull(
+			session.step(t.ref, List::of, () -> request).armed());
+		when(t.ref.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING, ThreadReference.THREAD_STATUS_ZOMBIE);
+
+		final SuspensionSession.NextStop result = targeted ? session.nextStop(20, t.ref) : session.awaitStepStop(20, step);
+
+		assertThat(result.outcome()).isEqualTo(SuspensionSession.Outcome.STEP_ENDED);
+		verify(manager).deleteEventRequest(request);
+	}
+
+	/** Keeps a step after a failed status read, then retires it when the mirror is collected. */
+	@Test
+	void heldThreadsRetiresCollectedSteps() throws Exception {
+		presented(stopOn(t, EventRequest.SUSPEND_EVENT_THREAD, 1));
+		final StepRequest request = stepRequest();
+		final EventRequestManager manager = mock(EventRequestManager.class);
+		when(model.vm.eventRequestManager()).thenReturn(manager);
+		assertThat(session.step(t.ref, List::of, () -> request).refusal()).isNull();
+		when(t.ref.status()).thenThrow(new InternalException()).thenThrow(new ObjectCollectedException());
+
+		assertThat(session.heldThreads(List.of(), false, 0)).containsKey(t.ref);
+		assertThat(session.heldThreads(List.of(), false, 0)).doesNotContainKey(t.ref);
+		verify(manager).deleteEventRequest(request);
 	}
 
 	/** Both wait paths can await the step's own landing without releasing its context. */
