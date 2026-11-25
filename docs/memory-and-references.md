@@ -176,15 +176,16 @@ When the agent calls `jdwp_get_fields(objectId)`, the server dispatches based on
 `collectionKind(...)` (`JDIConnectionService.java:168-175`) uses an exact-name allow-list:
 
 ```
-ArrayList, LinkedList, HashMap, LinkedHashMap, TreeMap, HashSet, LinkedHashSet, TreeSet
+ArrayList, LinkedList, HashMap, LinkedHashMap, TreeMap, HashSet, LinkedHashSet, TreeSet, ConcurrentHashMap
 ```
 
-`ConcurrentHashMap`, `ConcurrentSkipListMap`, `CopyOnWriteArrayList`, custom collections — all fall through to the generic field dump. The rationale is at lines 163-167: smart rendering needs to know the internal layout (the field names and types of the backing structure), which is stable for the JDK's standard collections but not for arbitrary user code or concurrent variants.
+Each smart view depends on the backing fields of a specific JDK collection class. `ConcurrentHashMap` has a dedicated view for its counters and bins. `ConcurrentHashMap.newKeySet()`, `ConcurrentSkipListMap`, `CopyOnWriteArrayList` and custom collections use the generic field dump.
 
 ### Limits
 
 - `COLLECTION_VIEW_LIMIT = 50` — first 50 entries shown, the rest summarized (`JDIConnectionService.java:51`).
 - `MAX_TREE_DEPTH = 64` — depth cutoff for `walkTreeMapInOrder` (`JDIConnectionService.java:63`).
+- A `ConcurrentHashMap` view reads up to 64 table chunks of 128 slots each, including chunks read during a resize. The footer reports when the scan stops at this limit.
 - Array rendering uses a separate cap of 100 (line 827-847).
 
 ### How it walks each layout
@@ -193,6 +194,7 @@ ArrayList, LinkedList, HashMap, LinkedHashMap, TreeMap, HashSet, LinkedHashSet, 
 - **`LinkedList`** — walks the `first → next` Node chain, reading `item` per node (lines 633-653). Stops at 50.
 - **`LinkedHashMap`** — follows the `head → after` insertion-order chain (lines 681-697).
 - **`HashMap`** — scans `table[]` buckets, walks each `next` chain, stops at 50 (lines 701-722).
+- **`ConcurrentHashMap`** sums `baseCount` and the values in `counterCells`, then clamps the size to the integer range from zero to `Integer.MAX_VALUE`. It follows node chains and tree-bin `first` chains. When a bin has moved during a resize, it follows the two replacement slots. It skips reservation nodes and shows each key reference once. All accesses use JDI reads. Other threads can change the map between reads, so the size and entries can reflect different moments.
 - **`TreeMap`** — in-order traversal from `root` via `left` / `right`, with depth and count cutoffs (lines 725-731, plus `walkTreeMapInOrder` at 750-776).
 - **`HashSet` / `TreeSet`** — locate the backing map field (`map` for `HashSet`, `m` for `TreeSet`) and delegate to `getMapEntries` (lines 798-821).
 

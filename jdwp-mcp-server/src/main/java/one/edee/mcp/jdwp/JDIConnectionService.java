@@ -30,8 +30,12 @@ import java.net.InetAddress;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -72,6 +76,9 @@ public class JDIConnectionService {
      * Maximum number of entries/elements to render in any smart-collection view.
      */
     private static final int COLLECTION_VIEW_LIMIT = 50;
+    /** Number and size of table reads allowed in a ConcurrentHashMap view. */
+    private static final int CONCURRENT_MAP_CHUNK_LIMIT = 64;
+    private static final int CONCURRENT_MAP_CHUNK_SIZE = 128;
     /**
      * Names of the eight Java primitive wrapper types — gates {@link #tryUnboxPrimitive} fast-path.
      */
@@ -222,6 +229,7 @@ public class JDIConnectionService {
         return switch (typeName) {
             case "java.util.ArrayList", "java.util.LinkedList" -> CollectionKind.LIST;
             case "java.util.HashMap", "java.util.LinkedHashMap", "java.util.TreeMap" -> CollectionKind.MAP;
+            case "java.util.concurrent.ConcurrentHashMap" -> CollectionKind.CONCURRENT_MAP;
             case "java.util.HashSet", "java.util.LinkedHashSet", "java.util.TreeSet" -> CollectionKind.SET;
             default -> CollectionKind.UNKNOWN;
         };
@@ -1224,7 +1232,7 @@ public class JDIConnectionService {
      * Renders the fields/elements of a previously cached object. The rendering branches on type:
      * - Arrays: first 100 elements via {@link #getArrayElements}.
      * - Recognised `java.util` collections (`ArrayList`, `LinkedList`, `HashMap`, `LinkedHashMap`,
-     * `HashSet`, `TreeMap`, `TreeSet`): "smart view" with size, first 50 elements/entries, and the
+     * `HashSet`, `TreeMap`, `TreeSet`, `ConcurrentHashMap`): "smart view" with size, first 50 elements/entries, and the
      * raw internal fields, via {@link #getCollectionView}.
      * - Anything else: a flat list of all fields (including inherited).
      * <p>
@@ -1283,31 +1291,36 @@ public class JDIConnectionService {
     }
 
     /**
-     * Renders a "smart view" for one of the supported collection types: prints the {@code size}
-     * field, dispatches to the type-specific element/entry walker, and then dumps the raw
+     * Renders a "smart view" for one of the supported collection types: prints the size,
+     * dispatches to the type-specific element/entry walker, and then dumps the raw
      * internal fields for completeness. Dispatch is by exact-name classification via
      * {@link #collectionKind(String)}.
      */
     private String getCollectionView(ObjectReference obj, long objectId, String typeName) {
         final StringBuilder result = new StringBuilder();
         result.append(String.format("Object #%d (%s):\n\n", objectId, typeName));
+        final CollectionKind kind = collectionKind(typeName);
 
         try {
-            final Field sizeField = obj.referenceType().fieldByName("size");
-            if (sizeField != null) {
-                final Value sizeValue = obj.getValue(sizeField);
-                if (!(sizeValue instanceof IntegerValue iv)) {
-                    result.append("Size: unknown (size field is not an integer)\n\n");
-                    return result.toString();
-                }
-                final int size = iv.value();
-                result.append(String.format("Size: %d\n\n", size));
+            if (kind == CollectionKind.CONCURRENT_MAP) {
+                appendConcurrentMapView(result, obj);
+            } else {
+                final Field sizeField = obj.referenceType().fieldByName("size");
+                if (sizeField != null) {
+                    final Value sizeValue = obj.getValue(sizeField);
+                    if (!(sizeValue instanceof IntegerValue iv)) {
+                        result.append("Size: unknown (size field is not an integer)\n\n");
+                        return result.toString();
+                    }
+                    final int size = iv.value();
+                    result.append(String.format("Size: %d\n\n", size));
 
-                switch (collectionKind(typeName)) {
-                    case LIST -> result.append(getListElements(obj, size));
-                    case MAP -> result.append(getMapEntries(obj, size));
-                    case SET -> result.append(getSetElements(obj, size));
-                    case UNKNOWN -> { /* allow-list filtered by isCollection — unreachable */ }
+                    switch (kind) {
+                        case LIST -> result.append(getListElements(obj, size));
+                        case MAP -> result.append(getMapEntries(obj, size));
+                        case SET -> result.append(getSetElements(obj, size));
+                        case CONCURRENT_MAP, UNKNOWN -> { /* Only LIST, MAP and SET use the size field. */ }
+                    }
                 }
             }
 
@@ -1324,6 +1337,92 @@ public class JDIConnectionService {
         }
 
         return result.toString();
+    }
+
+    /** Reads the striped size counters and renders entries using JDI field reads only. */
+    private void appendConcurrentMapView(StringBuilder out, ObjectReference map) {
+        try {
+            final Value base = concurrentMapField(map, "baseCount");
+            long count = base instanceof LongValue value ? value.value() : 0L;
+            if (concurrentMapField(map, "counterCells") instanceof ArrayReference cells) {
+                for (final @Nullable Value cell : cells.getValues()) {
+                    if (cell instanceof ObjectReference counter && concurrentMapField(counter, "value") instanceof LongValue v) {
+                        count += v.value();
+                    }
+                }
+            }
+            final int size = (int) Math.max(0L, Math.min(count, Integer.MAX_VALUE));
+            out.append(String.format("Size: %d\n\nEntries:\n", size));
+            if (concurrentMapField(map, "table") instanceof ArrayReference table) {
+                appendConcurrentMapEntries(out, table, size);
+            }
+        } catch (ObjectCollectedException e) {
+            out.append("  ... (map changed during inspection)\n");
+        }
+    }
+
+    /** Identifies a slot or the first slot of a cached table chunk. */
+    private record ConcurrentMapBin(ArrayReference table, int index) {}
+
+    /** Walks the original bins and their two replacements in each successive resize. */
+    private void appendConcurrentMapEntries(StringBuilder out, ArrayReference table, int size) {
+        final Map<ConcurrentMapBin, List<? extends @Nullable Value>> chunks = new HashMap<>();
+        final Set<ObjectReference> keys = new HashSet<>();
+        final Deque<ConcurrentMapBin> pending = new ArrayDeque<>();
+        final int length = table.length();
+        int index = 0;
+        while (keys.size() < COLLECTION_VIEW_LIMIT && (index < length || !pending.isEmpty())) {
+            if (pending.isEmpty()) {
+                pending.push(new ConcurrentMapBin(table, index++));
+            }
+            final ConcurrentMapBin bin = pending.pop();
+            final int binTableLength = bin.table().length();
+            final int chunkStart = bin.index() - bin.index() % CONCURRENT_MAP_CHUNK_SIZE;
+            final ConcurrentMapBin chunk = new ConcurrentMapBin(bin.table(), chunkStart);
+            List<? extends @Nullable Value> slots = chunks.get(chunk);
+            if (slots == null) {
+                if (chunks.size() == CONCURRENT_MAP_CHUNK_LIMIT) {
+                    out.append("  ... (table scan limit reached)\n");
+                    return;
+                }
+                slots = bin.table().getValues(chunkStart, Math.min(CONCURRENT_MAP_CHUNK_SIZE, binTableLength - chunkStart));
+                chunks.put(chunk, slots);
+            }
+            if (!(slots.get(bin.index() - chunkStart) instanceof ObjectReference node)) {
+                continue;
+            }
+            switch (node.referenceType().name()) {
+                case "java.util.concurrent.ConcurrentHashMap$ForwardingNode" -> {
+                    if (concurrentMapField(node, "nextTable") instanceof ArrayReference nextTable) {
+                        pending.push(new ConcurrentMapBin(nextTable, bin.index() + binTableLength));
+                        pending.push(new ConcurrentMapBin(nextTable, bin.index()));
+                    }
+                }
+                case "java.util.concurrent.ConcurrentHashMap$TreeBin" ->
+                    appendConcurrentMapChain(out, concurrentMapField(node, "first"), keys);
+                case "java.util.concurrent.ConcurrentHashMap$Node" -> appendConcurrentMapChain(out, node, keys);
+                default -> { /* Reservation nodes do not carry entries. */ }
+            }
+        }
+        appendOverflowFooter(out, size, "entries");
+    }
+
+    /** Renders a linked bin, deduplicating key references that survived a concurrent move. */
+    private void appendConcurrentMapChain(StringBuilder out, @Nullable Value first, Set<ObjectReference> keys) {
+        @Nullable Value current = first;
+        while (current instanceof ObjectReference node && keys.size() < COLLECTION_VIEW_LIMIT) {
+            if (concurrentMapField(node, "key") instanceof ObjectReference key && keys.add(key)) {
+                final Value value = concurrentMapField(node, "val");
+                out.append(String.format("  %s = %s\n", formatFieldValue(key), formatFieldValue(value)));
+            }
+            current = concurrentMapField(node, "next");
+        }
+    }
+
+    /** Reads a field from a known ConcurrentHashMap layout. */
+    private static @Nullable Value concurrentMapField(ObjectReference obj, String name) {
+        final Field field = obj.referenceType().fieldByName(name);
+        return field == null ? null : obj.getValue(field);
     }
 
     /**
@@ -2007,6 +2106,6 @@ public class JDIConnectionService {
     /**
      * Smart-collection-view dispatch tag — see {@link #collectionKind(String)}.
      */
-    private enum CollectionKind {LIST, MAP, SET, UNKNOWN}
+    private enum CollectionKind {LIST, MAP, CONCURRENT_MAP, SET, UNKNOWN}
 
 }

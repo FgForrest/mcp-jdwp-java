@@ -214,7 +214,7 @@ When a logpoint fires:
 5. Apply chain effects.
 6. Return `false` → no candidate; unless another event of the set stops, `finish` releases the set.
 
-Exception and field logpoints follow the same path after adding their event bindings. All three are subject to the same fail-safe rule: if the log expression fails, record `LOGPOINT_ERROR` / `EXCEPTION_LOG_ERROR` / `FIELD_LOGPOINT_ERROR` with the failure reason and continue.
+Exception and field logpoints follow the same path after adding their event bindings. All three are subject to the same fail-safe rule: if the log expression fails, record `LOGPOINT_ERROR` / `EXCEPTION_LOG_ERROR` / `FIELD_LOGPOINT_ERROR` with the failure reason and continue. The entry names the site and the thread; a failed field logpoint also shows the values.
 
 Line, exception and field logpoint results share the same formatter. Boxed primitives are rendered by reading their `value` field. Other objects appear as `Object (type)` with no inspection-cache entry. The formatter also handles field-event values, including `$oldValue` and `$newValue`, and invokes no target methods.
 

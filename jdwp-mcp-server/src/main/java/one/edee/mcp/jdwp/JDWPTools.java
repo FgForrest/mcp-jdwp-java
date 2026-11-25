@@ -430,12 +430,10 @@ public class JDWPTools {
     }
 
     /**
-     * Pre-flight check before any JDI {@code invokeMethod} call: a thread that is JDI-suspended on
-     * top of a Java-level monitor block ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside
-     * {@code Object.wait()} ({@link ThreadReference#THREAD_STATUS_WAIT}) cannot make progress when
-     * single-threaded resumed for an invocation — the lock it needs is held by another suspended
-     * thread, or the {@code notify()} that would wake it can never fire. JDI's {@code invokeMethod}
-     * has no timeout, so an invocation on such a thread hangs the MCP server indefinitely.
+     * Checks whether a single-threaded JDI {@code invokeMethod} can hang. A thread blocked on a
+     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) needs its owner to release it.
+     * A waiting thread ({@link ThreadReference#THREAD_STATUS_WAIT}) may need another thread to
+     * notify or unpark it. The invocation keeps the other threads suspended.
      * <p>
      * Returns an error message naming the contending state and recommending the safe alternative
      * ({@code jdwp_get_stack} / {@code jdwp_get_threads}) when the thread is unsafe to invoke on;
@@ -454,8 +452,8 @@ public class JDWPTools {
         }
         if (status == ThreadReference.THREAD_STATUS_WAIT) {
             return String.format(
-                "Error: Thread '%s' (#%d) is inside Object.wait() — invokeMethod would hang because "
-                + "the notify() that would wake it cannot fire while all threads are suspended. "
+                "Error: Thread '%s' (#%d) is waiting (Object.wait or a park). invokeMethod can hang because "
+                + "nothing can notify or unpark it while the other threads are suspended. "
                 + "Use jdwp_get_stack(%d) to inspect, or pick a different thread (any RUNNING-then-"
                 + "suspended thread is safe to invoke on).",
                 thread.name(), thread.uniqueID(), thread.uniqueID());
@@ -465,13 +463,11 @@ public class JDWPTools {
 
     /**
      * Builds the error returned when a thread the caller wants to <em>inspect</em>
-     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A thread parked on a
-     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside {@code Object.wait()}
-     * ({@link ThreadReference#THREAD_STATUS_WAIT}) — the deadlock case — will never stop at a
-     * breakpoint on its own, so the bare "stop it at a breakpoint" advice is a dead end for exactly
-     * the situation where reading the stack matters most. Point at {@code jdwp_suspend_thread}, which
-     * freezes the thread where it stands so its frames and locals become readable. For any other
-     * not-suspended status fall back to the same freeze-it advice alongside the breakpoint hint.
+     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A monitor-blocked
+     * thread can reach a breakpoint once it gets the monitor. A thread in
+     * {@link ThreadReference#THREAD_STATUS_WAIT} can reach one after a notification, unpark or timeout.
+     * {@code jdwp_suspend_thread} freezes either thread where it stands so its frames and locals
+     * become readable. For other statuses, include the option to stop at a breakpoint.
      *
      * <p>This is for read-only inspection only. {@code jdwp_suspend_thread} makes a MONITOR/WAIT
      * thread's frames inspectable, but it does <em>not</em> make {@code invokeMethod}-based tools
@@ -480,15 +476,19 @@ public class JDWPTools {
     private static String notSuspendedForInspection(ThreadReference thread) {
         final int status = thread.status();
         final long id = thread.uniqueID();
-        if (status == ThreadReference.THREAD_STATUS_MONITOR || status == ThreadReference.THREAD_STATUS_WAIT) {
-            final String parked = status == ThreadReference.THREAD_STATUS_MONITOR
-                ? "blocked on a Java monitor"
-                : "inside Object.wait()";
+        if (status == ThreadReference.THREAD_STATUS_MONITOR) {
             return String.format(
-                "Error: Thread '%s' (#%d) is %s but not JDI-suspended — it will never stop at a "
-                + "breakpoint on its own, so it cannot be inspected as-is. Call jdwp_suspend_thread(%d) "
+                "Error: Thread '%s' (#%d) is blocked on a Java monitor and is not JDI-suspended. "
+                + "It cannot reach a breakpoint until it gets the monitor. Call jdwp_suspend_thread(%d) "
                 + "to freeze it where it stands, then retry. This is the deadlock-inspection path.",
-                thread.name(), id, parked, id);
+                thread.name(), id, id);
+        }
+        if (status == ThreadReference.THREAD_STATUS_WAIT) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is waiting (Object.wait or a park) and is not JDI-suspended. "
+                + "It cannot reach a breakpoint until it is notified, unparked or its timeout ends. "
+                + "Call jdwp_suspend_thread(%d) to freeze it where it stands, then retry.",
+                thread.name(), id, id);
         }
         return String.format(
             "Error: Thread '%s' (#%d) is not suspended (status %s). Stop it at a breakpoint, or call "

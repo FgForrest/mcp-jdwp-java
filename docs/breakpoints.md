@@ -161,7 +161,7 @@ Same pattern in:
 - Exception logpoint — `handleExceptionEvent` lines 566-582, evaluator at `evaluateExceptionLogpoint` (lines 617-658).
 - Field logpoint — `handleWatchpointEvent` lines 737-742, evaluator at `evaluateFieldLogpoint` (lines 799-837).
 
-All three respect the same fail-safe rule: if the log expression fails to evaluate, record a `*_ERROR` entry (e.g. `LOGPOINT_ERROR`) with the failure reason and continue. The thread still auto-resumes.
+All three respect the same fail-safe rule: if the log expression fails to evaluate, record a `*_ERROR` entry (e.g. `LOGPOINT_ERROR`) with the failure reason and continue. The thread still auto-resumes. The entry names the site and the thread; a failed field logpoint also shows the values.
 
 ### 5a. Fast logpoints — evaluation moved into the target
 

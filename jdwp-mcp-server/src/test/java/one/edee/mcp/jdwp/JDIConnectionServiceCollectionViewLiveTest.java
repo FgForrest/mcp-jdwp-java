@@ -3,6 +3,8 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.ArrayReference;
 import com.sun.jdi.Field;
 import com.sun.jdi.IntegerValue;
+import com.sun.jdi.LongValue;
+import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
@@ -11,10 +13,15 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -230,6 +237,121 @@ class JDIConnectionServiceCollectionViewLiveTest {
 		assertThat(result).contains("Elements:");
 		assertThat(result).contains("\"x\"");
 		assertThat(result).contains("\"y\"");
+	}
+
+	/** Includes counter cells and follows only the two destination bins of each forwarding node. */
+	@Test
+	void shouldRenderConcurrentHashMapDuringNestedResize() throws Exception {
+		final ObjectReference sharedKey = mockString("moved");
+		final ObjectReference tree = concurrentNode("TreeBin");
+		final ObjectReference reservation = concurrentNode("ReservationNode");
+		final ObjectReference outer = concurrentNode("ForwardingNode");
+		final ObjectReference inner = concurrentNode("ForwardingNode");
+		concurrentField(tree, "first", concurrentEntry("TreeNode", mockString("tree"),
+			concurrentEntry("TreeNode", sharedKey, null)));
+		concurrentField(outer, "nextTable", concurrentTable(inner, null,
+			concurrentEntry("Node", mockString("split"), null), null));
+		concurrentField(inner, "nextTable", concurrentTable(concurrentEntry("Node", sharedKey, null), null,
+			null, null, reservation, concurrentEntry("Node", mockString("unrelated"), null), null, null));
+		final ObjectReference cell = mockConcurrentObject("CounterCell");
+		concurrentField(cell, "value", mockLong(2));
+		final ObjectReference map = concurrentMap(1, concurrentTable(outer, tree), concurrentTable(cell, null));
+
+		final String result = invokeGetCollectionView(map, 6L, "java.util.concurrent.ConcurrentHashMap");
+
+		assertThat(result).contains("Size: 3", "Entries:", "\"moved\" = 1", "\"split\" = 1", "\"tree\" = 1")
+			.doesNotContain("unrelated", "Error");
+		assertThat(result.lines().filter(line -> line.contains("\"moved\" = 1"))).hasSize(1);
+	}
+
+	/** Clamps the counter sum and tolerates a table collected after the map resized. */
+	@Test
+	void shouldClampConcurrentSizeAndTolerateCollectedTable() throws Exception {
+		final ObjectReference empty = concurrentMap(-1, null, null);
+		final ArrayReference collected = mock(ArrayReference.class);
+		when(collected.length()).thenThrow(new ObjectCollectedException());
+		final ObjectReference large = concurrentMap((long) Integer.MAX_VALUE + 1, collected, null);
+
+		assertThat(invokeGetCollectionView(empty, 6L, "java.util.concurrent.ConcurrentHashMap")).contains("Size: 0");
+		assertThat(invokeGetCollectionView(large, 7L, "java.util.concurrent.ConcurrentHashMap"))
+			.contains("Size: " + Integer.MAX_VALUE, "map changed during inspection")
+			.doesNotContain("Error");
+	}
+
+	/** Bounds sparse-table reads and reports that the scan ended early. */
+	@Test
+	void shouldBoundConcurrentHashMapTableReads() throws Exception {
+		final ArrayReference table = mock(ArrayReference.class);
+		when(table.length()).thenReturn(100_000);
+		when(table.getValues(anyInt(), anyInt())).thenAnswer(call ->
+			Collections.nCopies(call.<Integer>getArgument(1), null));
+		final ObjectReference map = concurrentMap(1, table, null);
+
+		assertThat(invokeGetCollectionView(map, 6L, "java.util.concurrent.ConcurrentHashMap"))
+			.contains("Size: 1", "table scan limit reached");
+		verify(table, org.mockito.Mockito.times(64)).getValues(anyInt(), anyInt());
+		verify(table, never()).getValue(anyInt());
+	}
+
+	/** Mirrors a ConcurrentHashMap with its striped counters and table. */
+	private ObjectReference concurrentMap(long base, ArrayReference table, ArrayReference cells) {
+		final ObjectReference map = mockConcurrentObject("java.util.concurrent.ConcurrentHashMap");
+		concurrentField(map, "baseCount", mockLong(base));
+		concurrentField(map, "counterCells", cells);
+		concurrentField(map, "table", table);
+		return map;
+	}
+
+	/** Mirrors a normal bin entry or a tree bin's linked entry. */
+	private ObjectReference concurrentEntry(String kind, ObjectReference key, ObjectReference next) {
+		final ObjectReference entry = concurrentNode(kind);
+		concurrentField(entry, "key", key);
+		concurrentField(entry, "val", mockValue(1));
+		concurrentField(entry, "next", next);
+		return entry;
+	}
+
+	/** Mirrors a bin or an entry by its concrete nested class name. */
+	private ObjectReference concurrentNode(String kind) {
+		return mockConcurrentObject("java.util.concurrent.ConcurrentHashMap$" + kind);
+	}
+
+	/** Creates a named JDI mirror for the ConcurrentHashMap layout tests. */
+	private ObjectReference mockConcurrentObject(String name) {
+		final ObjectReference obj = mock(ObjectReference.class);
+		final ReferenceType type = mock(ReferenceType.class);
+		when(obj.referenceType()).thenReturn(type);
+		when(type.name()).thenReturn(name);
+		return obj;
+	}
+
+	/** Wires a field lookup and value read on a ConcurrentHashMap mirror. */
+	private void concurrentField(ObjectReference obj, String name, Value value) {
+		final ReferenceType type = obj.referenceType();
+		final Field field = mock(Field.class);
+		when(type.fieldByName(name)).thenReturn(field);
+		when(obj.getValue(field)).thenReturn(value);
+	}
+
+	/** Mirrors array reads, including null entries and partial reads. */
+	private ArrayReference concurrentTable(Value... slots) {
+		final List<Value> values = Arrays.asList(slots);
+		final ArrayReference table = mock(ArrayReference.class);
+		when(table.length()).thenReturn(values.size());
+		when(table.getValues()).thenReturn(values);
+		when(table.getValues(anyInt(), anyInt())).thenAnswer(call -> {
+			final int start = call.getArgument(0);
+			final int length = call.getArgument(1);
+			return values.subList(start, start + length);
+		});
+		return table;
+	}
+
+	/** Mirrors a long counter. */
+	private LongValue mockLong(long count) {
+		final LongValue value = mock(LongValue.class);
+		when(value.value()).thenReturn(count);
+		return value;
 	}
 
 	// ── helpers ──

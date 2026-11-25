@@ -7,9 +7,17 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.*;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 
 /**
  * Reads the launch classpath and the context and defining loader chains. Only overrides of
@@ -39,6 +47,94 @@ public class ClasspathDiscoverer {
     public ClasspathDiscoverer(VirtualMachine vm, EvaluationGuard guard) {
         this.vm = vm;
         this.guard = guard;
+    }
+
+    /** Expands local launch manifests depth first, keeping each entry's first position. */
+    private static Set<String> expandLaunchEntries(List<String> classPath, @Nullable String baseDirectory) {
+        final Path base = absoluteLocalPath(baseDirectory);
+        final Deque<String> pending = new ArrayDeque<>();
+        for (final String entry : classPath) {
+            final String trimmed = entry.trim();
+            if (!trimmed.isEmpty()) {
+                pending.addLast(resolveLaunchEntry(trimmed, base));
+            }
+        }
+        final Set<String> found = new LinkedHashSet<>();
+        final Set<Path> visited = new HashSet<>();
+        while (!pending.isEmpty()) {
+            final String entry = pending.removeFirst();
+            final Path path = absoluteLocalPath(entry);
+            if (path != null && !visited.add(path.normalize())) {
+                continue;
+            }
+            if (found.add(entry) && path != null && Files.isRegularFile(path)) {
+                enqueueManifestEntries(path, pending);
+            }
+        }
+        return found;
+    }
+
+    /** Interprets only absolute paths in the server's filesystem syntax. */
+    private static @Nullable Path absoluteLocalPath(@Nullable String spelling) {
+        if (spelling == null) {
+            return null;
+        }
+        try {
+            final Path path = Path.of(spelling);
+            return path.isAbsolute() ? path : null;
+        } catch (InvalidPathException e) {
+            return null;
+        }
+    }
+
+    /** Keeps JDWP's spelling if the target-relative path cannot be found locally. */
+    private static String resolveLaunchEntry(String entry, @Nullable Path base) {
+        if (base != null) {
+            try {
+                final Path path = Path.of(entry);
+                if (!path.isAbsolute()) {
+                    final Path resolved = base.resolve(path);
+                    if (Files.exists(resolved)) {
+                        return resolved.toString();
+                    }
+                }
+            } catch (InvalidPathException e) {
+                // An entry from another filesystem can still be reported in its original form.
+            }
+        }
+        return entry;
+    }
+
+    /** Pushes existing local links ahead of the remaining launch entries in manifest order. */
+    private static void enqueueManifestEntries(Path path, Deque<String> pending) {
+        try (final JarFile jar = new JarFile(path.toFile(), false)) {
+            final Manifest manifest = jar.getManifest();
+            final String links = manifest == null ? null
+                : manifest.getMainAttributes().getValue(Attributes.Name.CLASS_PATH);
+            if (links == null || links.isBlank()) {
+                return;
+            }
+            final URI base = path.toUri();
+            final String[] tokens = links.trim().split("\\s+");
+            for (int i = tokens.length - 1; i >= 0; i--) {
+                final Path entry = manifestEntry(base, tokens[i]);
+                if (entry != null && Files.exists(entry)) {
+                    pending.addFirst(entry.toString());
+                }
+            }
+        } catch (IOException | SecurityException e) {
+            log.debug("[JDI] Could not read launch jar manifest in {}", path, e);
+        }
+    }
+
+    /** Resolves a single manifest URL and decodes it as a local file path. */
+    private static @Nullable Path manifestEntry(URI base, String token) {
+        try {
+            final URI resolved = base.resolve(token);
+            return "file".equalsIgnoreCase(resolved.getScheme()) ? Path.of(resolved) : null;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /**
@@ -258,19 +354,12 @@ public class ClasspathDiscoverer {
         /** Reads the launch order and distinguishes an empty classpath from a failed JDWP command. */
         private void readLaunch() {
             try {
-                final Set<String> found = new LinkedHashSet<>();
                 if (vm instanceof PathSearchingVirtualMachine target) {
-                    for (final String path : target.classPath()) {
-                        final String trimmed = path.trim();
-                        if (!trimmed.isEmpty()) {
-                            found.add(trimmed);
-                        }
-                    }
+                    // JDI reads the base directory from the same ClassPaths reply.
+                    launch = expandLaunchEntries(target.classPath(), target.baseDirectory());
                 } else {
                     incomplete("target VM", "JDWP launch classpath is unavailable");
-                    return;
                 }
-                launch = found;
             } catch (RuntimeException e) {
                 incomplete("target VM", "could not read launch classpath: " + describe(e));
             }

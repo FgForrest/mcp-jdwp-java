@@ -1422,7 +1422,7 @@ public class JdiEventListener {
                 String.format("%s thrown at %s on thread %s — error evaluating '%s': %s",
                     exceptionType, throwInfo, threadName, expression, evaluationFailureMessage(e)),
                 Map.of("exceptionType", exceptionType, "throwLocation", throwInfo,
-                    "thread", threadName, "expression", expression,
+                    "catchLocation", catchInfo, "thread", threadName, "expression", expression,
                     "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Exception logpoint evaluation failed for '{}': {}",
                 expression, evaluationFailureMessage(e));
@@ -1518,9 +1518,10 @@ public class JdiEventListener {
                         // A field logpoint never stops: its set was routed so (mayStop), and the
                         // redefinition rule did not count its thread. The failure is the logpoint's.
                         eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
-                            String.format("Field %s.%s %s on thread %s — its bindings could not be built: %s",
-                                className, fieldName, modeStr, threadName, bindEx.getMessage()),
+                            String.format("Field %s.%s %s on thread %s at %s: %s — its bindings could not be built: %s",
+                                className, fieldName, modeStr, threadName, site, values, bindEx.getMessage()),
                             Map.of("breakpointId", String.valueOf(bpId), "class", className, "field", fieldName,
+                                "mode", modeStr, "thread", threadName, "location", site,
                                 "error", String.valueOf(bindEx.getMessage()))));
                         return false;
                     }
@@ -1642,10 +1643,11 @@ public class JdiEventListener {
                 fieldName, modeStr, threadName, expression, resultStr, bpId);
         } catch (Throwable e) {
             eventHistory.record(new EventHistory.DebugEvent("FIELD_LOGPOINT_ERROR",
-                String.format("Field %s.%s %s on thread %s — error evaluating '%s': %s",
-                    className, fieldName, modeStr, threadName, expression, evaluationFailureMessage(e)),
+                String.format("Field %s.%s %s on thread %s at %s: %s — error evaluating '%s': %s",
+                    className, fieldName, modeStr, threadName, site, values, expression, evaluationFailureMessage(e)),
                 Map.of("breakpointId", String.valueOf(bpId),
                     "class", className, "field", fieldName,
+                    "mode", modeStr, "thread", threadName, "location", site,
                     "expression", expression,
                     "error", evaluationFailureMessage(e))));
             log.warn("[JDI] Field logpoint evaluation failed for {}.{}: {}",
@@ -1676,9 +1678,13 @@ public class JdiEventListener {
 
             log.info("[JDI] Logpoint {} evaluated: {} = {}", bpId, expression, resultStr);
         } catch (Throwable e) {
+            final String error = evaluationFailureMessage(e);
             eventHistory.record(new EventHistory.DebugEvent("LOGPOINT_ERROR",
-                String.format("[Logpoint %d] Error evaluating '%s': %s", bpId, expression, evaluationFailureMessage(e))));
-            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, evaluationFailureMessage(e));
+                String.format("[Logpoint %d] Error evaluating '%s' at %s:%d on thread %s: %s",
+                    bpId, expression, className, lineNumber, threadName, error),
+                Map.of("breakpointId", String.valueOf(bpId), "expression", expression, "error", error,
+                    "class", className, "line", String.valueOf(lineNumber), "thread", threadName)));
+            log.warn("[JDI] Logpoint {} evaluation failed: {}", bpId, error);
         }
     }
 

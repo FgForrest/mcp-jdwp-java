@@ -497,7 +497,7 @@ jdwp_set_logpoint(
 )
 ```
 
-A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Boxed primitives appear as values, and other objects appear as `Object (type)`. Where even that pause matters — races, hot loops — see fast logpoints below.
+A logpoint evaluates an expression every time the line is hit, logs the result to the event history, and **never leaves the thread stopped**: the hitting thread waits only while the server evaluates the condition and expression, then runs on. Combined with an optional condition, this gives the agent tracing without stopping execution. View results with `jdwp_get_events()`. Boxed primitives appear as values, and other objects appear as `Object (type)`. Where even that pause matters — races, hot loops — see fast logpoints below. If the evaluation fails, `LOGPOINT_ERROR` names the class, line and thread.
 
 ### Fast logpoints (in-target, consent required)
 
@@ -622,7 +622,7 @@ jdwp_set_field_logpoint(
 )
 ```
 
-Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR`. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
+Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR` with the site and the values. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
 
 Hard errors (no silent fallback): invalid `mode`, ambiguous or missing field, `objectFilterId` on a static field. The deferred path can't validate static-ness until class load, so it surfaces a warning Note in the response.
 
@@ -671,11 +671,11 @@ jdwp_evaluate_expression(
 → Result of order.getTotal(): 1250.0
 ```
 
-Field navigation, including private and package-private reads, runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor or in `wait()`. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
+Field navigation, including private and package-private reads, runs without compiling or invoking target code. A single field path can read private members of package-private classes in other packages. It works on manual holds, stop-all bystanders, and suspended threads blocked on a monitor, in `wait()` or parked. The interpreter can call a private or package-private method with one applicable signature on a thread stopped at its own event. Same-arity overloads, varargs, generic methods and lambdas use compilation. A tool evaluation still running in the target after 20 s returns `[STILL_RUNNING]`. The eventual result appears as `EVALUATION_COMPLETED_LATE` in `jdwp_get_events`.
 
 On JDK 17 and 21, ordinary compilation can retry visibility errors on private application field reads, method calls and constructors through reflection. The retry preserves exact value types and inlines type-qualified constants without class initialization. Assignment targets, inaccessible types, expression-qualified constants and closed JDK packages can still produce access errors. Fast probes and their arming evaluations use Java access rules.
 
-The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath, the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
+The first compiled evaluation or fast-probe arming compile discovers the remote classpath on demand. The debugger reads the launch classpath (relative entries resolve against the target's working directory, the manifest Class-Path of local jars is followed), the context loader chain and the selected frame's defining loader chain. A public `URLClassLoader.getURLs()` may supply custom repositories, and an overridden context-loader getter can run during a tool's compiled evaluation. `jdwp_diagnose` reports incomplete loader reads.
 
 Expressions see no imports. A simple type name covers `java.lang` and the current class's own and nested types; write other application types fully qualified, for example `com.acme.Status.ACTIVE`.
 

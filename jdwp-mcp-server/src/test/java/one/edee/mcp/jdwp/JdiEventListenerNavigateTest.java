@@ -288,6 +288,7 @@ class JdiEventListenerNavigateTest {
         when(event.location()).thenReturn(location);
         when(location.declaringType()).thenReturn(owner);
         when(owner.name()).thenReturn("example.App");
+        when(location.lineNumber()).thenReturn(27);
         final EventQueue queue = mock(EventQueue.class);
         final LinkedBlockingQueue<EventSet> sets = new LinkedBlockingQueue<>();
         when(target.vm.eventQueue()).thenReturn(queue);
@@ -303,7 +304,11 @@ class JdiEventListenerNavigateTest {
             assertThat(thread.count).isZero();
             assertThat(history.getRecent(20)).anySatisfy(record -> {
                 assertThat(record.type()).isEqualTo("LOGPOINT_ERROR");
-                assertThat(record.summary()).contains("StackOverflowError");
+                assertThat(record.summary()).isEqualTo("[Logpoint " + id
+                    + "] Error evaluating 'value()' at example.App:27 on thread event: StackOverflowError");
+                assertThat(record.details()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    "breakpointId", String.valueOf(id), "expression", "value()", "class", "example.App",
+                    "line", "27", "thread", "event", "error", "StackOverflowError"));
             });
         } finally {
             listener.stop();

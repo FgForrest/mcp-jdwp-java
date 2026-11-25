@@ -151,7 +151,7 @@ class JdiEventListenerExceptionLogTest {
 			request, ExceptionBreakpointSpec.logOnly("java.lang.NullPointerException", true, true, "$exception.getCause().getMessage()"));
 
 		ExceptionEvent event = mockExceptionEvent(request, thread, exception,
-			"com.example.Foo", 5);
+			"com.example.Foo", 5, "com.example.Handler", 17);
 		EventSet eventSet = mockEventSet(event);
 
 		runListenerWith(listener, eventSet);
@@ -161,6 +161,7 @@ class JdiEventListenerExceptionLogTest {
 		assertLatestEventType(eventHistory, "EXCEPTION_LOG_ERROR");
 		EventHistory.DebugEvent last = latestMeaningfulEvent(eventHistory);
 		assertThat(last.summary()).contains("compile failed");
+		assertThat(last.details()).containsEntry("catchLocation", "com.example.Handler:17");
 	}
 
 	@Test

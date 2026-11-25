@@ -110,7 +110,9 @@ The executor defines the primary wrapper, initializes it with `Class.forName` an
 
 ### `ClasspathDiscoverer`
 
-Discovery starts with the launch classpath from JDWP `VirtualMachine.ClassPaths`, which reports the value captured at agent initialization. The first compile adds the thread's context loader chain. Compiles add the selected frame's defining loader chain as needed, in first-seen order. Each chain follows `ClassLoader.parent` from child to parent. Entries keep their first position when a later chain contains the same path.
+Discovery starts with the launch classpath and base directory from the same JDWP `VirtualMachine.ClassPaths` reply. JDWP captures these values during agent initialization. A relative launch entry becomes absolute when the target's base directory is an absolute local path and the resolved entry exists on the server's filesystem. Otherwise discovery uses the reported spelling. For each local launch jar, discovery follows the manifest's `Class-Path` depth first in search order. It adds existing files and directories at their first occurrence and skips invalid and non-file URLs. An unreadable jar stays on the classpath and produces a debug log entry. The connection caches this launch walk.
+
+The first compile adds the thread's context loader chain. Compiles add the selected frame's defining loader chain as needed, in first-seen order. Each chain follows `ClassLoader.parent` from child to parent. Discovery uses loader URL paths as reported and applies manifest expansion only to the launch classpath. Entries keep their first position when a later chain contains the same path.
 
 Dispatcher compiles use the inherited `Thread.contextClassLoader` field and the frame's defining loader. Discovery leaves an overridden `getContextClassLoader()` pending for its originating thread. A compiled tool evaluation on that thread can invoke the getter under a lease in its 20-second `InvocationRunner` job, before taking the compiler configuration monitor. Failed or deferred getters keep the field result provisional until the getter succeeds, its thread dies, or the connection ends.
 
