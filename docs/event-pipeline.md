@@ -385,11 +385,17 @@ A step (`jdwp_step_over` / `_into` / `_out`) runs entirely under the session mon
 3. the request is stamped with the generation and recorded as T's pending step;
 4. T's ordinary holders are released with the same success checks as `releaseThread`.
 
+All three step requests exclude probe classes. A step into from application code also excludes the JDK packages, so it can land in an application callback or back in the caller. To stop inside a JDK method, set a breakpoint there. A step started inside the JDK uses only the probe exclusions. The same fallback applies when the frame view is available but its top frame cannot be read.
+
 If a release fails, the session deletes the step request and drops its pending entry. The tool returns without waiting for a landing even when `wait=true`. The reply reports earlier successful releases and all failures. A disconnect returns `[VM_DEATH]` and directs the user to reattach.
 
 With `SUSPEND_EVENT_THREAD`, only the stepping thread stops on landing. The arming summary reports the session’s ownership immediately after release, including failed automatic releases and unpaid lease debt. It reports remaining stop-alls independently of JDI enumeration, which can omit virtual threads. Stop-alls with the same state and origin are counted together. The arming summary shows up to five thread names across the stepping thread, stop-all origins and samples, and other hold groups. Further groups are summarized by count. The appended outcome report for `wait=true` is outside that budget because it identifies the stop. The summary says all remaining threads run only when no stop-all or outstanding recovery remains. Publication records the ending context on the armed-step handle and clears the pending entry. The landing is a `STEP` stop. Any other stop published on the stepping thread ends the step, deletes its request and records `STEP_INTERRUPTED`.
 
 The step tools return after arming by default. With `wait=true` they retain the armed-step handle. The reply appends the report of its landing or interrupting stop, or identifies it as already presented by another call. The wait uses the default 30 s deadline. A timeout leaves the step armed and gives `jdwp_resume_until_event(threadId=T)` as the continuation.
+
+JDK code runs much slower while a filtered step into is pending, because the JDWP agent watches every method entry of the thread. Measured on JDK 17 and 21 with 200,000 random boxed integers: a stream sort with a reverse comparator took 15–17 s against 1–2 s for a step over, and a grouping took 7–8 s against less than 1 s.
+
+A newly armed step on the same thread replaces the pending step, and `jdwp_reset` clears it. The evaluation watchdog can cancel a queued step landing to release a monitor (§ 14). Disconnect, reconnect, or target VM exit ends the stepping session.
 
 Example, from stop-all hold B (every thread at count 1):
 

@@ -1,7 +1,9 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.InternalException;
+import com.sun.jdi.InvalidStackFrameException;
 import com.sun.jdi.Location;
+import com.sun.jdi.Method;
 import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
@@ -15,6 +17,7 @@ import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.StepRequest;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
+import one.edee.mcp.jdwp.evaluation.FastBreakpointProbeSource;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,6 +29,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -46,6 +50,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -59,6 +64,9 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("jdwp_step_over / _into / _out")
 class JDWPToolsStepTest {
+
+	private static final String JDK_STEP_TIMEOUT = "The step may be passing JDK code, which runs slowly while the step is pending "
+		+ "or may be blocking. A breakpoint in the method of interest is quicker.";
 
 	private JDIConnectionService jdiService;
 	private BreakpointTracker breakpointTracker;
@@ -490,6 +498,28 @@ class JDWPToolsStepTest {
 		return location;
 	}
 
+	/** Gives the suspended thread stack frames in physical order, including any leading probe. */
+	private static void stack(ThreadReference thread, String... classNames) throws Exception {
+		final List<StackFrame> frames = new ArrayList<>();
+		for (final String className : classNames) {
+			final ReferenceType type = mock(ReferenceType.class);
+			when(type.name()).thenReturn(className);
+			final Method method = mock(Method.class);
+			when(method.name()).thenReturn(FastBreakpointProbeSource.STOP_METHOD);
+			final Location location = mock(Location.class);
+			when(location.declaringType()).thenReturn(type);
+			when(location.method()).thenReturn(method);
+			final StackFrame frame = mock(StackFrame.class);
+			when(frame.location()).thenReturn(location);
+			frames.add(frame);
+		}
+		when(thread.frameCount()).thenReturn(frames.size());
+		when(thread.frames(0, frames.size())).thenReturn(frames);
+		for (int i = 0; i < frames.size(); i++) {
+			when(thread.frame(i)).thenReturn(frames.get(i));
+		}
+	}
+
 	/** Ensures an armed step keeps its continuation hint when the previous diagnostic thread is stale. */
 	@Test
 	void shouldKeepArmedStepTimeoutWhenFormerStopThreadIsCollected() throws Exception {
@@ -506,7 +536,7 @@ class JDWPToolsStepTest {
 			.when(session).awaitStepStop(eq(30_000L), any());
 
 		assertThat(tools.jdwp_step_over(1L, true)).startsWith("Step over started")
-			.contains("[TIMEOUT]", "jdwp_resume_until_event(threadId=1)");
+			.contains("[TIMEOUT]", "jdwp_resume_until_event(threadId=1)").doesNotContain(JDK_STEP_TIMEOUT);
 		assertThat(session.stepPending(stepping)).isTrue();
 	}
 
@@ -532,19 +562,41 @@ class JDWPToolsStepTest {
 		verify(stepping).resume();
 	}
 
+	/** Uses the real default wait and confirms the request survives it. */
 	@Test
 	@DisplayName("a waiting step times out after the default wait and leaves the request armed")
 	void shouldLeaveTimedOutStepPending() throws Exception {
 		final ThreadReference stepping = suspendedThread(1L);
+		stack(stepping, "example.Work");
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(stepping));
-		final StepRequest request = stubStepRequestCreation(stepping, StepRequest.STEP_OUT);
+		final StepRequest request = stubStepRequestCreation(stepping, StepRequest.STEP_INTO);
 
-		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_out(1L, true));
-		assertThat(reply.get(40, TimeUnit.SECONDS)).startsWith("Step out started")
-			.contains("still_waiting", "[TIMEOUT]", "30000ms", "jdwp_resume_until_event(threadId=1)");
+		final CompletableFuture<String> reply = CompletableFuture.supplyAsync(() -> tools.jdwp_step_into(1L, true));
+		assertThat(reply.get(40, TimeUnit.SECONDS)).startsWith("Step into started")
+			.contains("still_waiting", "[TIMEOUT]", "30000ms", "jdwp_resume_until_event(threadId=1)", JDK_STEP_TIMEOUT);
 		assertThat(session.stepPending(stepping)).isTrue();
 		verify(erm, never()).deleteEventRequest(request);
+	}
+
+	/** Checks timeout advice for an unfiltered step into and a step out of application code. */
+	@ParameterizedTest
+	@CsvSource({"java.util.ArrayList, true", "example.Work, false"})
+	void shouldOmitJdkAdviceFromUnfilteredStepTimeouts(String className, boolean into) throws Exception {
+		final ThreadReference thread = suspendedThread(1L);
+		stack(thread, className);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		final StepRequest req = stubStepRequestCreation(thread, into ? StepRequest.STEP_INTO : StepRequest.STEP_OUT);
+		session = spy(session);
+		doReturn(session).when(breakpointTracker).suspensionSession();
+		doAnswer(invocation -> session.awaitStepStop(0, invocation.getArgument(1)))
+			.when(session).awaitStepStop(eq(30_000L), any());
+
+		final String reply = into ? tools.jdwp_step_into(1L, true) : tools.jdwp_step_out(1L, true);
+
+		assertThat(reply).contains("[TIMEOUT]", "jdwp_resume_until_event(threadId=1)").doesNotContain(JDK_STEP_TIMEOUT);
+		verify(req, never()).addClassExclusionFilter(any());
 	}
 
 	private CountDownLatch signalOnRelease(ThreadReference thread) {
@@ -560,10 +612,12 @@ class JDWPToolsStepTest {
 	@DisplayName("Step depth wiring")
 	class StepDepthWiring {
 
+		/** Keeps step over unfiltered in application code. */
 		@Test
 		@DisplayName("jdwp_step_over creates a STEP_LINE/STEP_OVER request, count-filtered and enabled")
 		void shouldCreateStepOverRequestWithStepLineAndStepOver() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
+			stack(thread, "example.Work");
 			when(jdiService.getVM()).thenReturn(vm);
 			when(vm.allThreads()).thenReturn(List.of(thread));
 			final StepRequest req = stubStepRequestCreation(thread, StepRequest.STEP_OVER);
@@ -571,14 +625,17 @@ class JDWPToolsStepTest {
 			tools.jdwp_step_over(1L);
 
 			verify(erm).createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER);
+			verify(req, never()).addClassExclusionFilter(any());
 			verify(req).addCountFilter(1);
 			verify(req).enable();
 		}
 
+		/** Checks that a step into from application code adds all platform filters before the count. */
 		@Test
-		@DisplayName("jdwp_step_into creates a STEP_LINE/STEP_INTO request, count-filtered and enabled")
+		@DisplayName("jdwp_step_into filters JDK classes before applying the count filter")
 		void shouldCreateStepIntoRequestWithStepLineAndStepInto() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
+			stack(thread, "example.Work");
 			when(jdiService.getVM()).thenReturn(vm);
 			when(vm.allThreads()).thenReturn(List.of(thread));
 			final StepRequest req = stubStepRequestCreation(thread, StepRequest.STEP_INTO);
@@ -586,14 +643,22 @@ class JDWPToolsStepTest {
 			tools.jdwp_step_into(1L);
 
 			verify(erm).createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_INTO);
-			verify(req).addCountFilter(1);
-			verify(req).enable();
+			final InOrder order = inOrder(req);
+			order.verify(req).addClassExclusionFilter("java.*");
+			order.verify(req).addClassExclusionFilter("javax.*");
+			order.verify(req).addClassExclusionFilter("jdk.*");
+			order.verify(req).addClassExclusionFilter("sun.*");
+			order.verify(req).addClassExclusionFilter("com.sun.*");
+			order.verify(req).addCountFilter(1);
+			order.verify(req).enable();
 		}
 
+		/** Keeps step out unfiltered in application code. */
 		@Test
 		@DisplayName("jdwp_step_out creates a STEP_LINE/STEP_OUT request, count-filtered and enabled")
 		void shouldCreateStepOutRequestWithStepLineAndStepOut() throws Exception {
 			final ThreadReference thread = suspendedThread(1L);
+			stack(thread, "example.Work");
 			when(jdiService.getVM()).thenReturn(vm);
 			when(vm.allThreads()).thenReturn(List.of(thread));
 			final StepRequest req = stubStepRequestCreation(thread, StepRequest.STEP_OUT);
@@ -601,7 +666,54 @@ class JDWPToolsStepTest {
 			tools.jdwp_step_out(1L);
 
 			verify(erm).createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OUT);
+			verify(req, never()).addClassExclusionFilter(any());
 			verify(req).addCountFilter(1);
+			verify(req).enable();
+		}
+
+		/** A hidden probe is excluded on every step, and the visible frame decides JDK filtering. */
+		@ParameterizedTest
+		@CsvSource({"example.Work, into", "java.util.ArrayList, into", "example.Work, over", "example.Work, out"})
+		void shouldExcludeProbeClassesAndUseVisibleFrame(String className, String direction) throws Exception {
+			final String probe = "example." + FastBreakpointProbeSource.CLASS_PREFIX + "Test";
+			final ThreadReference thread = suspendedThread(1L);
+			stack(thread, probe, className);
+			when(jdiService.getVM()).thenReturn(vm);
+			when(vm.allThreads()).thenReturn(List.of(thread));
+			final int depth = switch (direction) {
+				case "into" -> StepRequest.STEP_INTO;
+				case "over" -> StepRequest.STEP_OVER;
+				default -> StepRequest.STEP_OUT;
+			};
+			final StepRequest req = stubStepRequestCreation(thread, depth);
+
+			final String reply = switch (direction) {
+				case "into" -> tools.jdwp_step_into(1L);
+				case "over" -> tools.jdwp_step_over(1L);
+				default -> tools.jdwp_step_out(1L);
+			};
+
+			assertThat(reply).startsWith("Step " + direction + " started from " + className)
+				.contains("first lands on the stop line").doesNotContain(JDK_STEP_TIMEOUT);
+			final InOrder order = inOrder(req);
+			order.verify(req).addClassExclusionFilter(probe);
+			order.verify(req).addCountFilter(1);
+			final boolean filtered = "into".equals(direction) && "example.Work".equals(className);
+			verify(req, times(filtered ? 6 : 1)).addClassExclusionFilter(any());
+		}
+
+		/** Preserves stepping when a fresh read of the logical top frame fails. */
+		@Test
+		void shouldStepUnfilteredWhenTopFrameCannotBeRead() throws Exception {
+			final ThreadReference thread = suspendedThread(1L);
+			stack(thread, "example.Work");
+			when(thread.frame(0)).thenThrow(new InvalidStackFrameException());
+			when(jdiService.getVM()).thenReturn(vm);
+			when(vm.allThreads()).thenReturn(List.of(thread));
+			final StepRequest req = stubStepRequestCreation(thread, StepRequest.STEP_INTO);
+
+			assertThat(tools.jdwp_step_into(1L)).startsWith("Step into started on thread");
+			verify(req, never()).addClassExclusionFilter(any());
 			verify(req).enable();
 		}
 	}

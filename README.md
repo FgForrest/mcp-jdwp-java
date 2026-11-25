@@ -802,9 +802,11 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 Use `wait=true` to append that step's landing or interrupting stop in the same call. If another call already presented that stop, the step reply identifies it as already presented. Stops on other threads stay unseen. The wait is bounded at 30 seconds. If it times out, the step stays pending. Use `jdwp_resume_until_event(threadId=T)` to continue waiting or to collect the stop after a step made with the default `wait=false`.
 
+JDK code runs much slower while a step into from application code is pending, because the JDWP agent watches every method entry. On a line that does a lot of work in the JDK, set a breakpoint where you want to stop and resume.
+
 Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
 
-- **`step_into`** — polymorphic dispatch is unclear; you can't tell from source which override will run.
+- **`step_into`** — polymorphic dispatch is unclear; you can't tell from source which override will run. From application code the step passes over the JDK. To stop inside a JDK method, set a breakpoint in it.
 - **`step_out`** — an exception/early-abort left you deep in a frame you don't care about and finding the caller line for a breakpoint is awkward.
 - **`step_over`** — the *single* next line, when observing a state mutation is faster than predicting it. More than ~3 in a row → set a breakpoint instead.
 
@@ -844,7 +846,7 @@ Attach and disconnect replies show the local PID, start time, and launch selecto
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                                    |
 | `jdwp_resume_until_event` | `timeoutMs?`, `threadId?` | Resume and wait for the next stop, optionally scoped to one thread. Stop replies include any fast-breakpoint captures. Returns `[RESUME_FAILED]` on a failed release |
 | `jdwp_step_over`          | `threadId?`, `wait?` | Step over the current line and optionally wait for the thread's next stop |
-| `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call and optionally wait for the thread's next stop |
+| `jdwp_step_into`          | `threadId?`, `wait?` | Step into a method call, passing over the JDK from application code, and optionally wait for the thread's next stop |
 | `jdwp_step_out`           | `threadId?`, `wait?` | Step out of the current frame and optionally wait for the thread's next stop |
 
 Resume replies list which holds were released and which failed, with the JDI exception. For `[RESUME_FAILED]`, use `jdwp_resume_thread(threadId=…)` with the reported retry thread ID when available. Retrying a failed automatic stop-all releases its VM-wide suspension. `jdwp_resume` also releases every other presented stop and every `jdwp_suspend_thread` hold, including any stop-all a pending step relies on. A disconnect ends the session and directs you to reattach. A step with `wait=true` includes any captures from the stop that ended it.

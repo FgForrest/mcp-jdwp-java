@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * parks only its thread, a failing condition that stops once and then installs, a first hit that
  * stops before anything is installed, restoration of the original bytecode — at once, or once a stopped
  * thread is released, for one entry or two in the same class —, an evaluation that survives another
- * thread's stop-all, watchers by fast-breakpoint ID, a re-arm after a failed first hit, and a step into
+ * thread's stop-all, watchers by fast-breakpoint ID, a re-arm after a failed first hit, and stepping
  * from a fast stop.
  * <p>
  * Opt-in like {@link FastLogpointLiveTest}:
@@ -514,17 +514,17 @@ class FastBreakpointLiveTest {
 		assertBytecodeRestored();
 	}
 
-	/** Checks that stepping from either kind of probe stop lands in application code. */
-	@Test
+	/** Checks that each step from either kind of probe stop lands on the user's stop line. */
+	@ParameterizedTest
+	@ValueSource(strings = {"into", "over", "out"})
 	@Order(14)
-	@DisplayName("a step into from a fast stop, true or failed, lands in the user's code, never in the probe's helpers")
-	void stepIntoFromAFastStopLandsInTheUsersCode() throws Exception {
+	@DisplayName("stepping from a fast stop, true or failed, lands on the user's stop line")
+	void stepFromAFastStopLandsOnTheUsersStopLine(String direction) throws Exception {
 		final int id = idOf(tools.jdwp_set_fast_breakpoint(TARGET, probeLine, "i % 2000000 == 1999999", true, "thread",
 			null, null, null));
 		assertThat(waitForStop()).contains("fast_breakpoint=" + id + ", condition true");
 		final long trueStop = stoppedThread().uniqueID();
-		tools.jdwp_step_into(trueStop);
-		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':').contains("via=step");
+		assertStepLandsOnProbeLine(direction, trueStop);
 		releaseEverything();
 		tools.jdwp_clear_breakpoint(id);
 		await("the dispatcher to finish its sets", this::dispatcherIdle);
@@ -537,8 +537,19 @@ class FastBreakpointLiveTest {
 			.doesNotContain("Captured at the hit:");
 		assertThat(state(failing)).as("the failure came through the probe").isEqualTo(FastLogpointService.State.ARMED);
 		final long errorStop = stoppedThread().uniqueID();
-		tools.jdwp_step_into(errorStop);
-		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':').contains("via=step");
+		assertStepLandsOnProbeLine(direction, errorStop);
+	}
+
+	/** Steps from the probe and checks the exact landing before the original line executes. */
+	private void assertStepLandsOnProbeLine(String direction, long threadId) throws Exception {
+		final String reply = switch (direction) {
+			case "into" -> tools.jdwp_step_into(threadId);
+			case "over" -> tools.jdwp_step_over(threadId);
+			case "out" -> tools.jdwp_step_out(threadId);
+			default -> throw new IllegalArgumentException(direction);
+		};
+		assertThat(reply).startsWith("Step " + direction + " started");
+		assertThat(waitForStop()).startsWith("Event fired at " + TARGET + ':' + probeLine + ". Thread:").contains("via=step");
 	}
 
 	/** Checks that an installed probe reports the same capture in stop, context and history replies. */

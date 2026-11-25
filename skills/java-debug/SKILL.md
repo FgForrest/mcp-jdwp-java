@@ -341,13 +341,15 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 
 Each step is a JDWP round-trip — slow and token-expensive. Default to a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go next. Stepping wins in three narrow cases:
 
-- **`jdwp_step_into`** — polymorphic dispatch is unclear and you can't tell from source which override will actually run. One call, then go back to inspecting.
+- **`jdwp_step_into`** — polymorphic dispatch is unclear and you can't tell from source which override will actually run. One call, then go back to inspecting. From application code the step passes over the JDK: it lands in the application method the line calls, callbacks included, or on the next line. To stop inside a JDK method, set a breakpoint in it.
 - **`jdwp_step_out`** — an exception or early-abort dropped you in a frame you don't care about and finding the right caller line for a breakpoint would be awkward. One call escapes the frame.
 - **`jdwp_step_over`** — only for the *single* next statement, when observing a state mutation is faster than predicting it. More than ~3 `step_over`s in a row means "I should have set a breakpoint."
 
 A step releases the selected thread and reports any remaining stop-all, thread stops, and manual holds. A stop-all can still cover virtual threads that JDI omits from the displayed list. Omit `threadId` to step the thread of the current stop. When other threads can stop too, prefer `jdwp_step_over(threadId=T, wait=true)` or the equivalent step into or out. The reply identifies that step's landing or interrupting stop, even if another call already presented it. Stops on other threads stay held and unseen.
 
 `wait` defaults to false. To collect the stop from an asynchronous step or continue after a 30-second waiting-step timeout, use `jdwp_resume_until_event(threadId=T)`.
+
+JDK code runs much slower while such a step into is pending (a stream sort of 200,000 boxed numbers: 15 s instead of 2 s). On a line that does a lot of work in the JDK, set a breakpoint in the method of interest and resume.
 
 ## Anti-patterns
 

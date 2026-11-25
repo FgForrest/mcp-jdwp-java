@@ -2996,9 +2996,9 @@ public class JDWPTools {
         return jdwp_step_into(threadId, null);
     }
 
-    @McpTool(description = "Step into a method call (resumes the thread; JDI fires a STEP event on the first line of the callee). " +
-        "Thread must be suspended. Pass wait=true to block until the step lands, or call jdwp_resume_until_event(threadId) after it. " +
-        "Most useful when polymorphic dispatch is unclear and you can't tell from source which override will actually run.")
+    @McpTool(description = "Step into a method call. Thread must be suspended. From application code the step passes over the JDK: " +
+        "it lands in the application method the line calls or on the next line. To stop inside a JDK method, set a breakpoint in it. " +
+        "Pass wait=true to block until the step lands, or call jdwp_resume_until_event(threadId) after it.")
     public String jdwp_step_into(
         @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the current stop's thread.") @Nullable Long threadId,
         @McpToolParam(required = false, description = WAIT_FOR_STEP_DESCRIPTION) @Nullable Boolean wait) {
@@ -3143,14 +3143,20 @@ public class JDWPTools {
             // stepped FROM. Helps the agent verify they're at the expected line without an
             // extra get_breakpoint_context call.
             String startLocation = "";
+            final List<String> jdkExclusions = new ArrayList<>();
             try {
                 if (view.count() > 0) {
                     final com.sun.jdi.Location loc = view.frame(0).location();
-                    startLocation = String.format(" from %s:%d",
-                        loc.declaringType().name(), loc.lineNumber());
+                    final String startClass = loc.declaringType().name();
+                    startLocation = String.format(" from %s:%d", startClass, loc.lineNumber());
+                    if (stepDepth == StepRequest.STEP_INTO && !isPlatformClassName(startClass)) {
+                        for (final String prefix : PLATFORM_PACKAGE_PREFIXES) {
+                            jdkExclusions.add(prefix + "*");
+                        }
+                    }
                 }
             } catch (Exception ignore) {
-                // Best-effort — fall back to unannotated message.
+                // Without a readable start, preserve unfiltered stepping in case it is in the JDK.
             }
             final String fastStopNote = view.isFastStop()
                 ? " From a fast breakpoint's stop every kind of step first lands on the stop line, before its code."
@@ -3178,6 +3184,9 @@ public class JDWPTools {
                     // restarted by the JDWP agent and must not use up the count.
                     for (String probeClass : probeClasses) {
                         stepRequest.addClassExclusionFilter(probeClass);
+                    }
+                    for (final String exclusion : jdkExclusions) {
+                        stepRequest.addClassExclusionFilter(exclusion);
                     }
                     stepRequest.addCountFilter(1);
                     stepRequest.enable();
@@ -3211,8 +3220,12 @@ public class JDWPTools {
             try {
                 final SuspensionSession.NextStop next =
                     session.awaitStepStop(DEFAULT_STOP_WAIT_MS, java.util.Objects.requireNonNull(step.armed()));
+                final String jdkTimeoutAdvice = next.outcome() == SuspensionSession.Outcome.TIMEOUT && !jdkExclusions.isEmpty()
+                    ? "\nThe step may be passing JDK code, which runs slowly while the step is pending or may be blocking. "
+                        + "A breakpoint in the method of interest is quicker."
+                    : "";
                 return reply + fastStopNote + "\n" + renderNextStop(session, next, DEFAULT_STOP_WAIT_MS, id,
-                    "jdwp_step_" + label);
+                    "jdwp_step_" + label) + jdkTimeoutAdvice;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return reply + fastStopNote + "\nWait interrupted";
